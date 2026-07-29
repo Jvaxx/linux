@@ -90,7 +90,9 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* To be filled by loader */
 			next-level-cache = <&l2_cache_e>;
+			operating-points-v2 = <&opp_e>;
 			capacity-dmips-mhz = <668>;
+			performance-domains = <&cpufreq_e>;
 		};
 
 		cpu_e1: cpu@1 {
@@ -100,7 +102,9 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* To be filled by loader */
 			next-level-cache = <&l2_cache_e>;
+			operating-points-v2 = <&opp_e>;
 			capacity-dmips-mhz = <668>;
+			performance-domains = <&cpufreq_e>;
 		};
 
 		cpu_e2: cpu@2 {
@@ -110,7 +114,9 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* To be filled by loader */
 			next-level-cache = <&l2_cache_e>;
+			operating-points-v2 = <&opp_e>;
 			capacity-dmips-mhz = <668>;
+			performance-domains = <&cpufreq_e>;
 		};
 
 		cpu_e3: cpu@3 {
@@ -120,7 +126,9 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* To be filled by loader */
 			next-level-cache = <&l2_cache_e>;
+			operating-points-v2 = <&opp_e>;
 			capacity-dmips-mhz = <668>;
+			performance-domains = <&cpufreq_e>;
 		};
 
 		/* The boot CPU: the boot loader enters the kernel on it. */
@@ -129,7 +137,9 @@
 			device_type = "cpu";
 			reg = <0x0 0x10100>;
 			next-level-cache = <&l2_cache_p0>;
+			operating-points-v2 = <&opp_p0>;
 			capacity-dmips-mhz = <1024>;
+			performance-domains = <&cpufreq_p0>;
 		};
 
 		cpu_p01: cpu@10101 {
@@ -139,7 +149,9 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* To be filled by loader */
 			next-level-cache = <&l2_cache_p0>;
+			operating-points-v2 = <&opp_p0>;
 			capacity-dmips-mhz = <1024>;
+			performance-domains = <&cpufreq_p0>;
 		};
 
 		cpu_p02: cpu@10102 {
@@ -149,7 +161,9 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* To be filled by loader */
 			next-level-cache = <&l2_cache_p0>;
+			operating-points-v2 = <&opp_p0>;
 			capacity-dmips-mhz = <1024>;
+			performance-domains = <&cpufreq_p0>;
 		};
 
 		cpu_p03: cpu@10103 {
@@ -159,7 +173,9 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* To be filled by loader */
 			next-level-cache = <&l2_cache_p0>;
+			operating-points-v2 = <&opp_p0>;
 			capacity-dmips-mhz = <1024>;
+			performance-domains = <&cpufreq_p0>;
 		};
 
 		cpu_p04: cpu@10104 {
@@ -169,7 +185,9 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* To be filled by loader */
 			next-level-cache = <&l2_cache_p0>;
+			operating-points-v2 = <&opp_p0>;
 			capacity-dmips-mhz = <1024>;
+			performance-domains = <&cpufreq_p0>;
 		};
 
 		cpu_p10: cpu@10200 {
@@ -179,7 +197,9 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* To be filled by loader */
 			next-level-cache = <&l2_cache_p1>;
+			operating-points-v2 = <&opp_p1>;
 			capacity-dmips-mhz = <1024>;
+			performance-domains = <&cpufreq_p1>;
 		};
 
 		cpu_p11: cpu@10201 {
@@ -189,7 +209,9 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* To be filled by loader */
 			next-level-cache = <&l2_cache_p1>;
+			operating-points-v2 = <&opp_p1>;
 			capacity-dmips-mhz = <1024>;
+			performance-domains = <&cpufreq_p1>;
 		};
 
 		cpu_p12: cpu@10202 {
@@ -199,7 +221,9 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* To be filled by loader */
 			next-level-cache = <&l2_cache_p1>;
+			operating-points-v2 = <&opp_p1>;
 			capacity-dmips-mhz = <1024>;
+			performance-domains = <&cpufreq_p1>;
 		};
 
 		cpu_p13: cpu@10203 {
@@ -209,7 +233,9 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* To be filled by loader */
 			next-level-cache = <&l2_cache_p1>;
+			operating-points-v2 = <&opp_p1>;
 			capacity-dmips-mhz = <1024>;
+			performance-domains = <&cpufreq_p1>;
 		};
 
 		cpu_p14: cpu@10204 {
@@ -219,7 +245,9 @@
 			enable-method = "spin-table";
 			cpu-release-addr = <0 0>; /* To be filled by loader */
 			next-level-cache = <&l2_cache_p1>;
+			operating-points-v2 = <&opp_p1>;
 			capacity-dmips-mhz = <1024>;
+			performance-domains = <&cpufreq_p1>;
 		};
 	};
 
@@ -244,6 +272,211 @@
 		cache-size = <0x1000000>;
 	};
 
+	/*
+	 * DVFS states from the ADT: /arm-io/pmgr voltage-states1-sram (E),
+	 * voltage-states5-sram (P0) and voltage-states13-sram (P1), word 0
+	 * in kHz. opp-level is the hardware p-state. Each P cluster has its
+	 * own table even though the frequencies are the same: opp-shared
+	 * means one clock domain per table.
+	 */
+	opp_e: opp-table-e {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp01 {
+			opp-hz = /bits/ 64 <1020000000>;
+			opp-level = <1>;
+		};
+		opp02 {
+			opp-hz = /bits/ 64 <1404000000>;
+			opp-level = <2>;
+		};
+		opp03 {
+			opp-hz = /bits/ 64 <1788000000>;
+			opp-level = <3>;
+		};
+		opp04 {
+			opp-hz = /bits/ 64 <2112000000>;
+			opp-level = <4>;
+		};
+		opp05 {
+			opp-hz = /bits/ 64 <2352000000>;
+			opp-level = <5>;
+		};
+		opp06 {
+			opp-hz = /bits/ 64 <2532000000>;
+			opp-level = <6>;
+		};
+		opp07 {
+			opp-hz = /bits/ 64 <2592000000>;
+			opp-level = <7>;
+		};
+	};
+
+	opp_p0: opp-table-p0 {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp01 {
+			opp-hz = /bits/ 64 <1260000000>;
+			opp-level = <1>;
+		};
+		opp02 {
+			opp-hz = /bits/ 64 <1512000000>;
+			opp-level = <2>;
+		};
+		opp03 {
+			opp-hz = /bits/ 64 <1800000000>;
+			opp-level = <3>;
+		};
+		opp04 {
+			opp-hz = /bits/ 64 <2088000000>;
+			opp-level = <4>;
+		};
+		opp05 {
+			opp-hz = /bits/ 64 <2352000000>;
+			opp-level = <5>;
+		};
+		opp06 {
+			opp-hz = /bits/ 64 <2616000000>;
+			opp-level = <6>;
+		};
+		opp07 {
+			opp-hz = /bits/ 64 <2868000000>;
+			opp-level = <7>;
+		};
+		opp08 {
+			opp-hz = /bits/ 64 <3096000000>;
+			opp-level = <8>;
+		};
+		opp09 {
+			opp-hz = /bits/ 64 <3300000000>;
+			opp-level = <9>;
+		};
+		opp10 {
+			opp-hz = /bits/ 64 <3468000000>;
+			opp-level = <10>;
+		};
+		opp11 {
+			opp-hz = /bits/ 64 <3624000000>;
+			opp-level = <11>;
+		};
+		opp12 {
+			opp-hz = /bits/ 64 <3756000000>;
+			opp-level = <12>;
+		};
+		opp13 {
+			opp-hz = /bits/ 64 <3852000000>;
+			opp-level = <13>;
+		};
+		opp14 {
+			opp-hz = /bits/ 64 <3924000000>;
+			opp-level = <14>;
+		};
+		opp15 {
+			opp-hz = /bits/ 64 <3996000000>;
+			opp-level = <15>;
+		};
+		opp16 {
+			opp-hz = /bits/ 64 <4044000000>;
+			opp-level = <16>;
+		};
+		opp17 {
+			opp-hz = /bits/ 64 <4104000000>;
+			opp-level = <17>;
+		};
+		opp18 {
+			opp-hz = /bits/ 64 <4416000000>;
+			opp-level = <18>;
+		};
+		opp19 {
+			opp-hz = /bits/ 64 <4512000000>;
+			opp-level = <19>;
+		};
+	};
+
+	opp_p1: opp-table-p1 {
+		compatible = "operating-points-v2";
+		opp-shared;
+
+		opp01 {
+			opp-hz = /bits/ 64 <1260000000>;
+			opp-level = <1>;
+		};
+		opp02 {
+			opp-hz = /bits/ 64 <1512000000>;
+			opp-level = <2>;
+		};
+		opp03 {
+			opp-hz = /bits/ 64 <1800000000>;
+			opp-level = <3>;
+		};
+		opp04 {
+			opp-hz = /bits/ 64 <2088000000>;
+			opp-level = <4>;
+		};
+		opp05 {
+			opp-hz = /bits/ 64 <2352000000>;
+			opp-level = <5>;
+		};
+		opp06 {
+			opp-hz = /bits/ 64 <2616000000>;
+			opp-level = <6>;
+		};
+		opp07 {
+			opp-hz = /bits/ 64 <2868000000>;
+			opp-level = <7>;
+		};
+		opp08 {
+			opp-hz = /bits/ 64 <3096000000>;
+			opp-level = <8>;
+		};
+		opp09 {
+			opp-hz = /bits/ 64 <3300000000>;
+			opp-level = <9>;
+		};
+		opp10 {
+			opp-hz = /bits/ 64 <3468000000>;
+			opp-level = <10>;
+		};
+		opp11 {
+			opp-hz = /bits/ 64 <3624000000>;
+			opp-level = <11>;
+		};
+		opp12 {
+			opp-hz = /bits/ 64 <3756000000>;
+			opp-level = <12>;
+		};
+		opp13 {
+			opp-hz = /bits/ 64 <3852000000>;
+			opp-level = <13>;
+		};
+		opp14 {
+			opp-hz = /bits/ 64 <3924000000>;
+			opp-level = <14>;
+		};
+		opp15 {
+			opp-hz = /bits/ 64 <3996000000>;
+			opp-level = <15>;
+		};
+		opp16 {
+			opp-hz = /bits/ 64 <4044000000>;
+			opp-level = <16>;
+		};
+		opp17 {
+			opp-hz = /bits/ 64 <4104000000>;
+			opp-level = <17>;
+		};
+		opp18 {
+			opp-hz = /bits/ 64 <4416000000>;
+			opp-level = <18>;
+		};
+		opp19 {
+			opp-hz = /bits/ 64 <4512000000>;
+			opp-level = <19>;
+		};
+	};
+
 	timer {
 		compatible = "arm,armv8-timer";
 		interrupt-parent = <&aic>;
@@ -260,6 +493,27 @@
 		#clock-cells = <0>;
 		clock-frequency = <24000000>;
 		clock-output-names = "clkref";
+	};
+
+	cpufreq_e: cpufreq@210e20000 {
+		compatible = "apple,t6041-cluster-cpufreq", "apple,t8112-cluster-cpufreq";
+		reg = <0x2 0x10e20000 0x0 0x1000>;
+		nonposted-mmio;
+		#performance-domain-cells = <0>;
+	};
+
+	cpufreq_p0: cpufreq@211e20000 {
+		compatible = "apple,t6041-cluster-cpufreq", "apple,t8112-cluster-cpufreq";
+		reg = <0x2 0x11e20000 0x0 0x1000>;
+		nonposted-mmio;
+		#performance-domain-cells = <0>;
+	};
+
+	cpufreq_p1: cpufreq@212e20000 {
+		compatible = "apple,t6041-cluster-cpufreq", "apple,t8112-cluster-cpufreq";
+		reg = <0x2 0x12e20000 0x0 0x1000>;
+		nonposted-mmio;
+		#performance-domain-cells = <0>;
 	};
 
 	/* iBoot leaves the I2C gates on and the pins muxed to I2C. */
