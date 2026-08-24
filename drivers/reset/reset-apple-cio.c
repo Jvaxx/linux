@@ -41,6 +41,7 @@ struct apple_cio_reset_variant {
 struct apple_cio_reset {
 	struct reset_controller_dev rcdev;
 	const struct apple_cio_reset_variant *variant;
+	struct device *dev;
 	struct regmap *regmap;
 	u32 offset;
 	struct mutex lock; /* serializes access to the shared t600x register */
@@ -84,6 +85,20 @@ static int t6000_cio_deassert(struct apple_cio_reset *priv, unsigned long id)
 	 * Thus, there's no need to either RMW here or wait before polling.
 	 */
 	guard(mutex)(&priv->lock);
+
+	/*
+	 * Every port on the die shares this register, so a reconfiguration requested for
+	 * another port can still be running. The busy bits must clear before the request
+	 * is stored, and the result of that wait is advisory, so only
+	 * warn here: waiting can only help, while failing would turn a slow reconfigure
+	 * into a probe failure.
+	 */
+	ret = regmap_read_poll_timeout(priv->regmap, priv->offset, val,
+				       !(val & T6000_CIO_CTRL_INIT_BUSY(id)),
+				       APPLE_CIO_RESET_POLL_US,
+				       APPLE_CIO_RESET_TIMEOUT_US);
+	if (ret)
+		dev_warn(priv->dev, "CIO %lu still busy before reconfigure request\n", id);
 
 	ret = regmap_write(priv->regmap, priv->offset, T6000_CIO_CTRL_INIT_REQ(id));
 	if (ret)
@@ -137,6 +152,7 @@ static int apple_cio_reset_probe(struct platform_device *pdev)
 	priv->variant = of_device_get_match_data(dev);
 	if (!priv->variant)
 		return -ENODEV;
+	priv->dev = dev;
 
 	ret = devm_mutex_init(dev, &priv->lock);
 	if (ret)
