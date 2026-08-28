@@ -194,6 +194,18 @@
 	apple,always-on;
 };
 
+&usb4_0_acio {
+	apple,pcie-tunnel = <&usb4_0_pcie_tunnel>;
+};
+
+&usb4_1_acio {
+	apple,pcie-tunnel = <&usb4_1_pcie_tunnel>;
+};
+
+&usb4_2_acio {
+	apple,pcie-tunnel = <&usb4_2_pcie_tunnel>;
+};
+
 &usb4_3_acio {
 	apple,pcie-tunnel = <&usb4_3_pcie_tunnel>;
 };

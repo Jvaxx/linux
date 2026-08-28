@@ -250,6 +250,18 @@
 	apple,always-on;
 };
 
+&usb4_0_acio {
+	apple,pcie-tunnel = <&usb4_0_pcie_tunnel>;
+};
+
+&usb4_1_acio {
+	apple,pcie-tunnel = <&usb4_1_pcie_tunnel>;
+};
+
+&usb4_2_acio {
+	apple,pcie-tunnel = <&usb4_2_pcie_tunnel>;
+};
+
 /* Keep dptx_phy_ps on until DCP can sequence it during display bring-up. */
 &ps_dptx_phy_ps {
 	apple,always-on;
