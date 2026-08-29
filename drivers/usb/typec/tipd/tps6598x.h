@@ -380,6 +380,7 @@ struct cd321x {
 	struct typec_mux_state state;
 
 	struct typec_thunderbolt_switch *tbt_switch;
+	bool display_route_active;
 
 	struct cd321x_status update_status;
 	struct delayed_work update_work;
