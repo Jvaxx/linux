@@ -545,6 +545,7 @@ int tb_domain_suspend_noirq(struct tb *tb)
 
 	return ret;
 }
+EXPORT_SYMBOL_FOR_MODULES(tb_domain_suspend_noirq, "thunderbolt_apple");
 
 /**
  * tb_domain_resume_noirq() - Resume a domain
@@ -567,11 +568,13 @@ int tb_domain_resume_noirq(struct tb *tb)
 
 	return ret;
 }
+EXPORT_SYMBOL_FOR_MODULES(tb_domain_resume_noirq, "thunderbolt_apple");
 
 int tb_domain_suspend(struct tb *tb)
 {
 	return tb->cm_ops->suspend ? tb->cm_ops->suspend(tb) : 0;
 }
+EXPORT_SYMBOL_FOR_MODULES(tb_domain_suspend, "thunderbolt_apple");
 
 int tb_domain_freeze_noirq(struct tb *tb)
 {
@@ -586,6 +589,7 @@ int tb_domain_freeze_noirq(struct tb *tb)
 
 	return ret;
 }
+EXPORT_SYMBOL_FOR_MODULES(tb_domain_freeze_noirq, "thunderbolt_apple");
 
 int tb_domain_thaw_noirq(struct tb *tb)
 {
@@ -599,12 +603,14 @@ int tb_domain_thaw_noirq(struct tb *tb)
 
 	return ret;
 }
+EXPORT_SYMBOL_FOR_MODULES(tb_domain_thaw_noirq, "thunderbolt_apple");
 
 void tb_domain_complete(struct tb *tb)
 {
 	if (tb->cm_ops->complete)
 		tb->cm_ops->complete(tb);
 }
+EXPORT_SYMBOL_FOR_MODULES(tb_domain_complete, "thunderbolt_apple");
 
 int tb_domain_runtime_suspend(struct tb *tb)
 {
