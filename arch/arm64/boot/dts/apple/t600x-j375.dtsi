@@ -361,8 +361,6 @@
 
 #ifdef APPLE_T600X_NON_ULTRA
 &typec0 {
-	displayport = <&dcpext1>;
-
 	ports {
 		port@3 {
 			reg = <3>;
@@ -374,8 +372,6 @@
 };
 
 &typec1 {
-	displayport = <&dcpext1>;
-
 	ports {
 		port@3 {
 			reg = <3>;
@@ -387,8 +383,6 @@
 };
 
 &typec2 {
-	displayport = <&dcpext1>;
-
 	ports {
 		port@3 {
 			reg = <3>;
@@ -400,8 +394,6 @@
 };
 
 &typec3 {
-	displayport = <&dcpext1>;
-
 	ports {
 		port@3 {
 			reg = <3>;
