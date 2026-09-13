@@ -830,6 +830,7 @@ static int avd_h264_run(struct avd_ctx *ctx)
 
 err_free_jobs:
 	kfree(ctx->job.segments);
+	avd_run_postamble(ctx, &run.base);
 	return ret;
 }
 
