@@ -3969,6 +3969,7 @@ impl IdentityV1 {
 pub(crate) struct MatchResult {
     user_id: i32,
     identity: [u8; IDENTITY_UUID_LEN],
+    flags: u32,
 }
 
 impl MatchResult {
@@ -3986,6 +3987,7 @@ impl MatchResult {
                 bytes[MR_USER_ID + 3],
             ]),
             identity,
+            flags: u32::from_le_bytes(bytes[MR_FLAGS..MR_FLAGS + 4].try_into().ok()?),
         })
     }
 
@@ -3994,7 +3996,7 @@ impl MatchResult {
     }
 
     pub(crate) fn matches(&self, user: UserId) -> bool {
-        self.user_id == user.value()
+        self.flags & MR_FLAG_MATCH != 0 && self.user_id == user.value()
     }
 }
 

@@ -2447,6 +2447,9 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 	if (anv->hw->has_lsq_nvmmu)
 		anv->ctrl.crypto_profile = &anv->crypto_profile;
 
+	if (anv->hw->has_lsq_nvmmu)
+		anv->ctrl.crypto_profile = &anv->crypto_profile;
+
 	return anv;
 out_detach_genpd:
 	apple_nvme_detach_genpd(anv);

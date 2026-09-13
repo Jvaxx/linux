@@ -2243,10 +2243,7 @@ impl WorkItem<ENROL_WORK_ID> for SepData {
     type Pointer = Arc<SepData>;
 
     fn run(this: Arc<SepData>) {
-        // Taken before `capture_begin`, so the sleep drain never counts the
-        // wait for it.
-        let _writer = this.catacomb_writer.lock();
-        if this.shutting_down.load(Relaxed) || !this.capture_begin() {
+        if this.shutting_down.load(Relaxed) {
             return;
         }
         this.run_enrolment();
@@ -2258,8 +2255,7 @@ impl WorkItem<VERIFY_WORK_ID> for SepData {
     type Pointer = Arc<SepData>;
 
     fn run(this: Arc<SepData>) {
-        let _writer = this.catacomb_writer.lock();
-        if this.shutting_down.load(Relaxed) || !this.capture_begin() {
+        if this.shutting_down.load(Relaxed) {
             return;
         }
         this.run_verify();
@@ -2430,6 +2426,18 @@ module! {
         j414s_persistent_enrol: u8 {
             default: 0,
             description: "Opt-in J414s enrollment test: export owner from the fresh context, then save user before master at completion",
+        },
+        provision_keybag: u8 {
+            default: 0,
+            description: "Create the Linux identity keybag when none exists; requires xart_writes=1",
+        },
+        os_uuid_hi: u64 {
+            default: 0,
+            description: "High 64 bits of an explicit xART OS UUID",
+        },
+        os_uuid_lo: u64 {
+            default: 0,
+            description: "Low 64 bits of an explicit xART OS UUID",
         },
     },
 }
