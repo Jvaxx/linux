@@ -405,7 +405,7 @@ static void stream_slice(struct avd_ctx *ctx, struct avd_h264_run *run)
 	u32 off = 2;
 	u32 bytes_read = 2;
 
-	while (bytes_read < min_off) {
+	while (bytes_read < min_off && off < payload_len) {
 		if (data[off - 2] != 0x00 || data[off - 1] != 0x00 ||
 		    data[off] != 0x03)
 			bytes_read++;
@@ -810,6 +810,7 @@ static int avd_h264_run(struct avd_ctx *ctx)
 	}
 
 	if (is_new_frame(run.slice_params)) {
+		/* the header segment plus one per slice */
 		ret = avd_init_job(ctx, AVD_CODEC_H264,
 				   h264_ctx->alloc_slice_num + 1);
 		if (ret)
