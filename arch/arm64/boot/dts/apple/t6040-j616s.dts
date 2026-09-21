@@ -18,6 +18,10 @@
 	model = "Apple MacBook Pro (16-inch, M4 Pro, Nov 2024)";
 	chassis-type = "laptop";
 
+	aliases {
+		keyboard = &keyboard;
+	};
+
 	chosen {
 		#address-cells = <2>;
 		#size-cells = <2>;
@@ -91,4 +95,43 @@
 /* The Type-C retimers (ADT atcrt at 0x18/0x19/0x1a) sit on this bus; no driver yet. */
 &i2c6 {
 	status = "okay";
+};
+
+&mtp {
+	status = "okay";
+};
+
+&mtp_mbox {
+	status = "okay";
+};
+
+&mtp_dart {
+	status = "okay";
+};
+
+&mtp_dockchannel {
+	status = "okay";
+};
+
+&mtp_hid {
+	multi-touch {
+		firmware-name = "apple/tpmtfw-j616s.bin";
+	};
+
+	keyboard: keyboard {
+		hid-country-code = <0>;
+		apple,keyboard-layout-id = <2>;
+	};
+
+	stm {
+	};
+
+	actuator {
+	};
+
+	tp-accel {
+	};
+
+	mtp {
+	};
 };
