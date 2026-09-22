@@ -2093,6 +2093,13 @@ impl platform::Driver for SepDriver {
         _info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let dev: &device::Device<device::Core<'_>> = pdev.as_ref();
+        if *module_parameters::xart_writes.value() != 0 {
+            dev_err!(
+                dev,
+                "raw APFS xART writes are blocked until the .gl extent and update protocol are validated\n"
+            );
+            return Err(ENOTSUPP);
+        }
         if *module_parameters::provision_keybag.value() != 0
             && *module_parameters::xart_writes.value() == 0
         {
@@ -2184,7 +2191,7 @@ module! {
     params: {
         xart_writes: u8 {
             default: 0,
-            description: "Allow writes to the validated shared xART store",
+            description: "Request shared xART writes (refused by the raw APFS owner until its extent is verified)",
         },
         xart_start_sector: u64 {
             default: 0,
