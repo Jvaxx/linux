@@ -1039,6 +1039,12 @@ static u8 dcpep_cb_prop_end(struct apple_dcp *dcp,
 			 (int)sizeof(req->key), req->key, dcp->chunks.length,
 			 resp, dcp->nr_modes);
 
+	if (dcp->fixed_connector_type != DRM_MODE_CONNECTOR_eDP)
+		dev_info(dcp->dev,
+			 "DCP property key=%.*s bytes=%zu accepted=%u nr_modes=%u\n",
+			 (int)sizeof(req->key), req->key, dcp->chunks.length,
+			 resp, dcp->nr_modes);
+
 	/* move chunked data to connector to provide it via debugfs */
 	dcp_connector_update_dict(dcp->connector, req->key, &dcp->chunks);
 	dcp->chunks.data = NULL;
