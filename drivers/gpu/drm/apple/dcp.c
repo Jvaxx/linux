@@ -9,10 +9,12 @@
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/gpio/consumer.h>
+#include <linux/io.h>
 #include <linux/iommu.h>
 #include <linux/jiffies.h>
 #include <linux/kconfig.h>
 #include <linux/kernel.h>
+#include <linux/kmod.h>
 #include <linux/module.h>
 #include <linux/mux/driver.h>
 #include <linux/soc/apple/dp-tunnel.h>
@@ -25,9 +27,15 @@
 #include <linux/property.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
+#include <linux/soc/apple/dp-tunnel.h>
 #include <linux/soc/apple/j613-display.h>
 #include <linux/soc/apple/pmp-report.h>
 #include <linux/string.h>
+#include <linux/err.h>
+#include <linux/module.h>
+#include <linux/mux/driver.h>
+#include <linux/usb/typec.h>
+#include <linux/usb/typec_tbt.h>
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
 #include <linux/usb/typec_mux.h>
@@ -38,6 +46,7 @@
 #include <drm/drm_drv.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
+#include <drm/drm_modes.h>
 #include <drm/drm_module.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
@@ -69,6 +78,81 @@ static DEFINE_MUTEX(dcp_retained_sessions_lock);
 
 static bool dcp_session_retained(struct device *dev)
 {
+	struct apple_dcp *dcp = route->dcp;
+	int ret = 0;
+
+	/*
+	 * Under tb_lock so a DCP link (re)configuration can neither select
+	 * the crossbar nor restart the tunnel pixel clock behind our back.
+	 * Ported from aurora-silicon/linux#8.
+	 */
+	scoped_guard(mutex, &dcp->tb_lock) {
+		if (!route->tunnel || route->xbar_up)
+			ret = mux_control_deselect(route->active_xbar ?: route->xbar);
+		if (ret)
+			return ret;
+		route->xbar_up = false;
+
+		if (route->tunnel && dcp->phy) {
+			/* The tunnel pixel clock must not outlive the tunnel. */
+			typeof(&apple_atc_dp_tunnel_rate) stop =
+				symbol_get(apple_atc_dp_tunnel_rate);
+
+			if (stop) {
+				stop(dcp->phy, 0);
+				symbol_put(apple_atc_dp_tunnel_rate);
+			}
+		}
+		route->active_xbar = NULL;
+		route->tunnel = false;
+		dcp->dptx_tunnel = false;
+		dcp->dptx_dfp_port = 0;
+		dcp->tb_dpin_set_active = NULL;
+		dcp->tb_dpin_ctx = NULL;
+		dcp->tb_clock_ok = false;
+	}
+
+	route->selected = false;
+	if (dcp->active_typec_route == route)
+		dcp->active_typec_route = NULL;
+
+	if (route->port->connector &&
+	    route->port->connector->dcp == to_platform_device(dcp->dev)) {
+		/*
+		 * Until the port is activated again it has no pipeline behind
+		 * it, and nothing can read modes or EDID from it.  Report it
+		 * disconnected for that window: leaving a connected connector
+		 * whose ->dcp is NULL lets anything probing it in between --
+		 * a compositor starting up while the fabric is still settling
+		 * -- see an output it cannot get a mode for, and give up on
+		 * it.  The new pipeline marks it connected again once the
+		 * display has come back up on it.
+		 */
+		WRITE_ONCE(route->port->connector->connected, false);
+		route->port->connector->dcp = NULL;
+
+		/* Unrouted: the port could go to any of its pipelines again. */
+		if (route->port->connector->port_encoder)
+			route->port->connector->port_encoder->possible_crtcs =
+				route->port->connector->candidate_crtcs;
+	}
+	dcp->typec_connector = NULL;
+	dcp->connector = dcp->fixed_connector;
+
+	if (dcp->fixed_connector_type != DRM_MODE_CONNECTOR_USB) {
+		dcp->connector_type = dcp->fixed_connector_type;
+
+		/*
+		 * Only hand the pipeline back to its fixed output if that output
+		 * is live.  Re-targeting the DPTX endpoint at the fixed PHY while
+		 * nothing is attached there leaves DCP unable to train a link on a
+		 * later Type-C target: it answers DEVICE_NOT_STARTED and every
+		 * following DPTX call times out.  Park on a Type-C PHY instead,
+		 * for the same reason the USB-C-only case does below.
+		 */
+		if (dcp->hdmi_hpd && gpiod_get_value_cansleep(dcp->hdmi_hpd)) {
+			dcp->phy = dcp->fixed_phy;
+			dcp->dptx_phy = dcp->fixed_dptx_phy;
 	struct dcp_session_ref *session;
 	bool retained = false;
 
@@ -83,6 +167,277 @@ static bool dcp_session_retained(struct device *dev)
 	return retained;
 }
 
+/*
+ * Thunderbolt DP tunnels, ported from aurora-silicon/linux#8. Crossbar
+ * connection up/down, looked up at runtime so appledrm does not require the
+ * crossbar driver to be built.
+ */
+static int dcp_dpxbar_link(struct mux_control *mux, bool up)
+{
+	typeof(&apple_dpxbar_link_up) fn;
+	int ret;
+
+	fn = up ? symbol_get(apple_dpxbar_link_up) :
+		  symbol_get(apple_dpxbar_link_down);
+	if (!fn)
+		return -ENOENT;
+	ret = fn(mux);
+	if (up)
+		symbol_put(apple_dpxbar_link_up);
+	else
+		symbol_put(apple_dpxbar_link_down);
+	return ret;
+}
+
+/* DP IN adapter handshake through the thunderbolt glue; tb_lock held. */
+static int dcp_tunnel_dpin_locked(struct apple_dcp *dcp, bool active)
+{
+	lockdep_assert_held(&dcp->tb_lock);
+	if (!dcp->tb_dpin_set_active)
+		return -ENODEV;
+	return dcp->tb_dpin_set_active(dcp->tb_dpin_ctx, active);
+}
+
+/*
+ * Thunderbolt DP IN, from DCP's DidChangeLinkConfiguration once a link rate
+ * is set: bring the crossbar connection up (FIFO/PCLK/ATC enables) now that
+ * the tunnel pixel clock runs, and re-assert the DP IN adapter's
+ * DPTX_INACTIVE=0 afterwards. The first time this is the mux selection;
+ * after a re-link only the clocks are brought back (the mux selection and
+ * the ATC output enable are kept, see dcp_tunnel_crossbar_down()). Runs
+ * inside a DCP apcall: only tb_lock, which nobody holds across a DCP call.
+ */
+int dcp_tunnel_crossbar_up(struct apple_dcp *dcp)
+{
+	struct apple_dcp_typec_route *route;
+	int ret;
+
+	guard(mutex)(&dcp->tb_lock);
+	route = dcp->active_typec_route;
+	if (!route || !route->tunnel || !route->active_xbar)
+		return -ENODEV;
+	if (!dcp->tb_clock_ok) {
+		dev_warn(dcp->dev, "no DP tunnel pixel clock, crossbar left down\n");
+		return -EIO;
+	}
+	if (!route->xbar_up) {
+		/* Never block a DCP call on the mux semaphore. */
+		ret = mux_control_try_select(route->active_xbar, route->mux_index);
+		if (!ret)
+			route->xbar_up = true;
+	} else {
+		ret = dcp_dpxbar_link(route->active_xbar, true);
+	}
+	if (ret) {
+		dev_warn(dcp->dev, "DP tunnel crossbar up failed: %d\n", ret);
+		return ret;
+	}
+	return dcp_tunnel_dpin_locked(dcp, true);
+}
+
+/*
+ * Thunderbolt DP IN, from DCP's WillChangeLinkConfiguration on an
+ * established link: DP IN inactive, crossbar clocks down (mux selection and
+ * ATC output enable kept). DP IN goes active again in
+ * dcp_tunnel_crossbar_up().
+ */
+int dcp_tunnel_crossbar_down(struct apple_dcp *dcp)
+{
+	struct apple_dcp_typec_route *route;
+
+	guard(mutex)(&dcp->tb_lock);
+	route = dcp->active_typec_route;
+	if (!route || !route->tunnel || !route->xbar_up)
+		return 0;
+	dcp_tunnel_dpin_locked(dcp, false);
+	return dcp_dpxbar_link(route->active_xbar, false);
+}
+
+/*
+ * Thunderbolt DP IN, from DCP's SetLinkRate: start (rate != 0) or stop the
+ * tunnel pixel clock. A stopped clock also takes the crossbar connection
+ * down.
+ */
+int dcp_tunnel_set_rate(struct apple_dcp *dcp, struct phy *phy, u32 link_rate)
+{
+	typeof(&apple_atc_dp_tunnel_rate) fn;
+	struct apple_dcp_typec_route *route;
+	int ret;
+
+	guard(mutex)(&dcp->tb_lock);
+	if (!dcp->dptx_tunnel)
+		return -ENODEV;
+	fn = symbol_get(apple_atc_dp_tunnel_rate);
+	if (!fn) {
+		dev_err(dcp->dev, "phy-apple-atc not loaded, no DP tunnel clock\n");
+		return -ENOENT;
+	}
+	route = dcp->active_typec_route;
+	if (!link_rate && route && route->xbar_up)
+		dcp_dpxbar_link(route->active_xbar, false);
+	ret = fn(phy, link_rate);
+	symbol_put(apple_atc_dp_tunnel_rate);
+	dcp->tb_clock_ok = !ret && link_rate;
+	if (ret)
+		dev_warn(dcp->dev, "DP tunnel pixel clock (rate 0x%x) failed: %d\n",
+			 link_rate, ret);
+	return ret;
+}
+
+/* Thunderbolt DP IN: DCP Activate/Deactivate. */
+int dcp_tunnel_dpin_activate(struct apple_dcp *dcp, bool active)
+{
+	guard(mutex)(&dcp->tb_lock);
+	if (!dcp->dptx_tunnel)
+		return 0;
+	return dcp_tunnel_dpin_locked(dcp, active);
+}
+
+/*
+ * Thunderbolt DP tunnels: the host router's DP IN adapters sit behind the
+ * crossbar's dpin0/dpin1 outputs of the port's ATC. When the Thunderbolt
+ * connection manager has set up a tunnel from one of them, route a free
+ * display pipeline there and tell DCP a display is attached, so it trains
+ * the link (and completes DPRX) through the tunnel.
+ */
+int apple_dcp_tb_dp_tunnel(struct device_node *connector_np, unsigned int dpin,
+			   bool active, int (*set_active)(void *ctx, bool active),
+			   void *ctx)
+{
+	struct apple_dcp_typec_port *port = NULL, *pos;
+	struct apple_dcp_typec_route *candidate, *best = NULL;
+	unsigned int best_score = UINT_MAX;
+	struct mux_control *ctl;
+	struct apple_dcp *dcp;
+	int ret;
+
+	if (!connector_np || dpin > 1)
+		return -EINVAL;
+
+	guard(mutex)(&dcp_typec_fabric_lock);
+
+	list_for_each_entry(pos, &dcp_typec_ports, link) {
+		if (pos->connector_np == connector_np) {
+			port = pos;
+			break;
+		}
+	}
+	if (!port)
+		return -ENODEV;
+
+	if (!active) {
+		if (!port->owner || !port->owner->tunnel ||
+		    port->owner->tunnel_dpin != dpin)
+			return 0;
+		dcp = port->owner->dcp;
+		if (port->hpd || dcp->typec_cable_connected)
+			dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0);
+		port->hpd = false;
+		ret = dcp_typec_route_deactivate(port->owner);
+		if (ret) {
+			/* The caller's context is going away regardless. */
+			scoped_guard(mutex, &dcp->tb_lock) {
+				dcp->dptx_tunnel = false;
+				dcp->tb_dpin_set_active = NULL;
+				dcp->tb_dpin_ctx = NULL;
+			}
+			return ret;
+		}
+		port->owner = NULL;
+		/* Re-apply the next Type-C mux state in full. */
+		port->applied_valid = false;
+		if (dcp->hdmi_hpd && dcp->active &&
+		    gpiod_get_value_cansleep(dcp->hdmi_hpd))
+			dcp_dptx_connect(dcp, 0);
+		return 0;
+	}
+
+	if (port->owner) {
+		if (port->owner->tunnel && port->owner->tunnel_dpin == dpin)
+			return 0;
+		dev_warn(port->owner->dcp->dev,
+			 "port already routed, not taking DP tunnel dpin%u\n", dpin);
+		return -EBUSY;
+	}
+
+	list_for_each_entry(candidate, &port->routes, port_link) {
+		unsigned int score;
+
+		if (!dcp_typec_route_available(candidate))
+			continue;
+		score = dcp_typec_route_score(candidate);
+		/*
+		 * j416s-specific, not in the reference (t8103 has a single
+		 * dcpext): prefer a pipeline with a fixed output of its own
+		 * (dcpext0) for a Type-C tunnel route. dcpext1 (Type-C only,
+		 * no fixed output of its own) never completes link training
+		 * for a tunneled target on this hardware: DCP firmware
+		 * accepts request_display but never issues another apcall,
+		 * on every attempt, even though the driver-issued connect
+		 * parameters are byte-identical between the two pipelines.
+		 * Nothing in this driver's source explains the difference,
+		 * so this is a firmware-internal decision on the dcpext1
+		 * coprocessor instance, not something fixable here. dcpext0,
+		 * forced onto the same physical port and tunnel, reaches a
+		 * full AUX/DPCD link (DPRX_DONE=1) and a working picture, so
+		 * it is preferred unconditionally for a tunnel route on this
+		 * hardware.
+		 */
+		if (!candidate->dcp->fixed_phy)
+			score += 100;
+		if (score < best_score) {
+			best = candidate;
+			best_score = score;
+		}
+	}
+	if (!best)
+		return -EBUSY;
+
+	/* The route's crossbar control is dpphy (0); dpin0/dpin1 are 1/2. */
+	if (best->xbar != &best->xbar->chip->mux[0] ||
+	    best->xbar->chip->controllers < 3)
+		return -EOPNOTSUPP;
+	ctl = &best->xbar->chip->mux[1 + dpin];
+
+	dcp = best->dcp;
+	scoped_guard(mutex, &dcp->tb_lock) {
+		dcp->tb_dpin_set_active = set_active;
+		dcp->tb_dpin_ctx = ctx;
+	}
+	best->tunnel_dpin = dpin;
+	ret = dcp_typec_route_activate(best, ctl);
+	if (ret) {
+		scoped_guard(mutex, &dcp->tb_lock) {
+			dcp->tb_dpin_set_active = NULL;
+			dcp->tb_dpin_ctx = NULL;
+		}
+		return ret;
+	}
+	port->owner = best;
+
+	dev_info(dcp->dev, "display routed to Thunderbolt DP tunnel dpin%u\n", dpin);
+
+	/*
+	 * The DP IN adapter may only be woken (DPTX_INACTIVE=0) while DCP
+	 * drives the DPTX, i.e. from DCP's Activate call; waking it earlier
+	 * hangs the machine (confirmed independently by this project's own
+	 * AFK ordered-workqueue deadlock finding). dptxep calls set_active
+	 * back from Activate and Deactivate (set above, before the route
+	 * became a tunnel).
+	 */
+	if (!dcp->typec_connector)
+		dev_warn(dcp->dev, "no Type-C connector for the DP tunnel\n");
+	WRITE_ONCE(dcp->typec_cable_connected, true);
+	port->hpd = true;
+	if (dcp->typec_connector)
+		dcp_dptx_connect_oob(to_platform_device(dcp->dev), 0);
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_dcp_tb_dp_tunnel);
+
+static int dcp_typec_route_set(struct typec_mux_dev *mux,
+			       struct typec_mux_state *state)
 static int dcp_pin_live_session(struct apple_dcp *dcp)
 {
 	struct dcp_session_ref *session;
@@ -745,6 +1100,14 @@ static int dcp_dptx_connect_session(struct apple_dcp *dcp, u32 port,
 				dcp->dptx_die, dcp->dptx_phy, ret);
 			goto out_unlock;
 		}
+	ret = dptxport_validate_connection(dcp->dptxport[port].service,
+					   dcp->dptx_dfp_port,
+					   dcp->dptx_phy, dcp->dptx_die);
+	if (ret) {
+		dev_err(dcp->dev,
+			"dcp_dptx_connect: failed to validate DPTX target %u:%u: %d\n",
+			dcp->dptx_die, dcp->dptx_phy, ret);
+		goto out_unlock;
 	}
 
 	if (!dcp_connect_session_valid_locked(dcp, session, cable, recovery)) {
@@ -753,6 +1116,8 @@ static int dcp_dptx_connect_session(struct apple_dcp *dcp, u32 port,
 	}
 	ret = dptxport_connect(dcp->dptxport[port].service,
 			       dfp_port,
+	ret = dptxport_connect(dcp->dptxport[port].service,
+			       dcp->dptx_dfp_port,
 			       dcp->dptx_phy, dcp->dptx_die,
 			       dcp_is_typec_output(dcp) && !dcp_ext_dptx_607(dcp));
 	if (ret) {
@@ -3005,6 +3370,16 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	init_completion(&dcp->typec_iomfb_hpd_ready);
 	INIT_DELAYED_WORK(&dcp->typec_reconnect_wq,
 			  dcp_typec_reconnect_work);
+	INIT_DELAYED_WORK(&dcp->typec_fabric_retrain_wq,
+			  dcp_typec_retrain_work);
+	/*
+	 * Type-C and Thunderbolt routes can be activated as soon as they are
+	 * registered below (dcp_register_typec_routes()), before the DRM
+	 * device binds and dcp_comp_bind() would otherwise init this. Ported
+	 * from aurora-silicon/linux#8.
+	 */
+	mutex_init(&dcp->hpd_mutex);
+	mutex_init(&dcp->tb_lock);
 	INIT_DELAYED_WORK(&dcp->placeholder_edid_wq,
 			  dcp_placeholder_edid_work);
 	/* Balanced by enable at successful component bind. */
@@ -3391,6 +3766,11 @@ static void dcp_platform_shutdown(struct platform_device *pdev)
 		return;
 	}
 
+	if (dcp) {
+		WRITE_ONCE(dcp->typec_cable_connected, false);
+		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
+		cancel_delayed_work_sync(&dcp->typec_fabric_retrain_wq);
+	}
 	component_del(&pdev->dev, &dcp_comp_ops);
 }
 
@@ -3503,6 +3883,9 @@ static int dcp_platform_suspend(struct device *dev)
 	 */
 	dcp_disable_typec_work(dcp, false);
 	cancel_delayed_work_sync(&dcp->swap_watchdog_wq);
+	WRITE_ONCE(dcp->typec_cable_connected, false);
+	cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
+	cancel_delayed_work_sync(&dcp->typec_fabric_retrain_wq);
 
 	if (dcp->avep)
 		av_service_disconnect(dcp);

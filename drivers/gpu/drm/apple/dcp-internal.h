@@ -478,6 +478,24 @@ struct apple_dcp {
 	struct dcp_fabric_session typec_reconnect_session; /* hpd_mutex */
 	bool typec_work_enabled; /* hpd_mutex; IRQ recovery admission */
 
+	/* Ported from aurora-silicon/linux#8. */
+	/* DPTX feeds a Thunderbolt DP IN adapter, not the Type-C PHY lanes. */
+	bool dptx_tunnel;
+	/* DFP port in the DPTX target: 0 = dpphy, 1 = dpin0, 2 = dpin1. */
+	u8 dptx_dfp_port;
+	/* Wakes/sleeps the Thunderbolt DP IN adapter from DCP Activate/
+	 * Deactivate. Set by apple_dcp_tb_dp_tunnel(), cleared by
+	 * dcp_typec_route_deactivate().
+	 */
+	int (*tb_dpin_set_active)(void *ctx, bool active);
+	void *tb_dpin_ctx;
+	/* Serializes the Thunderbolt DP IN callback and tunnel crossbar state
+	 * between DCP apcalls and tunnel teardown; never held while waiting
+	 * for DCP.
+	 */
+	struct mutex tb_lock;
+	bool tb_clock_ok;
+
 	struct gpio_desc *hdmi_hpd;
 	struct gpio_desc *hdmi_pwren;
 	struct gpio_desc *dp2hdmi_pwren;
