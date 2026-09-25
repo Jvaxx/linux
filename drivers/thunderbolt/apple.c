@@ -134,6 +134,9 @@
 #define APPLE_CIO_NHI_BOOT_TIMEOUT_MS 10000
 #define APPLE_CIO_PCIEC_READY_DELAY_MS 300
 
+#define APPLE_CIO_START_RETRIES 5
+#define APPLE_CIO_START_RETRY_DELAY_MS 100
+
 #define APPLE_CIO_PCIEC_INTR2AXI_CTRL 0x80
 #define APPLE_CIO_PCIEC_INTR2AXI_ENABLE BIT(0)
 
@@ -1982,7 +1985,17 @@ static int apple_cio_start(struct apple_cio *acio)
 	 * After the power domains are on we need to signal and wait for the ACIO block
 	 * to actually start before we can bring up the co-processor.
 	 */
-	ret = reset_control_deassert(acio->reset);
+	for (i = 0; i < APPLE_CIO_START_RETRIES; i++) {
+		ret = reset_control_deassert(acio->reset);
+		if (!ret)
+			break;
+		if (i + 1 < APPLE_CIO_START_RETRIES) {
+			dev_warn(acio->dev,
+				 "ACIO block failed to start (attempt %d/%d): %d, retrying\n",
+				 i + 1, APPLE_CIO_START_RETRIES, ret);
+			msleep(APPLE_CIO_START_RETRY_DELAY_MS);
+		}
+	}
 	if (ret) {
 		dev_err(acio->dev, "ACIO block failed to start: %d\n", ret);
 		goto remove_links;
