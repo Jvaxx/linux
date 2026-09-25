@@ -107,7 +107,11 @@
 #include <linux/xarray.h>
 #include <sound/core.h>
 #include <sound/dmaengine_pcm.h>
+#include <linux/pm_domain.h>
+#include <linux/pm_runtime.h>
 #include <sound/pcm.h>
+#include <sound/soc.h>
+#include <sound/soc-dpcm.h>
 #include <trace/events/rust_sample.h>
 
 /*
@@ -137,6 +141,9 @@ const fop_flags_t RUST_CONST_HELPER_FOP_UNSIGNED_OFFSET = FOP_UNSIGNED_OFFSET;
 const u32 RUST_CONST_HELPER_APPLE_RTKIT_COPROC_PLACES_BUFFERS = APPLE_RTKIT_COPROC_PLACES_BUFFERS;
 
 const u64 BINDINGS_SNDRV_PCM_FMTBIT_FLOAT_LE = SNDRV_PCM_FMTBIT_FLOAT_LE;
+const u64 BINDINGS_SNDRV_PCM_FMTBIT_S32_LE = SNDRV_PCM_FMTBIT_S32_LE;
+const u64 BINDINGS_SNDRV_PCM_FMTBIT_S24_LE = SNDRV_PCM_FMTBIT_S24_LE;
+const u32 BINDINGS_SNDRV_PCM_SUBFMTBIT_STD = SNDRV_PCM_SUBFMTBIT_STD;
 
 const u32 BINDINGS_IIO_CHAN_INFO_RAW = IIO_CHAN_INFO_RAW;
 const u32 BINDINGS_IIO_CHAN_INFO_PROCESSED = IIO_CHAN_INFO_PROCESSED;
