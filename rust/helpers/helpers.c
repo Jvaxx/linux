@@ -39,6 +39,7 @@
 #endif
 
 #include "acpi.c"
+#include "arm_arch_timer.c"
 #include "atomic.c"
 #include "atomic_ext.c"
 #include "auxiliary.c"
