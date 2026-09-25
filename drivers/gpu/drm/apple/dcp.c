@@ -2832,6 +2832,7 @@ static int dcp_read_fw_version(struct device *dev, const char *name,
 static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 {
 	const struct apple_dcp_hw_data *hw = of_device_get_match_data(dev);
+	const struct dcp_v14_board *v14_board;
 	char compat_str[DCP_FW_VERSION_STR_LEN];
 	char fw_str[DCP_FW_VERSION_STR_LEN];
 	int ret;
@@ -2853,23 +2854,28 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 	}
 
 	/*
-	 * T6030 runs the 14.7 firmware session handed over by the boot loader
-	 * natively (iomfb_v14_7.c); other 14.7.0 DCPs keep the template below.
+	 * T6030 and the internal panels with a board record (T6030, J613) run
+	 * the 14.7 firmware session handed over by the boot loader natively
+	 * (iomfb_v14_7.c); other 14.7.0 DCPs keep the template below.
+	 * The T6030 external processors: the 14.x firmware IOMFB only.
 	 */
-	if (of_device_is_compatible(dev->of_node, "apple,t6030-dcp") ||
-	    of_device_is_compatible(dev->of_node, "apple,t6030-dcpext")) {
-		if (ret >= 0 && !strcmp(compat_str, "14.7.0"))
+	if (of_device_is_compatible(dev->of_node, "apple,t6030-dcpext")) {
+		if (!strcmp(compat_str, "14.7.0"))
 			return DCP_FIRMWARE_V_14_7;
 		dev_err(dev, "T6030 display not started: DCP firmware-compat %s is not 14.7.0\n",
 			compat_str);
 		return DCP_FIRMWARE_UNKNOWN;
 	}
 
-	if (of_device_is_compatible(dev->of_node, "apple,t8122-dcp")) {
-		if (ret >= 0 && !strcmp(compat_str, "14.7.0"))
+	/* The internal panels with a board record (T6030, J613): the same. */
+	v14_board = iomfb_v14_7_board(dev);
+	if (IS_ERR(v14_board))
+		return DCP_FIRMWARE_UNKNOWN;
+	if (v14_board) {
+		if (!strcmp(compat_str, "14.7.0"))
 			return DCP_FIRMWARE_V_14_7;
-		dev_err(dev, "T8122 display not started: DCP firmware-compat %s is not 14.7.0\n",
-			compat_str);
+		dev_err(dev, "%s display not started: DCP firmware-compat %s is not 14.7.0\n",
+			iomfb_v14_7_board_name(v14_board), compat_str);
 		return DCP_FIRMWARE_UNKNOWN;
 	}
 
