@@ -105,6 +105,20 @@ pub(crate) struct KeybagCreate {
     pub(crate) arg: i32,
 }
 
+/// Which key-store protocol the enclave speaks. It follows the sepOS the
+/// firmware hands the SEP, not the SoC alone: the T8103 stub boots macOS 13.5
+/// (22G74)'s sepOS, whose request shapes are those of the 13.5
+/// `AppleSEPKeyStore`; the T6020 sepOS is newer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyStore {
+    /// macOS 13.5's key store. Before any other request the endpoint is
+    /// initialised as `AppleKeyStore::init_sep_endpoint` does it: `0x4d`, then
+    /// `set_env` carrying the ADT's `/defaults` `cpx-encryption-mode`.
+    Sepos13 { cpx_encryption_mode: u32 },
+    /// The hardware-verified T6020 encoding (variant-5 create).
+    Variant5,
+}
+
 pub(crate) struct PlatformProfile {
     pub(crate) name: &'static str,
     /// Capacity of the boot shared-memory window. The layout is still checked
@@ -127,6 +141,8 @@ pub(crate) struct PlatformProfile {
     pub(crate) keybag_create: KeybagCreate,
     /// Require nonce authentication and signed sensor material before capture.
     pub(crate) nonce_session: bool,
+    /// Key-store protocol generation (see [`KeyStore`]).
+    pub(crate) key_store: KeyStore,
 }
 
 const T8103: PlatformProfile = PlatformProfile {
@@ -153,6 +169,10 @@ const T8103: PlatformProfile = PlatformProfile {
         variant: 0,
         bag_type: 0x20000,
         arg: 0,
+    },
+    // The j293 and j313 ADTs both carry `/defaults` `cpx-encryption-mode = 2`.
+    key_store: KeyStore::Sepos13 {
+        cpx_encryption_mode: 2,
     },
     nonce_session: false,
 };
@@ -182,6 +202,7 @@ const T6020: PlatformProfile = PlatformProfile {
         bag_type: 0,
         arg: -1,
     },
+    key_store: KeyStore::Variant5,
     nonce_session: false,
 };
 
@@ -189,6 +210,7 @@ const T6020: PlatformProfile = PlatformProfile {
 /// (0x3356), and a SEP DART aperture above 4 GiB. These values describe that
 /// board; device-tree nodes remain authoritative for addresses and resources.
 const T8140: PlatformProfile = PlatformProfile {
+    key_store: KeyStore::Variant5,
     name: "T8140/J700",
     shmem_capacity: 0x4_0000,
     shmem_first_item: b"CINP",
