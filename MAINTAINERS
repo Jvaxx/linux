@@ -2041,6 +2041,7 @@ F:	drivers/soc/apple/aop.rs
 F:	drivers/tty/serial/apple_dockchannel*
 F:	rust/kernel/iio/common/aop_sensors.rs
 F:	rust/kernel/soc/apple/aop.rs
+F:	sound/soc/apple/t8140_aop_audio.rs
 
 APPLETALK NETWORK LAYER
 L:	netdev@vger.kernel.org
