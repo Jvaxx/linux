@@ -27,7 +27,47 @@ def record(kind, revision):
     return out
 
 
+def extent_reference(start, blocks, owner, refcount=1, kind=1):
+    key = struct.pack("<Q", (2 << 60) | start)
+    value = struct.pack("<QQi", (kind << 60) | blocks, owner, refcount)
+    return key, value
+
+
+class ExtentReferenceTests(unittest.TestCase):
+    def test_unshared_whole_file_reference(self):
+        expected = (1236, 1536, 1, 16, 1)
+        self.assertEqual(
+            INSPECTOR.validate_extent_references(
+                [extent_reference(1236, 1536, 16)], 1236, 1536, 16),
+            expected)
+
+    def test_shared_or_mismatched_reference_fails_closed(self):
+        cases = [
+            [],
+            [extent_reference(1236, 1536, 16, refcount=2)],
+            [extent_reference(1236, 1536, 17)],
+            [extent_reference(1236, 1536, 16, kind=2)],
+            [extent_reference(1237, 1535, 16)],
+            [extent_reference(1235, 1537, 16)],
+            [extent_reference(1236, 1536, 16)] * 2,
+        ]
+        for entries in cases:
+            with self.subTest(entries=entries), self.assertRaises(ValueError):
+                INSPECTOR.validate_extent_references(entries, 1236, 1536, 16)
+
+
 class RawLocatorTests(unittest.TestCase):
+    def test_gigalocker_filename_forms(self):
+        self.assertTrue(INSPECTOR.is_gigalocker_name(b".gl"))
+        self.assertTrue(INSPECTOR.is_gigalocker_name(
+            b"01234567-89AB-5CDE-8F01-23456789ABCD.gl"))
+        self.assertTrue(INSPECTOR.is_gigalocker_name(
+            b"01234567-89ab-5cde-8f01-23456789abcd.gl"))
+        self.assertFalse(INSPECTOR.is_gigalocker_name(b"01234567.gl"))
+        self.assertFalse(INSPECTOR.is_gigalocker_name(
+            b"01234567-89AB-5CDE-8F01-23456789ABCG.gl"))
+        self.assertFalse(INSPECTOR.is_gigalocker_name(b"other.gl"))
+
     def test_roots_moved_forward_pick_window_outside_real_extent(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "synthetic-container"
