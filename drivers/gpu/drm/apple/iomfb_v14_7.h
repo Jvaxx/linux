@@ -1,17 +1,32 @@
-// SPDX-License-Identifier: GPL-2.0-only OR MIT
-/* Copyright The Asahi Linux Contributors */
+/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
 
 #ifndef __APPLE_IOMFB_V14_7_H__
 #define __APPLE_IOMFB_V14_7_H__
 
-#include "version_utils.h"
+#include <linux/types.h>
 
-#define DCP_FW v14_7_0
-#define DCP_FW_VER DCP_FW_VERSION(14, 7, 0)
+struct apple_dcp;
+struct apple_dcp_v14;
+struct drm_atomic_commit;
+struct drm_crtc;
+struct drm_crtc_state;
 
-#include "iomfb_template.h"
+/* Platform probe: firmware identity, boot loader handoff, PMP acknowledgment. */
+int iomfb_v14_7_probe(struct apple_dcp *dcp);
+/* Component bind: the running DCP's RTKit session. */
+int iomfb_v14_7_bind(struct apple_dcp *dcp);
+int iomfb_v14_7_external_start(struct apple_dcp *dcp);
+/* Component unbind: KMS goes away; the firmware session is kept until reboot. */
+void iomfb_v14_7_unbind(struct apple_dcp *dcp);
+/* DCPLink, start signal, first client open and the panel mode. */
+int iomfb_v14_7_start(struct apple_dcp *dcp);
 
-#undef DCP_FW_VER
-#undef DCP_FW
+int iomfb_v14_7_atomic_check(struct apple_dcp *dcp, struct drm_crtc *crtc,
+			     struct drm_atomic_commit *state);
+int iomfb_v14_7_modeset(struct apple_dcp *dcp, struct drm_crtc_state *crtc_state);
+void iomfb_v14_7_flush(struct apple_dcp *dcp, struct drm_crtc *crtc,
+		       struct drm_atomic_commit *state);
+void iomfb_v14_7_poweron(struct apple_dcp *dcp);
+void iomfb_v14_7_poweroff(struct apple_dcp *dcp);
 
 #endif /* __APPLE_IOMFB_V14_7_H__ */

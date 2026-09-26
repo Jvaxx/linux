@@ -28,6 +28,7 @@
 #include "iomfb_v12_3.h"
 #include "iomfb_v13_3.h"
 #include "iomfb_v14_7.h"
+#include "iomfb_v14_7_tpl.h"
 #include "epic/dpavservep.h"
 #include "version_utils.h"
 
@@ -96,6 +97,11 @@ enum {
 	DCP_EXPERT_ENDPOINT = 0x22,
 	DISP0_ENDPOINT = 0x23,
 	DPTX_CONTROLLER_ENDPOINT = 0x24,
+	/*
+	 * The same endpoint on T6030 14.7 firmware: the DPAV controller that
+	 * publishes the port service used by DPTX 0x2a.
+	 */
+	DPAV_CTRL_ENDPOINT = 0x24,
 	DPAVSERV_ENDPOINT = 0x28,
 	DPAVSERV_ENDPOINT_V2 = 0x2a,
 	AV_ENDPOINT = 0x29,
@@ -217,6 +223,8 @@ enum dcp_test_point {
 };
 
 /* TODO: move IOMFB members to its own struct */
+struct dcpext_scanout;
+
 struct apple_dcp {
 	/* An adopted session has no confirmed firmware DMA stop boundary. */
 	bool retain_dma;
@@ -262,6 +270,15 @@ struct apple_dcp {
 
 	/* firmware version and compatible firmware version */
 	enum dcp_firmware_version fw_compat;
+	bool external;
+	struct dcpext_scanout *dcpext_scanout;
+	bool external_link_ready; /* Full connect/HPD handshake completed. */
+	bool external_suspended; /* hpd_mutex serializes PM against explicit start */
+	struct work_struct external_work;
+	atomic_t external_requested;
+
+	/* DCP_FIRMWARE_V_14_7 state; outlives this device once RTKit runs. */
+	struct apple_dcp_v14 *v14;
 
 	/* Coprocessor control register */
 	void __iomem *coproc_reg;
@@ -427,6 +444,11 @@ struct apple_dcp {
 	struct apple_dcp_afkep *dptxep;
 	struct apple_dcp_afkep *dptx_controller_ep;
 	struct completion dptx_controller_ready;
+
+	struct apple_dcp_afkep *dpavctrlep;
+	struct apple_epic_service *dpav_ctrl;
+	struct completion dpav_ctrl_ready;
+	bool dpav_ctrl_open;
 
 	struct dptx_port dptxport[2];
 

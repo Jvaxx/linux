@@ -464,6 +464,17 @@ static int apple_probe_per_dcp(struct device *dev,
 	if (bitmap_empty(iomfb_surfaces, DCP_MAX_PLANES))
 		return dev_err_probe(dev, -EINVAL, "No usable display surfaces\n");
 
+	if (dcp_fw_compat_is_14_7(dcp)) {
+		planes[0] = apple_plane_init_v14_7(drm, 1U << num, 0,
+						    DRM_PLANE_TYPE_PRIMARY);
+		if (IS_ERR(planes[0]))
+			return PTR_ERR(planes[0]);
+		ret = drm_plane_create_zpos_immutable_property(planes[0], 0);
+		if (ret)
+			return ret;
+		zpos = 1;
+	}
+
 	/*
 	 * BUG:
 	 * Some DCPs support more than two surfaces. For some reason, these
@@ -474,6 +485,8 @@ static int apple_probe_per_dcp(struct device *dev,
 	 * from the surface.
 	 */
 	for_each_set_bit(surf, iomfb_surfaces, DCP_MAX_PLANES) {
+		if (dcp_fw_compat_is_14_7(dcp))
+			break;
 		plane_type = (zpos == 0) ? DRM_PLANE_TYPE_PRIMARY : DRM_PLANE_TYPE_OVERLAY;
 		interchange = (zpos <= 1 || surf != top_surf);
 
@@ -676,13 +689,20 @@ err:
 static const struct of_device_id apple_dcp_id_tbl[] = {
 	{ .compatible = "apple,dcp" },
 	{ .compatible = "apple,dcpext" },
+	/* T6030: apple_dcp_usable() keeps its dcpext outside the DRM device. */
+	{ .compatible = "apple,t6030-dcp" },
 	{},
 };
 
-/* A supported firmware-described external provider participates in component matching. */
+/*
+ * A supported firmware-described external provider participates in component
+ * matching. The T6030 external processor runs a separate session and never
+ * joins this DRM device.
+ */
 static bool apple_dcp_usable(struct device_node *np)
 {
 	return of_device_is_available(np) &&
+	       !of_device_is_compatible(np, "apple,t6030-dcpext") &&
 	       (!of_device_is_compatible(np, "apple,t8140-dcpext") ||
 		dcp_h17p_external_supported(np));
 }
@@ -975,6 +995,7 @@ static void apple_platform_remove(struct platform_device *pdev)
 
 static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,display-subsystem" },
+	{ .compatible = "apple,t6030-display-subsystem" },
 	{}
 };
 MODULE_DEVICE_TABLE(of, of_match);
@@ -1043,7 +1064,6 @@ static struct platform_driver apple_platform_driver = {
 	.probe		= apple_platform_probe,
 	.remove		= apple_platform_remove,
 };
-
 
 
 static int __init appledrm_register(void)

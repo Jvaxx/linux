@@ -24,7 +24,17 @@ enum dcp_firmware_version {
 	DCP_FIRMWARE_UNKNOWN,
 	DCP_FIRMWARE_V_12_3,
 	DCP_FIRMWARE_V_13_5,
+	/*
+	 * 14.7 firmware on T6030 (apple,t6030-dcp/-dcpext), driven natively
+	 * through the DCPLink session that the boot loader hands over
+	 * (iomfb_v14_7.c).
+	 */
 	DCP_FIRMWARE_V_14_7,
+	/*
+	 * Generic 14.7.0 firmware on M1/M2 DCPs, driven through the classic
+	 * IOMFB template (iomfb_v14_7_tpl.c), as on Asahi.
+	 */
+	DCP_FIRMWARE_V_14_7_TEMPLATE,
 	DCP_FIRMWARE_H17P,
 };
 

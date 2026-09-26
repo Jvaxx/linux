@@ -8,11 +8,13 @@
 #include <linux/delay.h>
 #include <linux/jiffies.h>
 #include <linux/printk.h>
+#include <linux/string.h>
 #include <linux/unaligned.h>
 
 #include <linux/soc/apple/dp-tunnel.h>
 
 #include "afk.h"
+#include <linux/soc/apple/rtkit.h>
 #include "dcp.h"
 #include "dptxep.h"
 #include "dcp-180hz.h"
@@ -533,8 +535,14 @@ static int dptxport_call_set_link_rate(struct apple_epic_service *service,
 		 * dcp_tunnel_crossbar_up().
 		 */
 		if (dptx->atcphy && service->ep->dcp->dptx_tunnel) {
-			dcp_tunnel_set_rate(service->ep->dcp, dptx->atcphy,
-					    link_rate);
+			ret = dcp_tunnel_set_rate(service->ep->dcp, dptx->atcphy,
+						 link_rate);
+			/* T6030 14.7: refuse a rate whose tunnel clock failed. */
+			if (ret && service->ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7) {
+				reply->retcode = cpu_to_le32(1);
+				reply->link_rate = cpu_to_le32(dptx->link_rate);
+				return 0;
+			}
 		} else if (dptx->atcphy) {
 			dptx->phy_ops.dp.link_rate = phy_link_rate;
 			dptx->phy_ops.dp.set_rate = 1;
@@ -608,6 +616,7 @@ dptxport_call_activate(struct apple_epic_service *service,
 {
 	struct dptx_port *dptx = service->cookie;
 	struct apple_dcp *dcp = service->ep->dcp;
+	int ret;
 
 	/*
 	 * No PHY mode change for a tunnel: the ATC PHY stays in USB4/TBT
@@ -617,8 +626,18 @@ dptxport_call_activate(struct apple_epic_service *service,
 	 */
 	if (dptx->atcphy && !dcp->phy_managed_by_typec)
 		phy_set_mode_ext(dptx->atcphy, PHY_MODE_DP, dcp->index);
-	if (dcp->dptx_tunnel)
-		dcp_tunnel_dpin_activate(dcp, true);
+	if (dcp->dptx_tunnel) {
+		ret = dcp_tunnel_dpin_activate(dcp, true);
+		/* T6030 14.7: report a failed tunnel activation to DCP. */
+		if (ret && dcp->fw_compat == DCP_FIRMWARE_V_14_7) {
+			dev_err(dcp->dev, "DPTX tunnel activation failed: %d\n", ret);
+			if (reply_size < sizeof(__le32))
+				return -EINVAL;
+			memcpy(reply, data, min(reply_size, data_size));
+			put_unaligned_le32(1, reply);
+			return 0;
+		}
+	}
 
 	memcpy(reply, data, min(reply_size, data_size));
 	if (reply_size >= 4)
@@ -691,6 +710,9 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 	trace_dptxport_apcall(dptx, 0, idx, data_size);
 	dev_dbg(service->ep->dcp->dev, "DPTXPort: APCALL %u (%zu bytes)\n",
 		 idx, data_size);
+	if (service->ep->dcp->external)
+		dev_info(service->ep->dcp->dev, "DPTX callback %u size %zu reply %zu\n",
+			 idx, data_size, reply_size);
 	if (data_size && service->ep->dcp->hw.iomfb_method_profile !=
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		print_hex_dump_debug("DPTXPort: apcall data: ",
@@ -706,8 +728,18 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 	case DPTX_APCALL_DID_CHANGE_LINK_CONFIG: {
 		int ret = dptxport_call_did_change_link_config(service);
 
-		if (!ret && service->ep->dcp->dptx_tunnel && dptx->link_rate)
-			dcp_tunnel_crossbar_up(service->ep->dcp);
+		if (!ret && service->ep->dcp->dptx_tunnel && dptx->link_rate) {
+			int xret = dcp_tunnel_crossbar_up(service->ep->dcp);
+
+			/* T6030 14.7: fail the link config without a crossbar. */
+			if (service->ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7)
+				ret = xret;
+		}
+		if (ret && service->ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7 &&
+		    service->ep->dcp->dptx_tunnel && reply_size >= sizeof(__le32)) {
+			put_unaligned_le32(1, reply);
+			return 0;
+		}
 		return ret;
 	}
 	case DPTX_APCALL_GET_MAX_LINK_RATE:
@@ -806,8 +838,20 @@ static int dptxport_prepare(struct apple_epic_service *service, const char *name
 			    const char *class, s64 unit)
 {
 	struct apple_dcp *dcp = service->ep->dcp;
-	int port = dptx_service_port(name, class, unit, service->ep->wire_v2,
-				     dcp->index, dcp->hw.num_dptx_ports);
+	int port;
+
+	/*
+	 * T6030 14.7 also announces the low-power port service, and may leave
+	 * its class empty.
+	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7 && name &&
+	    (!strcmp(name, "dcpdptx-port-epic") ||
+	     !strcmp(name, "dcp-lpdptx-port-epic")) &&
+	    (!class || !class[0] || !strcmp(class, "AppleDCPDPTXRemotePort")))
+		port = unit >= 0 && unit < 2 ? unit : -EINVAL;
+	else
+		port = dptx_service_port(name, class, unit, service->ep->wire_v2,
+					 dcp->index, dcp->hw.num_dptx_ports);
 
 	if (port < 0)
 		return port;
@@ -931,6 +975,21 @@ static const struct apple_epic_service_ops dptxep_ops[] = {
 		.call = dptxport_call,
 		.call_v2 = dptxport_group_call,
 	},
+	/* T6030 14.7 announces the port by name, possibly without a class. */
+	{
+		.name = "dcpdptx-port-epic",
+		.prepare = dptxport_prepare,
+		.teardown = dptxport_teardown,
+		.init = dptxport_init,
+		.call = dptxport_call,
+	},
+	{
+		.name = "dcp-lpdptx-port-epic",
+		.prepare = dptxport_prepare,
+		.teardown = dptxport_teardown,
+		.init = dptxport_init,
+		.call = dptxport_call,
+	},
 	{}
 };
 
@@ -1000,6 +1059,17 @@ int dptxep_init(struct apple_dcp *dcp)
 		ret = wait_for_completion_timeout(&dcp->dptxport[port].enable_completion,
 						timeout);
 		if (!ret) {
+			/*
+			 * 14.7 does not announce the port during boot. A fake
+			 * channel 0 is interface_id 0, and the firmware answers
+			 * kIOReturnNoDevice (0xe00002c0). Leave the endpoint
+			 * up so a later announce can still bind.
+			 */
+			if (dcp->fw_compat == DCP_FIRMWARE_V_14_7) {
+				dev_info(dcp->dev,
+					 "DPTX port %u not announced yet\n", port);
+				return 0;
+			}
 			dev_warn(dcp->dev, "DPTX transport ready but port %u service not announced\n",
 				 port);
 			return -ETIMEDOUT;
@@ -1010,4 +1080,97 @@ int dptxep_init(struct apple_dcp *dcp)
 	}
 
 	return dcp_180hz_init(dcp);
+}
+
+static void dpav_ctrl_bind(struct apple_epic_service *service, const char *name,
+			   const char *class, s64 unit)
+{
+	struct apple_dcp *dcp = service->ep->dcp;
+
+	dev_info(dcp->dev,
+		 "DPAV service %s class %s unit %lld channel %u\n",
+		 name ? name : "", class ? class : "", unit, service->channel);
+	if (name && !strcmp(name, "dcpav-controller-epic")) {
+		dcp->dpav_ctrl = service;
+		complete_all(&dcp->dpav_ctrl_ready);
+	}
+}
+
+static const struct apple_epic_service_ops dpav_ctrl_ops[] = {
+	{
+		.name = "dcpav-controller-epic",
+		.init = dpav_ctrl_bind,
+	},
+	{
+		.name = "DCPAVController",
+		.init = dpav_ctrl_bind,
+	},
+	{
+		.name = "dcpdp-controller-epic",
+		.init = dpav_ctrl_bind,
+	},
+	{}
+};
+
+static void dptx_av_bind(struct apple_epic_service *service, const char *name,
+			 const char *class, s64 unit)
+{
+	dev_info(service->ep->dcp->dev,
+		 "AV service %s class %s unit %lld channel %u\n",
+		 name ? name : "", class ? class : "", unit, service->channel);
+}
+
+static const struct apple_epic_service_ops dptx_av_ops[] = {
+	{ .name = "DCPAVSimpleVideoInterface", .init = dptx_av_bind },
+	{ .name = "dcpav-video-interface-epic", .init = dptx_av_bind },
+	{ .name = "IOAVVideoInterface", .init = dptx_av_bind },
+	{ .name = "IOAVController", .init = dptx_av_bind },
+	{}
+};
+
+int dptx_prepare_interfaces(struct apple_dcp *dcp)
+{
+	int ret;
+
+	if (apple_rtkit_has_endpoint(dcp->rtk, AV_ENDPOINT) && !dcp->avep) {
+		dcp->avep = afk_init(dcp, AV_ENDPOINT, dptx_av_ops);
+		if (IS_ERR(dcp->avep)) {
+			dev_warn(dcp->dev, "AV endpoint init failed: %ld\n",
+				 PTR_ERR(dcp->avep));
+			dcp->avep = NULL;
+		} else {
+			ret = afk_start(dcp->avep);
+			dev_info(dcp->dev, "AV endpoint start: %d\n", ret);
+		}
+	}
+
+	if (apple_rtkit_has_endpoint(dcp->rtk, DPAVSERV_ENDPOINT) &&
+	    !dcp->dcpavservep) {
+		ret = dpavservep_init(dcp);
+		dev_info(dcp->dev, "DPAV service endpoint: %d\n", ret);
+	}
+
+	return 0;
+}
+
+int dpav_ctrl_init(struct apple_dcp *dcp)
+{
+	int ret;
+
+	init_completion(&dcp->dpav_ctrl_ready);
+	dcp->dpavctrlep = afk_init(dcp, DPAV_CTRL_ENDPOINT, dpav_ctrl_ops);
+	if (IS_ERR(dcp->dpavctrlep))
+		return PTR_ERR(dcp->dpavctrlep);
+
+	ret = afk_start(dcp->dpavctrlep);
+	if (ret) {
+		dev_warn(dcp->dev, "DPAV controller endpoint failed to start: %d\n",
+			 ret);
+		return 0;
+	}
+
+	if (!wait_for_completion_timeout(&dcp->dpav_ctrl_ready,
+					 msecs_to_jiffies(1000)))
+		dev_info(dcp->dev, "DPAV controller did not announce a service\n");
+	return 0;
 }

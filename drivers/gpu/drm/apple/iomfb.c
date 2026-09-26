@@ -1717,8 +1717,11 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	case DCP_FIRMWARE_V_13_5:
 		ret = iomfb_modeset_v13_3(dcp, crtc_state);
 		break;
-	case DCP_FIRMWARE_V_14_7:
+	case DCP_FIRMWARE_V_14_7_TEMPLATE:
 		ret = iomfb_modeset_v14_7_0(dcp, crtc_state);
+		break;
+	case DCP_FIRMWARE_V_14_7:
+		ret = iomfb_v14_7_modeset(dcp, crtc_state);
 		break;
 	case DCP_FIRMWARE_H17P:
 		ret = iomfb_modeset_h17p(dcp, crtc_state);
@@ -2112,11 +2115,15 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 	struct platform_device *pdev = to_apple_crtc(crtc)->dcp;
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
+	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7) {
+		iomfb_v14_7_flush(dcp, crtc, commit);
+		return;
+	}
+
 	if (iomfb_uses_queue(dcp)) {
 		iomfb_queue_atomic(dcp, crtc, commit);
 		return;
 	}
-
 	/*
 	 * DCP does not complete swaps after a link loss.  A plane-only commit
 	 * arriving between the reconnect callback and the required modeset
@@ -2154,7 +2161,7 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 	case DCP_FIRMWARE_V_13_5:
 		iomfb_flush_v13_3(dcp, crtc, commit);
 		break;
-	case DCP_FIRMWARE_V_14_7:
+	case DCP_FIRMWARE_V_14_7_TEMPLATE:
 		iomfb_flush_v14_7_0(dcp, crtc, commit);
 		break;
 	case DCP_FIRMWARE_H17P:
@@ -2175,7 +2182,7 @@ static void iomfb_start(struct apple_dcp *dcp)
 	case DCP_FIRMWARE_V_13_5:
 		iomfb_start_v13_3(dcp);
 		break;
-	case DCP_FIRMWARE_V_14_7:
+	case DCP_FIRMWARE_V_14_7_TEMPLATE:
 		iomfb_start_v14_7_0(dcp);
 		break;
 	case DCP_FIRMWARE_H17P:
@@ -2289,7 +2296,7 @@ void iomfb_shutdown(struct apple_dcp *dcp)
 	case DCP_FIRMWARE_V_13_5:
 		iomfb_shutdown_v13_3(dcp);
 		break;
-	case DCP_FIRMWARE_V_14_7:
+	case DCP_FIRMWARE_V_14_7_TEMPLATE:
 		iomfb_shutdown_v14_7_0(dcp);
 		break;
 	case DCP_FIRMWARE_H17P:

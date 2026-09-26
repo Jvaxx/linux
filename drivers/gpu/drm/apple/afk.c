@@ -495,6 +495,15 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 	else
 		ops = afk_match_service(ep, service_name);
 
+	/* T6030 14.7: the DPAV controller endpoint binds whatever it announces. */
+	if (!ops && ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7 && ep->ops &&
+	    !strcmp(ep->ops->name, "dcpav-controller-epic")) {
+		dev_info(ep->dcp->dev,
+			 "AFK[ep:%02x]: binding unmatched DPAV service %s on channel %d\n",
+			 ep->endpoint, service_name, channel);
+		ops = ep->ops;
+	}
+
 	if (!ops) {
 		dev_err(ep->dcp->dev,
 			"AFK[ep:%02x]: unable to match service %s on channel %d\n",
@@ -788,6 +797,38 @@ static void afk_recv_handle_std_service(struct apple_dcp_afkep *ep, u32 channel,
 		if (service->ops->report)
 			service->ops->report(service, le16_to_cpu(eshdr->type),
 					     payload, payload_size);
+		return;
+	}
+
+	/*
+	 * 14.7 answers a command to an unpublished interface with a NOTIFY
+	 * whose category is REPLY and whose payload is one IOReturn
+	 * (kIOReturnNoDevice is 0xe00002c0). That is the command result.
+	 */
+	if (ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7 &&
+	    eshdr->category == EPIC_CAT_REPLY && payload_size >= 4 &&
+	    payload_size < sizeof(struct epic_cmd)) {
+		u32 rc;
+		u16 tag = le16_to_cpu(eshdr->tag);
+		u8 idx = tag & 0xff;
+		unsigned long flags;
+
+		memcpy(&rc, payload, sizeof(rc));
+		rc = le32_to_cpu(rc);
+		dev_err(ep->dcp->dev,
+			"AFK[ep:%02x]: channel %d short reply type %#x tag %#x ret %#x\n",
+			ep->endpoint, channel, type, tag, rc);
+		if (idx < MAX_PENDING_CMDS) {
+			spin_lock_irqsave(&service->lock, flags);
+			if (!service->cmds[idx].done &&
+			    service->cmds[idx].tag == tag) {
+				service->cmds[idx].done = true;
+				service->cmds[idx].retcode = rc;
+				if (service->cmds[idx].completion)
+					complete(service->cmds[idx].completion);
+			}
+			spin_unlock_irqrestore(&service->lock, flags);
+		}
 		return;
 	}
 
@@ -1169,7 +1210,21 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 	    subtype == EPIC_SUBTYPE_TEARDOWN)
 		return afk_recv_handle_teardown(ep, channel);
 
-	if (type == EPIC_TYPE_REPLY && eshdr->category == EPIC_CAT_REPLY)
+	/*
+	 * T6030 14.7 returns a command result as a NOTIFY whose category is
+	 * REPLY and whose body is a normal epic_cmd. The tag check inside the
+	 * reply handler ignores anything that is not one of our commands.
+	 */
+	if (ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7 &&
+	    (type == EPIC_TYPE_REPLY || type == EPIC_TYPE_NOTIFY) &&
+	    eshdr->category == EPIC_CAT_REPLY &&
+	    payload_size >= sizeof(struct epic_cmd))
+		return afk_recv_handle_reply(ep, channel,
+					     le16_to_cpu(eshdr->tag), payload,
+					     payload_size);
+
+	if (ep->dcp->fw_compat != DCP_FIRMWARE_V_14_7 &&
+	    type == EPIC_TYPE_REPLY && eshdr->category == EPIC_CAT_REPLY)
 		return afk_recv_handle_reply(ep, channel,
 					     le16_to_cpu(eshdr->tag), payload,
 					     payload_size);
@@ -1310,6 +1365,10 @@ static void afk_receive_message_worker(struct work_struct *work_)
 		break;
 
 	case RBEP_START_ACK:
+		/* T6030 14.7 may queue messages before it acks the start. */
+		if (work->ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7 &&
+		    work->ep->rxbfr.ready)
+			afk_recv_drain(work->ep);
 		complete_all(&work->ep->started);
 		break;
 
@@ -1795,6 +1854,21 @@ static int afk_send_command_timeout_len(struct apple_epic_service *service, u8 t
 				 "AFK[ep:%02x]: %s (chan:%u) command type 0x%x tag 0x%04x timed out after %u ms\n",
 				 ep->endpoint, service->ops->name, service->channel,
 				 type, tag, timeout_ms);
+			if (ep->dcp->external && ep->txbfr.ready && ep->rxbfr.ready) {
+				/* Diagnostic snapshot of shared RAM, not coprocessor MMIO.
+				 * Unequal TX pointers mean firmware has not drained the queue.
+				 */
+				dma_rmb();
+				dev_warn(ep->dcp->dev,
+					 "AFK timeout channel=%u tag=%#x TX r/w=%#x/%#x RX r/w=%#x/%#x running=%d crashed=%d\n",
+					 service->channel, tag,
+					 le32_to_cpu(READ_ONCE(*ep->txbfr.rptr)),
+					 le32_to_cpu(READ_ONCE(*ep->txbfr.wptr)),
+					 le32_to_cpu(READ_ONCE(*ep->rxbfr.rptr)),
+					 le32_to_cpu(READ_ONCE(*ep->rxbfr.wptr)),
+					 apple_rtkit_is_running(ep->dcp->rtk),
+					 apple_rtkit_is_crashed(ep->dcp->rtk));
+			}
 			afk_service_put(service);
 			return -ETIMEDOUT;
 		}
