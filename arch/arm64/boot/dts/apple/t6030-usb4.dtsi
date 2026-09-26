@@ -1,0 +1,32 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Extend the existing USB4 routers with their PCIe adapter and ASC windows. */
+
+&usb4_0_acio {
+	reg = <0x7 0x01ac0000 0x0 0xc000>,
+	      <0x7 0x01080000 0x0 0x20000>,
+	      <0x7 0x01e44000 0x0 0x4000>,
+	      <0x7 0x01100000 0x0 0x4000>;
+	reg-names = "rc", "sram", "pcie-adapter", "cpu";
+	power-domains = <&ps_atc0_cio>, <&ps_atc0_cio_pcie>,
+			<&ps_atc0_cio_usb>, <&ps_atc0_pcie>;
+};
+
+&usb4_1_acio {
+	reg = <0xb 0x01ac0000 0x0 0xc000>,
+	      <0xb 0x01080000 0x0 0x20000>,
+	      <0xb 0x01e44000 0x0 0x4000>,
+	      <0xb 0x01100000 0x0 0x4000>;
+	reg-names = "rc", "sram", "pcie-adapter", "cpu";
+	power-domains = <&ps_atc1_cio>, <&ps_atc1_cio_pcie>,
+			<&ps_atc1_cio_usb>, <&ps_atc1_pcie>;
+};
+
+&usb4_2_acio {
+	reg = <0xf 0x01ac0000 0x0 0xc000>,
+	      <0xf 0x01080000 0x0 0x20000>,
+	      <0xf 0x01e44000 0x0 0x4000>,
+	      <0xf 0x01100000 0x0 0x4000>;
+	reg-names = "rc", "sram", "pcie-adapter", "cpu";
+	power-domains = <&ps_atc2_cio>, <&ps_atc2_cio_pcie>,
+			<&ps_atc2_cio_usb>, <&ps_atc2_pcie>;
+};

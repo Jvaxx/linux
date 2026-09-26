@@ -1,0 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* Additional loader aliases for the T6030 PCIe adapter tunables. */
+
+/ {
+	aliases {
+		usb4_0_pcie_adapter = &usb4_0_acio;
+		usb4_1_pcie_adapter = &usb4_1_acio;
+		usb4_2_pcie_adapter = &usb4_2_acio;
+	};
+};
