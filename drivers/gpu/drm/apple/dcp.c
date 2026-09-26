@@ -2781,6 +2781,7 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 			return -ENOLINK;
 		}
 		smp_store_release(&dcp->external_link_ready, true);
+		dcpext_scanout_link_restored(dcp);
 		mutex_unlock(&dcp->hpd_mutex);
 	}
 
