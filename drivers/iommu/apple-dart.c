@@ -882,6 +882,25 @@ apple_dart_hw_sync_locked(struct io_pgtable_cfg *cfg,
 				ret = -EIO;
 				goto out;
 			}
+			/*
+			 * Legacy display DARTs hand their locked root to Linux.
+			 * The IOMMU core has rebuilt the firmware reservations
+			 * before attachment, so replace the old root entries.
+			 * T8110 v2.2+ instead retains firmware-owned entries.
+			 */
+			if (dart->hw->type != DART_T8110 || dart->version < 0x0202) {
+				size_t entry;
+
+				dma_wmb();
+				for (entry = 0; entry < dart->pgsize / sizeof(*live); entry++) {
+					u64 next = READ_ONCE(ours[entry]);
+
+					WRITE_ONCE(live[entry], next);
+					WRITE_ONCE(owned[entry], next);
+				}
+				dma_wmb();
+				continue;
+			}
 			ret = apple_dart_publish_root(dart, live, owned, ours,
 						      dart->locked_fw[sid][idx],
 						      dart->pgsize / sizeof(*live));
@@ -1177,6 +1196,8 @@ static int apple_dart_domain_flush_tlb_range(struct apple_dart_domain *domain,
 		stream.dart = map->dart;
 		for (j = 0; j < BITS_TO_LONGS(stream.dart->num_streams); j++)
 			stream.sidmap[j] = atomic_long_read(&map->sidmap[j]);
+		if (bitmap_empty(stream.sidmap, stream.dart->num_streams))
+			continue;
 		ret = pm_runtime_resume_and_get(stream.dart->dev);
 		if (ret < 0) {
 			dev_err_ratelimited(stream.dart->dev,
@@ -1483,11 +1504,11 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 	if (dart_domain->finalized)
 		goto done;
 
+	/* Reserved mappings may be installed before any device is attached. */
 	for (i = 0; i < MAX_DARTS_PER_DEVICE; ++i) {
 		dart_domain->stream_maps[i].dart = cfg->stream_maps[i].dart;
-		for (j = 0; j < BITS_TO_LONGS(dart->num_streams); j++)
-			atomic_long_set(&dart_domain->stream_maps[i].sidmap[j],
-					cfg->stream_maps[i].sidmap[j]);
+		for (j = 0; j < BITS_TO_LONGS(DART_MAX_STREAMS); j++)
+			atomic_long_set(&dart_domain->stream_maps[i].sidmap[j], 0);
 	}
 
 	pgtbl_cfg = (struct io_pgtable_cfg){
@@ -1805,6 +1826,8 @@ static void apple_dart_domain_free(struct iommu_domain *domain)
 		stream.dart = map->dart;
 		for (j = 0; j < BITS_TO_LONGS(stream.dart->num_streams); j++)
 			stream.sidmap[j] = atomic_long_read(&map->sidmap[j]);
+		if (bitmap_empty(stream.sidmap, stream.dart->num_streams))
+			continue;
 		j = pm_runtime_resume_and_get(stream.dart->dev);
 		if (j < 0) {
 			dev_err_ratelimited(stream.dart->dev,
@@ -2925,6 +2948,10 @@ static struct kunit_suite apple_dart_fw_suite = {
 };
 
 kunit_test_suite(apple_dart_fw_suite);
+#endif
+
+#if IS_ENABLED(CONFIG_APPLE_DART_KUNIT_TEST)
+#include "apple-dart-test.c"
 #endif
 
 MODULE_DESCRIPTION("IOMMU API for Apple's DART");
