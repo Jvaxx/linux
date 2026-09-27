@@ -3027,8 +3027,10 @@ static void tb_stop(struct tb *tb)
 		else if (tb_tunnel_is_dp(tunnel) && !tb_tunnel_is_active(tunnel))
 			tb_tunnel_deactivate(tunnel);
 		/* the host side of a DP tunnel goes away with us */
-		else if (tb_tunnel_is_dp(tunnel))
+		else if (tb_tunnel_is_dp(tunnel)) {
 			tb_dp_tunnel_notify(tunnel, false);
+			tb_dp_tunnel_deactivate_host(tunnel);
+		}
 		tb_tunnel_put(tunnel);
 	}
 	tb_switch_remove(tb->root_switch);
