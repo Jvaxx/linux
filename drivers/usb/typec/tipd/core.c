@@ -897,7 +897,6 @@ static void cd321x_update_work(struct work_struct *work)
 			      (TPS_DATA_STATUS_USB2_CONNECTION | TPS_DATA_STATUS_USB3_CONNECTION);
 	bool dp_mode_changed = cd321x_dp_mode_changed(st.data_status,
 						       st.data_status_changed);
-	bool dp_connected = st.data_status & TPS_DATA_STATUS_DP_CONNECTION;
 	struct cd321x_dp_update dp = {
 		.data_status = st.data_status,
 		.changed = st.data_status_changed,
@@ -905,6 +904,10 @@ static void cd321x_update_work(struct work_struct *work)
 		.route_active = cd321x->display_route_active,
 		.sink_reported = cd321x->dp_sink_reported,
 	};
+
+	bool usb4_started =
+		(st.data_status_changed & CD321X_DATA_STATUS_USB4_CONNECTION) &&
+		(st.data_status & CD321X_DATA_STATUS_USB4_CONNECTION);
 
 	enum usb_role old_role = usb_role_switch_get_role(tps->role_sw);
 	enum usb_role new_role = USB_ROLE_NONE;
@@ -1054,12 +1057,21 @@ static void cd321x_update_work(struct work_struct *work)
 	if (ret && !display_busy)
 		goto retry;
 	/* A shared display route can be busy while the dock's USB path is usable. */
-	cd321x->display_route_active = dp_connected && !ret;
+	cd321x->display_route_active = !ret &&
+		cd321x->state.alt == cd321x->port_altmode_dp;
 
 	/* Launch the USB role switch */
 	ret = usb_role_switch_set_role(tps->role_sw, new_role);
 	if (ret)
 		goto retry;
+
+	/* A new USB4 route can disturb another port on the shared fabric. */
+	if (IS_REACHABLE(CONFIG_DRM) && cd321x->connector_fwnode &&
+	    !of_machine_is_compatible("apple,t8140") &&
+	    !of_machine_is_compatible("apple,t8142") &&
+	    usb4_started && !cd321x->display_route_active)
+		drm_connector_oob_hotplug_event(cd321x->connector_fwnode,
+						connector_status_unknown);
 
 	/* An IRQ_HPD is delivered now, or overtaken by a connect. */
 	cd321x->dp_irq_hpd = false;
