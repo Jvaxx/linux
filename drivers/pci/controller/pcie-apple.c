@@ -116,6 +116,21 @@ bool apple_pcie_tunnel_needs_cold_init(struct device_node *np)
 	return tunables;
 }
 EXPORT_SYMBOL_GPL(apple_pcie_tunnel_needs_cold_init);
+static bool tunnel_kernel_init;
+module_param(tunnel_kernel_init, bool, 0644);
+MODULE_PARM_DESC(tunnel_kernel_init,
+		 "Cold-initialize apple,pciec-kernel-init PCIe-C ports (experimental, default off)");
+
+static unsigned int tunnel_kernel_init_trace_ms;
+module_param(tunnel_kernel_init_trace_ms, uint, 0644);
+MODULE_PARM_DESC(tunnel_kernel_init_trace_ms,
+		 "Log each PCIe-C cold init step and sleep this long after it (debug)");
+
+bool apple_pcie_tunnel_kernel_init_enabled(void)
+{
+	return READ_ONCE(tunnel_kernel_init);
+}
+EXPORT_SYMBOL_GPL(apple_pcie_tunnel_kernel_init_enabled);
 
 /* T8103 (original M1) and related SoCs */
 #define CORE_RC_PHYIF_CTL		0x00024
@@ -983,6 +998,74 @@ static int apple_pcie_tunnel_reinitialize(struct apple_pcie_port *port)
 	return 0;
 }
 
+static void apple_pcie_tunnel_cold_init_step(struct apple_pcie_port *port,
+					     const char *step)
+{
+	unsigned int ms = READ_ONCE(tunnel_kernel_init_trace_ms);
+
+	if (!ms)
+		return;
+	dev_info(port->pcie->dev, "PCIe-C %pOF cold init: %s\n", port->np, step);
+	msleep(ms);
+}
+
+/*
+ * Cold-initialize a PCIe-C port that no m1n1 handoff brought up. This
+ * follows the enablePortHardware() baseline of apple_pcie_tunnel_start() and
+ * the t8103 cold init of aurora-silicon/linux#8: the port leaves reset with
+ * APPCLK running and reports RUN before anything touches the root port's
+ * config space. The downstream (tunnel) reset stays asserted until
+ * apple_pcie_setup_port() releases it before link training.
+ */
+static int apple_pcie_tunnel_cold_init(struct apple_pcie_port *port)
+{
+	struct apple_pcie *pcie = port->pcie;
+	u32 stat;
+	int i, ret;
+
+	apple_pcie_tunnel_cold_init_step(port, "debug and fabric tunables");
+	apple_pcie_tunnel_apply_tunable(pcie->debug_base, pcie->debug_tunable);
+	apple_pcie_tunnel_apply_tunable(pcie->fabric_base,
+					pcie->fabric_tunable);
+	apple_pcie_tunnel_cold_init_step(port, "port reset table");
+	apple_pcie_tunnel_reset_hardware(port);
+	apple_pcie_tunnel_cold_init_step(port, "port tunables");
+	apple_pcie_tunnel_apply_tunable(port->base, port->tunable);
+
+	apple_pcie_tunnel_cold_init_step(port, "PERST off, APPCLK on");
+	apple_pcie_port_rmw_set(port, PORT_PERST_OFF, pcie->hw->port_perst);
+	apple_pcie_port_rmw_set(port, PORT_APPCLK_EN, PORT_APPCLK);
+	ret = read_poll_timeout_atomic(apple_pcie_port_readl, stat,
+				       stat & PORT_STATUS_READY,
+				       10, 250000, false, port, PORT_STATUS);
+	if (ret)
+		return dev_err_probe(pcie->dev, ret,
+				     "PCIe-C %pOF cold init: port did not enter RUN (status %#x)\n",
+				     port->np, stat);
+
+	apple_pcie_tunnel_cold_init_step(port, "root complex tunables");
+	apple_pcie_tunnel_apply_tunable(pcie->cfg->win, pcie->rc_tunable);
+	apple_pcie_tunnel_cold_init_step(port, "APPCLK ungate, counters, Intr2AXI");
+	apple_pcie_port_rmw_clear(port, PORT_APPCLK_CGDIS, PORT_APPCLK);
+	apple_pcie_port_writel(port, PORT_COUNTER_ENABLE, PORT_COUNTER_CTRL);
+	apple_pcie_port_writel(port, ~0, PORT_INTSTAT);
+	apple_pcie_port_writel(port, ~0, PORT_LINKCMDSTS);
+	apple_pcie_tunnel_writel(pcie->intr2axi_base, PCIEC_INTR2AXI_ENABLE,
+				 PCIEC_INTR2AXI_CTRL);
+
+	ret = read_poll_timeout_atomic(apple_pcie_port_readl, stat,
+				       !(stat & PORT_LINKSTS_BUSY),
+				       10, 250000, false, port, PORT_LINKSTS);
+	if (ret)
+		return dev_err_probe(pcie->dev, ret,
+				     "PCIe-C %pOF cold init: link still busy (status %#x)\n",
+				     port->np, stat);
+
+	for (i = 0; i < pcie->hw->max_rid2sid; i++)
+		apple_pcie_rid2sid_write(port, i, 0);
+
+	dev_info(pcie->dev, "PCIe-C %pOF cold init done, status %#x tunstat %#x\n",
+		 port->np, apple_pcie_port_readl(port, PORT_STATUS),
 /*
  * Bring up a port that no firmware handoff left running (t8103, or
  * T600x/T602x with pcie_apple.tunnel_kernel_init): tunables and the reset
@@ -3501,6 +3584,151 @@ static const struct of_device_id apple_pcie_of_match[] = {
 	{ }
 };
 MODULE_DEVICE_TABLE(of, apple_pcie_of_match);
+
+struct apple_pcie_tunnel_map {
+	struct resource res;
+	void __iomem *base;
+};
+
+static int apple_pcie_tunnel_map_named(struct device_node *np,
+				       const char *name,
+				       struct apple_pcie_tunnel_map *map)
+{
+	int index, ret;
+
+	index = of_property_match_string(np, "reg-names", name);
+	if (index < 0)
+		return index;
+	ret = of_address_to_resource(np, index, &map->res);
+	if (ret)
+		return ret;
+	/* Tunneled PCIe-C MMIO is non-posted, as in the probe path. */
+	map->base = ioremap_np(map->res.start, resource_size(&map->res));
+	return map->base ? 0 : -ENOMEM;
+}
+
+static void apple_pcie_tunnel_unmap(struct apple_pcie_tunnel_map *map)
+{
+	if (map->base)
+		iounmap(map->base);
+}
+
+/*
+ * Cold-initialize an "apple,pciec-kernel-init" PCIe-C port before the tunnel
+ * children are populated. The DART is the first child and probes as soon as
+ * it is created, and its command engine never completes an invalidation
+ * while the port's APPCLK is gated. A port that is already running (m1n1
+ * handoff, or retained from an earlier connection) is left alone.
+ *
+ * There is no host bridge yet, so build a transient one around temporary
+ * mappings and reuse the port enable sequence.
+ */
+int apple_pcie_tunnel_prepare(struct device *dev, struct device_node *tunnel)
+{
+	struct apple_pcie_tunnel_map config = {}, debug = {}, fabric = {},
+				     intr2axi = {}, portmap = {};
+	struct device_node *np = NULL, *port_np = NULL;
+	const struct of_device_id *match;
+	struct pci_config_window cfg = {};
+	struct apple_pcie_port port = {};
+	struct apple_pcie pcie = {};
+	void *group = NULL;
+	u32 stat;
+	int ret;
+
+	for_each_available_child_of_node(tunnel, np)
+		if (of_property_read_bool(np, "apple,pciec-kernel-init"))
+			break;
+	if (!np)
+		return 0;
+
+	if (!apple_pcie_tunnel_kernel_init_enabled()) {
+		dev_err(dev, "PCIe-C %pOF: kernel init disabled (pcie_apple.tunnel_kernel_init=0)\n",
+			np);
+		ret = -EPERM;
+		goto out;
+	}
+
+	match = of_match_node(apple_pcie_of_match, np);
+	port_np = of_get_next_available_child(np, NULL);
+	if (!match || !((const struct hw_info *)match->data)->tunneled ||
+	    !port_np) {
+		ret = -ENODEV;
+		goto out;
+	}
+
+	ret = apple_pcie_tunnel_map_named(np, "port0", &portmap);
+	if (ret)
+		goto out;
+
+	pcie.dev = dev;
+	pcie.hw = match->data;
+	port.pcie = &pcie;
+	port.np = port_np;
+	port.base = portmap.base;
+
+	apple_pcie_tunnel_cold_init_step(&port, "read port status");
+	stat = apple_pcie_port_readl(&port, PORT_STATUS);
+	if (stat & PORT_STATUS_READY) {
+		dev_info(dev, "PCIe-C port %pOF already running\n", port_np);
+		goto out;
+	}
+
+	ret = apple_pcie_tunnel_map_named(np, "config", &config);
+	if (!ret)
+		ret = apple_pcie_tunnel_map_named(np, "debug", &debug);
+	if (!ret)
+		ret = apple_pcie_tunnel_map_named(np, "fabric", &fabric);
+	if (!ret)
+		ret = apple_pcie_tunnel_map_named(np, "intr2axi", &intr2axi);
+	if (ret)
+		goto out;
+
+	group = devres_open_group(dev, NULL, GFP_KERNEL);
+	if (!group) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	pcie.rc_tunable = devm_apple_tunable_parse(dev, np, "apple,tunable-rc",
+						   &config.res);
+	pcie.debug_tunable = devm_apple_tunable_parse(dev, np,
+						      "apple,tunable-debug",
+						      &debug.res);
+	pcie.fabric_tunable = devm_apple_tunable_parse(dev, np,
+						       "apple,tunable-fabric",
+						       &fabric.res);
+	port.tunable = devm_apple_tunable_parse(dev, port_np, "apple,tunable",
+						&portmap.res);
+	if (IS_ERR(pcie.rc_tunable) || IS_ERR(pcie.debug_tunable) ||
+	    IS_ERR(pcie.fabric_tunable) || IS_ERR(port.tunable)) {
+		ret = dev_err_probe(dev, -ENODEV,
+				    "PCIe-C %pOF tunables unavailable\n", np);
+		goto out;
+	}
+
+	cfg.win = config.base;
+	pcie.cfg = &cfg;
+	pcie.debug_base = debug.base;
+	pcie.fabric_base = fabric.base;
+	pcie.intr2axi_base = intr2axi.base;
+
+	dev_info(dev, "PCIe-C port %pOF cold init (status %#x)\n",
+		 port_np, stat);
+	ret = apple_pcie_tunnel_cold_init(&port);
+
+out:
+	if (group)
+		devres_release_group(dev, group);
+	apple_pcie_tunnel_unmap(&intr2axi);
+	apple_pcie_tunnel_unmap(&fabric);
+	apple_pcie_tunnel_unmap(&debug);
+	apple_pcie_tunnel_unmap(&config);
+	apple_pcie_tunnel_unmap(&portmap);
+	of_node_put(port_np);
+	of_node_put(np);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_pcie_tunnel_prepare);
 
 static struct platform_driver apple_pcie_driver = {
 	.probe	= apple_pcie_probe,
