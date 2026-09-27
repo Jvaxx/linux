@@ -1037,6 +1037,10 @@ void dcp_queue_typec_reconnect(struct apple_dcp *dcp, unsigned long delay)
 	dcp->typec_reconnect_session = dcp_session_locked(dcp);
 	mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq, delay);
 }
+#define DPTX_CONNECT_TIMEOUT msecs_to_jiffies(2000)
+#define DPTX_TUNNEL_CONNECT_TIMEOUT msecs_to_jiffies(8000)
+#define DPTX_RECONNECT_DELAY msecs_to_jiffies(1000)
+#define DPTX_RECONNECT_RETRIES 5
 
 static int dcp_dptx_connect_session(struct apple_dcp *dcp, u32 port,
 				    struct dcp_fabric_session session, bool cable,
@@ -1600,6 +1604,10 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
 	}
 	if (++dcp->typec_reconnect_tries <
 	    (dcp_uses_t6020_tunnel_flow(dcp) ? 1 : DPTX_RECONNECT_RETRIES)) {
+
+	if (++dcp->typec_reconnect_tries <
+	    (dcp_is_usb4_output(dcp) && of_machine_is_compatible("apple,j416s") ?
+	     1 : DPTX_RECONNECT_RETRIES)) {
 		mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq,
 				 DPTX_RECONNECT_DELAY);
 		return;
@@ -3769,6 +3777,10 @@ static void dcp_platform_shutdown(struct platform_device *pdev)
 	if (dcp) {
 		WRITE_ONCE(dcp->typec_cable_connected, false);
 		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
+	if (dcp) {
+		WRITE_ONCE(dcp->typec_cable_connected, false);
+		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
+		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
 		cancel_delayed_work_sync(&dcp->typec_fabric_retrain_wq);
 	}
 	component_del(&pdev->dev, &dcp_comp_ops);
@@ -3885,6 +3897,9 @@ static int dcp_platform_suspend(struct device *dev)
 	cancel_delayed_work_sync(&dcp->swap_watchdog_wq);
 	WRITE_ONCE(dcp->typec_cable_connected, false);
 	cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
+	WRITE_ONCE(dcp->typec_cable_connected, false);
+	cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
+	cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
 	cancel_delayed_work_sync(&dcp->typec_fabric_retrain_wq);
 
 	if (dcp->avep)

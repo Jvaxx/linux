@@ -3440,6 +3440,11 @@ int apple_atc_dp_tunnel_rate_source(struct phy *phy, unsigned int source,
 	if (!apple_atc_tunnel_is_t6030(atcphy) ||
 	    apple_dp_tunnel_t6030_pclk(source, dpin) < 0)
 		return -EOPNOTSUPP;
+	if (of_machine_is_compatible("apple,j416s") &&
+	    (!of_device_is_compatible(atcphy->np, "apple,t6020-atcphy") ||
+	     !apple_atc_is_typec_core(atcphy->res.core->start) ||
+	     resource_size(atcphy->res.core) < 0x7048))
+		return -EINVAL;
 	guard(mutex)(&atcphy->lock);
 	atcphy_restore_after_pd_off(atcphy);
 	/* A stale source must not retune or stop another source's clock. */
