@@ -216,6 +216,7 @@ struct apple_cio {
 	struct delayed_work pcie_tunnel_work;
 	bool pcie_tunnel_requested;
 	bool pcie_tunnel_populated;
+	bool pcie_tunnel_stopping;
 	bool pcie_pm_prepared;
 	bool pcie_quiesce_pending;
 
@@ -993,7 +994,7 @@ static void apple_cio_pcie_tunnel_work(struct work_struct *work)
 	int ret = 0;
 
 	mutex_lock(&acio->pcie_tunnel_lock);
-	if (acio->pcie_pm_prepared)
+	if (acio->pcie_tunnel_stopping || acio->pcie_pm_prepared)
 		goto unlock;
 	if (acio->pcie_quiesce_pending) {
 		ret = apple_cio_quiesce_pcie_tunnel_locked(acio);
@@ -1022,6 +1023,8 @@ static int apple_nhi_pci_tunnel_deactivate(struct tb_nhi *nhi)
 	 * nothing to enumerate onto when the tunnel comes back.
 	 */
 	mutex_lock(&acio->pcie_tunnel_lock);
+	if (acio->pcie_tunnel_stopping)
+		goto unlock;
 	WRITE_ONCE(acio->pcie_tunnel_requested, false);
 	cancel_delayed_work(&acio->pcie_tunnel_work);
 	acio->pcie_quiesce_pending = true;
@@ -1034,6 +1037,7 @@ static int apple_nhi_pci_tunnel_deactivate(struct tb_nhi *nhi)
 				 ret);
 	}
 
+unlock:
 	mutex_unlock(&acio->pcie_tunnel_lock);
 
 	return ret;
@@ -1051,11 +1055,35 @@ static int apple_nhi_pci_tunnel_post_activate(struct tb_nhi *nhi)
 	 * hardware reset state without blocking completion of the tunnel paths.
 	 */
 	mutex_lock(&acio->pcie_tunnel_lock);
+	if (acio->pcie_tunnel_stopping) {
+		mutex_unlock(&acio->pcie_tunnel_lock);
+		return -ESHUTDOWN;
+	}
 	WRITE_ONCE(acio->pcie_tunnel_requested, true);
 	/* No PCI removal or rescan until system resume has finished. */
 	mod_delayed_work(system_freezable_wq, &acio->pcie_tunnel_work, 0);
 	mutex_unlock(&acio->pcie_tunnel_lock);
 	return 0;
+}
+
+static void apple_cio_stop_pcie_tunnel(struct apple_cio *acio)
+{
+	int ret;
+
+	/* Block new requests before draining work, without nesting tb->lock. */
+	mutex_lock(&acio->pcie_tunnel_lock);
+	acio->pcie_tunnel_stopping = true;
+	WRITE_ONCE(acio->pcie_tunnel_requested, false);
+	mutex_unlock(&acio->pcie_tunnel_lock);
+	cancel_delayed_work_sync(&acio->pcie_tunnel_work);
+
+	/* The NHI must remain alive to complete the tunneled reset handshake. */
+	mutex_lock(&acio->pcie_tunnel_lock);
+	ret = apple_cio_quiesce_pcie_tunnel_locked(acio);
+	mutex_unlock(&acio->pcie_tunnel_lock);
+	if (ret)
+		dev_warn(acio->dev,
+			 "failed to quiesce PCIe-C before NHI shutdown: %d\n", ret);
 }
 
 #define APPLE_DP_AUX_POLL_MS		500
@@ -1673,9 +1701,14 @@ static int apple_nhi_probe(struct platform_device *pdev)
 		goto err;
 	}
 
+	scoped_guard(mutex, &acio->pcie_tunnel_lock) {
+		acio->pcie_tunnel_stopping = false;
+		acio->pcie_pm_prepared = false;
+	}
 	ret = tb_domain_add(anhi->tb, false);
 	if (ret) {
 		dev_err_probe(anhi->dev, ret, "failed to add TB domain\n");
+		apple_cio_stop_pcie_tunnel(acio);
 		tb_domain_put(anhi->tb);
 		wait_for_completion(&anhi->nhi.domain_released);
 		goto err;
@@ -1728,6 +1761,8 @@ static int apple_nhi_probe(struct platform_device *pdev)
 
 err_unlock_tb_domain:
 	mutex_unlock(&anhi->tb->lock);
+	disable_delayed_work_sync(&anhi->dp_aux_work);
+	apple_cio_stop_pcie_tunnel(acio);
 	tb_domain_remove(anhi->tb);
 	wait_for_completion(&anhi->nhi.domain_released);
 err:
@@ -1742,6 +1777,7 @@ static void apple_nhi_remove(struct platform_device *pdev)
 
 	/* Stop racing tunnel activation from rearming work during removal. */
 	disable_delayed_work_sync(&anhi->dp_aux_work);
+	apple_cio_stop_pcie_tunnel(anhi->acio);
 	WRITE_ONCE(anhi->acio->nhi_pdev, NULL);
 	tb_domain_remove(anhi->tb);
 	wait_for_completion(&anhi->nhi.domain_released);
@@ -1806,7 +1842,8 @@ static void apple_nhi_complete(struct device *dev)
 
 	guard(mutex)(&acio->pcie_tunnel_lock);
 	acio->pcie_pm_prepared = false;
-	if (acio->pcie_quiesce_pending || READ_ONCE(acio->pcie_tunnel_requested))
+	if (!acio->pcie_tunnel_stopping &&
+	    (acio->pcie_quiesce_pending || READ_ONCE(acio->pcie_tunnel_requested)))
 		mod_delayed_work(system_freezable_wq, &acio->pcie_tunnel_work, 0);
 }
 
@@ -1863,45 +1900,18 @@ static struct platform_device *apple_cio_find_pcie_tunnel(struct apple_cio *acio
 	return pdev;
 }
 
-/**
- * apple_cio_stop - Stop and power down the ACIO complex
- * @acio: ACIO complex to stop
- *
- * Remove the NHI and DART children before shutting down the co-processor and
- * dropping the power-domain links. The Type-C PHY must remain configured
- * until this function returns. The caller must hold @acio->lock.
- */
-static void apple_cio_stop(struct apple_cio *acio)
+static void apple_cio_remove_children(struct apple_cio *acio)
 {
-	struct platform_device *nhi_pdev, *pcie_pdev;
-	int ret, i;
+	struct platform_device *nhi_pdev;
 
 	lockdep_assert_held(&acio->lock);
 
 	/*
-	 * First, shutdown the blocks inside the ACIO complex, like the NHI and the IOMMU.
-	 * After we shut down the ACIO co-processor we will no longer be able to access
-	 * the MMIO space of these so make sure nothing tries to do just that.
+	 * Stop requests before removing the NHI. Do not hold pcie_tunnel_lock
+	 * across domain removal: it takes tb->lock, which tunnel callbacks hold
+	 * when they acquire pcie_tunnel_lock.
 	 */
-	WRITE_ONCE(acio->pcie_tunnel_requested, false);
-	cancel_delayed_work_sync(&acio->pcie_tunnel_work);
-	mutex_lock(&acio->pcie_tunnel_lock);
-
-	/*
-	 * The PCIe-C tunnel reset handshake is carried by the NHI. Quiesce the
-	 * remote PCI hierarchy and acknowledge tunneled PERST before removing
-	 * that control plane. PCIe-C and its DART stay bound until the general
-	 * child depopulation below.
-	 */
-	pcie_pdev = apple_cio_find_pcie_tunnel(acio);
-	if (pcie_pdev) {
-		ret = apple_pcie_tunnel_quiesce(&pcie_pdev->dev);
-		if (ret)
-			dev_warn(acio->dev,
-				 "failed to quiesce PCIe-C before NHI shutdown: %d\n",
-				 ret);
-		put_device(&pcie_pdev->dev);
-	}
+	apple_cio_stop_pcie_tunnel(acio);
 
 	/*
 	 * The NHI is the tunnel control plane. Stop it while the tunneled PCIe
@@ -1919,9 +1929,26 @@ static void apple_cio_stop(struct apple_cio *acio)
 		flush_workqueue(acio->dp_wq);
 
 	of_platform_depopulate(acio->dev);
-	acio->pcie_tunnel_populated = false;
-	acio->pcie_quiesce_pending = false;
-	mutex_unlock(&acio->pcie_tunnel_lock);
+	scoped_guard(mutex, &acio->pcie_tunnel_lock) {
+		acio->pcie_tunnel_populated = false;
+		acio->pcie_quiesce_pending = false;
+	}
+}
+
+/**
+ * apple_cio_stop - Stop and power down the ACIO complex
+ * @acio: ACIO complex to stop
+ *
+ * Remove the NHI and DART children before shutting down the co-processor and
+ * dropping the power-domain links. The Type-C PHY must remain configured
+ * until this function returns. The caller must hold @acio->lock.
+ */
+static void apple_cio_stop(struct apple_cio *acio)
+{
+	int ret, i;
+
+	lockdep_assert_held(&acio->lock);
+	apple_cio_remove_children(acio);
 
 	/* Try to shut down and power off the co-processor gracefully */
 	ret = apple_rtkit_poweroff(acio->rtk);
@@ -2065,7 +2092,7 @@ static int apple_cio_start(struct apple_cio *acio)
 	return 0;
 
 err_depopulate:
-	of_platform_depopulate(acio->dev);
+	apple_cio_remove_children(acio);
 err_shutdown_rtkit:
 	/* Ignore errors here since we're about to cut power to the entire block anyway */
 	apple_rtkit_poweroff(acio->rtk);
