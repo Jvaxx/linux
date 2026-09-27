@@ -192,6 +192,7 @@ struct tb_nhi_ops {
 #define QUIRK_RESET_DMA_ON_TEARDOWN			BIT(2)
 #define QUIRK_NO_DMA_PORT				BIT(3)
 #define QUIRK_NO_USB3_BW_ALLOC				BIT(4)
+#define QUIRK_HOST_DP_NFC_CREDITS			BIT(5)
 
 /*
  * Minimal number of vectors when we use MSI-X. Two for control channel
