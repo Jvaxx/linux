@@ -6,6 +6,7 @@
  * Author: Mika Westerberg <mika.westerberg@linux.intel.com>
  */
 
+#include <linux/delay.h>
 #include <kunit/test.h>
 #include <linux/idr.h>
 
@@ -3357,7 +3358,101 @@ static void tb_test_tunnel_dp_host_credits(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, tb_port_needs_host_dp_credits(&host->ports[5]));
 }
 
+/* 7.2 owns the domain reference in DPRX, not in the callback. */
+struct tb_test_dprx {
+	struct tb tb;
+	struct tb_nhi nhi;
+	struct kunit *test;
+	unsigned int completions;
+};
+
+static void tb_test_dprx_release(struct device *dev)
+{
+	/* The context is owned by KUnit and survives the final device put. */
+}
+
+static void tb_test_dprx_complete(struct tb_tunnel *tunnel)
+{
+	struct tb_test_dprx *ctx = container_of(tunnel->tb, struct tb_test_dprx, tb);
+
+	KUNIT_EXPECT_TRUE(ctx->test, tunnel->dprx_canceled);
+	ctx->completions++;
+}
+
+static void tb_test_dp_dprx_cancel_common(struct kunit *test, bool running)
+{
+	struct tb_test_dprx *ctx;
+	struct tb_switch *host, *dev;
+	struct tb_tunnel *tunnel;
+	struct tb *tb;
+	ktime_t deadline;
+
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	ctx->test = test;
+	tb = &ctx->tb;
+	tb->nhi = &ctx->nhi;
+	host = alloc_host(test);
+	KUNIT_ASSERT_NOT_NULL(test, host);
+	dev = alloc_dev_default(test, host, 0x1, true);
+	KUNIT_ASSERT_NOT_NULL(test, dev);
+	tunnel = tb_tunnel_alloc_dp(tb, &host->ports[5], &dev->ports[13],
+				    1, 0, 0, tb_test_dprx_complete);
+	KUNIT_ASSERT_NOT_NULL(test, tunnel);
+	tb->wq = alloc_ordered_workqueue("tb-dprx-test", 0);
+	if (!tb->wq) {
+		tb_tunnel_put(tunnel);
+		KUNIT_FAIL(test, "failed to allocate DPRX workqueue");
+		return;
+	}
+	device_initialize(&tb->dev);
+	tb->dev.release = tb_test_dprx_release;
+	mutex_init(&tb->lock);
+	mutex_lock(&tb->lock);
+	kref_get(&tunnel->kref);
+	tb_domain_get(tb);
+	tunnel->dprx_started = true;
+	queue_delayed_work(tb->wq, &tunnel->dprx_work, running ? 0 : 60 * HZ);
+	if (running) {
+		deadline = ktime_add_ms(ktime_get(), 5000);
+		while (!(work_busy(&tunnel->dprx_work.work) & WORK_BUSY_RUNNING) &&
+		       ktime_before(ktime_get(), deadline))
+			usleep_range(100, 200);
+		KUNIT_EXPECT_TRUE(test,
+			work_busy(&tunnel->dprx_work.work) & WORK_BUSY_RUNNING);
+	}
+	tb_dp_tunnel_cancel_dprx(tunnel);
+	KUNIT_EXPECT_FALSE(test, tunnel->dprx_started);
+	KUNIT_EXPECT_TRUE(test, tunnel->dprx_canceled);
+	/* 7.2 cancellation must not wait for a worker blocked on this lock. */
+	mutex_unlock(&tb->lock);
+	flush_workqueue(tb->wq);
+	KUNIT_EXPECT_EQ(test, ctx->completions, running ? 1U : 0U);
+	KUNIT_EXPECT_EQ(test, kref_read(&tunnel->kref), 1U);
+	KUNIT_EXPECT_EQ(test, kref_read(&tb->dev.kobj.kref), 1U);
+	mutex_lock(&tb->lock);
+	tb_dp_tunnel_cancel_dprx(tunnel);
+	mutex_unlock(&tb->lock);
+	KUNIT_EXPECT_EQ(test, kref_read(&tunnel->kref), 1U);
+	destroy_workqueue(tb->wq);
+	tb_tunnel_put(tunnel);
+	put_device(&tb->dev);
+	mutex_destroy(&tb->lock);
+}
+
+static void tb_test_dp_dprx_cancel(struct kunit *test)
+{
+	tb_test_dp_dprx_cancel_common(test, false);
+}
+
+static void tb_test_dp_dprx_cancel_running(struct kunit *test)
+{
+	tb_test_dp_dprx_cancel_common(test, true);
+}
+
 static struct kunit_case tb_test_cases[] = {
+	KUNIT_CASE(tb_test_dp_dprx_cancel),
+	KUNIT_CASE(tb_test_dp_dprx_cancel_running),
 	KUNIT_CASE(tb_test_property_parse_u32_wrap),
 	KUNIT_CASE(tb_test_property_parse_recursion),
 	KUNIT_CASE(tb_test_property_parse_dir_len_underflow),

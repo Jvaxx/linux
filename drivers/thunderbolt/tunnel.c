@@ -1341,6 +1341,13 @@ void tb_dp_tunnel_deactivate_host(struct tb_tunnel *tunnel)
 					  tunnel->dst_port);
 }
 
+/* Cancel before the domain releases its ports, including early-active DP. */
+void tb_dp_tunnel_cancel_dprx(struct tb_tunnel *tunnel)
+{
+	lockdep_assert_held(&tunnel->tb->lock);
+	tb_dp_dprx_stop(tunnel);
+}
+
 static int tb_dp_activate(struct tb_tunnel *tunnel, bool active)
 {
 	int ret;

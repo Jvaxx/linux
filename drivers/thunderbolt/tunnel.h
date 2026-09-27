@@ -128,6 +128,7 @@ struct tb_tunnel *tb_tunnel_discover_dp(struct tb *tb, struct tb_port *in,
 					bool alloc_hopid,
 					void (*callback)(struct tb_tunnel *, void *),
 					void *callback_data);
+void tb_dp_tunnel_cancel_dprx(struct tb_tunnel *tunnel);
 struct tb_tunnel *tb_tunnel_alloc_dp(struct tb *tb, struct tb_port *in,
 				     struct tb_port *out, int link_nr,
 				     int max_up, int max_down,
