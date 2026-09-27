@@ -90,9 +90,10 @@ pub(crate) struct SensorProfile {
 
 /// Identity keybag `CREATE_KEYBAG` field encoding. The strict T8103 enclave
 /// reads the request's first word as the bag type and rejects the value the
-/// lenient T6020 enclave accepts there; macOS carries the type in the third
-/// word instead. Kept per-SoC so the strict path is correct without disturbing
-/// the proven T6020 encoding (hardware-verified for enrol, match, and reboot).
+/// lenient T6020 enclave accepts there; the strict enclave takes the type in
+/// the third word instead. Kept per-SoC so the strict path is correct without
+/// disturbing the proven T6020 encoding (hardware-verified for enrol, match,
+/// and reboot).
 pub(crate) struct KeybagCreate {
     /// First word: request variant, echoed back in the reply.
     pub(crate) variant: u32,
