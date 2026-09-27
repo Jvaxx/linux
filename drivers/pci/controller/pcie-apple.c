@@ -2325,6 +2325,13 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	mutex_init(&pcie->lock);
 	INIT_LIST_HEAD(&pcie->ports);
 
+	/* Resolve PM dependencies before publishing the PCI hierarchy. */
+	if (pcie->hw->tunneled) {
+		ret = apple_pcie_tunnel_add_links(pcie);
+		if (ret)
+			return ret;
+	}
+
 	ret = apple_msi_init(pcie);
 	if (ret)
 		return ret;
@@ -2339,9 +2346,13 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	 * Port mappings are allocated by the ECAM init callback. Register cleanup
 	 * afterwards so devres runs it before unmapping those registers.
 	 */
-	ret = devm_add_action_or_reset(dev, apple_pcie_cleanup, pcie);
-	if (ret)
+	ret = devm_add_action(dev, apple_pcie_cleanup, pcie);
+	if (ret) {
+		/* Drivers must release their IRQs before the domains disappear. */
+		pci_host_common_remove(pdev);
+		apple_pcie_cleanup(pcie);
 		return ret;
+	}
 
 	if (pcie->piodma_supplier) {
 		/* All fallible devres setup precedes publication of DMA pointers. */
@@ -2352,10 +2363,8 @@ static int apple_pcie_probe(struct platform_device *pdev)
 		return 0;
 	}
 
-	if (pcie->hw->tunneled) {
+	if (pcie->hw->tunneled)
 		pci_walk_bus(bridge->bus, apple_pcie_tunnel_keep_d0, NULL);
-		return apple_pcie_tunnel_add_links(pcie);
-	}
 
 	return 0;
 }
