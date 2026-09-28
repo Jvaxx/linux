@@ -202,6 +202,11 @@ struct tb_nhi_ops {
  * was told to sleep drops its link on its own some tens of seconds later.
  */
 #define QUIRK_NO_SYSTEM_SLEEP				BIT(6)
+/*
+ * Set for one system sleep when the routers stayed awake and the tunneled
+ * PCIe host kept its link up: the tunnels are still active on resume.
+ */
+#define QUIRK_KEEP_TUNNELS				BIT(7)
 
 /*
  * Minimal number of vectors when we use MSI-X. Two for control channel
