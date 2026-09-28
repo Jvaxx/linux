@@ -3330,6 +3330,43 @@ static int tb_thaw_noirq(struct tb *tb)
 	return 0;
 }
 
+static bool tb_dp_resource_listed(struct tb *tb, struct tb_port *port)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+	struct tb_port *p;
+
+	list_for_each_entry(p, &tcm->dp_resources, list) {
+		if (p == port)
+			return true;
+	}
+	return false;
+}
+
+static void tb_restore_dp_resources(struct tb_switch *sw)
+{
+	struct tb_cm *tcm = tb_priv(sw->tb);
+	struct tb_port *port;
+
+	if (sw->is_unplugged)
+		return;
+
+	tb_switch_for_each_port(sw, port) {
+		if (tb_port_has_remote(port)) {
+			tb_restore_dp_resources(port->remote->sw);
+		} else if (tb_port_is_dpin(port)) {
+			if (tb_dp_resource_listed(sw->tb, port) ||
+			    !tb_switch_query_dp_resource(sw, port))
+				continue;
+			tb_port_dbg(port, "DP IN resource available after resume\n");
+			list_add_tail(&port->list, &tcm->dp_resources);
+		} else if (tb_port_is_dpout(port) &&
+			   tb_dp_port_hpd_is_active(port) == 1 &&
+			   !tb_dp_port_is_enabled(port)) {
+			tb_dp_resource_available(sw->tb, port);
+		}
+	}
+}
+
 static void tb_complete(struct tb *tb)
 {
 	/*
@@ -3340,6 +3377,16 @@ static void tb_complete(struct tb *tb)
 	if (tb_domain_unregister_unplugged_xdomains(tb)) {
 		scoped_guard(mutex, &tb->lock)
 			tb_scan_switch(tb->root_switch);
+	}
+
+	/*
+	 * Routers kept awake through system sleep send no plug events for
+	 * the DP resources released at suspend, so pair them up again here.
+	 */
+	if (tb->nhi->quirks & QUIRK_NO_SYSTEM_SLEEP) {
+		guard(mutex)(&tb->lock);
+		tb_restore_dp_resources(tb->root_switch);
+		tb_tunnel_dp(tb);
 	}
 }
 
