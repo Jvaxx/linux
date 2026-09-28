@@ -1864,6 +1864,77 @@ static void dcp_release_piodma_iommu_dev(struct apple_dcp *dcp)
 	dcp->piodma_created = false;
 }
 
+void dcp_retain_framebuffer(struct platform_device *pdev,
+			    struct dcp_fb_reference *entry)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	mutex_lock(&dcp->swapped_out_fbs_lock);
+	list_add_tail(&entry->head, &dcp->swapped_out_fbs);
+	mutex_unlock(&dcp->swapped_out_fbs_lock);
+}
+
+void dcp_arm_retained_framebuffers(struct apple_dcp *dcp, u32 swap_id)
+{
+	struct dcp_fb_reference *entry;
+
+	mutex_lock(&dcp->swapped_out_fbs_lock);
+	list_for_each_entry(entry, &dcp->swapped_out_fbs, head) {
+		if (entry->armed)
+			continue;
+		entry->swap_id = swap_id;
+		entry->armed = true;
+	}
+	mutex_unlock(&dcp->swapped_out_fbs_lock);
+}
+
+void dcp_unarm_retained_framebuffers(struct apple_dcp *dcp, u32 swap_id)
+{
+	struct dcp_fb_reference *entry;
+
+	mutex_lock(&dcp->swapped_out_fbs_lock);
+	list_for_each_entry(entry, &dcp->swapped_out_fbs, head)
+		if (entry->armed && entry->swap_id == swap_id)
+			entry->armed = false;
+	mutex_unlock(&dcp->swapped_out_fbs_lock);
+}
+
+void dcp_release_retained_framebuffers(struct apple_dcp *dcp, u32 swap_id)
+{
+	struct dcp_fb_reference *entry, *tmp;
+	LIST_HEAD(completed);
+
+	mutex_lock(&dcp->swapped_out_fbs_lock);
+	list_for_each_entry_safe(entry, tmp, &dcp->swapped_out_fbs, head) {
+		if (!entry->armed || entry->swap_id != swap_id)
+			continue;
+		list_move_tail(&entry->head, &completed);
+	}
+	mutex_unlock(&dcp->swapped_out_fbs_lock);
+
+	list_for_each_entry_safe(entry, tmp, &completed, head) {
+		list_del(&entry->head);
+		drm_framebuffer_put(entry->fb);
+		kfree(entry);
+	}
+}
+
+void dcp_release_all_retained_framebuffers(struct apple_dcp *dcp)
+{
+	struct dcp_fb_reference *entry, *tmp;
+	LIST_HEAD(completed);
+
+	mutex_lock(&dcp->swapped_out_fbs_lock);
+	list_splice_init(&dcp->swapped_out_fbs, &completed);
+	mutex_unlock(&dcp->swapped_out_fbs_lock);
+
+	list_for_each_entry_safe(entry, tmp, &completed, head) {
+		list_del(&entry->head);
+		drm_framebuffer_put(entry->fb);
+		kfree(entry);
+	}
+}
+
 static int dcp_create_piodma_iommu_dev(struct apple_dcp *dcp)
 {
 	int ret;
@@ -2312,6 +2383,14 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 	u32 cpu_ctrl;
 	int ret;
 
+	/* A timed-out prior session may still scan these mappings. */
+	mutex_lock(&dcp->swapped_out_fbs_lock);
+	ret = list_empty(&dcp->swapped_out_fbs) ? 0 : -EBUSY;
+	mutex_unlock(&dcp->swapped_out_fbs_lock);
+	if (ret)
+		return dev_err_probe(dev, ret,
+				     "Previous scanout has not been stopped\n");
+
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(42));
 	if (ret)
 		return ret;
@@ -2694,6 +2773,9 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	dcp = devm_kzalloc(dev, sizeof(*dcp), GFP_KERNEL);
 	if (!dcp)
 		return -ENOMEM;
+
+	INIT_LIST_HEAD(&dcp->swapped_out_fbs);
+	mutex_init(&dcp->swapped_out_fbs_lock);
 
 	dcp->fw_compat = fw_compat;
 	dcp->ext_failsafe = of_device_is_compatible(dev->of_node, "apple,t8122-dcpext");
