@@ -1823,6 +1823,19 @@ static void dcp_work_update_backlight(struct work_struct *work)
 	dcp_backlight_update(dcp);
 }
 
+static void dcp_release_piodma_iommu_dev(struct apple_dcp *dcp)
+{
+	if (dcp->piodma) {
+		if (dcp->piodma_created)
+			of_platform_device_destroy(&dcp->piodma->dev, NULL);
+		else
+			put_device(&dcp->piodma->dev);
+	}
+	dcp->piodma = NULL;
+	dcp->iommu_dom = NULL;
+	dcp->piodma_created = false;
+}
+
 static int dcp_create_piodma_iommu_dev(struct apple_dcp *dcp)
 {
 	int ret;
@@ -1832,6 +1845,13 @@ static int dcp_create_piodma_iommu_dev(struct apple_dcp *dcp)
 		return dev_err_probe(dcp->dev, -ENODEV,
 				     "Failed to get piodma child DT node\n");
 
+	dcp->piodma = of_find_device_by_node(node);
+	dcp->piodma_created = !dcp->piodma;
+	if (dcp->piodma_created)
+		dcp->piodma = of_platform_device_create(node, NULL, dcp->dev);
+	if (!dcp->piodma)
+		return dev_err_probe(dcp->dev, -ENODEV,
+				     "Failed to create piodma pdev for %pOF\n", node);
 	dcp->piodma = of_platform_device_create(node, NULL, dcp->dev);
 	if (!dcp->piodma)
 		return dev_err_probe(dcp->dev, -ENODEV, "Failed to create piodma pdev for %pOF\n", node);
@@ -1858,7 +1878,7 @@ static int dcp_create_piodma_iommu_dev(struct apple_dcp *dcp)
 
 	return 0;
 err_destroy_pdev:
-	of_platform_device_destroy(&dcp->piodma->dev, NULL);
+	dcp_release_piodma_iommu_dev(dcp);
 	return ret;
 }
 
@@ -2381,24 +2401,33 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 	}
 
 	ret = dcp_create_piodma_iommu_dev(dcp);
-	if (ret || !dcp->iommu_dom)
+	if (ret)
 		return dev_err_probe(dev, ret,
-				"Failed to created PIODMA iommu child device");
+				     "Failed to create PIODMA iommu child device\n");
+	if (!dcp->iommu_dom) {
+		ret = dev_err_probe(dev, -EPROBE_DEFER,
+				    "PIODMA iommu domain is unavailable\n");
+		goto err_piodma;
+	}
 
 	ret = dcp_get_disp_regs(dcp);
 	if (ret) {
 		dev_err(dev, "failed to find display registers\n");
-		return ret;
+		goto err_piodma;
 	}
 
 	dcp->clk = devm_clk_get(dev, NULL);
-	if (IS_ERR(dcp->clk))
-		return dev_err_probe(dev, PTR_ERR(dcp->clk),
-				     "Unable to find clock\n");
+	if (IS_ERR(dcp->clk)) {
+		ret = dev_err_probe(dev, PTR_ERR(dcp->clk),
+				    "Unable to find clock\n");
+		goto err_piodma;
+	}
 	dcp->clk_194 = devm_clk_get_optional(dev, "clock-194");
-	if (IS_ERR(dcp->clk_194))
-		return dev_err_probe(dev, PTR_ERR(dcp->clk_194),
-				     "Unable to find clock 0x194\n");
+	if (IS_ERR(dcp->clk_194)) {
+		ret = dev_err_probe(dev, PTR_ERR(dcp->clk_194),
+				    "Unable to find clock 0x194\n");
+		goto err_piodma;
+	}
 
 	bitmap_zero(dcp->memdesc_map, DCP_MAX_MAPPINGS);
 	// TDOD: mem_desc IDs start at 1, for simplicity just skip '0' entry
@@ -2425,9 +2454,11 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 	}
 
 	dcp->rtk = devm_apple_rtkit_init(dev, dcp, "mbox", 0, &rtkit_ops);
-	if (IS_ERR(dcp->rtk))
-		return dev_err_probe(dev, PTR_ERR(dcp->rtk),
-				     "Failed to initialize RTKit\n");
+	if (IS_ERR(dcp->rtk)) {
+		ret = dev_err_probe(dev, PTR_ERR(dcp->rtk),
+				    "Failed to initialize RTKit\n");
+		goto err_piodma;
+	}
 
 	if (dcp->hw.adopt_live_session)
 		dev_info(dev, "negotiating RTKit with the running DCP\n");
@@ -2460,6 +2491,14 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 		dcp_ext_give_up(dcp, ret, "bind");
 		return 0;
 	}
+	if (ret) {
+		ret = dev_err_probe(dev, ret, "Failed to boot RTKit: %d\n", ret);
+		goto err_piodma;
+	}
+	return 0;
+
+err_piodma:
+	dcp_release_piodma_iommu_dev(dcp);
 	return ret;
 }
 
@@ -2545,11 +2584,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 	if (dcp->shmem)
 		iomfb_shutdown(dcp);
 
-	if (dcp->piodma) {
-		dcp->iommu_dom = NULL;
-		of_platform_device_destroy(&dcp->piodma->dev, NULL);
-		dcp->piodma = NULL;
-	}
+	dcp_release_piodma_iommu_dev(dcp);
 
 	devm_clk_put(dev, dcp->clk);
 	dcp->clk = NULL;
