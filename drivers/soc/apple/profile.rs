@@ -142,6 +142,8 @@ pub(crate) struct PlatformProfile {
     pub(crate) nonce_session: bool,
     /// Key-store protocol generation (see [`KeyStore`]).
     pub(crate) key_store: KeyStore,
+    /// Platforms with reboot-tested owner export and user-before-master saves.
+    pub(crate) persistent_enrol: bool,
 }
 
 const T8103: PlatformProfile = PlatformProfile {
@@ -174,6 +176,7 @@ const T8103: PlatformProfile = PlatformProfile {
     key_store: KeyStore::Sepos13 {
         cpx_encryption_mode: 2,
     },
+    persistent_enrol: true,
     nonce_session: false,
 };
 
@@ -203,6 +206,7 @@ const T6020: PlatformProfile = PlatformProfile {
         arg: -1,
     },
     key_store: KeyStore::Variant5,
+    persistent_enrol: true,
     nonce_session: false,
 };
 
@@ -211,6 +215,7 @@ const T6020: PlatformProfile = PlatformProfile {
 /// board; device-tree nodes remain authoritative for addresses and resources.
 const T8140: PlatformProfile = PlatformProfile {
     key_store: KeyStore::Variant5,
+    persistent_enrol: true,
     name: "T8140/J700",
     shmem_capacity: 0x4_0000,
     shmem_first_item: b"CINP",
