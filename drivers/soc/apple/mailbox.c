@@ -763,6 +763,9 @@ static int apple_mbox_probe(struct platform_device *pdev)
 	ret = devm_add_action_or_reset(dev, apple_mbox_quiesce, mbox);
 	if (ret)
 		return ret;
+	ret = devm_add_action_or_reset(dev, apple_mbox_quiesce, mbox);
+	if (ret)
+		return ret;
 
 	platform_set_drvdata(pdev, mbox);
 	return 0;
