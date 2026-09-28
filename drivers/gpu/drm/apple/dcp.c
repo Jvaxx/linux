@@ -296,6 +296,7 @@ void dcp_swap_watchdog_complete(struct apple_dcp *dcp)
 static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 {
 	struct apple_dcp *dcp = cookie;
+	struct apple_dcp_afkep *ep;
 
 	trace_dcp_recv_msg(dcp, endpoint, message);
 
@@ -318,7 +319,29 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 	case IOMFB_ENDPOINT:
 		return iomfb_recv_msg(dcp, message);
 	case AV_ENDPOINT:
-		afk_receive_message(dcp->avep, message);
+		ep = dcp->avep;
+		break;
+	case SYSTEM_ENDPOINT:
+		ep = dcp->systemep;
+		break;
+	case DISP0_ENDPOINT:
+		ep = dcp->ibootep;
+		break;
+	case DPAVSERV_ENDPOINT:
+		ep = dcp->dcpavservep;
+		break;
+	case DPTX_ENDPOINT:
+		ep = dcp->dptxep;
+		break;
+	default:
+		ep = NULL;
+		break;
+	}
+
+	if (!ep) {
+		dev_warn_ratelimited(dcp->dev,
+				     "dropping message for unhandled endpoint %#x\n",
+				     endpoint);
 		return;
 	case SYSTEM_ENDPOINT:
 		afk_receive_message(dcp->systemep, message);
@@ -335,6 +358,8 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 	default:
 		WARN(endpoint, "unknown DCP endpoint %hhu\n", endpoint);
 	}
+
+	afk_receive_message(ep, message);
 }
 
 static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_size)
@@ -1392,6 +1417,9 @@ int dcp_start(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	int ret;
+
+	if (!dcp->rtk)
+		return -ENODEV;
 
 	init_completion(&dcp->start_done);
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6)
