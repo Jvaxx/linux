@@ -9,8 +9,10 @@
 
 #include <linux/bitmap.h>
 #include <linux/completion.h>
+#include <linux/errno.h>
 #include <linux/spinlock.h>
 #include <linux/kconfig.h>
+#include <linux/math.h>
 #include <linux/types.h>
 
 #include "dcp.h"
@@ -172,6 +174,29 @@ struct afk_ringbuffer_header {
 	__le32 wptr;
 	u32 _pad3[15];
 };
+static inline int afk_ring_stride(u32 total, u32 bufsz, u32 *stride)
+{
+	u32 header, block;
+
+	if (bufsz >= total)
+		return -EINVAL;
+	header = total - bufsz;
+	block = header / 3;
+	if (header % 3 || block < 0x40 || block % 0x40 ||
+	    bufsz < block || bufsz % block)
+		return -EINVAL;
+
+	*stride = block;
+	return 0;
+}
+
+static inline u32 afk_ring_advance(u32 ptr, u32 bytes, u32 bufsz,
+				   u32 stride)
+{
+	u32 next = roundup(ptr + bytes, stride);
+
+	return next == bufsz ? 0 : next;
+}
 
 struct afk_qe {
 #define QE_MAGIC 0x20504f49 // ' POI'
@@ -259,20 +284,13 @@ enum epic_subtype {
 
 struct afk_ringbuffer {
 	bool ready;
-	void *hdr;
-	u32 block;			/* control-block stride, 0x40 or 0x80 */
-	u32 rptr;
+	__le32 *rptr;
+	__le32 *wptr;
 	void *buf;
 	size_t bufsz;
+	u32 stride;
 };
 
-static inline __le32 *afk_rb_field(struct afk_ringbuffer *bfr, unsigned int idx)
-{
-	return (__le32 *)((u8 *)bfr->hdr + idx * bfr->block);
-}
-
-#define afk_rb_rptr(bfr)	afk_rb_field(bfr, 1)
-#define afk_rb_wptr(bfr)	afk_rb_field(bfr, 2)
 
 struct apple_dcp_afkep {
 	struct apple_dcp *dcp;
