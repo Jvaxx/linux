@@ -501,6 +501,66 @@ static int macsmc_hwmon_create_sensor(struct device *dev, struct apple_smc *smc,
 	return 0;
 }
 
+/* Discover reporting-only temperatures without a board-specific key table. */
+static int macsmc_hwmon_discover_temperatures(struct macsmc_hwmon *hwmon)
+{
+	struct apple_smc *smc = hwmon->smc;
+	struct macsmc_hwmon_sensor *sensor;
+	struct apple_smc_key_info info;
+	smc_key key, previous = 0;
+	u32 i;
+	int ret;
+
+	if (!of_property_read_bool(hwmon->dev->of_node, "apple,discover-temperatures"))
+		return 0;
+
+	/* Dynamic channel numbers must not replace a DT-described thermal policy. */
+	if (hwmon->temp.count ||
+	    of_property_read_bool(hwmon->dev->of_node, "apple,cpu-thermal-policy"))
+		return -EINVAL;
+
+	/* Bound both allocation and mailbox transactions for invalid firmware data. */
+	if (!smc->key_count || smc->key_count > U16_MAX)
+		return -EINVAL;
+
+	hwmon->temp.sensors = devm_kcalloc(hwmon->dev, smc->key_count,
+					   sizeof(*sensor), GFP_KERNEL);
+	if (!hwmon->temp.sensors)
+		return -ENOMEM;
+
+	for (i = 0; i < smc->key_count; i++) {
+		ret = apple_smc_get_key_by_index(smc, i, &key);
+		if (ret < 0)
+			return ret;
+		/* SMC key tables are strictly ordered; reject duplicates as well. */
+		if (i && key <= previous)
+			return -EINVAL;
+		previous = key;
+		if ((key >> 24) < 'T')
+			continue;
+		if ((key >> 24) > 'T')
+			break;
+
+		ret = apple_smc_get_key_info(smc, key, &info);
+		if (ret < 0)
+			return ret;
+		if (!(info.flags & APPLE_SMC_READABLE) ||
+		    (info.flags & APPLE_SMC_FUNCTION) ||
+		    info.type_code != __SMC_KEY('f', 'l', 't', ' ') || info.size != 4)
+			continue;
+
+		sensor = &hwmon->temp.sensors[hwmon->temp.count++];
+		sensor->macsmc_key = key;
+		sensor->info = info;
+		sensor->attrs = HWMON_T_INPUT | HWMON_T_LABEL;
+		/* Key identity only: do not invent locations or calibration. */
+		snprintf(sensor->label, sizeof(sensor->label), "%c%c%c%c",
+			 key >> 24, (key >> 16) & 0xff, (key >> 8) & 0xff, key & 0xff);
+	}
+
+	return 0;
+}
+
 /*
  * Fan data is exposed by the SMC as multiple sensors.
  *
@@ -809,6 +869,10 @@ static int macsmc_hwmon_probe(struct platform_device *pdev)
 		dev_err(hwmon->dev, "Could not parse sensors\n");
 		return ret;
 	}
+
+	ret = macsmc_hwmon_discover_temperatures(hwmon);
+	if (ret)
+		return dev_err_probe(hwmon->dev, ret, "Temperature discovery failed\n");
 
 	if (!hwmon->curr.count && !hwmon->fan.count &&
 	    !hwmon->power.count && !hwmon->temp.count &&
