@@ -6,11 +6,35 @@ Apple J813 initial native Linux boot
 
 J813 is the 13-inch M5 MacBook Air (T8142, Mac17,3). This configuration
 
+The device tree describes all ten CPU affinities. For the initial one-CPU
+baseline, keep secondary cores stopped in m1n1 and use ``maxcpus=1``.
+The loader removes unavailable CPUs and fills the release addresses of the
+remaining nodes. The P-core
 affinities are 0x10100 through 0x10103, rather than the 0x100 through 0x103
 values in the Apple Device Tree.
 
 The CPU compatible strings identify T8142 explicitly. The firmware's reused
 ``sawtooth`` and ``everest`` names do not identify the M5 microarchitecture.
+
+SMP bring-up
+============
+
+M5 secondary CPUs can return from WFI with cleared general-purpose registers.
+Both M5 MIDRs (parts 0x062 and 0x063) select the Apple register-preserving idle
+path. Without it, all ten CPUs can start and then panic in their idle tasks.
+
+SMP also requires the M5-capable m1n1 secondary-start path: dense PMGR CPU
+masks, correct reset vectors and per-core stacks. Verify all ten cores there
+before preparing the FDT, and use ``maxcpus=10`` for the Linux test. The
+existing J813 DT and configuration support this handoff.
+
+On J813, this path reached the RAM shell with CPUs 0-9 online. A five-second
+sleep advanced every CPU's architectural timer count by 1,251 interrupts.
+Ten concurrent, individually pinned jobs each hashed 16 MiB of zeros to
+``080acf35a507ac9849cfcba47dc2ad83e01b75663a516279c8b9d243b719643e``.
+Verify affinity through ``Cpus_allowed_list`` and retain the console output,
+kernel configuration hash and payload hashes when repeating the test.
+Hotplug, deep sleep and KVM remain unqualified.
 
 Bootloader requirements
 =======================
