@@ -1090,9 +1090,12 @@ impl SepData {
                 self.dev,
                 "sbio: the sensor did not wake at attach; the next verify retries the bring-up\n"
             );
+            diag::sensor_brought_up(false);
             return;
         };
-        if !self.complete_bringup(patch) {
+        let online = self.complete_bringup(patch);
+        diag::sensor_brought_up(online);
+        if !online {
             dev_warn!(
                 self.dev,
                 "sbio: attach-time sensor bring-up did not complete; matching remains unavailable until a later bring-up succeeds.\n"
@@ -1102,6 +1105,7 @@ impl SepData {
 
     fn bring_sensor_online(&self) -> bool {
         let Some(mut patch) = self.wake_sensor() else {
+            diag::sensor_brought_up(false);
             return false;
         };
 
@@ -1118,6 +1122,7 @@ impl SepData {
 
         if !self.sensor_calibrated.load(Relaxed) {
             if !self.calibrate_sensor() {
+                diag::sensor_brought_up(false);
                 return false;
             }
             self.sensor_calibrated.store(true, Relaxed);
@@ -1133,6 +1138,7 @@ impl SepData {
             Some(parameters) => self.finish_sensor_setup(patch, parameters),
             None => self.complete_bringup(patch),
         };
+        diag::sensor_brought_up(ok);
         // The sensor is patched and idle here -- the only safe moment to
         // configure the data-ready interrupt, which is then left alone for the
         // driver's life. Interrupt capture is the default; a machine that does
@@ -1165,6 +1171,7 @@ impl SepData {
             );
             return;
         }
+        diag::keystore_open();
         if *module_parameters::provision_keybag.value() != 0 {
             if *module_parameters::xart_writes.value() == 0 {
                 dev_err!(
@@ -1178,8 +1185,11 @@ impl SepData {
                     self.dev,
                     "bringup: identity-keybag provisioning failed; no retry this boot\n"
                 );
+                diag::keybag(diag::Keybag::Failed);
                 return;
             }
+            // Either one was already persisted or one has just been.
+            diag::keybag(diag::Keybag::Present);
         }
         if let Err(e) = self.register_bio() {
             dev_err!(
@@ -1228,6 +1238,7 @@ impl SepData {
             Ok(keybag::State::Present(stored)) => stored,
             Ok(keybag::State::Absent(_)) => {
                 dev_err!(self.dev, "Touch ID: no persisted identity keybag exists\n");
+                diag::keybag(diag::Keybag::Missing);
                 return Err(ENOENT);
             }
             Err(e) => {
@@ -1236,6 +1247,7 @@ impl SepData {
                     "Touch ID: reading the persisted identity keybag failed: {:?}\n",
                     e
                 );
+                diag::keybag(diag::Keybag::Failed);
                 return Err(e);
             }
         };
@@ -1251,8 +1263,10 @@ impl SepData {
                 self.dev,
                 "Touch ID: the persisted identity keybag did not recover\n"
             );
+            diag::keybag(diag::Keybag::Failed);
             EIO
         })?;
+        diag::keybag(diag::Keybag::Present);
         self.sks_designate_user_keybag(handle, stored.secret());
         self.sks_machine_refkey(handle, stored.secret());
         let prepared = self.cold_match_continue(handle, uuid, stored.uuid_provenance());
@@ -1261,6 +1275,7 @@ impl SepData {
         self.probe_owner_export();
         self.refresh_match_credential();
         self.touchid_started.store(true, Relaxed);
+        diag::touchid(true);
         Ok(())
     }
 
@@ -1288,6 +1303,7 @@ impl SepData {
     fn prepare_bio_open(&self) -> Result<()> {
         if let Err(e) = self.activate_touchid() {
             self.touchid_failed.store(true, Relaxed);
+            diag::touchid(false);
             dev_err!(
                 self.dev,
                 "Touch ID activation failed: {:?}; refusing retries this boot because a partial keybag load is not safely repeatable\n",
@@ -2711,6 +2727,7 @@ impl SepData {
         }?;
 
         *guard = Some(dev);
+        diag::bio_published();
         Ok(())
     }
 
