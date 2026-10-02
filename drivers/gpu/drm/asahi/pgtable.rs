@@ -54,6 +54,10 @@ const UAT_LVSZ: usize = UAT_NPTE;
 const UAT_LVMSK: u64 = (UAT_LVSZ - 1) as u64;
 
 const UAT_LEVELS: usize = crate::uat::UAT_LEVELS;
+const UAT_LEVELS: usize = 3;
+
+/// Number of address bits below the index of a top-level page table entry.
+pub(crate) const UAT_TOP_LEVEL_SHIFT: usize = UAT_PGBIT + (UAT_LEVELS - 1) * UAT_LVBIT;
 
 const PTE_TYPE_BITS: u64 = 3;
 const PTE_TYPE_LEAF_TABLE: u64 = 3;
@@ -368,6 +372,8 @@ pub(crate) struct UatPageTable {
 }
 
 impl UatPageTable {
+    pub(crate) fn new(ias: u32, oas: u32) -> Result<Self> {
+        mod_pr_debug!("UATPageTable::new: ias={} oas={}\n", ias, oas);
     pub(crate) fn new(ias: u8, oas: u32) -> Result<Self> {
         mod_pr_debug!("UATPageTable::new: ias={} oas={}\n", ias, oas);
         let geometry = UatGeometry::new(ias).ok_or(EINVAL)?;
@@ -382,6 +388,8 @@ impl UatPageTable {
             reserved_tables: None,
             va_range: 0..geometry.root_size(),
             geometry,
+            va_range: 0..(1u64 << ias),
+            ias_mask: (1u64 << ias) - 1,
             oas_mask: (1u64 << oas) - 1,
             coverage: None,
         })
@@ -421,6 +429,10 @@ impl UatPageTable {
         ttb: PhysicalAddr,
         va_range: Range<u64>,
         ias: u8,
+    pub(crate) fn new_with_ttb(
+        ttb: PhysicalAddr,
+        va_range: Range<u64>,
+        ias: u32,
         oas: u32,
     ) -> Result<Self> {
         mod_pr_debug!(

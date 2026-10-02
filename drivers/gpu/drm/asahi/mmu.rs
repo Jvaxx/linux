@@ -83,7 +83,8 @@ pub(crate) use pgtable::{
     UatPageTable,
     UAT_PGBIT,
     UAT_PGMSK,
-    UAT_PGSZ, //
+    UAT_PGSZ,
+    UAT_TOP_LEVEL_SHIFT, //
 };
 
 use pin_init;
@@ -228,12 +229,59 @@ pub(crate) fn kern_iova_range(cfg: &hw::HwConfig, range: Range<u64>) -> Range<u6
     kern_iova(cfg, range.start)..kern_iova(cfg, range.end)
 }
 
+/// Top-level page table entry of the upper half that holds the driver-managed kernel VA range.
+const IOVA_KERN_TOP_LEVEL_INDEX: u64 = 2;
+
 const TTBR_VALID: u64 = 0x1; // BIT(0)
 const TTBR_ASID_SHIFT: usize = 48;
 
-/// Address of a special dummy page?
-//const IOVA_UNK_PAGE: u64 = 0x6f_ffff8000;
-pub(crate) const IOVA_UNK_PAGE: u64 = IOVA_USER_TOP - 2 * UAT_PGSZ as u64;
+/// UAT address space geometry of a given SoC.
+#[derive(Debug, Copy, Clone)]
+pub(crate) struct UatGeometry {
+    /// Input address bits translated by each page table root.
+    pub(crate) ias: u32,
+    /// Output (physical) address bits.
+    pub(crate) oas: u32,
+}
+
+impl UatGeometry {
+    /// Lower/user top VA
+    const fn user_top(&self) -> u64 {
+        1 << self.ias
+    }
+
+    /// Lower/user VA range
+    pub(crate) const fn user_range(&self) -> Range<u64> {
+        IOVA_USER_BASE..self.user_top()
+    }
+
+    /// Address of a special dummy page?
+    pub(crate) const fn unk_page(&self) -> u64 {
+        self.user_top() - 2 * UAT_PGSZ as u64
+    }
+
+    /// User VA range excluding the unk page
+    pub(crate) const fn user_usable_range(&self) -> Range<u64> {
+        IOVA_USER_BASE..self.unk_page()
+    }
+
+    /// Upper/kernel base VA
+    const fn upper_base(&self) -> u64 {
+        !(self.user_top() - 1)
+    }
+
+    /// Driver-managed kernel VA range
+    pub(crate) const fn kernel_range(&self) -> Range<u64> {
+        let start = self.upper_base() + (IOVA_KERN_TOP_LEVEL_INDEX << UAT_TOP_LEVEL_SHIFT);
+        start..(start + (1 << UAT_TOP_LEVEL_SHIFT))
+    }
+
+    /// Full kernel VA range
+    #[cfg(CONFIG_DEV_COREDUMP)]
+    const fn upper_range(&self) -> Range<u64> {
+        self.upper_base()..(!UAT_PGMSK as u64)
+    }
+}
 
 /// A pre-allocated memory region for UAT management
 struct UatRegion {
@@ -1442,6 +1490,7 @@ impl UatInner {
 pub(crate) struct Uat {
     dev: driver::AsahiDevRef,
     cfg: UatConfig,
+    geometry: UatGeometry,
 
     inner: Arc<UatInner>,
     slots: slotalloc::SlotAllocator<SlotInner>,
@@ -1682,6 +1731,7 @@ impl Vm {
         dev: &driver::AsahiDevice,
         uat_inner: Arc<UatInner>,
         kernel_range: Range<u64>,
+        geometry: UatGeometry,
         cfg: UatConfig,
         ttb: Option<PhysicalAddr>,
         id: u64,
@@ -1722,12 +1772,13 @@ impl Vm {
             UatPageTable::new_m3_coherent(cfg.ias,cfg.oas,dev)?
 
         } else {
-            UatPageTable::new(cfg.ias, cfg.oas)?
+            UatPageTable::new(geometry.ias, geometry.oas)?
         };
 
         let lower_start = IOVA_USER_BASE;
         let driver_start = lower_start;
         let (va_range, gpuvm_range) = if is_kernel {
+            (geometry.kernel_range(), kernel_range.clone())
             (iova_kern_range, kernel_range.clone())
         } else {
             (
@@ -2586,6 +2637,11 @@ impl Uat {
         )
     }
 
+    /// Returns the address space geometry of this UAT.
+    pub(crate) fn geometry(&self) -> UatGeometry {
+        self.geometry
+    }
+
     /// Creates the reference-counted inner data for a new `Uat` instance.
     #[inline(never)]
     fn make_inner(dev: &driver::AsahiDevice, handoff_mode: HandoffMode, m3: bool) -> Result<Arc<UatInner>> {
@@ -2683,7 +2739,7 @@ impl Uat {
     #[inline(never)]
     pub(crate) fn new(
         dev: &driver::AsahiDevice,
-        cfg: &'static hw::HwConfig,
+        geometry: UatGeometry,
         map_kernel_to_user: bool,
     ) -> Result<Self> {
         Self::new_with_handoff_mode(dev, cfg, map_kernel_to_user, HandoffMode::FirmwareDekker)
@@ -2784,13 +2840,22 @@ impl Uat {
             kernel_lower_vm.inner.exec_lock(None, false)?.fixed_slot = Some(0);
         }
         let kernel_vm = Vm::new(dev, inner.clone(), kernel_range, cfg, Some(ttb1), 0)?;
+        let kernel_lower_vm = Vm::new(dev, inner.clone(), geometry.user_range(), geometry, None, 1)?;
+        let kernel_vm = Vm::new(
+            dev,
+            inner.clone(),
+            geometry.kernel_range(),
+            geometry,
+            Some(ttb1),
+            0,
+        )?;
 
         dev_info!(dev.as_ref(), "MMU: Kernel page tables created\n");
 
         let ttb0 = kernel_lower_vm.ttb();
         let uat = Self {
             dev: dev.into(),
-            cfg,
+            geometry,
             kernel_vm,
             kernel_lower_vm,
             inner,

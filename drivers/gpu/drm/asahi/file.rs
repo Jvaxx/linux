@@ -66,6 +66,7 @@ struct Vm {
     ualloc: Arc<Mutex<alloc::DefaultAllocator>>,
     ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>,
     vm: mmu::Vm,
+    user_range: Range<u64>,
     kernel_range: Range<u64>,
     user_range: Range<u64>,
     _dummy_mapping: mmu::KernelMapping,
@@ -221,6 +222,8 @@ pub(crate) enum Object {
 // #[pin_data]
 pub(crate) struct File {
     id: u64,
+    /// Available VM range for the user
+    user_range: Range<u64>,
     // #[pin]
     vms: xarray::XArray<KBox<Vm>>,
     // #[pin]
@@ -519,6 +522,7 @@ impl File {
                 ualloc,
                 ualloc_priv,
                 vm,
+                user_range,
                 kernel_range,
                 user_range,
                 _dummy_mapping: dummy_mapping,
