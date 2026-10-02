@@ -36,6 +36,54 @@ Verify affinity through ``Cpus_allowed_list`` and retain the console output,
 kernel configuration hash and payload hashes when repeating the test.
 Hotplug, deep sleep and KVM remain unqualified.
 
+CPU frequency bring-up
+======================
+
+The T8142 cluster controllers use five-bit P-state requests with busy and
+command-state readback. The driver preserves firmware voltage, PLL and
+CLPC/PMP configuration, and stops issuing requests after a timeout or an
+unexpected command state. Unlike T8140, this initial J813 path does not
+register a Linux SMC thermal policy. The DT exposes only states up to the
+measured firmware handoff values; higher states remain unqualified.
+
+State 1 is 300 MHz on both clusters. The firmware SRAM voltage tables begin
+at state 2: the E cluster exposes 300/972 MHz, and the P cluster exposes
+300/1308/1608/1932/2220/2508/2820/3072/3300/3516 MHz. A dependent decrement
+loop timed against CNTPCT_EL0 in m1n1 confirmed this mapping on J813.
+``scaling_cur_freq`` reports the requested state, not an independent clock
+measurement or a guarantee against firmware throttling.
+
+The configuration enables the userspace governor. On a fresh ten-core boot,
+capture a sweep of both policies to the host serial log::
+
+  set -e
+  for p in /sys/devices/system/cpu/cpufreq/policy*; do
+      cat "$p/affected_cpus"
+      echo userspace > "$p/scaling_governor"
+      for round in 1 2; do
+          for f in $(cat "$p/scaling_available_frequencies"); do
+              echo "$f" > "$p/scaling_setspeed"
+              test "$(cat "$p/scaling_cur_freq")" = "$f"
+              echo "$p $f"
+              sleep 0.02
+          done
+      done
+      cat "$p/cpuinfo_max_freq" > "$p/scaling_setspeed"
+      cat "$p/stats/total_trans"
+  done
+  dmesg
+
+Retain the transcript and payload hashes. Qualification also compared three
+pairs of pinned, checksum-verified integer workloads at each cluster's
+minimum and maximum states and checked every CPU's timer and pinned SHA-256
+job afterwards. Short frequency sweeps do not qualify sustained thermal
+behavior, automatic governors, suspend or states above the handoff limit.
+
+T8142 can also lose registers on WFIT in delay loops. Frequency transition
+polling exposed this as a cleared pointer in the cpufreq driver. T8142 uses
+the existing counter delay loop, avoiding low-power waits with live kernel
+register state.
+
 Bootloader requirements
 =======================
 
