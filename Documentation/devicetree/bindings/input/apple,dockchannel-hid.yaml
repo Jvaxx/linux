@@ -23,7 +23,9 @@ description: |
   trackpad itself and asks the host to pulse a reset line when it needs one.
   With power method 2 the host announces each power transition to the
   coprocessor, drives the reset line of the trackpad analog front end (AFE)
-  itself and then confirms the transition.
+  itself and then confirms the transition. On systems with firmware-managed
+  reset, the same notifications bracket a firmware-owned transition and the
+  host waits 50 ms during power-on without operating a GPIO.
 
 properties:
   compatible:
@@ -140,7 +142,27 @@ properties:
         default: 1
         description:
           The power sequencing protocol of the coprocessor firmware, as
-          described above. Power method 2 requires apple,afe-reset-gpios.
+          described above. Power method 2 requires apple,afe-reset-gpios
+          unless apple,firmware-managed-reset is present.
+
+      apple,firmware-managed-reset:
+        type: boolean
+        description:
+          The coprocessor owns the trackpad reset signal. The host sends
+          power method 2 notifications without controlling an AFE GPIO.
+          Mutually exclusive with apple,afe-reset-gpios on the parent.
+
+    allOf:
+      - if:
+          required:
+            - apple,firmware-managed-reset
+        then:
+          properties:
+            apple,power-method:
+              const: 2
+          required:
+            - apple,power-method
+            - firmware-name
 
   stm:
     type: object
@@ -170,6 +192,18 @@ required:
   - apple,helper-cpu
 
 additionalProperties: false
+
+allOf:
+  - if:
+      properties:
+        multi-touch:
+          required:
+            - apple,firmware-managed-reset
+      required:
+        - multi-touch
+    then:
+      properties:
+        apple,afe-reset-gpios: false
 
 examples:
   - |
