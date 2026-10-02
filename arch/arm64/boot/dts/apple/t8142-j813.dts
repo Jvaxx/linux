@@ -290,3 +290,5 @@
 		};
 	};
 };
+
+#include "t8142-j813-peripherals.dtsi"
