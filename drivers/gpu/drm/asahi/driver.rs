@@ -109,6 +109,16 @@ pub(crate) enum ProbeConfig {
 unsafe impl Send for AsahiDriver {}
 unsafe impl Sync for AsahiDriver {}
 
+impl Drop for AsahiDriver {
+    fn drop(&mut self) {
+        // SAFETY: `self.raw_dev` was set in `probe` from the platform
+        // device's `as_raw()`, valid for the lifetime of the bound driver.
+        if !self.raw_dev.is_null() {
+            crate::sysfs_exports::unregister(self.raw_dev);
+        }
+    }
+}
+
 /// Convenience type alias for the DRM device type for this driver.
 pub(crate) type AsahiDevice = drm::device::Device<AsahiDriver>;
 pub(crate) type AsahiDevRef = ARef<AsahiDevice>;
