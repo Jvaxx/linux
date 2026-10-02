@@ -177,6 +177,9 @@ int apple_rtkit_quiesce(struct apple_rtkit *rtk);
  */
 int apple_rtkit_wake(struct apple_rtkit *rtk);
 
+/* Wake helpers which require AP readiness before their IOP power acknowledgment. */
+int apple_rtkit_wake_early_ap(struct apple_rtkit *rtk);
+
 /*
  * Shutdown the co-processor
  */
