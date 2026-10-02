@@ -5,8 +5,9 @@ Apple J813 initial native Linux boot
 =====================================
 
 J813 is the 13-inch M5 MacBook Air (T8142, Mac17,3). This configuration
-provides an initial RAM-only boot path: one boot CPU, AICv3, architectural
-timers, DockChannel console and the framebuffer left by the boot firmware.
+provides a RAM-only boot path with AICv3, architectural timers, DockChannel
+console and the framebuffer left by the boot firmware. The J813 tree also
+describes SMC temperature monitoring, MTP input and the keyboard backlight.
 
 The device tree describes all ten CPU affinities. For the initial one-CPU
 baseline, keep secondary cores stopped in m1n1 and use ``maxcpus=1``.
@@ -98,8 +99,8 @@ loader is not sufficient. Before entering Linux, the loader must:
 * Fill the firmware framebuffer's address, size, geometry and format before
   enabling it.
 * Prepare DMA protection only for devices enabled in the supplied FDT. The
-  initial tree exposes no AOP, MTP, PMP or ISP DMA consumers. Their firmware
-  protection state must remain intact during the native FDT handoff.
+  ``mtp`` alias enables the MTP DAPF handoff. Leave the protection state of
+  unrelated AOP, PMP and ISP firmware intact.
 * Leave the console, interrupt controller and display powered. This minimal
   DT does not describe their power domains.
 * Give U-Boot a T8142 memory map covering its MMIO and high DRAM addresses.
@@ -119,14 +120,14 @@ On an arm64 Linux build host with the usual kernel build dependencies::
       KCONFIG_ALLCONFIG=arch/arm64/configs/j813.config allnoconfig
   make ARCH=arm64 O="$out" -j"$(nproc)" W=1 Image apple/t8142-j813.dtb
 
-The fragment is deliberately minimal and does not enable KVM or storage
-drivers. Add ``CROSS_COMPILE=aarch64-linux-gnu-`` to both commands when
+The fragment does not enable KVM or storage drivers. Add
+``CROSS_COMPILE=aarch64-linux-gnu-`` to both commands when
 cross-compiling with GCC from another architecture.
 
 With dtschema installed, check the affected bindings and DTB::
 
   make ARCH=arm64 O="$out" CHECK_DTBS=y \
-      DT_SCHEMA_FILES=arm/apple.yaml:arm/cpus.yaml:cpufreq/apple,cluster-cpufreq.yaml:opp/opp-v2-base.yaml:interrupt-controller/apple,aic2.yaml:serial/apple,dockchannel-uart.yaml:serial/samsung_uart.yaml:display/simple-framebuffer.yaml \
+      DT_SCHEMA_FILES=arm/apple.yaml:arm/cpus.yaml:cpufreq/apple,cluster-cpufreq.yaml:opp/opp-v2-base.yaml:interrupt-controller/apple,aic2.yaml:serial/apple,dockchannel-uart.yaml:serial/samsung_uart.yaml:display/simple-framebuffer.yaml:apple,pmgr.yaml:apple,smc-hwmon.yaml:apple,dockchannel-hid.yaml:apple,dart.yaml:apple,mailbox.yaml:apple,smc.yaml:apple,pmgr-pwrstate.yaml:apple,s5l-fpwm.yaml:apple,dockchannel.yaml:apple,rtk-helper-asc4.yaml \
       apple/t8142-j813.dtb
 
 Boot and qualification
@@ -171,7 +172,71 @@ RAM boot. Preserve the complete console transcript and a hash manifest;
 an Image build or successful loader exit alone is not a boot result.
 Review captures for device identifiers and boot entropy before publishing.
 
-These tests do not establish CPU hotplug, KVM guest timers,
-sustained thermal behavior, suspend, native DCP, GPU acceleration, built-in input, USB,
-storage, networking or audio support. The disabled Samsung UART node
+These boot tests do not establish CPU hotplug, KVM guest timers,
+sustained thermal behavior, suspend, native DCP, GPU acceleration, USB,
+storage, networking or audio support. Input and monitoring require their
+separate checks below. The disabled Samsung UART node
 records its measured resources; the qualified console path is DockChannel.
+
+Temperature monitoring and built-in input
+========================================
+
+Temperature monitoring enumerates the running SMC's readable, non-function
+``T`` keys with four-byte floating-point values. It exposes their identifiers
+through ``/sys/class/hwmon/*/temp*_label`` and millidegrees Celsius through
+``temp*_input``. It does not embed a sensor inventory, calibration, inferred
+sensor locations, trip temperatures or a new CPU cooling policy. Channel
+numbers can change with firmware; identify channels by label. These keys can
+include virtual or inactive channels; their number is not a count of physical
+sensors, and a readable value does not establish a sensor's location. Read failures,
+NaNs and infinities remain errors, rather than fabricated temperatures.
+The existing J700 thermal provider and bounded J813 frequency states are
+unchanged. Temperature reporting alone does not qualify sustained load.
+
+MTP provides keyboard and trackpad HID descriptors and identifiers at runtime.
+The ``keyboard`` alias lets m1n1 fill ``hid-country-code`` and
+``apple,keyboard-layout-id`` from this machine's own boot environment. The
+source tree does not assume a US keyboard or contain another machine's layout.
+The J813 trackpad uses power method 2 with firmware-owned reset; the host
+does not operate an AFE GPIO. Other machines retain their existing sequence.
+
+The trackpad requires an externally supplied
+``/lib/firmware/apple/tpmtfw-j813.bin``. The existing DockChannel firmware
+container has a 20-byte little-endian header: magic ``0x46444948`` (``HIDF``),
+version 1, header length, data length and interface-byte offset. See
+``struct fw_header`` and ``dchid_get_firmware()`` for validation. An interface
+offset of zero means no patching. The payload must
+be prepared from firmware and any required calibration belonging to the
+user's own machine. A filename is a lookup contract, not a firmware payload.
+No Apple firmware, captured command buffers or calibration bytes are bundled.
+Future IPSW/macOS extraction tools can provide this file without changing the
+driver. A missing or invalid file fails trackpad startup; it does not prevent
+the keyboard or temperature monitor from registering.
+
+The loader must preserve the iBoot-loaded MTP image and SRAM, prepare its DMA
+protection, and leave MTP ready for Linux's RTKit startup. A prior-stage MTP
+client must complete a compatible shutdown before Linux starts; a partially
+initialized or crashed coprocessor is not a supported handoff.
+
+The backlight uses the existing PWM and LED drivers. Its boot brightness is
+retained when the initial PWM period is valid, otherwise it starts off.
+Userspace controls ``/sys/class/leds/kbd_backlight/brightness``
+on a linear 0--255 scale. No captured brightness curve or factory calibration
+is included.
+
+Physical verification
+---------------------
+
+Place the user's touch firmware in a private RAM initramfs, then run::
+
+  sh tools/testing/selftests/drivers/apple/j813-peripherals.sh 30
+
+The check reads temperatures twice, exercises and restores backlight
+brightness, and counts keyboard and trackpad events during a bounded physical
+interaction window. It records no key codes or pointer coordinates. Press
+and release keys and move/click the built-in trackpad during that window.
+Confirm visible brightness changes separately; sysfs readback is not optical
+proof. Preserve stdout, the source revision and SHA-256 hashes of the exact
+Image, DTB, configuration, initramfs and bootloaders as the repeatable result.
+Keep firmware and raw machine data private. Without physical events the input
+check fails rather than crediting device registration as working input.
