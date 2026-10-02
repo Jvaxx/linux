@@ -113,7 +113,10 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 		       helper->asc_base + APPLE_ASC_CPU_CONTROL);
 
 	/* Works for both wake and boot */
-	ret = apple_rtkit_wake(helper->rtk);
+	if (of_device_is_compatible(dev->of_node, "apple,t8142-mtp"))
+		ret = apple_rtkit_wake_early_ap(helper->rtk);
+	else
+		ret = apple_rtkit_wake(helper->rtk);
 	if (ret != 0)
 		return dev_err_probe(dev, ret, "Failed to wake up coprocessor");
 
