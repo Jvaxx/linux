@@ -26,7 +26,10 @@ use crate::debug::*;
 use crate::driver::{AsahiDevRef, AsahiDevice};
 use crate::file::MAX_COMMANDS_PER_SUBMISSION;
 use crate::fw::types::*;
-use crate::gpu::GpuManager;
+use crate::gpu::{
+    Gpu,
+    GpuManager, //
+};
 use crate::inner_weak_ptr;
 use crate::microseq;
 use crate::module_parameters;
@@ -442,9 +445,9 @@ static QUEUE_CLASS_KEY: Pin<&LockClassKey> = kernel::static_lock_class!();
 impl Queue::ver {
     /// Create a new user queue.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new<'drm>(
+    pub(crate) fn new(
         dev: AsahiDevice,
-        reg_data: &AsahiRegData<'drm>,
+        gpu: &dyn GpuManager,
         vm: mmu::Vm,
         alloc: &mut gpu::KernelAllocators,
         ualloc: Arc<Mutex<alloc::DefaultAllocator>>,
@@ -495,8 +498,7 @@ impl Queue::ver {
         )?;
         let entity = sched::Entity::new(&sched, sched::Priority::Kernel)?;
 
-        let buffer =
-            buffer::Buffer::ver::new(&*reg_data.gpu, alloc, ualloc.clone(), ualloc_priv, mgr)?;
+        let buffer = buffer::Buffer::ver::new(gpu, alloc, ualloc.clone(), ualloc_priv, mgr)?;
 
         let mut ret = Queue::ver {
             dev: dev.clone(),
