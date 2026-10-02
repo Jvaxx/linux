@@ -1743,6 +1743,13 @@ impl Vm {
         let iova_kern_range = iova_kern_range(cfg)?;
 
         let page_table = if let Some(ttb) = ttb {
+            UatPageTable::new_with_ttb(
+                ttb,
+                geometry.kernel_range(),
+                geometry.ias,
+                geometry.oas,
+                false,
+            )?
             if cfg.reserved_tables {
                 let node = dev.as_ref().of_node().ok_or(ENODEV)?;
                 let mut resources = KVec::new();
