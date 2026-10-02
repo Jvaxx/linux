@@ -177,6 +177,7 @@ struct dchid_iface {
 
 	u32 keyboard_layout_id;
 	u32 power_method;
+	bool firmware_managed_reset;
 };
 
 struct dockchannel_hid {
@@ -217,6 +218,7 @@ static struct dchid_iface *
 dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 {
 	u32 power_method = DCHID_POWER_METHOD_1;
+	bool firmware_managed_reset = false;
 	struct device_node *of_node = NULL;
 	struct dchid_iface *iface;
 
@@ -240,13 +242,19 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 		}
 
 		of_property_read_u32(of_node, "apple,power-method", &power_method);
+		firmware_managed_reset =
+			of_property_read_bool(of_node, "apple,firmware-managed-reset");
+		if (firmware_managed_reset &&
+		    (strcmp(name, "multi-touch") || power_method != DCHID_POWER_METHOD_2))
+			goto err_put_node;
 		if (power_method != DCHID_POWER_METHOD_1 &&
 		    power_method != DCHID_POWER_METHOD_2) {
 			dev_err(dchid->dev, "Unsupported power method %u for %s\n",
 				power_method, name);
 			goto err_put_node;
 		}
-		if (power_method == DCHID_POWER_METHOD_2 && !dchid->afe_reset) {
+		if (power_method == DCHID_POWER_METHOD_2 &&
+		    !firmware_managed_reset && !dchid->afe_reset) {
 			dev_err(dchid->dev, "Power method 2 for %s needs the AFE reset line\n",
 				name);
 			goto err_put_node;
@@ -264,6 +272,7 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 	iface->dchid = dchid;
 	iface->of_node = of_node;
 	iface->power_method = power_method;
+	iface->firmware_managed_reset = firmware_managed_reset;
 	iface->out_report = -1;
 	init_completion(&iface->out_complete);
 	init_completion(&iface->ready);
@@ -425,12 +434,18 @@ static int dchid_pm2_set_power(struct dchid_iface *iface, u8 state)
 	if (ret < 0)
 		return ret;
 
-	ret = gpiod_set_value_cansleep(dchid->afe_reset,
-				       state == DCHID_POWER_STATE_OFF);
-	if (ret < 0)
-		return ret;
-	if (state == DCHID_POWER_STATE_OFF)
-		fsleep(50 * USEC_PER_MSEC);
+	if (iface->firmware_managed_reset) {
+		/* Firmware owns the reset; allow its power-on transition to settle. */
+		if (state == DCHID_POWER_STATE_ON)
+			fsleep(50 * USEC_PER_MSEC);
+	} else {
+		ret = gpiod_set_value_cansleep(dchid->afe_reset,
+					       state == DCHID_POWER_STATE_OFF);
+		if (ret < 0)
+			return ret;
+		if (state == DCHID_POWER_STATE_OFF)
+			fsleep(50 * USEC_PER_MSEC);
+	}
 
 	dchid_pm2_command(iface->index, state, true, msg);
 	return dchid_comm_cmd(dchid, msg, sizeof(msg));
@@ -526,6 +541,9 @@ static int dchid_request_gpio(struct dchid_iface *iface)
 {
 	char prop_name[MAX_GPIO_NAME + 16];
 	int ret;
+
+	if (iface->firmware_managed_reset)
+		return -EINVAL;
 
 	if (iface->gpio)
 		return 0;
@@ -1308,10 +1326,17 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	child = of_get_child_by_name(dev->of_node, "multi-touch");
 	if (child) {
 		u32 power_method = DCHID_POWER_METHOD_1;
+		bool firmware_managed_reset;
 
 		of_property_read_u32(child, "apple,power-method", &power_method);
+		firmware_managed_reset =
+			of_property_read_bool(child, "apple,firmware-managed-reset");
 		of_node_put(child);
-		if (power_method == DCHID_POWER_METHOD_2) {
+		if (firmware_managed_reset &&
+		    (power_method != DCHID_POWER_METHOD_2 ||
+		     of_property_present(dev->of_node, "apple,afe-reset-gpios")))
+			return dev_err_probe(dev, -EINVAL, "Conflicting touch reset ownership\n");
+		if (power_method == DCHID_POWER_METHOD_2 && !firmware_managed_reset) {
 			dchid->afe_reset = devm_gpiod_get(dev, "apple,afe-reset",
 							  GPIOD_ASIS);
 			if (IS_ERR(dchid->afe_reset))
