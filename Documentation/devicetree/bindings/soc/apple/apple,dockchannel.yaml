@@ -28,6 +28,7 @@ properties:
           - apple,t8112-dockchannel
           - apple,t8122-dockchannel
           - apple,t8140-dockchannel
+          - apple,t8142-dockchannel
       - const: apple,dockchannel
 
   reg:
