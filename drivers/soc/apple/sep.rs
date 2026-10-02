@@ -13,6 +13,7 @@ mod bio;
 mod catacomb;
 mod control;
 mod der;
+mod diag;
 mod dt;
 mod fv;
 mod hwrng;
@@ -1908,6 +1909,8 @@ impl SepData {
                 "attach: {} messages received but no endpoint advertised; xART and key store cannot run\n",
                 now
             );
+            diag::attach(false);
+            diag::bringup_ended();
             this.phase.store(PHASE_READY, Relaxed);
             return;
         }
@@ -1917,6 +1920,7 @@ impl SepData {
             this.endpoint_count(),
             now
         );
+        diag::attach(true);
 
         this.prepare_os_uuid();
 
@@ -1928,6 +1932,7 @@ impl SepData {
                 "xarm: out-of-line buffer registration failed ({:?}); the persistent-state exchange cannot run\n",
                 e
             );
+            diag::bringup_ended();
             this.phase.store(PHASE_READY, Relaxed);
             return;
         }
@@ -1968,6 +1973,7 @@ impl SepData {
         }
 
         this.run_bringup();
+        diag::bringup_ended();
         this.phase.store(PHASE_READY, Relaxed);
         Self::arm_settle(this);
     }
@@ -2026,6 +2032,7 @@ impl SepData {
         match f.ty {
             proto::DISCOVER_TYPE_DESCRIPTOR | proto::DISCOVER_TYPE_CONFIG => {
                 let _ = table.slot(f.param);
+                diag::endpoints(table.eps.len());
                 dev_info!(
                     self.dev,
                     "discover: endpoint {:#04x} (type {}, msg0 {:#018x}); {} known\n",
@@ -2305,6 +2312,12 @@ impl platform::Driver for SepDriver {
         }
 
         let data = SepData::new(pdev)?;
+
+        // As soon as the fixed facts are known, so a tool can watch the attach
+        // from "pending" on. Diagnostics are not worth failing the probe for.
+        if let Err(e) = diag::register(dev, data.profile, data.xart_writable()) {
+            dev_warn!(dev, "diag: could not add the sysfs attributes ({:?})\n", e);
+        }
 
         *data.mbox.lock() = Some(Mailbox::new_byname(dev, c"mbox", data.clone())?);
 
