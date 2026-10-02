@@ -63,6 +63,8 @@
 struct apple_soc_cpufreq_info {
 	bool has_ps2;
 	bool verify_transition;
+	u32 transition_timeout_us;
+	u32 max_unmanaged_pstate;
 	u64 min_pstate;
 	u64 max_pstate;
 	u64 cur_pstate_mask;
@@ -116,7 +118,19 @@ static const struct apple_soc_cpufreq_info soc_t8112_info = {
  */
 static const struct apple_soc_cpufreq_info soc_t8140_info = {
 	.verify_transition = true,
+	.max_unmanaged_pstate = 2,
 	.min_pstate = 1,
+	.max_pstate = 31,
+	.ps1_mask = APPLE_DVFS_CMD_PS1,
+	.ps1_shift = APPLE_DVFS_CMD_PS1_SHIFT,
+};
+
+/* T8152 ACC uses state 2 as the first OPP and shares P/M requests. */
+static const struct apple_soc_cpufreq_info soc_t8152_info = {
+	.verify_transition = true,
+	.transition_timeout_us = 2000,
+	.max_unmanaged_pstate = 3,
+	.min_pstate = 2,
 	.max_pstate = 31,
 	.ps1_mask = APPLE_DVFS_CMD_PS1,
 	.ps1_shift = APPLE_DVFS_CMD_PS1_SHIFT,
@@ -151,8 +165,17 @@ static const struct of_device_id apple_soc_cpufreq_of_match[] __maybe_unused = {
 		.compatible = "apple,t8140-cluster-cpufreq",
 		.data = &soc_t8140_info,
 	},
+	{
+		.compatible = "apple,t8152-cluster-cpufreq",
+		.data = &soc_t8152_info,
+	},
 	{}
 };
+
+static u32 apple_soc_cpufreq_timeout(const struct apple_soc_cpufreq_info *info)
+{
+	return info->transition_timeout_us ?: APPLE_DVFS_TRANSITION_TIMEOUT;
+}
 
 static unsigned int apple_soc_cpufreq_get_rate(unsigned int cpu)
 {
@@ -205,7 +228,7 @@ static int apple_soc_cpufreq_set_target(struct cpufreq_policy *policy,
 
 	if (readq_poll_timeout_atomic(priv->reg_base + APPLE_DVFS_CMD, reg,
 				      !(reg & APPLE_DVFS_CMD_BUSY), 2,
-				      APPLE_DVFS_TRANSITION_TIMEOUT)) {
+				      apple_soc_cpufreq_timeout(priv->info))) {
 		if (priv->info->verify_transition) {
 			priv->transition_failed = true;
 			dev_err(priv->cpu_dev,
@@ -240,7 +263,7 @@ static int apple_soc_cpufreq_set_target(struct cpufreq_policy *policy,
 	    readq_poll_timeout_atomic(priv->reg_base + APPLE_DVFS_CMD, reg,
 				      !(reg & APPLE_DVFS_CMD_BUSY) &&
 				      FIELD_GET(APPLE_DVFS_CMD_PS1, reg) == pstate,
-				      2, APPLE_DVFS_TRANSITION_TIMEOUT)) {
+				      2, apple_soc_cpufreq_timeout(priv->info))) {
 		/* Do not issue another request or guess a rollback after failure. */
 		priv->transition_failed = true;
 		dev_err(priv->cpu_dev,
@@ -363,7 +386,7 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 		/* Registration must not silently reset an unknown inherited state. */
 		ret = readq_poll_timeout_atomic(reg_base + APPLE_DVFS_CMD, cmd,
 						!(cmd & APPLE_DVFS_CMD_BUSY), 2,
-						APPLE_DVFS_TRANSITION_TIMEOUT);
+						apple_soc_cpufreq_timeout(info));
 		if (ret)
 			goto out_free_cpufreq_table;
 		state = FIELD_GET(APPLE_DVFS_CMD_PS1, cmd);
@@ -387,7 +410,7 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 	transition_latency = dev_pm_opp_get_max_transition_latency(cpu_dev);
 	if (!transition_latency) {
 		/* Conservative transaction bound, not a measured transition time. */
-		transition_latency = APPLE_DVFS_TRANSITION_TIMEOUT * NSEC_PER_USEC;
+		transition_latency = apple_soc_cpufreq_timeout(info) * NSEC_PER_USEC;
 		if (info->verify_transition)
 			transition_latency *= 2;
 	}
@@ -398,11 +421,12 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 	policy->suspend_freq = freq_table[0].frequency;
 	if (info->verify_transition) {
 		/*
-		 * P-states above 2 need a thermal policy that can cap them;
-		 * refuse such a table rather than run it unthrottled.
+		 * P-states above the unmanaged ceiling need a thermal policy
+		 * that can cap them; refuse such a table rather than run it
+		 * unthrottled.
 		 */
 		cpufreq_for_each_valid_entry(p, policy->freq_table) {
-			if (p->driver_data > 2) {
+			if (p->driver_data > info->max_unmanaged_pstate) {
 				dev_err(cpu_dev, "P-state %u requires a CPU thermal policy\n",
 					p->driver_data);
 				ret = -ENODEV;
