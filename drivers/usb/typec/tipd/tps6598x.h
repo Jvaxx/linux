@@ -16,6 +16,8 @@
 #ifndef __TPS6598X_H__
 #define __TPS6598X_H__
 
+#define TPS_REG_MODE			0x03
+
 #define TPS_FIELD_GET(_mask, _reg) ((typeof(_mask))(((_reg) & (_mask)) >> __bf_shf(_mask)))
 
 /* TPS_REG_STATUS bits */
@@ -392,6 +394,7 @@ struct cd321x {
 
 struct sn201202x {
 	struct cd321x cd;
+	bool polled;
 	struct completion select_completion;
 	struct completion sleep_completion;
 	struct completion wake_completion;

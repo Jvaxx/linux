@@ -28,7 +28,6 @@
 
 /* Register offsets */
 #define TPS_REG_VID			0x00
-#define TPS_REG_MODE			0x03
 #define TPS_REG_CMD1			0x08
 #define TPS_REG_DATA1			0x09
 #define TPS_REG_VERSION			0x0F
@@ -771,7 +770,7 @@ static void cd321x_update_work(struct work_struct *work)
 	 * request is rejected with -EBUSY; treating that sink as the connector
 	 * owner would tear down the display carried by the first port.
 	 */
-	if (cd321x->connector_fwnode &&
+	if (IS_REACHABLE(CONFIG_DRM) && cd321x->connector_fwnode &&
 	    dp_route_was_active &&
 	    (!new_connected || was_disconnected || !dp_connected || !dp_hpd ||
 	     dp_hpd_changed || dp_mode_changed)) {
@@ -850,7 +849,8 @@ static void cd321x_update_work(struct work_struct *work)
 	/* Launch the USB role switch */
 	usb_role_switch_set_role(tps->role_sw, new_role);
 
-	if (cd321x->connector_fwnode && cd321x->display_route_active && dp_hpd)
+	if (IS_REACHABLE(CONFIG_DRM) && cd321x->connector_fwnode &&
+	    cd321x->display_route_active && dp_hpd)
 		drm_connector_oob_hotplug_event(cd321x->connector_fwnode, connector_status_connected);
 
 	/*
@@ -859,7 +859,8 @@ static void cd321x_update_work(struct work_struct *work)
 	 * changing that display's HPD state.  Ask the display driver to retrain the
 	 * still-connected route after ACIO and the USB role are live.
 	 */
-	if (cd321x->connector_fwnode && usb4_started && !dp_connected)
+	if (IS_REACHABLE(CONFIG_DRM) && cd321x->connector_fwnode &&
+	    usb4_started && !dp_connected)
 		drm_connector_oob_hotplug_event(cd321x->connector_fwnode,
 						connector_status_unknown);
 
