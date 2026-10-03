@@ -170,6 +170,7 @@
  */
 struct apple_cio {
 	struct device *dev;
+	bool type7;
 	struct device_node *np;
 	struct device_node *pcie_tunnel_np;
 	bool pcie_tunnel_preinitialized;
@@ -550,7 +551,9 @@ static void apple_nhi_ring_configure(struct tb_ring *ring, u32 flags, u32 e2e_fl
 
 		sof_eof_mask = ring->sof_mask << 16 | ring->eof_mask;
 		writel(sof_eof_mask, options + 4);
-		writel(sof_eof_mask, anhi->pdf_base + ring->hop * APPLE_CIO_NHI_PDF_STRIDE);
+		if (anhi->pdf_base)
+			writel(sof_eof_mask,
+			       anhi->pdf_base + ring->hop * APPLE_CIO_NHI_PDF_STRIDE);
 	}
 
 	/*
@@ -742,6 +745,12 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	int cap_apple;
 	int ret = 0;
 
+	if (acio->type7 !=
+	    of_device_is_compatible(pdev->dev.of_node, "apple,t8142-usb4-nhi")) {
+		ret = dev_err_probe(&pdev->dev, -EINVAL, "ACIO/NHI generation mismatch\n");
+		goto err;
+	}
+
 	anhi = devm_kzalloc(&pdev->dev, sizeof(*anhi), GFP_KERNEL);
 	if (!anhi) {
 		ret = -ENOMEM;
@@ -757,6 +766,12 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(42));
 	if (ret)
 		goto err;
+	if (acio->type7 &&
+	    of_property_count_u32_elems(anhi->np, "apple,tunable-nhi") <= 0) {
+		ret = dev_err_probe(anhi->dev, -EINVAL,
+				    "Missing bootloader NHI tuning\n");
+		goto err;
+	}
 
 	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "nhi");
 	anhi->nhi_base = devm_ioremap_resource(&pdev->dev, res);
@@ -772,12 +787,15 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	}
 	apple_tunable_apply(anhi->nhi_base, tunable);
 
-	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "pdf");
-	anhi->pdf_base = devm_ioremap_resource(&pdev->dev, res);
-	if (IS_ERR(anhi->pdf_base)) {
-		ret = dev_err_probe(&pdev->dev, PTR_ERR(anhi->pdf_base),
-				    "Unable to map PDF regs\n");
-		goto err;
+	/* Type 7 keeps the PDF masks in the receive ring registers only. */
+	if (!acio->type7) {
+		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "pdf");
+		anhi->pdf_base = devm_ioremap_resource(&pdev->dev, res);
+		if (IS_ERR(anhi->pdf_base)) {
+			ret = dev_err_probe(&pdev->dev, PTR_ERR(anhi->pdf_base),
+					    "Unable to map PDF regs\n");
+			goto err;
+		}
 	}
 
 	ret = apple_nhi_probe_irqs(anhi);
@@ -949,6 +967,9 @@ static const struct dev_pm_ops apple_nhi_pm_ops = {
 };
 
 static const struct of_device_id apple_nhi_match[] = {
+	{
+		.compatible = "apple,t8142-usb4-nhi",
+	},
 	{
 		.compatible = "apple,t8103-usb4-nhi",
 	},
@@ -1130,8 +1151,11 @@ static int apple_cio_start(struct apple_cio *acio)
 		goto err_free_rtkit;
 	}
 
+	/* Type 7 reports ready as state 1; other nonzero states are not ready. */
 	ret = readl_poll_timeout(acio->rc_base + APPLE_CIO_M3_STAT, state,
-				 state & APPLE_CIO_M3_STAT_STATE, 100, 500000);
+				 acio->type7 ?
+				 (state & APPLE_CIO_M3_STAT_STATE) == BIT(24) :
+				 (state & APPLE_CIO_M3_STAT_STATE), 100, 500000);
 	if (ret < 0) {
 		dev_err(acio->dev, "M3 firmware failed to get ready: %d\n", ret);
 		goto err_shutdown_rtkit;
@@ -1291,6 +1315,11 @@ static int apple_cio_probe(struct platform_device *pdev)
 	init_completion(&acio->nhi_boot_completion);
 	acio->dev = &pdev->dev;
 	acio->np = dev->of_node;
+	acio->type7 = of_device_is_compatible(acio->np, "apple,t8142-usb4-acio");
+	if (acio->type7 &&
+	    of_property_count_u32_elems(acio->np, "apple,tunable-rc") <= 0)
+		return dev_err_probe(dev, -EINVAL, "Missing bootloader RC tuning\n");
+
 	acio->pcie_tunnel_np =
 		of_parse_phandle(dev->of_node, "apple,pcie-tunnel", 0);
 	if (acio->pcie_tunnel_np) {
@@ -1402,6 +1431,9 @@ static const struct dev_pm_ops apple_cio_pm_ops = {
 };
 
 static const struct of_device_id apple_acio_match[] = {
+	{
+		.compatible = "apple,t8142-usb4-acio",
+	},
 	{
 		.compatible = "apple,t8103-usb4-acio",
 	},
