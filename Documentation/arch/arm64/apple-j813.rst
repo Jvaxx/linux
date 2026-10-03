@@ -173,7 +173,7 @@ an Image build or successful loader exit alone is not a boot result.
 Review captures for device identifiers and boot entropy before publishing.
 
 These boot tests do not establish CPU hotplug, KVM guest timers,
-sustained thermal behavior, suspend, native DCP, GPU acceleration, USB,
+sustained thermal behavior, suspend, GPU acceleration, USB,
 storage, networking or audio support. Input and monitoring require their
 separate checks below. The disabled Samsung UART node
 records its measured resources; the qualified console path is DockChannel.
@@ -216,7 +216,9 @@ the keyboard or temperature monitor from registering.
 The loader must preserve the iBoot-loaded MTP image and SRAM, prepare its DMA
 protection, and leave MTP ready for Linux's RTKit startup. A prior-stage MTP
 client must complete a compatible shutdown before Linux starts; a partially
-initialized or crashed coprocessor is not a supported handoff.
+initialized or crashed coprocessor is not a supported handoff. On J813, U-Boot
+must not start and stop MTP before Linux: Linux's later restart crashes the
+firmware and takes the keyboard and trackpad down.
 
 The backlight uses the existing PWM and LED drivers. Its boot brightness is
 retained when the initial PWM period is valid, otherwise it starts off.
@@ -240,3 +242,37 @@ proof. Preserve stdout, the source revision and SHA-256 hashes of the exact
 Image, DTB, configuration, initramfs and bootloaders as the repeatable result.
 Keep firmware and raw machine data private. Without physical events the input
 check fails rather than crediting device registration as working input.
+
+Native display
+==============
+
+The internal panel is driven by the display coprocessor (DCP) through the
+Apple DRM driver. iBoot leaves DCP running with H17-generation (macOS 26)
+firmware mapped through locked DARTs. Linux attaches to that live session:
+it sends the standard RTKit wake handshake and never stops, resets or reloads
+the coprocessor. No firmware file is loaded by Linux.
+
+The loader must:
+
+* reserve every live DCP firmware segment and the boot framebuffer, and
+  export their IOVAs to the ``dcp``, ``disp0`` and ``disp0_piodma`` nodes;
+* enable the display DART (the first ``iommus`` entry of ``disp0``) and the
+  ``dcp`` node only after doing so.
+
+The display DARTs keep the firmware's root page-table slots. Linux publishes
+its own translations only into vacant slots. On ``apple,t8142-dart``, a
+firmware slot is accepted when it already translates every page Linux mapped
+there to the same physical address, and later Linux mappings into it must
+match the firmware's translation. Firmware buffers DCP later asks Linux to
+share are resolved through those firmware tables.
+
+The DCP firmware reports the panel dimensions at startup; the driver does not
+embed a panel timing or geometry. The J813 panel reports 2560x1664; the driver
+hides its 64-pixel notch area by default, so the mode is 2560x1600 at 60 Hz.
+The primary plane scans out IOMFB surface 2. Backlight control and a cursor
+plane are not provided yet.
+
+Boot the RAM payload as above with ``CONFIG_DRM_APPLE``. On J813 this reached
+``DCP booted``, registered ``appledrmfb`` as the console framebuffer, and ran
+a KDE Plasma Wayland session with the built-in keyboard and trackpad. The
+desktop renders in software; GPU acceleration is separate work.
