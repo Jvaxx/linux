@@ -162,7 +162,7 @@ static int apple_piodma_pm_notify(struct notifier_block *nb,
 	case PM_RESTORE_PREPARE:
 		dev_warn(diag->dev,
 			 "sleep refused: Neo radio bootstrap retains DMA memory until full hardware reset\n");
-		return notifier_from_errno(-EBUSY);
+		return notifier_from_errno(-EOPNOTSUPP);
 	default:
 		return NOTIFY_DONE;
 	}
@@ -182,7 +182,7 @@ static int apple_piodma_pm_prepare(struct device *dev)
 	 */
 	dev_warn(dev,
 		 "sleep refused: Neo radio bootstrap retains DMA memory until full hardware reset\n");
-	return -EBUSY;
+	return -EOPNOTSUPP;
 }
 
 static const struct dev_pm_ops apple_piodma_pm_ops = {
