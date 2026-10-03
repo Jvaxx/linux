@@ -469,8 +469,10 @@ enum atcphy_lane_mode {
 #define PIPEHANDLER_OVERRIDE_VAL_PHY_STATUS BIT(4)
 
 #define PIPEHANDLER_MUX_CTRL 0x0c
-#define PIPEHANDLER_MUX_CTRL_CLK GENMASK(5, 3)
-#define PIPEHANDLER_MUX_CTRL_DATA GENMASK(2, 0)
+#define PIPEHANDLER_MUX_CTRL_CLK_T8103 GENMASK(5, 3)
+#define PIPEHANDLER_MUX_CTRL_DATA_T8103 GENMASK(2, 0)
+#define PIPEHANDLER_MUX_CTRL_CLK_T8142 GENMASK(6, 4)
+#define PIPEHANDLER_MUX_CTRL_DATA_T8142 GENMASK(1, 0)
 #define PIPEHANDLER_MUX_CTRL_CLK_OFF 0
 #define PIPEHANDLER_MUX_CTRL_CLK_USB3 1
 #define PIPEHANDLER_MUX_CTRL_CLK_USB4 2
@@ -605,6 +607,8 @@ struct apple_atcphy;
  * @aciophy_lane_mode: Lane mode register offset
  * @aciophy_crossbar: Crossbar register offset
  * @has_usb4: A USB4/Thunderbolt controller sits behind the PHY
+ * @pipe_mux_clk: PIPE clock selection field mask
+ * @pipe_mux_data: PIPE data selection field mask
  * @has_usb2phy_reg: The PHY has the secondary eUSB2 register bank (T8140)
  * @optional_tunables: The bootloader may leave out the common-a tunables (this
  *                     generation has none) and the SuperSpeed tunables; USB2
@@ -616,6 +620,8 @@ struct atcphy_hw {
 	int aciophy_lane_mode;
 	int aciophy_crossbar;
 	bool has_usb4;
+	u32 pipe_mux_clk;
+	u32 pipe_mux_data;
 	bool has_usb2phy_reg;
 	bool optional_tunables;
 };
@@ -1191,14 +1197,14 @@ static void atcphy_configure_pipehandler_usb3_host_t8103(struct apple_atcphy *at
 
 static void atcphy_pipehandler_set_mux(struct apple_atcphy *atcphy, u32 data, u32 clk)
 {
-	mask32(atcphy->regs.pipehandler + PIPEHANDLER_MUX_CTRL, PIPEHANDLER_MUX_CTRL_CLK,
-	       FIELD_PREP(PIPEHANDLER_MUX_CTRL_CLK, PIPEHANDLER_MUX_CTRL_CLK_OFF));
+	mask32(atcphy->regs.pipehandler + PIPEHANDLER_MUX_CTRL, atcphy->hw->pipe_mux_clk,
+	       field_prep(atcphy->hw->pipe_mux_clk, PIPEHANDLER_MUX_CTRL_CLK_OFF));
 	udelay(10);
-	mask32(atcphy->regs.pipehandler + PIPEHANDLER_MUX_CTRL, PIPEHANDLER_MUX_CTRL_DATA,
-	       FIELD_PREP(PIPEHANDLER_MUX_CTRL_DATA, data));
+	mask32(atcphy->regs.pipehandler + PIPEHANDLER_MUX_CTRL, atcphy->hw->pipe_mux_data,
+	       field_prep(atcphy->hw->pipe_mux_data, data));
 	udelay(10);
-	mask32(atcphy->regs.pipehandler + PIPEHANDLER_MUX_CTRL, PIPEHANDLER_MUX_CTRL_CLK,
-	       FIELD_PREP(PIPEHANDLER_MUX_CTRL_CLK, clk));
+	mask32(atcphy->regs.pipehandler + PIPEHANDLER_MUX_CTRL, atcphy->hw->pipe_mux_clk,
+	       field_prep(atcphy->hw->pipe_mux_clk, clk));
 	udelay(10);
 }
 
@@ -2051,11 +2057,11 @@ static void atcphy_configure_post_tunable_t8122(struct apple_atcphy *atcphy, enu
 }
 
 /*
- * T8140 shares the T8122 register generation but has no USB4. The common
- * blocks are woken after the tunables in every mode, DisplayPort included,
- * as this PHY was brought up and qualified.
+ * T8140 and T8142 share the T8122 register generation. Their common blocks
+ * are woken after the tunables in every mode, DisplayPort included, as these
+ * PHYs were brought up and qualified.
  */
-static void atcphy_configure_post_tunable_t8140(struct apple_atcphy *atcphy, enum atcphy_mode mode)
+static void atcphy_configure_post_tunable_all_modes(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 {
 	atcphy_wake_common_t8122(atcphy);
 }
@@ -2803,6 +2809,8 @@ static const struct atcphy_hw atcphy_hw_t8103 = {
 	.aciophy_lane_mode = ACIOPHY_LANE_MODE_T8103,
 	.aciophy_crossbar = ACIOPHY_CROSSBAR_T8103,
 	.configure_post_tunable = atcphy_configure_post_tunable_t8103,
+	.pipe_mux_clk = PIPEHANDLER_MUX_CTRL_CLK_T8103,
+	.pipe_mux_data = PIPEHANDLER_MUX_CTRL_DATA_T8103,
 	.has_usb4 = true,
 };
 
@@ -2811,21 +2819,36 @@ static const struct atcphy_hw atcphy_hw_t8122 = {
 	.aciophy_lane_mode = ACIOPHY_LANE_MODE_T8122,
 	.aciophy_crossbar = ACIOPHY_CROSSBAR_T8122,
 	.configure_post_tunable = atcphy_configure_post_tunable_t8122,
+	.pipe_mux_clk = PIPEHANDLER_MUX_CTRL_CLK_T8103,
+	.pipe_mux_data = PIPEHANDLER_MUX_CTRL_DATA_T8103,
 	.has_usb4 = true,
 };
 
 static const struct atcphy_hw atcphy_hw_t8140 = {
-	.configure_post_tunable = atcphy_configure_post_tunable_t8140,
+	.configure_post_tunable = atcphy_configure_post_tunable_all_modes,
 	.gen = ATCPHY_GENERATION_T8122,
 	.aciophy_lane_mode = ACIOPHY_LANE_MODE_T8122,
 	.aciophy_crossbar = ACIOPHY_CROSSBAR_T8122,
+	.pipe_mux_clk = PIPEHANDLER_MUX_CTRL_CLK_T8103,
+	.pipe_mux_data = PIPEHANDLER_MUX_CTRL_DATA_T8103,
 	.has_usb2phy_reg = true,
 	.optional_tunables = true,
+};
+
+static const struct atcphy_hw atcphy_hw_t8142 = {
+	.configure_post_tunable = atcphy_configure_post_tunable_all_modes,
+	.gen = ATCPHY_GENERATION_T8122,
+	.aciophy_lane_mode = ACIOPHY_LANE_MODE_T8122,
+	.aciophy_crossbar = ACIOPHY_CROSSBAR_T8122,
+	.pipe_mux_clk = PIPEHANDLER_MUX_CTRL_CLK_T8142,
+	.pipe_mux_data = PIPEHANDLER_MUX_CTRL_DATA_T8142,
+	.has_usb4 = true,
 };
 
 static const struct of_device_id atcphy_match[] = {
 	{ .compatible = "apple,t8103-atcphy", .data = &atcphy_hw_t8103 },
 	{ .compatible = "apple,t8122-atcphy", .data = &atcphy_hw_t8122 },
+	{ .compatible = "apple,t8142-atcphy", .data = &atcphy_hw_t8142 },
 	{ .compatible = "apple,t8140-atcphy", .data = &atcphy_hw_t8140 },
 	{},
 };
