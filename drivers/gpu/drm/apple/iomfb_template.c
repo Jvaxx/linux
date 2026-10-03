@@ -1103,14 +1103,18 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 	} else if (!strcmp(req->key, "DisplayAttributes")) {
 		struct dcp_parse_ctx metadata_ctx = ctx;
 
+		bool backlight_control;
+
 		ret = parse_display_attributes(&ctx, &dcp->width_mm,
-					&dcp->height_mm);
+					&dcp->height_mm, &backlight_control);
 
 		if (ret) {
 			dev_warn(dcp->dev, "failed to parse display attribs\n");
 			return false;
 		}
 
+		WRITE_ONCE(dcp->ext_backlight,
+			   backlight_control && !dcp_has_panel(dcp));
 		dcp_set_dimensions(dcp);
 		if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL) {
 			struct dcp_display_metadata metadata;
