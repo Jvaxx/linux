@@ -733,12 +733,24 @@ struct SepData {
     #[pin]
     sleep_over: CondVar,
 
-    // Enrol and verify work items between `capture_begin` and `capture_end`.
+    // Enrol and verify work items, and deletions, between `capture_begin`
+    // and `capture_end`.
     captures_running: Atomic<u32>,
 
     // Signalled when an enrol or verify work item has stopped.
     #[pin]
     worker_gone: CondVar,
+
+    // Held by an enrol or verify work item for its whole run and by a
+    // deletion while it removes identities and saves the Catacombs, so two
+    // Catacomb save sequences never interleave.
+    #[pin]
+    catacomb_writer: Mutex<()>,
+
+    // An identity has left the enclave but the Catacomb save that makes its
+    // deletion durable failed; the next deletion retries the save. Changed
+    // only under `catacomb_writer`.
+    deletion_unsaved: Atomic<bool>,
 
     #[pin]
     rx_work: Work<SepData>,
@@ -919,6 +931,8 @@ impl SepData {
                 sleep_over <- new_condvar!("SepData::sleep_over"),
                 captures_running: Atomic::new(0),
                 worker_gone <- new_condvar!("SepData::worker_gone"),
+                catacomb_writer <- new_mutex!(()),
+                deletion_unsaved: Atomic::new(false),
                 rx_work <- new_work!("SepData::rx_work"),
                 enrol_work <- new_work!("SepData::enrol_work"),
                 verify_work <- new_work!("SepData::verify_work"),
@@ -2495,6 +2509,8 @@ impl WorkItem<ENROL_WORK_ID> for SepData {
     type Pointer = Arc<SepData>;
 
     fn run(this: Arc<SepData>) {
+        // Serialize saves before joining the suspend drain.
+        let _writer = this.catacomb_writer.lock();
         let epoch = this.capture_epoch.load(Relaxed);
         if !this.shutting_down.load(Relaxed) && this.capture_begin() {
             this.run_enrolment();
@@ -2508,6 +2524,8 @@ impl WorkItem<VERIFY_WORK_ID> for SepData {
     type Pointer = Arc<SepData>;
 
     fn run(this: Arc<SepData>) {
+        // Serialize saves before joining the suspend drain.
+        let _writer = this.catacomb_writer.lock();
         let epoch = this.capture_epoch.load(Relaxed);
         if !this.shutting_down.load(Relaxed) && this.capture_begin() {
             this.run_verify();
