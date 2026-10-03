@@ -104,7 +104,9 @@ int afk_start(struct apple_dcp_afkep *ep)
 	int ret;
 
 	reinit_completion(&ep->started);
-	apple_rtkit_start_ep(ep->dcp->rtk, ep->endpoint);
+	ret = apple_rtkit_start_ep(ep->dcp->rtk, ep->endpoint);
+	if (ret)
+		return ret;
 	afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_INIT));
 
 	ret = wait_for_completion_timeout(&ep->started, msecs_to_jiffies(1000));
@@ -116,7 +118,7 @@ int afk_start(struct apple_dcp_afkep *ep)
 
 static void afk_getbuf(struct apple_dcp_afkep *ep, u64 message)
 {
-	u16 size = FIELD_GET(GETBUF_SIZE, message) << BLOCK_SHIFT;
+	u32 size = FIELD_GET(GETBUF_SIZE, message) << BLOCK_SHIFT;
 	u16 tag = FIELD_GET(GETBUF_TAG, message);
 	u64 reply;
 
@@ -147,10 +149,10 @@ static void afk_getbuf(struct apple_dcp_afkep *ep, u64 message)
 static void afk_init_rxtx(struct apple_dcp_afkep *ep, u64 message,
 			  struct afk_ringbuffer *bfr)
 {
-	u16 base = FIELD_GET(INITRB_OFFSET, message) << BLOCK_SHIFT;
-	u16 size = FIELD_GET(INITRB_SIZE, message) << BLOCK_SHIFT;
+	u32 base = FIELD_GET(INITRB_OFFSET, message) << BLOCK_SHIFT;
+	u32 size = FIELD_GET(INITRB_SIZE, message) << BLOCK_SHIFT;
 	u16 tag = FIELD_GET(INITRB_TAG, message);
-	u32 bufsz, end;
+	u32 bufsz, hdrsz, end, block;
 
 	if (tag != ep->bfr_tag) {
 		dev_err(ep->dcp->dev, "AFK[ep:%02x]: expected tag 0x%x but got 0x%x\n",
@@ -164,7 +166,7 @@ static void afk_init_rxtx(struct apple_dcp_afkep *ep, u64 message,
 		return;
 	}
 
-	if (base >= ep->bfr_size) {
+	if (!ep->bfr || size < sizeof(__le32) || base >= ep->bfr_size) {
 		dev_err(ep->dcp->dev,
 			"AFK[ep:%02x]: requested base 0x%x >= max size 0x%lx\n",
 			ep->endpoint, base, ep->bfr_size);
@@ -180,15 +182,21 @@ static void afk_init_rxtx(struct apple_dcp_afkep *ep, u64 message,
 	}
 
 	bfr->hdr = ep->bfr + base;
-	bufsz = le32_to_cpu(bfr->hdr->bufsz);
-	if (bufsz + sizeof(*bfr->hdr) != size) {
+	dma_rmb();
+	bufsz = le32_to_cpu(READ_ONCE(*(__le32 *)bfr->hdr));
+	hdrsz = size - bufsz;
+	block = hdrsz / AFK_RB_BLOCKS;
+	if (bufsz >= size || hdrsz % AFK_RB_BLOCKS ||
+	    block < AFK_RB_BLOCK_MIN || !is_power_of_2(block) ||
+	    !IS_ALIGNED(bufsz, block) || bufsz < 2 * block) {
 		dev_err(ep->dcp->dev,
-			"AFK[ep:%02x]: ring buffer size 0x%x != expected 0x%lx\n",
-			ep->endpoint, bufsz, sizeof(*bfr->hdr));
+			"AFK[ep:%02x]: ring bufsz %#x with size %#x gives no valid header (base %#x, msg %#llx)\n",
+			ep->endpoint, bufsz, size, base, message);
 		return;
 	}
+	bfr->block = block;
 
-	bfr->buf = bfr->hdr + 1;
+	bfr->buf = (u8 *)bfr->hdr + hdrsz;
 	bfr->bufsz = bufsz;
 	bfr->ready = true;
 
@@ -312,7 +320,8 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 				ep->endpoint, name);
 			return;
 		}
-		ret = parse_epic_service_init(&ctx, &epic_name, &epic_class, &epic_unit);
+		ret = parse_epic_service_init(&ctx, &epic_name, &epic_class, &epic_unit,
+					      ep->dcp->fw_compat == DCP_FIRMWARE_H17P);
 		if (ret) {
 			dev_err(ep->dcp->dev,
 				"AFK[ep:%02x]: failed to extract init props: %d\n",
@@ -553,16 +562,51 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 	struct epic_hdr *ehdr = (struct epic_hdr *)data;
 	struct epic_sub_hdr *eshdr =
 		(struct epic_sub_hdr *)(data + sizeof(*ehdr));
-	u16 subtype = le16_to_cpu(eshdr->type);
-	u8 *payload = data + sizeof(*ehdr) + sizeof(*eshdr);
+	struct epic_sub_hdr h17p_eshdr;
+	size_t hdr_len = sizeof(*ehdr) + sizeof(*eshdr);
+	u16 subtype;
+	u8 *payload;
 	size_t payload_size;
 
-	if (data_size < sizeof(*ehdr) + sizeof(*eshdr)) {
-		dev_err(ep->dcp->dev, "AFK[ep:%02x]: payload too small: %lx\n",
-			ep->endpoint, data_size);
-		return;
+	if (ep->dcp->fw_compat == DCP_FIRMWARE_H17P) {
+		const struct epic_sub_hdr_h17p *c =
+			(const struct epic_sub_hdr_h17p *)(data + sizeof(*ehdr));
+
+		hdr_len = sizeof(*ehdr) + sizeof(*c);
+		if (data_size < hdr_len)
+			goto too_small;
+
+		/*
+		 * H17P multiplexes every service of an endpoint onto queue
+		 * channel 0 and carries the real channel in the EPIC header
+		 * instead: byte 0 is a sequence counter, byte 1 a flags byte
+		 * and bytes 2-3 the channel.  ep:20 announces "system" as
+		 * channel 1 and "powerlog-service" as channel 3, then sends the
+		 * mNits/uAmps/iDAC backlight reports on channel 3.  Taking the
+		 * queue channel at face value binds "system" to 0 and makes
+		 * every later announce and report look like a duplicate.
+		 */
+		channel = le16_to_cpup((__le16 *)(data + 2));
+
+		/*
+		 * Normalise into the wide sub-header the rest of this file
+		 * expects, mapping H17P's announce subtype onto the canonical
+		 * one so no downstream check has to know the difference.
+		 */
+		memset(&h17p_eshdr, 0, sizeof(h17p_eshdr));
+		h17p_eshdr.category = c->category;
+		h17p_eshdr.type = cpu_to_le16(c->type == EPIC_SUBTYPE_ANNOUNCE_H17P ?
+					      EPIC_SUBTYPE_ANNOUNCE : c->type);
+		h17p_eshdr.tag = cpu_to_le16(le32_to_cpu(c->tag));
+		eshdr = &h17p_eshdr;
 	}
-	payload_size = data_size - sizeof(*ehdr) - sizeof(*eshdr);
+
+	if (data_size < hdr_len)
+		goto too_small;
+
+	subtype = le16_to_cpu(eshdr->type);
+	payload = data + hdr_len;
+	payload_size = data_size - hdr_len;
 
 	trace_afk_recv_handle(ep, channel, type, data_size, ehdr, eshdr);
 
@@ -620,6 +664,11 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 		"(type %x subtype %x)\n", ep->endpoint, channel, type, subtype);
 	print_hex_dump(KERN_INFO, "AFK: ", DUMP_PREFIX_NONE, 16, 1, payload,
 				   payload_size, true);
+	return;
+
+too_small:
+	dev_err(ep->dcp->dev, "AFK[ep:%02x]: payload too small: %lx\n",
+		ep->endpoint, data_size);
 }
 
 static bool afk_recv(struct apple_dcp_afkep *ep)
@@ -634,8 +683,8 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 		return false;
 	}
 
-	rptr = le32_to_cpu(ep->rxbfr.hdr->rptr);
-	wptr = le32_to_cpu(ep->rxbfr.hdr->wptr);
+	rptr = le32_to_cpu(*afk_rb_rptr(&ep->rxbfr));
+	wptr = le32_to_cpu(*afk_rb_wptr(&ep->rxbfr));
 	trace_afk_recv_rwptr_pre(ep, rptr, wptr);
 
 	if (rptr == wptr)
@@ -680,7 +729,7 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 			return false;
 		}
 
-		ep->rxbfr.hdr->rptr = cpu_to_le32(rptr);
+		*afk_rb_rptr(&ep->rxbfr) = cpu_to_le32(rptr);
 	}
 
 	if (rptr + size + sizeof(*hdr) > ep->rxbfr.bufsz) {
@@ -693,7 +742,7 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 	channel = le32_to_cpu(hdr->channel);
 	type = le32_to_cpu(hdr->type);
 
-	rptr = ALIGN(rptr + sizeof(*hdr) + size, 1 << BLOCK_SHIFT);
+	rptr = ALIGN(rptr + sizeof(*hdr) + size, ep->rxbfr.block);
 	if (WARN_ON(rptr > ep->rxbfr.bufsz))
 		rptr = 0;
 	if (rptr == ep->rxbfr.bufsz)
@@ -701,7 +750,7 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 
 	dma_mb();
 
-	ep->rxbfr.hdr->rptr = cpu_to_le32(rptr);
+	*afk_rb_rptr(&ep->rxbfr) = cpu_to_le32(rptr);
 	trace_afk_recv_rwptr_post(ep, rptr, wptr);
 
 	/*
@@ -790,11 +839,27 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	size_t total_epic_size, total_size;
 	int ret;
 
+	/*
+	 * H17P frames EPIC messages differently (see afk_recv_handle()): an
+	 * 8-byte sub-header, with the service channel carried in the EPIC
+	 * header on queue channel 0.  Only the receive side of that format is
+	 * known, and the 24-byte framing below would be misparsed, so send
+	 * nothing.  The display path needs no AP-initiated EPIC traffic: the
+	 * callers are optional (verbose firmware logging, EDID copy, audio,
+	 * DPTX, debugfs) or replies to calls only DPTX services make.
+	 */
+	if (ep->dcp->fw_compat == DCP_FIRMWARE_H17P) {
+		dev_dbg_once(ep->dcp->dev,
+			     "AFK[ep:%02x]: not sending EPIC message on H17P\n",
+			     ep->endpoint);
+		return -EOPNOTSUPP;
+	}
+
 	spin_lock_irqsave(&ep->lock, flags);
 
 	dma_rmb();
-	rptr = le32_to_cpu(ep->txbfr.hdr->rptr);
-	wptr = le32_to_cpu(ep->txbfr.hdr->wptr);
+	rptr = le32_to_cpu(*afk_rb_rptr(&ep->txbfr));
+	wptr = le32_to_cpu(*afk_rb_wptr(&ep->txbfr));
 	trace_afk_send_rwptr_pre(ep, rptr, wptr);
 	total_epic_size = sizeof(*ehdr) + sizeof(*eshdr) + payload_len;
 	total_size = sizeof(*hdr) + total_epic_size;
@@ -907,12 +972,12 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 
 	memcpy(ep->txbfr.buf + wptr, payload, payload_len);
 	wptr += payload_len;
-	wptr = ALIGN(wptr, 1 << BLOCK_SHIFT);
+	wptr = ALIGN(wptr, ep->txbfr.block);
 	if (wptr == ep->txbfr.bufsz)
 		wptr = 0;
 	trace_afk_send_rwptr_post(ep, rptr, wptr);
 
-	ep->txbfr.hdr->wptr = cpu_to_le32(wptr);
+	*afk_rb_wptr(&ep->txbfr) = cpu_to_le32(wptr);
 	afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_SEND) |
 			     FIELD_PREP(SEND_WPTR, wptr));
 	ret = 0;
