@@ -45,6 +45,13 @@ pub enum Priority {
 
 /// Trait to be implemented by driver job objects.
 pub trait JobImpl: Sized {
+    /// Reconsider a timeout before the backend starts recovery. Returning true
+    /// reinserts this job and rearms its timeout without changing its fences.
+    /// The callback must not stop or restart the scheduler.
+    fn false_timeout(_job: &mut Job<Self>) -> bool {
+        false
+    }
+
     /// Called when the scheduler is considering scheduling this job next, to get another Fence
     /// for this job to block on. Once it returns None, run() may be called.
     fn prepare(_job: &mut Job<Self>) -> Option<Fence> {
@@ -57,6 +64,9 @@ pub trait JobImpl: Sized {
     fn run(job: &mut Job<Self>) -> Result<Option<Fence>>;
 
     /// Called when a job has taken too long to execute, to trigger GPU recovery.
+    ///
+    /// A driver that handles timeouts without a scheduler reset returns [`Status::NoHang`].
+    /// [`Job::is_finished`] tells whether the job completed after the timeout fired.
     ///
     /// This method is called in a workqueue context.
     fn timed_out(job: &mut Job<Self>) -> Status;
@@ -100,7 +110,12 @@ unsafe extern "C" fn timedout_job_cb<T: JobImpl>(
     // SAFETY: All of our jobs are Job<T>.
     let p = unsafe { crate::container_of!(sched_job, Job<T>, job) as *mut Job<T> };
 
-    // SAFETY: All of our jobs are Job<T>.
+    // SAFETY: The timeout worker retains this detached Job<T> until this
+    // callback returns, including when its parent fence signals concurrently.
+    if T::false_timeout(unsafe { &mut *p }) {
+        return bindings::drm_gpu_sched_stat_DRM_GPU_SCHED_STAT_NO_HANG;
+    }
+    // SAFETY: The same retained job remains valid after the first callback.
     T::timed_out(unsafe { &mut *p }) as bindings::drm_gpu_sched_stat
 }
 
