@@ -672,8 +672,10 @@ struct pci_host_bridge {
 						   system suspend is broken */
 	/* Disable sysfs device removal for this hierarchy; set before probing. */
 	unsigned int	no_user_remove:1;
-	/* Disable sysfs function/bridge reset; set before probing. */
-	unsigned int	no_user_reset:1;
+	/* Retained DMA is sensitive to uncoordinated reset/recovery/assignment.
+	 * Immutable after probing; driver-coordinated resets remain permitted.
+	 */
+	unsigned int	reset_sensitive:1;
 
 	/* Resource alignment requirements */
 	resource_size_t (*align_resource)(struct pci_dev *dev,
