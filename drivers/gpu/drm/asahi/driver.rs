@@ -26,6 +26,7 @@ use crate::{
     drm_gpu,
     file,
     g15_boot,
+    g17,
     gem::AsahiObject,
     gpu,
     hw,
@@ -164,12 +165,22 @@ impl drm::driver::Driver for AsahiDriver {
     }
 }
 
-// OF Device ID table.s
+/// Firmware interface selected by the hardware compatible.
+pub(crate) enum ProbeConfig {
+    Legacy(&'static hw::HwConfig),
+    G17(&'static g17::Config),
+}
+
+// OF Device ID table.
 kernel::of_device_table!(
     OF_TABLE,
     MODULE_OF_TABLE,
     <AsahiDriver as platform::Driver>::IdInfo,
     [
+        (
+            of::DeviceId::new(c_str!("apple,agx-t8140")),
+            ProbeConfig::G17(&hw::t8140::CONFIG)
+        ),
         (
             of::DeviceId::new(c_str!("apple,agx-t8103")),
             ProbeConfig::Supported(&hw::t8103::HWCONFIG)
@@ -418,6 +429,9 @@ impl platform::Driver for AsahiDriver {
             AsahiRuntime::M3(runtime) => runtime.stop(),
             AsahiRuntime::G16(runtime) => runtime.stop(),
             _ => {},
+        if let Some(gpu) = (*this.drm).gpu.as_any().downcast_ref::<g17::Gpu>() {
+            // Driver data is dropped after devres, so CPU control must happen in unbind.
+            gpu.shutdown();
         }
     }
 
@@ -483,6 +497,8 @@ impl platform::Driver for AsahiDriver {
                 }
             }
             ProbeConfig::Agx3Diagnostic(soc) => return Err(refuse_agx3_probe(pdev, soc)),
+            ProbeConfig::Legacy(cfg) => *cfg,
+            ProbeConfig::G17(cfg) => return Self::probe_g17(pdev, cfg),
         };
 
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(cfg.uat_oas)?)? };
@@ -542,5 +558,46 @@ impl platform::Driver for AsahiDriver {
         Ok(Self {
             runtime: AsahiRuntime::Legacy(drm),
         })
+    }
+}
+
+impl AsahiDriver {
+    fn probe_g17(pdev: &platform::Device<Core>, cfg: &'static g17::Config) -> Result<Self> {
+        // SAFETY: The GPU performs DMA through a UAT whose output width is part of the SoC config.
+        unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(cfg.uat_oas)?)? };
+        let res = regs::Resources::new(pdev)?;
+        // SAFETY: As in the legacy probe, the data is inaccessible until the fully initialized
+        // manager is installed below and the DRM device is registered.
+        // If construction fails, drm::device::Device::release leaves the data
+        // untouched rather than dropping an uninitialized AsahiData.
+        let uninit = unsafe { pin_init::pin_init_from_closure::<AsahiData, Error>(|_slot| Ok(())) };
+        let drm: ARef<AsahiDevice> = drm::device::Device::new(pdev.as_ref(), uninit)?;
+        let gpu = g17::Gpu::new(pdev, &drm, cfg, res.clone())?;
+        let data_gpu = gpu.clone() as Arc<dyn gpu::Gpu>;
+        let data = try_pin_init!(AsahiData {
+            gpu: data_gpu,
+            pdev: pdev.into(),
+            resources: res,
+        });
+        let ptr = &raw const **drm;
+        // SAFETY: The allocation is pinned and its data slot has not been initialized yet.
+        if let Err(error) = unsafe { data.__pinned_init(ptr as *mut AsahiData) } {
+            gpu.shutdown();
+            return Err(error);
+        }
+        if let Err(error) = drm::driver::Registration::new_foreign_owned(&drm, pdev.as_ref(), 0) {
+            gpu.shutdown();
+            return Err(error);
+        }
+        Ok(Self { drm })
+    }
+}
+
+impl Drop for AsahiDriver {
+    fn drop(&mut self) {
+        if let Some(gpu) = (*self.drm).gpu.as_any().downcast_ref::<g17::Gpu>() {
+            // Also covers failure to allocate platform driver data after the probe body returned.
+            gpu.shutdown();
+        }
     }
 }

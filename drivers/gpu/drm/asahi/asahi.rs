@@ -110,6 +110,7 @@ mod agx_resources;
 mod agx_status;
 mod agx_uapi;
 mod gem;
+mod g17;
 mod gpu;
 mod hw;
 mod identity;

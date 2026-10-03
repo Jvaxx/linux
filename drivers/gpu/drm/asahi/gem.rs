@@ -184,6 +184,20 @@ fn new_kernel_object_with_cpu_mapping(
     size: usize,
     map_wc: bool,
 ) -> Result<ObjectRef> {
+/// Create a new kernel-owned GEM object.
+pub(crate) fn new_kernel_object(dev: &AsahiDevice, size: usize) -> Result<ObjectRef> {
+    new_kernel_object_mapped(dev, size, false)
+}
+
+/// Create a new kernel-owned GEM object whose kernel mapping is write-combined.
+///
+/// Used for memory that a non-coherent agent reads as soon as the host has stored to it and
+/// issued a barrier, without cache maintenance.
+pub(crate) fn new_kernel_object_wc(dev: &AsahiDevice, size: usize) -> Result<ObjectRef> {
+    new_kernel_object_mapped(dev, size, true)
+}
+
+fn new_kernel_object_mapped(dev: &AsahiDevice, size: usize, map_wc: bool) -> Result<ObjectRef> {
     let gem = shmem::Object::<AsahiObject>::new(
         dev,
         checked_object_size(size)?,
