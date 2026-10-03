@@ -590,8 +590,8 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 	if (ret)
 		return ERR_PTR(ret);
 
-	/* Start with a worst case allocation */
-	modes = kmalloc_array(it.len, sizeof(*modes), GFP_KERNEL);
+	/* Start with a worst case allocation; parse_mode() only sets vrr. */
+	modes = kcalloc(it.len, sizeof(*modes), GFP_KERNEL);
 	*count = 0;
 
 	if (!modes)
