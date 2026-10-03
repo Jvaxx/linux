@@ -18,6 +18,7 @@
  *	t8103	0	0x84000 + 0x4000 * port	BIT(0), rmw	BIT(1)
  *	t8112	0x63	0x8000 / 0x4000	BIT(0), rmw	BIT(1)
  *	t8122	0x62	0x8		BIT(slot)	BIT(16 + slot)
+ *	t8142	0x62	0x30		BIT(2 * port)	BIT(2 * port + 1)
  *	t6000	0	0x1a034		BIT(port)	BIT(16 + port)
  *	t6020	0	0xa02c		BIT(port)	BIT(16 + port)
  *	t6030	0x4c	0x8		BIT(slot)	BIT(16 + slot)
@@ -38,8 +39,9 @@
  *
  * t8132 and t8142 use a different, per-port layout and are not supported.
  *
- * Every implementation polls the busy bits, stores the request, then polls
- * again, with a 192 ms budget. The first poll's result is discarded.
+ * Reference firmware polls the busy bits, stores the request, then polls
+ * again, with a 192 ms budget. It discards the first poll's result. The
+ * t8142 implementation below instead refuses to issue a request while busy.
  */
 
 #include <linux/bits.h>
@@ -61,6 +63,11 @@
 
 #define T6000_CIO_CTRL_INIT_REQ(port) BIT(port)
 #define T6000_CIO_CTRL_INIT_BUSY(port) BIT(16 + (port))
+
+#define T8142_CIO_CTRL 0x30
+#define T8142_CIO_CTRL_INIT_REQ(port) BIT(2 * (port))
+#define T8142_CIO_CTRL_INIT_BUSY(port) BIT(2 * (port) + 1)
+#define T8142_CIO_CTRL_BUSY_MASK 0xaa
 
 struct apple_cio_reset;
 
@@ -143,6 +150,37 @@ static int t6000_cio_deassert(struct apple_cio_reset *priv, unsigned long id)
 					APPLE_CIO_RESET_TIMEOUT_US);
 }
 
+static int t8142_cio_deassert(struct apple_cio_reset *priv, unsigned long id)
+{
+	u32 val;
+	int ret;
+
+	guard(mutex)(&priv->lock);
+
+	/* Serialize all four ports sharing the request register. */
+	ret = regmap_read_poll_timeout(priv->regmap, T8142_CIO_CTRL, val,
+				       !(val & T8142_CIO_CTRL_BUSY_MASK),
+				       APPLE_CIO_RESET_POLL_US,
+				       APPLE_CIO_RESET_TIMEOUT_US);
+	if (ret)
+		return ret;
+
+	ret = regmap_write(priv->regmap, T8142_CIO_CTRL,
+			   T8142_CIO_CTRL_INIT_REQ(id));
+	if (ret)
+		return ret;
+
+	return regmap_read_poll_timeout(priv->regmap, T8142_CIO_CTRL, val,
+				       !(val & T8142_CIO_CTRL_INIT_BUSY(id)),
+				       APPLE_CIO_RESET_POLL_US,
+				       APPLE_CIO_RESET_TIMEOUT_US);
+}
+
+static const struct apple_cio_reset_variant apple_t8142_cio_reset = {
+	.nr_resets = 4,
+	.deassert = t8142_cio_deassert,
+};
+
 static const struct apple_cio_reset_variant apple_t8103_cio_reset = {
 	.nr_resets = 2,
 	.deassert = t8103_cio_deassert,
@@ -221,6 +259,10 @@ static int apple_cio_reset_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id apple_cio_reset_match[] = {
+	{
+		.compatible = "apple,t8142-cio-reset",
+		.data = &apple_t8142_cio_reset,
+	},
 	{
 		.compatible = "apple,t8103-cio-reset",
 		.data = &apple_t8103_cio_reset,
