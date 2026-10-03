@@ -78,6 +78,7 @@ properties:
           - const: apple,t8103-atcphy
       - const: apple,t8103-atcphy
       - const: apple,t8140-atcphy
+      - const: apple,t8142-atcphy
 
   reg:
     minItems: 5

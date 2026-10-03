@@ -52,8 +52,32 @@
 #define REG_POLL_INTERVAL_US 10000
 #define REG_POLL_TIMEOUT_US (REG_POLL_INTERVAL_US * 5)
 
+struct apple_spmi_hw {
+	u32 status;
+	u32 command;
+	u32 reply;
+	u32 rx_empty;
+	bool legacy_irqs;
+};
+
+static const struct apple_spmi_hw apple_spmi_gen1 = {
+	.status = SPMI_STATUS_REG,
+	.command = SPMI_CMD_REG,
+	.reply = SPMI_RSP_REG,
+	.rx_empty = SPMI_RX_FIFO_EMPTY,
+	.legacy_irqs = true,
+};
+
+static const struct apple_spmi_hw apple_spmi_gen4 = {
+	.status = 0x200,
+	.command = 0x210,
+	.reply = 0x220,
+	.rx_empty = BIT(30),
+};
+
 struct apple_spmi {
 	void __iomem *regs;
+	const struct apple_spmi_hw *hw;
 	struct mutex fifo_lock;
 	struct completion fifo_rx;
 	struct irq_domain *irqd;
@@ -63,10 +87,6 @@ struct apple_spmi {
 	bool notify_irq;
 	bool prev_fail;
 };
-
-#define poll_reg(spmi, reg, val, cond) \
-	readl_poll_timeout((spmi)->regs + (reg), (val), (cond), \
-			   REG_POLL_INTERVAL_US, REG_POLL_TIMEOUT_US)
 
 static void apple_spmi_irq_ack_raw(struct apple_spmi *spmi, u32 irq)
 {
@@ -135,12 +155,14 @@ static int apple_spmi_wait_rx_not_empty(struct spmi_controller *ctrl)
 			usecs_to_jiffies(REG_POLL_TIMEOUT_US));
 		if (!ret)
 			ret = -ETIMEDOUT;
-		else if (readl(spmi->regs + SPMI_STATUS_REG) & SPMI_RX_FIFO_EMPTY)
+		else if (readl(spmi->regs + spmi->hw->status) & spmi->hw->rx_empty)
 			ret = -EIO;
 		else
 			ret = 0;
 	} else {
-		ret = poll_reg(spmi, SPMI_STATUS_REG, status, !(status & SPMI_RX_FIFO_EMPTY));
+		ret = readl_poll_timeout(spmi->regs + spmi->hw->status, status,
+					 !(status & spmi->hw->rx_empty), 10,
+					 REG_POLL_TIMEOUT_US);
 	}
 
 	if (ret) {
@@ -166,19 +188,22 @@ static int spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid,
 	guard(mutex)(&spmi->fifo_lock);
 
 	if (spmi->prev_fail) {
-		writel(SPMI_ACT_FIFO_FLUSH, spmi->regs + SPMI_RSP_REG);
+		/* Do not consume a late reply as the reply to a new command. */
+		if (!spmi->hw->legacy_irqs)
+			return -EIO;
+		writel(SPMI_ACT_FIFO_FLUSH, spmi->regs + SPMI_ACT_REG);
 		apple_spmi_irq_ack_raw(spmi, SPMI_IRQ_NOTIFY);
 		spmi->prev_fail = false;
 	}
 	reinit_completion(&spmi->fifo_rx);
 
-	writel(spmi_cmd, spmi->regs + SPMI_CMD_REG);
+	writel(spmi_cmd, spmi->regs + spmi->hw->command);
 
 	while (i < len) {
 		j = min_t(size_t, sizeof(spmi_cmd), len - i);
 		spmi_cmd = 0;
 		memcpy(&spmi_cmd, buf + i, j);
-		writel(spmi_cmd, spmi->regs + SPMI_CMD_REG);
+		writel(spmi_cmd, spmi->regs + spmi->hw->command);
 		i += j;
 	}
 
@@ -186,23 +211,23 @@ static int spmi_raw_cmd(struct spmi_controller *ctrl, u8 opc, u8 sid,
 	if (ret)
 		return ret;
 
-	reply = readl(spmi->regs + SPMI_RSP_REG);
+	reply = readl(spmi->regs + spmi->hw->reply);
 
 	/* Read SPMI data reply */
 	while (len_read < ilen) {
-		if (readl(spmi->regs + SPMI_STATUS_REG) & SPMI_RX_FIFO_EMPTY) {
+		if (readl(spmi->regs + spmi->hw->status) & spmi->hw->rx_empty) {
 			spmi->prev_fail = true;
 			dev_err_ratelimited(&ctrl->dev,
 					    "FIFO lacks reply data, controller stuck?\n");
 			return -EIO;
 		}
-		rsp = readl(spmi->regs + SPMI_RSP_REG);
+		rsp = readl(spmi->regs + spmi->hw->reply);
 		i = min_t(size_t, sizeof(spmi_cmd), ilen - len_read);
 		memcpy(ibuf + len_read, &rsp, i);
 		len_read += i;
 	}
 
-	if (!(readl(spmi->regs + SPMI_STATUS_REG) & SPMI_RX_FIFO_EMPTY)) {
+	if (!(readl(spmi->regs + spmi->hw->status) & spmi->hw->rx_empty)) {
 		dev_warn(&ctrl->dev, "FIFO has extra data\n");
 		spmi->prev_fail = true;
 	}
@@ -441,6 +466,9 @@ static int apple_spmi_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	spmi = spmi_controller_get_drvdata(ctrl);
+	spmi->hw = device_get_match_data(&pdev->dev);
+	if (!spmi->hw)
+		return -EINVAL;
 	mutex_init(&spmi->fifo_lock);
 	init_completion(&spmi->fifo_rx);
 	platform_set_drvdata(pdev, spmi);
@@ -459,6 +487,9 @@ static int apple_spmi_probe(struct platform_device *pdev)
 	if (spmi->irq < 0 && spmi->irq != -ENXIO)
 		return spmi->irq;
 	if (spmi->irq >= 0) {
+		if (!spmi->hw->legacy_irqs)
+			return dev_err_probe(&pdev->dev, -EOPNOTSUPP,
+					     "Generation 4 interrupt layout is not supported\n");
 		ret = apple_spmi_init_irq(pdev, spmi, spmi->irq);
 		if (ret)
 			return ret;
@@ -473,8 +504,9 @@ static int apple_spmi_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id apple_spmi_match_table[] = {
-	{ .compatible = "apple,t8103-spmi", },
-	{ .compatible = "apple,spmi", },
+	{ .compatible = "apple,t8142-spmi", .data = &apple_spmi_gen4 },
+	{ .compatible = "apple,t8103-spmi", .data = &apple_spmi_gen1 },
+	{ .compatible = "apple,spmi", .data = &apple_spmi_gen1 },
 	{}
 };
 MODULE_DEVICE_TABLE(of, apple_spmi_match_table);
