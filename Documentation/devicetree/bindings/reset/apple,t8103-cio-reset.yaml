@@ -19,13 +19,17 @@ description: |
   the PMGR MMIO region it is represented as a sub-node of the PMGR
   syscon with reg used as an offset into it.
 
-  In both cases the reset id is the CIO port index on the die.
+  On t8142, a standalone register page contains a shared request register
+  with alternating request and busy bits for four ports.
+
+  In all cases the reset id is the CIO port index on the die.
 
 properties:
   compatible:
     oneOf:
       - enum:
           - apple,t8103-cio-reset
+          - apple,t8142-cio-reset
           - apple,t6000-cio-reset
       - items:
           - const: apple,t8112-cio-reset
