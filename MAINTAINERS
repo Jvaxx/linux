@@ -2038,6 +2038,7 @@ F:	include/linux/soc/apple/pmp-report.h
 F:	Documentation/devicetree/bindings/chosen/apple,dcp-rtkit-quiesced.yaml
 F:	Documentation/devicetree/bindings/display/apple,dcp.yaml
 F:	Documentation/devicetree/bindings/display/apple,display-subsystem.yaml
+F:	Documentation/PCI/controller/apple-t8140.rst
 F:	Documentation/devicetree/bindings/iio/light/apple,t8140-aop-als.yaml
 F:	Documentation/devicetree/bindings/input/apple,dockchannel-hid.yaml
 F:	Documentation/devicetree/bindings/mailbox/apple,ascwrap-v6.yaml
@@ -2054,6 +2055,7 @@ F:	Documentation/devicetree/bindings/sound/apple,t8140-aop-audio.yaml
 F:	Documentation/devicetree/bindings/usb/vialab,vl122.yaml
 F:	Documentation/gpu/apple-dcp-backlight.rst
 F:	Documentation/hid/apple-j700-multitouch.rst
+F:	Documentation/networking/device_drivers/wifi/mt7932-neo.rst
 F:	arch/arm64/boot/dts/apple/t8140*
 F:	arch/arm64/configs/j700*.config
 F:	arch/arm64/include/asm/apple-idle.h
@@ -2064,6 +2066,7 @@ F:	drivers/rtc/rtc-apple-pmu.c
 F:	drivers/soc/apple/aop.rs
 F:	drivers/soc/apple/mcc.c
 F:	drivers/tty/serial/apple_dockchannel*
+F:	drivers/pci/controller/pcie-apple-piodma*
 F:	rust/kernel/iio/common/aop_sensors.rs
 F:	rust/kernel/soc/apple/aop.rs
 F:	sound/soc/apple/t8140_aop_audio.rs
