@@ -9,6 +9,7 @@
 #include <linux/ioport.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
+#include <linux/spinlock.h>
 #include <linux/mux/consumer.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
@@ -19,6 +20,7 @@
 #include "dcp-fabric-session.h"
 #include "dptxep.h"
 #include "iomfb.h"
+#include "iomfb_h17p.h"
 #include "iomfb-state.h"
 #include "iomfb_v12_3.h"
 #include "iomfb_v13_3.h"
@@ -51,6 +53,7 @@ enum dcp_firmware_version {
 	 * endpoints speak the 14.7 protocol (dcp_fw_is_14_7()).
 	 */
 	DCP_FIRMWARE_V_14_7_TEMPLATE,
+	DCP_FIRMWARE_H17P,
 };
 
 enum {
@@ -84,6 +87,8 @@ struct dcp_mem_descriptor {
 	dma_addr_t dva;
 	struct sg_table map;
 	u64 reg;
+	/* live iommu mappings installed by dcpep_cb_map_piodma() */
+	bool piodma_mapped;
 };
 
 /* Limit on call stack depth (arbitrary). Some nesting is required */
@@ -106,7 +111,14 @@ struct dcp_channel {
 struct dcp_fb_reference {
 	struct list_head head;
 	struct drm_framebuffer *fb;
+	/*
+	 * Id of the swap that unbinds @fb, i.e. the one that puts its
+	 * replacement on screen.  Only meaningful once @armed is set: the
+	 * firmware assigns the id in the swap_start reply, which happens after
+	 * the atomic commit that displaced @fb has already queued this entry.
+	 */
 	u32 swap_id;
+	bool armed;
 };
 
 #define MAX_NOTCH_HEIGHT 160
@@ -132,9 +144,21 @@ struct dcp_panel {
 	bool has_mini_led;
 };
 
+enum dcp_iomfb_method_profile {
+	DCP_IOMFB_METHODS_DEFAULT,
+	DCP_IOMFB_METHODS_H17G,
+};
+
 struct apple_dcp_hw_data {
 	u32 num_dptx_ports;
 	bool t6020_tunnel_flow;
+	enum dcp_iomfb_method_profile iomfb_method_profile;
+	/*
+	 * The bootloader leaves the coprocessor running.  Attach to it with a
+	 * standard RTKit wake instead of starting or restarting the ASC.
+	 */
+	bool adopt_live_session;
+	enum dcp_firmware_version firmware_compat;
 };
 
 /* TODO: move IOMFB members to its own struct */
@@ -146,6 +170,8 @@ struct apple_dcp {
 	struct device *dev;
 	struct platform_device *piodma;
 	struct iommu_domain *iommu_dom;
+	/* which of the nine cumulative A031 notify-client states to send next */
+	unsigned int a031_step;
 	struct apple_rtkit *rtk;
 	struct apple_crtc *crtc;
 	struct apple_connector *connector;
@@ -215,6 +241,7 @@ struct apple_dcp {
 
 	/* clock rate request by dcp in */
 	struct clk *clk;
+	struct clk *clk_194;
 
 	/* DCP shared memory */
 	void *shmem;
@@ -252,10 +279,13 @@ struct apple_dcp {
 		struct dcp_swap_submit_req_v12_3 v12_3;
 		struct dcp_swap_submit_req_v13_3 v13_3;
 		struct dcp_swap_submit_req_v14_7_0 v14_7_0;
+		struct dcp_swap_submit_req_h17p h17p;
 	} swap;
 
 	/* swap id of the last completed swap */
 	u32 last_swap_id;
+	/* last_swap_id is only meaningful after the first swap completes */
+	bool have_swap_complete;
 	ktime_t swap_start;
 	u64 swap_submit_timestamp;
 
@@ -322,6 +352,12 @@ struct apple_dcp {
 	 * on the next successfully completed swap.
 	 */
 	struct list_head swapped_out_fbs;
+	/*
+	 * Protects swapped_out_fbs, which is appended to from the DRM atomic
+	 * commit (dcp_flush -> .atomic_flush) and armed/drained from the RTKit
+	 * workqueue that runs the DCP callbacks.
+	 */
+	spinlock_t swapped_out_lock;
 
 	struct dcp_brightness brightness;
 	/* Workqueue for updating the initial brightness */

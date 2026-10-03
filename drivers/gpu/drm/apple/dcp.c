@@ -17,6 +17,7 @@
 #include <linux/mux/driver.h>
 #include <linux/soc/apple/dp-tunnel.h>
 #include <linux/moduleparam.h>
+#include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_device.h>
 #include <linux/of_graph.h>
@@ -247,6 +248,25 @@ static void dcp_delayed_vblank(struct work_struct *work)
  * hotplug worker re-apply the active CRTC.
  */
 static void dcp_swap_watchdog(struct work_struct *work)
+static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *dcp, u8 endpoint)
+{
+	switch (endpoint) {
+	case AV_ENDPOINT:
+		return dcp->avep;
+	case SYSTEM_ENDPOINT:
+		return dcp->systemep;
+	case DISP0_ENDPOINT:
+		return dcp->ibootep;
+	case DPAVSERV_ENDPOINT:
+		return dcp->dcpavservep;
+	case DPTX_ENDPOINT:
+		return dcp->dptxep;
+	default:
+		return NULL;
+	}
+}
+
+static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 {
 	struct apple_dcp *dcp =
 		container_of(to_delayed_work(work), struct apple_dcp,
@@ -282,6 +302,17 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 	/* A failed T8122 dcpext: its firmware may still talk, nobody listens. */
 	if (READ_ONCE(dcp->ext_dead))
 		return;
+	/*
+	 * H17P starts endpoints that have no AFK instance behind them (the
+	 * remote allocator endpoint, for one).  Log their messages rather than
+	 * dereferencing a NULL afkep or warning about an unknown endpoint.
+	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P && endpoint != IOMFB_ENDPOINT &&
+	    !dcp_afkep(dcp, endpoint)) {
+		dev_dbg_ratelimited(dcp->dev, "ep %#04x: %#llx\n", endpoint,
+				    message);
+		return;
+	}
 
 	switch (endpoint) {
 	case IOMFB_ENDPOINT:
@@ -329,9 +360,32 @@ static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_
 	complete(&dcp->start_done);
 }
 
+/*
+ * Check that every IOMMU page of [iova, iova + size) translates to the same
+ * offset from @phys as it has from @iova.
+ */
+static int dcp_check_iova_contiguous(struct iommu_domain *domain,
+				     dma_addr_t iova, size_t size,
+				     phys_addr_t phys)
+{
+	unsigned long pgsize = domain->pgsize_bitmap ?
+			       1UL << __ffs(domain->pgsize_bitmap) : PAGE_SIZE;
+	dma_addr_t end = iova + size;
+	dma_addr_t addr = iova;
+
+	while (addr < end) {
+		if (iommu_iova_to_phys(domain, addr) != phys + (addr - iova))
+			return -EINVAL;
+		addr = ALIGN_DOWN(addr, pgsize) + pgsize;
+	}
+
+	return 0;
+}
+
 static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 {
 	struct apple_dcp *dcp = cookie;
+	int ret;
 
 	if (bfr->iova) {
 		struct iommu_domain *domain =
@@ -345,6 +399,16 @@ static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 		phy_addr = iommu_iova_to_phys(domain, bfr->iova);
 		if (!phy_addr)
 			return -ENOMEM;
+
+		/* memremap() below needs the whole buffer physically contiguous */
+		ret = dcp_check_iova_contiguous(domain, bfr->iova, bfr->size,
+						phy_addr);
+		if (ret) {
+			dev_err(dcp->dev,
+				"shmem_setup: iova %pad (%#zx bytes) is not physically contiguous\n",
+				&bfr->iova, bfr->size);
+			return ret;
+		}
 
 		// TODO: verify phy_addr, cache attribute
 		bfr->buffer = memremap(phy_addr, bfr->size, MEMREMAP_WB);
@@ -1351,6 +1415,18 @@ int dcp_start(struct platform_device *pdev)
 		return 0;
 	}
 
+	/*
+	 * The coprocessor start can fail (or be recovered from) without tearing
+	 * the DRM side down, so this can be reached with no RTKit instance at
+	 * all.  Starting an endpoint then dereferences NULL inside
+	 * apple_rtkit_start_ep() and takes the machine with it.
+	 */
+	if (!dcp->rtk || IS_ERR(dcp->rtk)) {
+		dev_err(dcp->dev,
+			"cannot start endpoints: RTKit is not initialised\n");
+		return -ENODEV;
+	}
+
 	/* start RTKit endpoints */
 	ret = systemep_init(dcp);
 	if (ret)
@@ -1435,6 +1511,8 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_V_14_7:
 		iomfb_v14_7_poweroff(dcp);
+	case DCP_FIRMWARE_H17P:
+		iomfb_poweroff_h17p(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
@@ -1523,6 +1601,8 @@ static void __maybe_unused dcp_sleep(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_V_14_7:
 		iomfb_v14_7_poweroff(dcp);
+	case DCP_FIRMWARE_H17P:
+		iomfb_sleep_h17p(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
@@ -1611,6 +1691,8 @@ void dcp_poweron(struct platform_device *pdev)
 		break;
 	case DCP_FIRMWARE_V_14_7:
 		iomfb_v14_7_poweron(dcp);
+	case DCP_FIRMWARE_H17P:
+		iomfb_poweron_h17p(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
@@ -1877,18 +1959,66 @@ err_of_node_put:
 	return ret;
 }
 
+/*
+ * Count the "disp-*" entries in reg-names.
+ *
+ * The positional form below assumes the reg layout is [coproc, disp-0 ...],
+ * i.e. exactly one non-disp register, and derives the count as
+ * num_resources - 1.  DCPs with H17-generation firmware list a trailing
+ * "iop-vbar" register after the display apertures, which would inflate that
+ * count, bind the last disp_registers[] entry to iop-vbar and make the
+ * "apple,bw-scratch" disp_reg index check reject a valid device tree.
+ *
+ * Returns a negative errno when reg-names is absent, so callers fall back.
+ */
+static int dcp_count_disp_regs(struct device *dev)
+{
+	int n = of_property_count_strings(dev->of_node, "reg-names");
+	const char *name;
+	int i, count = 0;
+
+	if (n <= 0)
+		return -EINVAL;
+
+	for (i = 0; i < n; ++i) {
+		if (of_property_read_string_index(dev->of_node, "reg-names", i,
+						  &name))
+			return -EINVAL;
+		if (!strncmp(name, "disp-", 5))
+			count++;
+	}
+
+	return count ? count : -EINVAL;
+}
+
 static int dcp_get_disp_regs(struct apple_dcp *dcp)
 {
 	struct platform_device *pdev = to_platform_device(dcp->dev);
 	int count = pdev->num_resources - 1;
 	int i, ret;
 
+	/* Device trees without reg-names keep the historical positional form. */
+	if (!by_name)
+		count = pdev->num_resources - 1;
+
 	if (count <= 0 || count > MAX_DISP_REGISTERS)
 		return -EINVAL;
 
 	for (i = 0; i < count; ++i) {
-		dcp->disp_registers[i] =
-			platform_get_resource(pdev, IORESOURCE_MEM, 1 + i);
+		if (by_name) {
+			char name[8];
+
+			snprintf(name, sizeof(name), "disp-%d", i);
+			dcp->disp_registers[i] = platform_get_resource_byname(
+				pdev, IORESOURCE_MEM, name);
+		} else {
+			dcp->disp_registers[i] = platform_get_resource(
+				pdev, IORESOURCE_MEM, 1 + i);
+		}
+		if (!dcp->disp_registers[i]) {
+			dev_err(dcp->dev, "missing display register %d\n", i);
+			return -EINVAL;
+		}
 	}
 
 	/* load pmgr bandwidth scratch resource and offset */
@@ -1955,6 +2085,7 @@ static int dcp_read_fw_version(struct device *dev, const char *name,
 
 static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 {
+	const struct apple_dcp_hw_data *hw = of_device_get_match_data(dev);
 	const struct dcp_v14_board *v14_board;
 	char compat_str[DCP_FW_VERSION_STR_LEN];
 	char fw_str[DCP_FW_VERSION_STR_LEN];
@@ -2004,6 +2135,15 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 			compat_str);
 		return DCP_FIRMWARE_UNKNOWN;
 	}
+	/*
+	 * SoCs introduced with H17-generation firmware pin its interface; the
+	 * loader may not recognise their boot firmware version.
+	 */
+	if (hw->firmware_compat != DCP_FIRMWARE_UNKNOWN)
+		return hw->firmware_compat;
+
+	/* firmware version is just informative */
+	dcp_read_fw_version(dev, "apple,firmware-version", fw_str);
 
 	/* The internal panels with a board record (T6030, J613): the same. */
 	v14_board = iomfb_v14_7_board(dev);
@@ -2156,6 +2296,20 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 			return PTR_ERR(dcp->coproc_reg);
 	}
 
+	/*
+	 * Display coprocessors running H17-generation firmware are left running
+	 * by the bootloader with their firmware mapped through a locked DART.
+	 * Linux attaches to that session with a standard RTKit INIT/HELLO
+	 * exchange and must not stop or restart the ASC.
+	 */
+	if (dcp->hw.adopt_live_session) {
+		cpu_ctrl = readl_relaxed(dcp->coproc_reg +
+					 APPLE_DCP_COPROC_CPU_CONTROL);
+		if (!(cpu_ctrl & APPLE_DCP_COPROC_CPU_CONTROL_RUN))
+			return dev_err_probe(dev, -EOPNOTSUPP,
+					     "DCP was not left running by the bootloader\n");
+	}
+
 	if (dcp->index || dcp->dptx_phy || dcp->dptx_die)
 		dev_info(dev, "DCP index:%u dptx target phy: %u dptx die: %u\n",
 			 dcp->index, dcp->dptx_phy, dcp->dptx_die);
@@ -2241,6 +2395,10 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 	if (IS_ERR(dcp->clk))
 		return dev_err_probe(dev, PTR_ERR(dcp->clk),
 				     "Unable to find clock\n");
+	dcp->clk_194 = devm_clk_get_optional(dev, "clock-194");
+	if (IS_ERR(dcp->clk_194))
+		return dev_err_probe(dev, PTR_ERR(dcp->clk_194),
+				     "Unable to find clock 0x194\n");
 
 	bitmap_zero(dcp->memdesc_map, DCP_MAX_MAPPINGS);
 	// TDOD: mem_desc IDs start at 1, for simplicity just skip '0' entry
@@ -2251,6 +2409,7 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 
 	dcp->swapped_out_fbs =
 		(struct list_head)LIST_HEAD_INIT(dcp->swapped_out_fbs);
+	spin_lock_init(&dcp->swapped_out_lock);
 
 	dcp_ext_wait_pmp(dcp);
 
@@ -2258,11 +2417,20 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 		readl_relaxed(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
 	writel_relaxed(cpu_ctrl | APPLE_DCP_COPROC_CPU_CONTROL_RUN,
 		       dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+	if (!dcp->hw.adopt_live_session) {
+		cpu_ctrl =
+			readl_relaxed(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+		writel_relaxed(cpu_ctrl | APPLE_DCP_COPROC_CPU_CONTROL_RUN,
+			       dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+	}
 
 	dcp->rtk = devm_apple_rtkit_init(dev, dcp, "mbox", 0, &rtkit_ops);
 	if (IS_ERR(dcp->rtk))
 		return dev_err_probe(dev, PTR_ERR(dcp->rtk),
 				     "Failed to initialize RTKit\n");
+
+	if (dcp->hw.adopt_live_session)
+		dev_info(dev, "negotiating RTKit with the running DCP\n");
 
 	ret = apple_rtkit_wake(dcp->rtk);
 	if (ret)
@@ -2385,6 +2553,8 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 
 	devm_clk_put(dev, dcp->clk);
 	dcp->clk = NULL;
+	/* optional and possibly NULL, released with the bind's devres group */
+	dcp->clk_194 = NULL;
 }
 
 static const struct component_ops dcp_comp_ops = {
@@ -3049,6 +3219,17 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8112 = {
 	.num_dptx_ports = 2,
 };
 
+/*
+ * M5 (T8142) runs H17-generation DCP firmware with the H17G method numbering
+ * and is left running by the bootloader.
+ */
+static const struct apple_dcp_hw_data apple_dcp_hw_t8142 = {
+	.num_dptx_ports = 0,
+	.iomfb_method_profile = DCP_IOMFB_METHODS_H17G,
+	.adopt_live_session = true,
+	.firmware_compat = DCP_FIRMWARE_H17P,
+};
+
 static const struct apple_dcp_hw_data apple_dcp_hw_dcp = {
 	.num_dptx_ports = 0,
 };
@@ -3087,6 +3268,7 @@ static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t8122-dcp", .data = &apple_dcp_hw_t8122, },
 	{ .compatible = "apple,t6031-dcp", .data = &apple_dcp_hw_t6031, },
 	{ .compatible = "apple,t8122-dcpext", .data = &apple_dcp_hw_t8122_dcpext, },
+	{ .compatible = "apple,t8142-dcp", .data = &apple_dcp_hw_t8142,  },
 	{ .compatible = "apple,dcp",       .data = &apple_dcp_hw_dcp,    },
 	{ .compatible = "apple,dcpext",    .data = &apple_dcp_hw_dcpext, },
 	{}

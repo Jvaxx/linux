@@ -201,6 +201,21 @@ struct epic_sub_hdr {
 	__le32 inline_len;
 } __attribute__((packed));
 
+/*
+ * H17P compresses the EPIC sub-header from 24 bytes to 8 and drops the
+ * separate length/timestamp: the announce for the "system" service puts its
+ * name at data + 0x18, not data + 0x28.  An announce carries type 0x11 and a
+ * standard-service report carries the usual 0xc0.
+ */
+struct epic_sub_hdr_h17p {
+	u8 type;
+	u8 category;
+	__le16 flags;
+	__le32 tag;
+} __packed;
+
+#define EPIC_SUBTYPE_ANNOUNCE_H17P 0x11
+
 struct epic_cmd {
 	__le32 retcode;
 	__le64 rxbuf;
@@ -244,11 +259,20 @@ enum epic_subtype {
 
 struct afk_ringbuffer {
 	bool ready;
-	struct afk_ringbuffer_header *hdr;
+	void *hdr;
+	u32 block;			/* control-block stride, 0x40 or 0x80 */
 	u32 rptr;
 	void *buf;
 	size_t bufsz;
 };
+
+static inline __le32 *afk_rb_field(struct afk_ringbuffer *bfr, unsigned int idx)
+{
+	return (__le32 *)((u8 *)bfr->hdr + idx * bfr->block);
+}
+
+#define afk_rb_rptr(bfr)	afk_rb_field(bfr, 1)
+#define afk_rb_wptr(bfr)	afk_rb_field(bfr, 2)
 
 struct apple_dcp_afkep {
 	struct apple_dcp *dcp;
