@@ -29,6 +29,7 @@ properties:
   compatible:
     oneOf:
       - const: apple,t8103-usb4-acio
+      - const: apple,t8142-usb4-acio
       - items:
           - enum:
               - apple,t6000-usb4-acio
