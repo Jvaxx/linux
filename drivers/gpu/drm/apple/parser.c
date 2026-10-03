@@ -655,7 +655,7 @@ int parse_display_attributes(struct dcp_parse_ctx *handle, int *width_mm,
 }
 
 int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
-			    const char **class, s64 *unit)
+			    const char **class, s64 *unit, bool h17p_keys)
 {
 	int ret = 0;
 	struct iterator it;
@@ -674,19 +674,36 @@ int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
 			break;
 		}
 
-		if (!strcmp(key, "EPICName")) {
+		/*
+		 * H17P advertises its system service with lower-case keys --
+		 * "compartment", "name", "interface-id" -- where earlier
+		 * firmware uses EPICName/EPICProviderClass/EPICUnit.  Without
+		 * them the service never registers, the firmware has no system
+		 * service to ask and idles the panel, so no vblank and no swap
+		 * ever completes.  Only H17P callers accept them.  If a
+		 * dictionary carries both spellings, the later value wins and
+		 * the earlier string is freed.
+		 */
+		if (!strcmp(key, "EPICName") ||
+		    (h17p_keys && !strcmp(key, "compartment"))) {
+			if (parsed_name)
+				kfree(*name);
 			*name = parse_string(it.handle);
 			if (IS_ERR(*name))
 				ret = PTR_ERR(*name);
 			else
 				parsed_name = true;
-		} else if (!strcmp(key, "EPICProviderClass")) {
+		} else if (!strcmp(key, "EPICProviderClass") ||
+			   (h17p_keys && !strcmp(key, "name"))) {
+			if (parsed_class)
+				kfree(*class);
 			*class = parse_string(it.handle);
 			if (IS_ERR(*class))
 				ret = PTR_ERR(*class);
 			else
 				parsed_class = true;
-		} else if (!strcmp(key, "EPICUnit")) {
+		} else if (!strcmp(key, "EPICUnit") ||
+			   (h17p_keys && !strcmp(key, "interface-id"))) {
 			ret = parse_int(it.handle, unit);
 			if (!ret)
 				parsed_unit = true;

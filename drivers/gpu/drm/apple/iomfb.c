@@ -161,6 +161,13 @@ void dcp_push(struct apple_dcp *dcp, bool oob, const struct dcp_method_entry *ca
 		     u32 in_len, u32 out_len, void *data, dcp_callback_t cb,
 		     void *cookie)
 {
+	struct dcp_method_entry resolved = *call;
+
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G &&
+	    call->tag_h17g[0])
+		memcpy(resolved.tag, call->tag_h17g, sizeof(resolved.tag));
+	call = &resolved;
+
 	enum dcp_context_id context = dcp_call_context(dcp, oob);
 	struct dcp_channel *ch = dcp_get_channel(dcp, context);
 
@@ -324,14 +331,29 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 	struct dcp_channel *ch = dcp_get_channel(dcp, context);
 	u8 depth;
 
-	if (tag < 0 || tag >= IOMFB_MAX_CB || !dcp->cb_handlers || !dcp->cb_handlers[tag]) {
-		dev_warn(dev, "received unknown callback %c%c%c%c\n",
-			 hdr->tag[3], hdr->tag[2], hdr->tag[1], hdr->tag[0]);
-		return;
-	}
-
 	in = data + sizeof(*hdr);
 	out = in + hdr->in_len;
+
+	if (tag < 0 || tag >= IOMFB_MAX_CB || !dcp->cb_handlers ||
+	    !dcp->cb_handlers[tag]) {
+		dev_warn(dev, "received unknown callback %c%c%c%c\n",
+			 hdr->tag[3], hdr->tag[2], hdr->tag[1], hdr->tag[0]);
+		/*
+		 * Leaving a callback unanswered wedges the coprocessor: it
+		 * waits for the ack forever and the outer call never returns.
+		 * On H17P answer it with a zeroed output instead.
+		 */
+		if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
+			if (hdr->out_len)
+				memset(out, 0, hdr->out_len);
+			depth = dcp_push_depth(&ch->depth);
+			ch->output[depth] = out;
+			ch->end[depth] = offset +
+					 ALIGN(length, DCP_PACKET_ALIGNMENT);
+			dcp_ack(dcp, context);
+		}
+		return;
+	}
 
 	// TODO: verify that in_len and out_len match our prototypes
 	// for now just clear the out data to have at least consistent results
@@ -351,11 +373,17 @@ static void dcpep_handle_ack(struct apple_dcp *dcp, enum dcp_context_id context,
 {
 	struct dcp_packet_header *header = data;
 	struct dcp_channel *ch = dcp_get_channel(dcp, context);
-	void *cookie;
+	bool h17p = dcp->fw_compat == DCP_FIRMWARE_H17P;
+	void *cookie, *out;
 	dcp_callback_t cb;
 
 	if (!ch) {
 		dev_warn(dcp->dev, "ignoring ack on context %X\n", context);
+		return;
+	}
+
+	if (h17p && !ch->depth) {
+		dev_warn(dcp->dev, "ignoring ack on idle context %X\n", context);
 		return;
 	}
 
@@ -367,8 +395,21 @@ static void dcpep_handle_ack(struct apple_dcp *dcp, enum dcp_context_id context,
 	ch->callbacks[ch->depth] = NULL;
 	ch->cookies[ch->depth] = NULL;
 
+	if (h17p) {
+		/*
+		 * H17P acks carry no payload and offset zero, including for
+		 * nested calls, so the output cannot be located from the ack
+		 * message.  It is in the original AP command record, whose
+		 * address dcp_push() saved.
+		 */
+		out = ch->output[ch->depth];
+		ch->output[ch->depth] = NULL;
+	} else {
+		out = data + sizeof(*header) + header->in_len;
+	}
+
 	if (cb)
-		cb(dcp, data + sizeof(*header) + header->in_len, cookie);
+		cb(dcp, out, cookie);
 }
 
 static void dcpep_got_msg(struct apple_dcp *dcp, u64 message)
@@ -437,7 +478,9 @@ int dcp_get_modes(struct drm_connector *connector)
 	}
 	drm_connector_set_vrr_capable_property(connector, vrr_capable);
 
+	/* H17P sends no EPIC commands; see afk_send_epic(). */
 	if (dcp->nr_modes && dcp->dcpavserv.enabled &&
+	    dcp->fw_compat != DCP_FIRMWARE_H17P &&
 	    !apple_connector->drm_edid) {
 		const struct drm_edid *edid;
 		edid = dcpavserv_copy_edid(dcp->dcpavserv.service);
@@ -482,6 +525,27 @@ struct dcp_display_mode *lookup_mode(struct apple_dcp *dcp,
 	return NULL;
 }
 
+/*
+ * H17P keeps the mode the bootloader programmed and never sends
+ * set_digital_out_mode (see DCP_INHERIT_BOOT_MODE in iomfb_template.c), so a
+ * modeset to any other mode would silently not be applied.  The bootloader
+ * brings the panel up in its native timing, which is the mode the firmware
+ * scores highest and enumerate_modes() marks preferred; offer only that one.
+ */
+static bool dcp_mode_settable(struct apple_dcp *dcp,
+			      const struct drm_display_mode *mode)
+{
+	struct dcp_display_mode *dcp_mode = lookup_mode(dcp, mode);
+
+	if (!dcp_mode)
+		return false;
+
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+		return dcp_mode->mode.type & DRM_MODE_TYPE_PREFERRED;
+
+	return true;
+}
+
 enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
 				    const struct drm_display_mode *mode)
 {
@@ -493,7 +557,7 @@ enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
 		return MODE_ERROR;
 	dcp = platform_get_drvdata(pdev);
 
-	return lookup_mode(dcp, mode) ? MODE_OK : MODE_BAD;
+	return dcp_mode_settable(dcp, mode) ? MODE_OK : MODE_BAD;
 }
 
 int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
@@ -528,6 +592,9 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	case DCP_FIRMWARE_V_14_7:
 		ret = iomfb_modeset_v14_7_0(dcp, crtc_state);
 		break;
+	case DCP_FIRMWARE_H17P:
+		ret = iomfb_modeset_h17p(dcp, crtc_state);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n",
 			  dcp->fw_compat);
@@ -546,7 +613,7 @@ bool dcp_crtc_mode_fixup(struct drm_crtc *crtc,
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
 	/* TODO: support synthesized modes through scaling */
-	return lookup_mode(dcp, mode) != NULL;
+	return dcp_mode_settable(dcp, mode);
 }
 
 
@@ -595,6 +662,9 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit)
 	case DCP_FIRMWARE_V_14_7:
 		iomfb_flush_v14_7_0(dcp, crtc, commit);
 		break;
+	case DCP_FIRMWARE_H17P:
+		iomfb_flush_h17p(dcp, crtc, commit);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
@@ -613,6 +683,9 @@ static void iomfb_start(struct apple_dcp *dcp)
 	case DCP_FIRMWARE_V_14_7:
 		iomfb_start_v14_7_0(dcp);
 		break;
+	case DCP_FIRMWARE_H17P:
+		iomfb_start_h17p(dcp);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
@@ -630,9 +703,19 @@ void iomfb_recv_msg(struct apple_dcp *dcp, u64 message)
 {
 	enum dcpep_type type = FIELD_GET(IOMFB_MESSAGE_TYPE, message);
 
-	if (type == IOMFB_MESSAGE_TYPE_INITIALIZED)
+	if (type == IOMFB_MESSAGE_TYPE_INITIALIZED) {
+		/*
+		 * H17P reports its interface version (bits 63:48) and a
+		 * firmware hash in the high half of the InitComplete word.
+		 * The transport below it is unchanged.
+		 */
+		if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+			dev_info(dcp->dev,
+				 "IOMFB: init complete %#llx (version %llu)\n",
+				 message,
+				 FIELD_GET(GENMASK_ULL(63, 48), message));
 		iomfb_start(dcp);
-	else if (type == IOMFB_MESSAGE_TYPE_MSG)
+	} else if (type == IOMFB_MESSAGE_TYPE_MSG)
 		dcpep_got_msg(dcp, message);
 	else
 		dev_warn(dcp->dev, "Ignoring unknown message %llx\n", message);
@@ -641,10 +724,27 @@ void iomfb_recv_msg(struct apple_dcp *dcp, u64 message)
 int iomfb_start_rtkit(struct apple_dcp *dcp)
 {
 	dma_addr_t shmem_iova;
-	apple_rtkit_start_ep(dcp->rtk, IOMFB_ENDPOINT);
+	int ret;
+
+	/*
+	 * H17P firmware expects the remote allocator endpoint to be started
+	 * before IOMFB.  A firmware subsystem whose endpoint was never started
+	 * has nothing answering it on the AP side, and without this one the
+	 * display DART faults.
+	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
+		ret = apple_rtkit_start_ep(dcp->rtk, REMOTE_ALLOC_ENDPOINT);
+		if (ret)
+			return ret;
+	}
+	ret = apple_rtkit_start_ep(dcp->rtk, IOMFB_ENDPOINT);
+	if (ret)
+		return ret;
 
 	dcp->shmem = dma_alloc_coherent(dcp->dev, DCP_SHMEM_SIZE, &shmem_iova,
 					GFP_KERNEL);
+	if (!dcp->shmem)
+		return -ENOMEM;
 
 	dcp_send_message(dcp, IOMFB_ENDPOINT, dcpep_set_shmem(shmem_iova));
 
@@ -666,6 +766,9 @@ void iomfb_shutdown(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_V_14_7:
 		iomfb_shutdown_v14_7_0(dcp);
+		break;
+	case DCP_FIRMWARE_H17P:
+		iomfb_shutdown_h17p(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
