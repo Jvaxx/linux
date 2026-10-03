@@ -1392,6 +1392,15 @@ impl UatPageTable {
         })
     }
 
+    /// Discards an aligned map operation that failed before acquiring a GPUVA owner.
+    /// Missing tables and leaves are expected; existing table storage stays allocated.
+    pub(crate) fn discard_partial_map(&mut self, iova_range: Range<u64>) -> Result {
+        self.with_pages(iova_range, false, false, |_, ptes| {
+            for pte in ptes {
+                pte.store(0, Ordering::Relaxed);
+            }
+            Ok(())
+        })
     /// Read one PTE from a page table page, without ever allocating or modifying anything.
     ///
     /// Fails with an error (instead of oopsing) if the table page is not mapped.
