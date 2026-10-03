@@ -1099,6 +1099,8 @@ void dcp_hotplug(struct work_struct *work)
 	scoped_guard(mutex, &connector->base.dev->mode_config.mutex)
 		dcp_consume_edid_invalidation(connector);
 
+	apple_connector_backlight_sync(connector);
+
 	pdev = READ_ONCE(connector->dcp);
 	if (!pdev) {	/* a Type-C port unrouted after this was queued */
 		scoped_guard(mutex, &connector->base.dev->mode_config.mutex) {
