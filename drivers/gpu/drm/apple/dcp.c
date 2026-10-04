@@ -4292,6 +4292,12 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 		return dev_err_probe(dev, -EBUSY,
 				     "Live DCP session cannot be rebound; reboot required\n");
 
+	if (dcp->vblank_works_disabled) {
+		enable_work(&dcp->vblank_wq);
+		enable_delayed_work(&dcp->swap_watchdog_wq);
+		dcp->vblank_works_disabled = false;
+	}
+
 	if (dcp->external_prepared)
 		return 0;
 
@@ -4531,6 +4537,13 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 		disable_irq(dcp->hdmi_hpd_irq);
 
 	dcp_disable_typec_work(dcp, true);
+	/* RTKit is released after this unbind callback, and can still deliver
+	 * a final swap completion or hotplug while its receive queue drains.
+	 * The works are set up at probe; the next bind enables them again.
+	 */
+	disable_delayed_work_sync(&dcp->swap_watchdog_wq);
+	disable_work_sync(&dcp->vblank_wq);
+	dcp->vblank_works_disabled = true;
 
 	if (dcp->fixed_connector_type == DRM_MODE_CONNECTOR_eDP) {
 		/* Registration runs asynchronously and its devres can belong
@@ -4607,9 +4620,6 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 		cancel_work_sync(&dcp->bl_register_wq);
 		cancel_work_sync(&dcp->bl_update_wq);
 	}
-	cancel_delayed_work_sync(&dcp->swap_watchdog_wq);
-	cancel_work_sync(&dcp->vblank_wq);
-
 	devm_clk_put(dev, dcp->clk);
 	dcp->clk = NULL;
 	/* optional and possibly NULL, released with the bind's devres group */

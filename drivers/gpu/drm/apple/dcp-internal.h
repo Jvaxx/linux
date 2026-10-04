@@ -222,6 +222,8 @@ struct apple_dcp {
 	bool retain_dma;
 	bool quiescing;
 	bool drm_retained;
+	/* vblank_wq and swap_watchdog_wq disabled by the last unbind */
+	bool vblank_works_disabled;
 	struct device *dev;
 	struct platform_device *piodma;
 	bool piodma_created;
