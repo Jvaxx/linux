@@ -1099,8 +1099,6 @@ void dcp_hotplug(struct work_struct *work)
 	scoped_guard(mutex, &connector->base.dev->mode_config.mutex)
 		dcp_consume_edid_invalidation(connector);
 
-	apple_connector_backlight_sync(connector);
-
 	pdev = READ_ONCE(connector->dcp);
 	if (!pdev) {	/* a Type-C port unrouted after this was queued */
 		scoped_guard(mutex, &connector->base.dev->mode_config.mutex) {
@@ -1110,6 +1108,7 @@ void dcp_hotplug(struct work_struct *work)
 			}
 		}
 		drm_kms_helper_connector_hotplug_event(&connector->base);
+		apple_connector_backlight_sync(connector);
 		return;
 	}
 	dcp = platform_get_drvdata(pdev);
@@ -1169,6 +1168,8 @@ void dcp_hotplug(struct work_struct *work)
 
 	dcp_test_point(dcp, DCP_TEST_HOTPLUG_EVENT);
 	drm_kms_helper_connector_hotplug_event(&connector->base);
+	/* after the event, so registering a backlight cannot delay it */
+	apple_connector_backlight_sync(connector);
 }
 
 /*
