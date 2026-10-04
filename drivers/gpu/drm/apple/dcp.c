@@ -4532,6 +4532,25 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 
 	dcp_disable_typec_work(dcp, true);
 
+	if (dcp->fixed_connector_type == DRM_MODE_CONNECTOR_eDP) {
+		/* Registration runs asynchronously and its devres can belong
+		 * to the platform device rather than the component bind group.
+		 * Stop callbacks and userspace writes while the CRTC, RTKit and
+		 * IOMMU they use are still available. The works are set up at
+		 * probe, so cancel rather than disable them: a rebind uses them.
+		 * Firmware callbacks may still queue them until the endpoints
+		 * are shut down, so they are cancelled again below.
+		 */
+		cancel_delayed_work_sync(&dcp->bl_fallback_wq);
+		dcp_backlight_stop(dcp);
+		cancel_work_sync(&dcp->bl_register_wq);
+		cancel_work_sync(&dcp->bl_update_wq);
+		if (dcp->brightness.bl_dev) {
+			devm_backlight_device_unregister(dev, dcp->brightness.bl_dev);
+			dcp->brightness.bl_dev = NULL;
+		}
+	}
+
 	if (dcp->avep) {
 		av_service_disconnect(dcp);
 		afk_shutdown(dcp->avep);
