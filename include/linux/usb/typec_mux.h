@@ -201,6 +201,8 @@ struct typec_thunderbolt_switch_dev;
 
 /* Recheck fresh cable data and provider health; not a request to reset. */
 #define TYPEC_THUNDERBOLT_SWITCH_REVALIDATE 1
+/* A deferred activation completed; this is not a link-failure event. */
+#define TYPEC_THUNDERBOLT_SWITCH_READY 2
 
 enum typec_thunderbolt_switch_state {
 	TYPEC_THUNDERBOLT_SWITCH_OFF,
@@ -254,6 +256,7 @@ int typec_thunderbolt_switch_register_notifier(struct typec_thunderbolt_switch *
 void typec_thunderbolt_switch_unregister_notifier(struct typec_thunderbolt_switch *sw,
 						  struct notifier_block *nb);
 void typec_thunderbolt_switch_notify(struct typec_thunderbolt_switch_dev *sw);
+void typec_thunderbolt_switch_notify_ready(struct typec_thunderbolt_switch_dev *sw);
 
 struct typec_thunderbolt_switch_dev *
 typec_thunderbolt_switch_register(struct device *parent,
@@ -307,6 +310,11 @@ typec_thunderbolt_switch_unregister_notifier(struct typec_thunderbolt_switch *sw
 
 static inline void
 typec_thunderbolt_switch_notify(struct typec_thunderbolt_switch_dev *sw)
+{
+}
+
+static inline void
+typec_thunderbolt_switch_notify_ready(struct typec_thunderbolt_switch_dev *sw)
 {
 }
 
