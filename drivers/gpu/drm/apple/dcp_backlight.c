@@ -605,11 +605,11 @@ static int dcp_ext_backlight_update_status(struct backlight_device *bd)
 	struct platform_device *pdev;
 	struct apple_dcp *dcp;
 
-	/* The display's power belongs to DRM, not to fbdev blanking. */
-	if (backlight_is_blank(bd))
-		return 0;
-
 	/*
+	 * The display's power belongs to DRM: fbdev blanking never reaches
+	 * this device (controls_device), and bl_power does not turn the
+	 * display off, so the level is stored and sent whatever their state.
+	 *
 	 * Until a level is chosen the device reports DCP_EXT_BL_MAX, and
 	 * systemd-backlight writes what it reads back when it has nothing
 	 * saved. Sending that would turn the display to full brightness.
@@ -656,7 +656,7 @@ static void apple_connector_backlight_commit_work(struct work_struct *work)
 			connector->base.name, ret);
 }
 
-/* Never follow fbdev blanking, which would store a level of 0. */
+/* Never follow fbdev blanking: DRM owns the external display's power. */
 static bool dcp_ext_backlight_controls_device(struct backlight_device *bd,
 					      struct device *display_dev)
 {
