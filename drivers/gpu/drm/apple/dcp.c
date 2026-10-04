@@ -3300,6 +3300,47 @@ void dcp_link(struct platform_device *pdev, struct apple_crtc *crtc,
 	}
 }
 
+/* Called after component unbind has drained all firmware callbacks. The
+ * platform devices and their Type-C muxes can outlive this DRM instance.
+ */
+void dcp_unlink(struct drm_device *drm)
+{
+	struct apple_dcp_typec_port *port;
+	struct drm_crtc *crtc;
+
+	guard(mutex)(&dcp_typec_fabric_lock);
+
+	list_for_each_entry(port, &dcp_typec_ports, link) {
+		if (port->connector && port->connector->base.dev == drm)
+			port->connector = NULL;
+		if (port->secondary_connector &&
+		    port->secondary_connector->base.dev == drm)
+			port->secondary_connector = NULL;
+	}
+
+	drm_for_each_crtc(crtc, drm) {
+		struct apple_crtc *apple_crtc = to_apple_crtc(crtc);
+		struct apple_dcp *dcp;
+
+		if (!apple_crtc->dcp)
+			continue;
+		dcp = platform_get_drvdata(apple_crtc->dcp);
+		if (dcp->crtc != apple_crtc)
+			continue;
+		/*
+		 * A DCP that kept its DMA pinned this DRM device for its late
+		 * firmware callbacks; its references stay valid, keep them.
+		 */
+		if (READ_ONCE(dcp->retain_dma))
+			continue;
+		dcp->crtc = NULL;
+		dcp->connector = NULL;
+		dcp->fixed_connector = NULL;
+		dcp->typec_connector = NULL;
+		WRITE_ONCE(dcp->ext_backlight, false);
+	}
+}
+
 
 bool dcp_fw_compat_is_12_x(struct platform_device *pdev)
 {
@@ -4498,8 +4539,20 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 	}
 
 	if (dcp->dptxep) {
+		/* Mux/tunnel callbacks must stop using the service before its
+		 * endpoint is released. Firmware callbacks are drained by AFK.
+		 */
+		guard(mutex)(&dcp_typec_fabric_lock);
+
 		afk_shutdown(dcp->dptxep);
 		dcp->dptxep = NULL;
+		scoped_guard(mutex, &dcp->hpd_mutex) {
+			for (int i = 0; i < ARRAY_SIZE(dcp->dptxport); i++) {
+				dcp->dptxport[i].enabled = false;
+				dcp->dptxport[i].connected = false;
+				dcp->dptxport[i].service = NULL;
+			}
+		}
 	}
 
 	if (!IS_ERR_OR_NULL(dcp->dptx_controller_ep)) {
