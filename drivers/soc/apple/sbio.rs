@@ -1693,7 +1693,7 @@ impl SepData {
                     has_template,
                 } => {
                     counter = counter.saturating_add(1);
-                    last_percent = percent;
+                    last_percent = last_percent.max(percent);
                     let woke = bio::enrol_advance(
                         &mut self.bio_session.lock(),
                         self.capture_epoch.load(Relaxed),
@@ -1738,7 +1738,11 @@ impl SepData {
                 ImageOutcome::Failed(status) => break Some(Err(status)),
             }
 
-            self.pace_between_captures();
+            // A spent budget ends the run at the top of the loop; don't make
+            // the person wait out a reposition pause first.
+            if counter < ENROL_MAX_CAPTURES {
+                self.pace_between_captures();
+            }
         };
 
         if enrolment_completed {
