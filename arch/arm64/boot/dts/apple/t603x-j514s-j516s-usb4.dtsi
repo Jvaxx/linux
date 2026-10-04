@@ -3,8 +3,21 @@
 
 / {
 	aliases {
+		usb4_0_pcie = &usb4_0_pcie;
 		usb4_0_pcie_adapter = &usb4_0_acio;
 		usb4_1_pcie_adapter = &usb4_1_acio;
 		usb4_2_pcie_adapter = &usb4_2_acio;
 	};
 };
+
+&typec0 {
+	ports {
+		port@3 {
+			reg = <3>;
+			typec0_dcpext: endpoint {
+				remote-endpoint = <&dcpext_typec0>;
+			};
+		};
+	};
+};
+
