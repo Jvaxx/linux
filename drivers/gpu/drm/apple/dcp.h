@@ -10,6 +10,7 @@
 
 #include "connector.h"
 #include "dcp-internal.h"
+#include "dcp-fabric.h"
 #include "parser.h"
 
 bool dcp_h17p_external_supported(struct device_node *np);
@@ -38,27 +39,9 @@ void dcp_external_recover(struct platform_device *pdev);
 int dcp_set_crc(struct drm_crtc *crtc, bool enabled);
 int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commit);
 int dcp_get_connector_type(struct platform_device *pdev);
-bool dcp_has_typec_routes(struct platform_device *pdev);
-
-/*
- * The Type-C display fabric.  Ports are enumerated in device-tree order, not
- * DCP probe order, so a given physical port keeps the same DRM connector index
- * across boots -- userspace keys its per-monitor configuration on that name.
- */
-unsigned int dcp_typec_nr_ports(void);
-struct device_node *dcp_typec_port_of_node(unsigned int idx);
-bool dcp_typec_port_has_candidate(unsigned int idx, struct platform_device *pdev);
-void dcp_typec_port_set_connector(unsigned int idx, bool secondary,
-				  struct apple_connector *connector);
-bool dcp_typec_dual_stream(void);
-void dcp_typec_reorder(void);
-bool dcp_is_typec_only(struct platform_device *pdev);
 bool dcp_fw_compat_is_12_x(struct platform_device *pdev);
 bool dcp_fw_compat_is_14_7(struct platform_device *pdev);
 unsigned long* dcp_get_iomfb_surfaces(struct platform_device *pdev);
-void dcp_link(struct platform_device *pdev, struct apple_crtc *apple,
-	      struct apple_connector *connector);
-void dcp_unlink(struct drm_device *drm);
 int dcp_start(struct platform_device *pdev);
 int dcp_wait_ready(struct platform_device *pdev, u64 timeout);
 void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_commit *commit);
@@ -87,14 +70,6 @@ void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message);
 int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port);
 int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port);
 bool dcp_hold_resume_event(struct platform_device *pdev);
-
-struct apple_dcp;
-struct phy;
-/* Thunderbolt DP tunnels, called from the DPTX endpoint */
-int dcp_tunnel_crossbar_up(struct apple_dcp *dcp);
-int dcp_tunnel_crossbar_down(struct apple_dcp *dcp);
-int dcp_tunnel_set_rate(struct apple_dcp *dcp, struct phy *phy, u32 link_rate);
-int dcp_tunnel_dpin_activate(struct apple_dcp *dcp, bool active);
 
 int iomfb_start_rtkit(struct apple_dcp *dcp);
 void iomfb_shutdown(struct apple_dcp *dcp);

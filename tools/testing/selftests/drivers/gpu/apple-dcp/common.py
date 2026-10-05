@@ -4,6 +4,21 @@
 from pathlib import Path
 import hashlib, json, os, re, shlex, subprocess
 
+# The Type-C display fabric moved from dcp.c to dcp-fabric.c; extract from
+# them as one unit so a function is found whichever file holds it.
+_read_text = Path.read_text
+
+
+def _read_dcp_unit(self, *args, **kwargs):
+    text = _read_text(self, *args, **kwargs)
+    fabric = self.with_name('dcp-fabric.c')
+    if self.name == 'dcp.c' and self.parent.name == 'apple' and fabric.exists():
+        text += '\n' + _read_text(fabric, *args, **kwargs)
+    return text
+
+
+Path.read_text = _read_dcp_unit
+
 def block(source, marker):
     start = source.index(marker) if isinstance(marker, str) else marker
     opening = source.index('{', start)
