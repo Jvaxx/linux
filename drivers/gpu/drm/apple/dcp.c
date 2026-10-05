@@ -1796,6 +1796,23 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 	}
 }
 
+static void dcp_resume_enable_irq(void *ctx)
+{
+	struct apple_dcp *dcp = ctx;
+
+	enable_irq(dcp->hdmi_hpd_irq);
+}
+
+static void dcp_resume_sample(void *ctx)
+{
+	dcp_fabric_hdmi_resume(ctx);
+}
+
+static const struct dcp_fabric_resume_ops dcp_resume_ops = {
+	.enable_irq = dcp_resume_enable_irq,
+	.sample = dcp_resume_sample,
+};
+
 static int dcp_enable_dp2hdmi_hpd(struct apple_dcp *dcp)
 {
 	if (dcp_is_typec_output(dcp)) {
@@ -1813,7 +1830,7 @@ static int dcp_enable_dp2hdmi_hpd(struct apple_dcp *dcp)
 	}
 
 	if (dcp->hdmi_hpd_irq)
-		enable_irq(dcp->hdmi_hpd_irq);
+		dcp_fabric_run_resume(&dcp_resume_ops, dcp);
 
 	return 0;
 }
@@ -3502,23 +3519,6 @@ static int dcp_platform_suspend(struct device *dev)
 
 	return 0;
 }
-
-static void dcp_resume_enable_irq(void *ctx)
-{
-	struct apple_dcp *dcp = ctx;
-
-	enable_irq(dcp->hdmi_hpd_irq);
-}
-
-static void dcp_resume_sample(void *ctx)
-{
-	dcp_fabric_hdmi_resume(ctx);
-}
-
-static const struct dcp_fabric_resume_ops dcp_resume_ops = {
-	.enable_irq = dcp_resume_enable_irq,
-	.sample = dcp_resume_sample,
-};
 
 static int dcp_platform_resume(struct device *dev)
 {
