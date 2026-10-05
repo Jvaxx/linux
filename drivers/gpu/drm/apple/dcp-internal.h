@@ -554,6 +554,8 @@ struct apple_dcp {
 		 */
 		struct list_head dropped;
 	} iomfb;
+	/* jiffies until which a Thunderbolt tunnel may not borrow this pipeline */
+	unsigned long hdmi_hold_until;
 };
 
 void dcp_firmware_metadata_connection(struct apple_dcp *dcp, u64 generation, bool connected);
