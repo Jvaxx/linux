@@ -208,6 +208,7 @@ struct apple_dcp {
 	bool drm_retained;
 	/* vblank_wq and swap_watchdog_wq disabled by the last unbind */
 	bool vblank_works_disabled;
+	struct dcp_fabric_pipeline fabric;
 	struct device *dev;
 	struct platform_device *piodma;
 	bool piodma_created;
