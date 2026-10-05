@@ -90,10 +90,4 @@ int dcp_dptx_connect(struct apple_dcp *dcp, u32 port);
 int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port);
 bool dcp_is_external_h17p(struct apple_dcp *dcp);
 
-/*
- * Optional TB capacity wakeup: RCU lookup and queue only, never a mutex/wait.
- * Declared here rather than in the 170-usb owned dp-tunnel.h; no provider.
- */
-void apple_tb_dp_capacity_available(struct device_node *connector_np);
-
 #endif /* __APPLE_DCP_FABRIC_H__ */
