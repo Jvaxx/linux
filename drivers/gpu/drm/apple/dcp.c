@@ -1018,7 +1018,7 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 	}
 	dcp->dptxport[port].connected = true;
 	if (dcp_is_typec_output(dcp)) {
-		if (dcp_is_usb4_output(dcp) && apple_dp_tunnel_t602x())
+		if (dcp_uses_t6020_tunnel_flow(dcp))
 			ret = dptxport_set_hpd_timeout(dcp->dptxport[port].service,
 						       true, 8000);
 		else
@@ -1033,7 +1033,7 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 	}
 
 	mutex_unlock(&dcp->hpd_mutex);
-	timeout = dcp_is_usb4_output(dcp) && apple_dp_tunnel_t602x() ?
+	timeout = dcp_uses_t6020_tunnel_flow(dcp) ?
 		  DPTX_TUNNEL_CONNECT_TIMEOUT : DPTX_CONNECT_TIMEOUT;
 	ret = wait_for_completion_timeout(&dcp->dptxport[port].linkcfg_completion,
 					  timeout);
@@ -1472,7 +1472,7 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
 		dcp_announce_kick(dcp);
 
 	if (++dcp->typec_reconnect_tries <
-	    (dcp_is_usb4_output(dcp) && apple_dp_tunnel_t602x() ?
+	    (dcp_uses_t6020_tunnel_flow(dcp) ?
 	     1 : DPTX_RECONNECT_RETRIES)) {
 		mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq,
 				 DPTX_RECONNECT_DELAY);
@@ -3540,6 +3540,12 @@ static const struct dev_pm_ops dcp_platform_pm_ops = {
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t6020 = {
 	.num_dptx_ports = 1,
+	.t6020_tunnel_flow = true,
+};
+
+static const struct apple_dcp_hw_data apple_dcp_hw_t6020_dcpext = {
+	.num_dptx_ports = 2,
+	.t6020_tunnel_flow = true,
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t8112 = {
@@ -3602,6 +3608,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_dcpext = {
 
 static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t6020-dcp", .data = &apple_dcp_hw_t6020,  },
+	{ .compatible = "apple,t6020-dcpext", .data = &apple_dcp_hw_t6020_dcpext, },
 	{ .compatible = "apple,t8112-dcp", .data = &apple_dcp_hw_t8112,  },
 	{ .compatible = "apple,t8140-dcp", .data = &apple_dcp_hw_t8140,  },
 	{ .compatible = "apple,t8140-dcpext", .data = &apple_dcp_hw_t8140_external, },

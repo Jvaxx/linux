@@ -190,6 +190,8 @@ struct apple_dcp_hw_data {
 	u32 firmware_display_windows;
 	u32 firmware_scratch;
 	u32 firmware_request;
+	/* M2 Pro/Max laptop T6020 Thunderbolt flow, from the match data */
+	bool t6020_tunnel_flow;
 };
 
 enum dcp_test_point {
