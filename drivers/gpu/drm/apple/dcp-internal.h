@@ -531,8 +531,10 @@ struct apple_dcp {
 		 */
 		struct list_head dropped;
 	} iomfb;
-	/* jiffies until which a Thunderbolt tunnel may not borrow this pipeline */
-	unsigned long hdmi_hold_until;
+	/* Hardirq, resume and expiry share one generation under this lock. */
+	spinlock_t hdmi_presence_lock;
+	struct dcp_fabric_presence hdmi_presence;
+	struct delayed_work hdmi_settle_wq;
 };
 
 void dcp_firmware_metadata_connection(struct apple_dcp *dcp, u64 generation, bool connected);

@@ -76,7 +76,8 @@ int dcp_tunnel_dpin_activate(struct apple_dcp *dcp, bool active);
 /* DCP probe, resume and endpoint teardown hooks. */
 int dcp_register_typec_routes(struct apple_dcp *dcp);
 void dcp_typec_retrain_work(struct work_struct *work);
-void dcp_hdmi_hold(struct apple_dcp *dcp);
+void dcp_fabric_init(struct apple_dcp *dcp);
+void dcp_fabric_hdmi_resume(struct apple_dcp *dcp);
 irqreturn_t dcp_dp2hdmi_hpd_edge(int irq, void *data);
 irqreturn_t dcp_dp2hdmi_hpd(int irq, void *data);
 void dcp_fabric_shutdown_dptx(struct apple_dcp *dcp);
@@ -85,5 +86,11 @@ void dcp_fabric_shutdown_dptx(struct apple_dcp *dcp);
 int dcp_dptx_connect(struct apple_dcp *dcp, u32 port);
 int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port);
 bool dcp_is_external_h17p(struct apple_dcp *dcp);
+
+/*
+ * Optional TB capacity wakeup: RCU lookup and queue only, never a mutex/wait.
+ * Declared here rather than in the 170-usb owned dp-tunnel.h; no provider.
+ */
+void apple_tb_dp_capacity_available(struct device_node *connector_np);
 
 #endif /* __APPLE_DCP_FABRIC_H__ */

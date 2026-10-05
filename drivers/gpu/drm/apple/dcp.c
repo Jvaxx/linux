@@ -2592,6 +2592,7 @@ VISIBLE_IF_KUNIT void dcp_disable_typec_work(struct apple_dcp *dcp, bool release
 	disable_delayed_work_sync(&dcp->announce_wq);
 	cancel_work_sync(&dcp->external_stop_work);
 	cancel_delayed_work_sync(&dcp->external_stop_retry_wq);
+	disable_delayed_work_sync(&dcp->hdmi_settle_wq);
 }
 
 VISIBLE_IF_KUNIT void dcp_enable_typec_work(struct apple_dcp *dcp)
@@ -2599,6 +2600,7 @@ VISIBLE_IF_KUNIT void dcp_enable_typec_work(struct apple_dcp *dcp)
 	enable_delayed_work(&dcp->typec_reconnect_wq);
 	enable_delayed_work(&dcp->placeholder_edid_wq);
 	enable_delayed_work(&dcp->announce_wq);
+	enable_delayed_work(&dcp->hdmi_settle_wq);
 	/* A cable can be routed before the DRM component binds. */
 	if (READ_ONCE(dcp->typec_cable_connected))
 		mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq, 0);
@@ -3040,6 +3042,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	INIT_WORK(&dcp->external_stop_work, dcp_external_stop_work);
 	INIT_DELAYED_WORK(&dcp->external_stop_retry_wq, dcp_external_stop_retry);
 	mutex_init(&dcp->tb_lock);
+	dcp_fabric_init(dcp);
 	spin_lock_init(&dcp->mode_state.lock);
 	spin_lock_init(&dcp->metadata.lock);
 	mutex_init(&dcp->dcpavserv.lock);
@@ -3504,9 +3507,9 @@ static int dcp_platform_resume(struct device *dev)
 	dcp_release_after_sleep(dcp);
 	dcp_enable_typec_work(dcp);
 	if (dcp->hdmi_hpd_irq) {
-		/* edges were not seen in sleep, and monitors blink on waking */
-		dcp_hdmi_hold(dcp);
+		/* Observe future edges before sampling any edges lost in sleep. */
 		enable_irq(dcp->hdmi_hpd_irq);
+		dcp_fabric_hdmi_resume(dcp);
 	}
 
 	if (dcp->avep)
