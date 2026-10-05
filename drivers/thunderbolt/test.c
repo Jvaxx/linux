@@ -3363,6 +3363,7 @@ struct tb_test_dprx {
 	struct tb tb;
 	struct tb_nhi nhi;
 	struct kunit *test;
+	struct completion worker_passed;
 	unsigned int completions;
 };
 
@@ -3450,7 +3451,109 @@ static void tb_test_dp_dprx_cancel_running(struct kunit *test)
 	tb_test_dp_dprx_cancel_common(test, true);
 }
 
+struct tb_test_dprx_gate {
+	struct tb_nhi nhi;
+	bool deferred;
+	struct completion *worker_passed;
+	unsigned int samples;
+};
+
+static bool tb_test_dprx_awaits_display(struct tb_nhi *nhi, struct tb_port *in)
+{
+	struct tb_test_dprx_gate *gate = container_of(nhi, struct tb_test_dprx_gate, nhi);
+
+	if (gate->deferred && !gate->samples++)
+		complete(gate->worker_passed);
+	return gate->deferred;
+}
+
+static void tb_test_dprx_finished(struct tb_tunnel *tunnel)
+{
+	struct tb_test_dprx *ctx = container_of(tunnel->tb, struct tb_test_dprx, tb);
+
+	ctx->completions++;
+	complete(&ctx->worker_passed);
+}
+
+static void tb_test_dp_dprx_deferred_first(struct kunit *test)
+{
+	static const struct tb_nhi_ops ops = {
+		.dp_tunnel_awaits_display = tb_test_dprx_awaits_display,
+	};
+	struct tb_test_dprx_gate gate = { .nhi.ops = &ops, .deferred = true };
+	struct tb_test_dprx *ctx;
+	struct tb_switch *host, *dev;
+	struct tb_tunnel *tunnel;
+	struct tb *tb;
+
+	ctx = kunit_kzalloc(test, sizeof(*ctx), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, ctx);
+	ctx->test = test;
+	tb = &ctx->tb;
+	tb->nhi = &gate.nhi;
+	host = alloc_host(test);
+	KUNIT_ASSERT_NOT_NULL(test, host);
+	dev = alloc_dev_default(test, host, 0x1, true);
+	KUNIT_ASSERT_NOT_NULL(test, dev);
+	tunnel = tb_tunnel_alloc_dp(tb, &host->ports[5], &dev->ports[13],
+				    1, 0, 0, tb_test_dprx_finished);
+	KUNIT_ASSERT_NOT_NULL(test, tunnel);
+	tb->wq = alloc_ordered_workqueue("tb-dprx-gate-test", 0);
+	if (!tb->wq) {
+		tb_tunnel_put(tunnel);
+		KUNIT_FAIL(test, "failed to allocate DPRX workqueue");
+		return;
+	}
+	device_initialize(&tb->dev);
+	tb->dev.release = tb_test_dprx_release;
+	mutex_init(&tb->lock);
+	init_completion(&ctx->worker_passed);
+	gate.worker_passed = &ctx->worker_passed;
+	mutex_lock(&tb->lock);
+	kref_get(&tunnel->kref);
+	tb_domain_get(tb);
+	tunnel->dprx_started = true;
+	tunnel->dprx_timeout = ktime_sub_ms(ktime_get(), 30000);
+	queue_delayed_work(tb->wq, &tunnel->dprx_work, 0);
+	mutex_unlock(&tb->lock);
+	if (!wait_for_completion_timeout(&ctx->worker_passed, 5 * HZ)) {
+		KUNIT_FAIL(test, "DPRX worker did not reach deferred gate");
+		goto out;
+	}
+	mutex_lock(&tb->lock);
+	KUNIT_EXPECT_EQ(test, ctx->completions, 0U);
+	KUNIT_EXPECT_TRUE(test, tunnel->dprx_started);
+	KUNIT_EXPECT_TRUE(test, ktime_after(tunnel->dprx_timeout, ktime_get()));
+	KUNIT_EXPECT_EQ(test, kref_read(&tunnel->kref), 2U);
+	gate.deferred = false;
+	host->generation = 3;
+	reinit_completion(&ctx->worker_passed);
+	mod_delayed_work(tb->wq, &tunnel->dprx_work, 0);
+	mutex_unlock(&tb->lock);
+	if (!wait_for_completion_timeout(&ctx->worker_passed, 5 * HZ)) {
+		KUNIT_FAIL(test, "released DPRX worker did not finish");
+		goto out;
+	}
+	/* Completion precedes 7.2's final tunnel/domain puts. Drain before inspection. */
+	flush_workqueue(tb->wq);
+	mutex_lock(&tb->lock);
+	KUNIT_EXPECT_EQ(test, ctx->completions, 1U);
+	KUNIT_EXPECT_EQ(test, kref_read(&tunnel->kref), 1U);
+	KUNIT_EXPECT_EQ(test, kref_read(&tb->dev.kobj.kref), 1U);
+	mutex_unlock(&tb->lock);
+out:
+	mutex_lock(&tb->lock);
+	tb_dp_tunnel_cancel_dprx(tunnel);
+	mutex_unlock(&tb->lock);
+	flush_workqueue(tb->wq);
+	destroy_workqueue(tb->wq);
+	tb_tunnel_put(tunnel);
+	put_device(&tb->dev);
+	mutex_destroy(&tb->lock);
+}
+
 static struct kunit_case tb_test_cases[] = {
+	KUNIT_CASE(tb_test_dp_dprx_deferred_first),
 	KUNIT_CASE(tb_test_dp_dprx_cancel),
 	KUNIT_CASE(tb_test_dp_dprx_cancel_running),
 	KUNIT_CASE(tb_test_property_parse_u32_wrap),
