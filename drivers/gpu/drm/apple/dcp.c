@@ -977,12 +977,93 @@ int dcp_get_connector_type(struct platform_device *pdev)
 #define DPTX_RECONNECT_RETRIES 5
 
 /*
+ * The connection a DPTX connect or queued reconnect belongs to: the Type-C
+ * attachment generation and, for a Thunderbolt tunnel, the cookie of the
+ * binding DCP admitted (zero for direct DP-alt and HDMI).
+ */
+static struct dcp_fabric_session dcp_session_locked(struct apple_dcp *dcp)
+{
+	struct dcp_fabric_session session = { .generation = dcp->typec_generation };
+
+	lockdep_assert_held(&dcp->hpd_mutex);
+	scoped_guard(mutex, &dcp->tb_lock)
+		session.cookie = dcp->tb_generation;
+	return session;
+}
+
+/* This tree has no tb_retiring: a route follow is the retiring handoff. */
+static bool dcp_session_valid_locked(struct apple_dcp *dcp,
+				     struct dcp_fabric_session session, bool cable)
+{
+	return dcp_fabric_session_valid(session, dcp_session_locked(dcp),
+					!cable || dcp->typec_cable_connected,
+					READ_ONCE(dcp->typec_follow_retiring));
+}
+
+/*
+ * Recovery must not wake a deliberately parked or disabled output. Without
+ * a @session (H17P) nothing is checked.
+ */
+static bool dcp_connect_session_valid_locked(struct apple_dcp *dcp,
+					    const struct dcp_fabric_session *session,
+					    bool cable, bool recovery)
+{
+	lockdep_assert_held(&dcp->hpd_mutex);
+	if (!session)
+		return true;
+	return (!recovery || (dcp->typec_work_enabled &&
+			     !READ_ONCE(dcp->typec_crtc_off) &&
+			     !READ_ONCE(dcp->crashed))) &&
+	       dcp_session_valid_locked(dcp, *session, cable);
+}
+
+static bool dcp_connect_session_valid(struct apple_dcp *dcp,
+				      const struct dcp_fabric_session *session,
+				      bool cable, bool recovery)
+{
+	if (!session)
+		return true;
+	guard(mutex)(&dcp->hpd_mutex);
+	return dcp_connect_session_valid_locked(dcp, session, cable, recovery);
+}
+
+/* H17P (J700, T8140, T8142) connects and reconnects as before, without one. */
+static bool dcp_typec_sessionless(struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_H17P || dcp_is_external_h17p(dcp);
+}
+
+/* Capture the session at enqueue, not when a stale worker eventually runs. */
+static void dcp_queue_typec_reconnect_locked(struct apple_dcp *dcp,
+					     unsigned long delay)
+{
+	lockdep_assert_held(&dcp->hpd_mutex);
+	/* H17P keeps its cable-checked reconnect. */
+	if (!dcp_typec_sessionless(dcp)) {
+		if (!dcp->typec_cable_connected)
+			return;
+		dcp->typec_reconnect_session = dcp_session_locked(dcp);
+	}
+	mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq, delay);
+}
+
+void dcp_queue_typec_reconnect(struct apple_dcp *dcp, unsigned long delay)
+{
+	guard(mutex)(&dcp->hpd_mutex);
+	dcp_queue_typec_reconnect_locked(dcp, delay);
+}
+
+/*
  * Connect DPTX port @port. On failure, @retryable (if given) tells whether
  * the attempt left nothing outstanding in the firmware, so that a later
  * connection may simply try again: the service was not published yet, or a
  * link that never came up was withdrawn and the firmware acknowledged that.
+ * With a @session, every step checks that it is still the live one, and a
+ * revoked session returns -ESTALE without touching the new one's state.
  */
-static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable)
+static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable,
+				const struct dcp_fabric_session *session, bool cable,
+				bool recovery)
 {
 	/* T8122 dcpext: HPD only after the link wait, see dcp_ext_dptx_607() */
 	bool late_hpd = dcp_ext_dptx_607(dcp);
@@ -1010,6 +1091,10 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		dcp->connector_type, dcp->dptxport[port].connected);
 
 	mutex_lock(&dcp->hpd_mutex);
+	if (!dcp_connect_session_valid_locked(dcp, session, cable, recovery)) {
+		ret = -ESTALE;
+		goto out_unlock;
+	}
 	if (dcp->external && dcpext_scanout_terminal(dcp)) {
 		mutex_unlock(&dcp->hpd_mutex);
 		return -ESHUTDOWN;
@@ -1047,6 +1132,10 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		}
 	}
 
+	if (!dcp_connect_session_valid_locked(dcp, session, cable, recovery)) {
+		ret = -ESTALE;
+		goto out_unlock;
+	}
 	ret = dptxport_connect(dcp->dptxport[port].service,
 			       dfp_port,
 			       dcp->dptx_phy, dcp->dptx_die,
@@ -1058,11 +1147,19 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		goto out_unlock;
 	}
 
+	if (!dcp_connect_session_valid_locked(dcp, session, cable, recovery)) {
+		ret = -ESTALE;
+		goto out_unlock;
+	}
 	ret = dptxport_request_display(dcp->dptxport[port].service);
 	if (ret) {
 		dev_err(dcp->dev,
 			"dcp_dptx_connect: failed to request display: %d\n",
 			ret);
+		goto out_release;
+	}
+	if (!dcp_connect_session_valid_locked(dcp, session, cable, recovery)) {
+		ret = -ESTALE;
 		goto out_release;
 	}
 	dcp->dptxport[port].connected = true;
@@ -1095,6 +1192,9 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		  DPTX_TUNNEL_CONNECT_TIMEOUT : DPTX_CONNECT_TIMEOUT;
 	ret = wait_for_completion_timeout(&dcp->dptxport[port].linkcfg_completion,
 					  timeout);
+	/* A revoked wait must not disconnect or publish readiness for a new session. */
+	if (!dcp_connect_session_valid(dcp, session, cable, recovery))
+		return -ESTALE;
 	if (!ret && late_hpd) {
 		/* Without HPD this firmware does not train: assert it now. */
 		dev_dbg(dcp->dev,
@@ -1123,6 +1223,8 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		if (ret && (dcp->external || late_hpd))
 			goto out_withdraw;
 	}
+	if (!dcp_connect_session_valid(dcp, session, cable, recovery))
+		return -ESTALE;
 	if (dcp->external) {
 		/*
 		 * The port must still have its display: a Type-C cable, or HPD
@@ -1223,7 +1325,7 @@ static int dcp_external_link_locked(struct apple_dcp *dcp)
 		return dcp->external_error;
 	if (!dcp->external_cable)
 		return -ENODEV;
-	ret = dcp_dptx_connect_raw(dcp, 0, &retryable);
+	ret = dcp_dptx_connect_raw(dcp, 0, &retryable, NULL, false, false);
 	if (ret && !retryable)
 		dcp->external_error = ret;
 	return ret;
@@ -1312,8 +1414,7 @@ void dcp_external_ready(struct apple_dcp *dcp)
 	if (READ_ONCE(dcp->typec_cable_connected)) {
 		guard(mutex)(&dcp->hpd_mutex);
 		dcp->typec_reconnect_tries = 0;
-		if (dcp->typec_cable_connected)
-			mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq, 0);
+		dcp_queue_typec_reconnect_locked(dcp, 0);
 	} else if (dcp->hdmi_hpd && dcp->active &&
 		   gpiod_get_value_cansleep(dcp->hdmi_hpd)) {
 		int ret = dcp_dptx_connect(dcp, 0);
@@ -1448,8 +1549,7 @@ void dcp_external_retry_work(struct work_struct *work)
 		dcp->typec_reconnect_tries = 0;
 	}
 	guard(mutex)(&dcp->hpd_mutex);
-	if (dcp->typec_cable_connected)
-		mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq, 0);
+	dcp_queue_typec_reconnect_locked(dcp, 0);
 }
 
 /*
@@ -1494,7 +1594,7 @@ static int dcp_dptx_connect_tile(struct apple_dcp *dcp)
 
 	scoped_guard(mutex, &dcp->tb_lock)
 		split = dcp->split.active && dcp->split.ready &&
-			dcp->split.set_active;
+			dcp->split.generation;
 	if (!split)
 		return 0;
 	ret = dcp_dptx_connect(dcp, 1);
@@ -1505,10 +1605,19 @@ static int dcp_dptx_connect_tile(struct apple_dcp *dcp)
 
 int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 {
+	struct dcp_fabric_session session = {};
 	int ret;
 
 	if (!dcp_is_external_h17p(dcp)) {
-		ret = dcp_dptx_connect_raw(dcp, port, NULL);
+		if (dcp_typec_sessionless(dcp)) {
+			ret = dcp_dptx_connect_raw(dcp, port, NULL, NULL, false, false);
+		} else {
+			scoped_guard(mutex, &dcp->hpd_mutex)
+				session = dcp_session_locked(dcp);
+			/* A tunnel's connection also needs its cable; DP-alt/HDMI do not. */
+			ret = dcp_dptx_connect_raw(dcp, port, NULL, &session,
+						   !!session.cookie, false);
+		}
 		if (!ret && !port)
 			ret = dcp_dptx_connect_tile(dcp);
 		return ret;
@@ -1775,6 +1884,7 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
 	struct apple_dcp *dcp =
 		container_of(to_delayed_work(work), struct apple_dcp,
 			     typec_reconnect_wq);
+	struct dcp_fabric_session session;
 	int ret;
 
 	/* A route following its CRTC hands the link over itself. */
@@ -1783,7 +1893,23 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
 	    READ_ONCE(dcp->typec_follow_retiring))
 		return;
 
-	ret = dcp_dptx_connect(dcp, 0);
+	if (dcp_typec_sessionless(dcp)) {
+		ret = dcp_dptx_connect(dcp, 0);
+	} else {
+		/* Only the session this work was queued for may connect. */
+		scoped_guard(mutex, &dcp->hpd_mutex) {
+			session = dcp->typec_reconnect_session;
+			if (!dcp_session_valid_locked(dcp, session, true))
+				return;
+		}
+		ret = dcp_dptx_connect_raw(dcp, 0, NULL, &session, true, false);
+		if (!ret)
+			ret = dcp_dptx_connect_tile(dcp);
+		scoped_guard(mutex, &dcp->hpd_mutex) {
+			if (!dcp_session_valid_locked(dcp, session, true))
+				return;
+		}
+	}
 	if (!ret) {
 		dcp->typec_reconnect_tries = 0;
 		return;
@@ -2060,8 +2186,7 @@ int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 
 	ret = dcp_dptx_connect(dcp, port);
 	if (ret && ret != -ESHUTDOWN && dcp_is_typec_output(dcp))
-		mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq,
-				 DPTX_RECONNECT_DELAY);
+		dcp_queue_typec_reconnect(dcp, DPTX_RECONNECT_DELAY);
 
 	return ret;
 }
@@ -2106,12 +2231,15 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 
 /*
  * A delivered sink IRQ can follow a firmware unplug with cable HPD still high.
- * This tree has no fabric session: the route is revoked by a typec_generation
- * bump, and recovery is refused unless the Type-C work is enabled, the cable
- * is routed and no follow handoff is retiring the attachment.
+ * Recovery is refused unless the Type-C work is enabled, the cable is routed
+ * and no follow handoff is retiring the attachment; the session it revokes
+ * older waits with is rechecked at every step.
  */
 int dcp_dptx_recover_irq(struct apple_dcp *dcp)
 {
+	struct dcp_fabric_session session;
+	const struct dcp_fabric_session *checked =
+		dcp_typec_sessionless(dcp) ? NULL : &session;
 	int ret;
 
 	mutex_lock(&dcp->hpd_mutex);
@@ -2131,9 +2259,17 @@ int dcp_dptx_recover_irq(struct apple_dcp *dcp)
 		ret = -EAGAIN;
 		goto out_unlock;
 	}
+	if (checked)
+		session = dcp_session_locked(dcp);
+	if (!dcp_connect_session_valid_locked(dcp, checked, true, true)) {
+		ret = -ESTALE;
+		goto out_unlock;
+	}
 
 	/* Revoke older reconnect waits without changing physical cable state. */
 	dcp->typec_generation++;
+	if (checked)
+		session = dcp_session_locked(dcp);
 	cancel_delayed_work(&dcp->typec_reconnect_wq);
 	cancel_delayed_work(&dcp->placeholder_edid_wq);
 	if (dcp->avep)
@@ -2141,15 +2277,23 @@ int dcp_dptx_recover_irq(struct apple_dcp *dcp)
 	ret = dptxport_set_hpd(dcp->dptxport[0].service, false);
 	if (ret)
 		goto out_unlock;
+	if (!dcp_connect_session_valid_locked(dcp, checked, true, true)) {
+		ret = -ESTALE;
+		goto out_unlock;
+	}
 	/* A failed earlier connect may also have left an unconfirmed release. */
 	ret = dptxport_release_display(dcp->dptxport[0].service);
 	if (ret)
 		goto out_unlock;
+	if (!dcp_connect_session_valid_locked(dcp, checked, true, true)) {
+		ret = -ESTALE;
+		goto out_unlock;
+	}
 	dcp->dptxport[0].connected = false;
 	mutex_unlock(&dcp->hpd_mutex);
 
 	/* Another delivered IRQ must confirm release before a failed attempt retries. */
-	return dcp_dptx_connect_raw(dcp, 0, NULL);
+	return dcp_dptx_connect_raw(dcp, 0, NULL, checked, true, true);
 
 out_unlock:
 	mutex_unlock(&dcp->hpd_mutex);
@@ -2558,9 +2702,7 @@ void dcp_poweron(struct platform_device *pdev)
 			WRITE_ONCE(dcp->typec_poweron_hpd, true);
 			ret = dcp_dptx_connect(dcp, 0);
 			if (ret)
-				mod_delayed_work(system_freezable_wq,
-						 &dcp->typec_reconnect_wq,
-						 DPTX_RECONNECT_DELAY);
+				dcp_queue_typec_reconnect(dcp, DPTX_RECONNECT_DELAY);
 			else if (wait_for_typec_hpd) {
 				remaining = wait_for_completion_timeout(
 					&dcp->typec_iomfb_hpd_ready,
@@ -3326,7 +3468,7 @@ VISIBLE_IF_KUNIT void dcp_enable_typec_work(struct apple_dcp *dcp)
 		dcp->typec_work_enabled = true;
 	/* A cable can be routed before the DRM component binds. */
 	if (READ_ONCE(dcp->typec_cable_connected))
-		mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq, 0);
+		dcp_queue_typec_reconnect(dcp, 0);
 	if (dcp_is_external_h17p(dcp)) {
 		struct apple_connector *con = READ_ONCE(dcp->connector);
 

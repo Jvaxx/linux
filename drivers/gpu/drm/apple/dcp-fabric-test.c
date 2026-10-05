@@ -8,6 +8,7 @@
 
 #include "dcp-fabric-core.h"
 #include "dcp-fabric-effects.h"
+#include "dcp-fabric-session.h"
 
 struct fabric_fixture {
 	struct dcp_fabric_pipeline pipeline[2];
@@ -2002,12 +2003,150 @@ static void fabric_t6030_follow_test(struct kunit *test)
 					      NULL, NULL, false, &f.policy), DCP_FABRIC_FOLLOW_MOVE);
 }
 
+static void fabric_binding_cookie_test(struct kunit *test)
+{
+	/* First admission may callback before attach returns/owner is published. */
+	KUNIT_EXPECT_EQ(test, dcp_fabric_binding_request(0, 11, true, false), 0);
+	KUNIT_EXPECT_TRUE(test, dcp_fabric_callback_valid(11, 11));
+	KUNIT_EXPECT_EQ(test, dcp_fabric_binding_request(11, 11, true, true), 1);
+	KUNIT_EXPECT_EQ(test, dcp_fabric_binding_request(11, 11, true, false), -ESTALE);
+	KUNIT_EXPECT_EQ(test, dcp_fabric_binding_request(11, 12, true, true), -ESTALE);
+	KUNIT_EXPECT_EQ(test, dcp_fabric_binding_request(11, 10, false, true), -ESTALE);
+	KUNIT_EXPECT_EQ(test, dcp_fabric_binding_request(11, 11, false, false), 0);
+	KUNIT_EXPECT_EQ(test, dcp_fabric_binding_request(0, 11, false, true), -ESTALE);
+	KUNIT_EXPECT_EQ(test, dcp_fabric_binding_request(0, 0, true, true), -EINVAL);
+	KUNIT_EXPECT_FALSE(test, dcp_fabric_callback_valid(11, 0));
+	KUNIT_EXPECT_FALSE(test, dcp_fabric_callback_valid(12, 11));
+	/* Complete drain removes the lease; a reloaded TB allocator may start at 1. */
+	KUNIT_EXPECT_EQ(test, dcp_fabric_binding_request(0, 1, true, false), 0);
+}
+
+static void fabric_reconnect_session_test(struct kunit *test)
+{
+	struct dcp_fabric_session queued = { .generation = 7, .cookie = 11 };
+	struct dcp_fabric_session live_session = queued;
+
+	KUNIT_EXPECT_TRUE(test, dcp_fabric_session_valid(queued, live_session, true, false));
+	KUNIT_EXPECT_FALSE(test, dcp_fabric_session_valid(queued, live_session, false, false));
+	KUNIT_EXPECT_FALSE(test, dcp_fabric_session_valid(queued, live_session, true, true));
+	live_session.generation++;
+	KUNIT_EXPECT_FALSE(test, dcp_fabric_session_valid(queued, live_session, true, false));
+	live_session = queued;
+	live_session.cookie++;
+	KUNIT_EXPECT_FALSE(test, dcp_fabric_session_valid(queued, live_session, true, false));
+	live_session.cookie = 0;
+	KUNIT_EXPECT_FALSE(test, dcp_fabric_session_valid(queued, live_session, true, false));
+	/* Retained sleep keeps the TB cookie but invalidates the DCP connection. */
+	live_session = queued;
+	live_session.generation++;
+	queued = live_session;
+	KUNIT_EXPECT_TRUE(test, dcp_fabric_session_valid(queued, live_session, true, false));
+	/* Direct DP-alt uses cookie zero; local generation still guards queued work. */
+	queued.cookie = 0;
+	live_session.cookie = 0;
+	KUNIT_EXPECT_TRUE(test, dcp_fabric_session_valid(queued, live_session, true, false));
+	live_session.generation++;
+	KUNIT_EXPECT_FALSE(test, dcp_fabric_session_valid(queued, live_session, true, false));
+}
+
+struct fabric_drain_fake {
+	struct kunit *test;
+	unsigned int step;
+	u64 lease;
+	u64 admitted;
+	bool fabric_locked;
+	bool reserved;
+	bool cable;
+	bool work_running;
+};
+
+static void fabric_drain_reserve(void *data)
+{
+	struct fabric_drain_fake *f = data;
+
+	KUNIT_EXPECT_EQ(f->test, f->step++, 0U);
+	KUNIT_EXPECT_TRUE(f->test, f->fabric_locked);
+	f->reserved = true;
+	f->admitted = 0;
+}
+
+static void fabric_drain_invalidate(void *data)
+{
+	struct fabric_drain_fake *f = data;
+
+	KUNIT_EXPECT_EQ(f->test, f->step++, 1U);
+	KUNIT_EXPECT_FALSE(f->test, dcp_fabric_callback_valid(f->lease, f->admitted));
+	f->cable = false;
+}
+
+static void fabric_drain_unlock(void *data)
+{
+	struct fabric_drain_fake *f = data;
+
+	KUNIT_EXPECT_EQ(f->test, f->step++, 2U);
+	f->fabric_locked = false;
+}
+
+static void fabric_drain_wait(void *data)
+{
+	struct fabric_drain_fake *f = data;
+
+	KUNIT_EXPECT_EQ(f->test, f->step++, 3U);
+	KUNIT_EXPECT_FALSE(f->test, f->fabric_locked);
+	KUNIT_EXPECT_TRUE(f->test, f->reserved);
+	KUNIT_EXPECT_EQ(f->test, f->lease, 11ULL);
+	KUNIT_EXPECT_FALSE(f->test, f->cable);
+	KUNIT_EXPECT_TRUE(f->test, f->work_running);
+	f->work_running = false;
+}
+
+static void fabric_drain_lock(void *data)
+{
+	struct fabric_drain_fake *f = data;
+
+	KUNIT_EXPECT_EQ(f->test, f->step++, 4U);
+	KUNIT_EXPECT_FALSE(f->test, f->work_running);
+	f->fabric_locked = true;
+}
+
+static void fabric_binding_drain_test(struct kunit *test)
+{
+	static const struct dcp_fabric_drain_ops ops = {
+		.reserve_revoke = fabric_drain_reserve,
+		.invalidate = fabric_drain_invalidate,
+		.unlock = fabric_drain_unlock,
+		.drain = fabric_drain_wait,
+		.lock = fabric_drain_lock,
+	};
+	unsigned int i;
+
+	/* The shared executor drives both failed-attach and detach drain paths. */
+	for (i = 0; i < 2; i++) {
+		struct fabric_drain_fake f = {
+			.test = test, .lease = 11, .admitted = 11,
+			.fabric_locked = true, .cable = true, .work_running = true,
+		};
+
+		dcp_fabric_drain_binding(&ops, &f);
+		KUNIT_EXPECT_EQ(test, f.step, 5U);
+		KUNIT_EXPECT_FALSE(test, f.work_running);
+		KUNIT_EXPECT_TRUE(test, f.fabric_locked);
+		/* Only now may the caller release its lease/reservation and return. */
+		f.lease = 0;
+		f.reserved = false;
+		KUNIT_EXPECT_EQ(test, dcp_fabric_binding_request(f.lease, 1, true, false), 0);
+	}
+}
+
 static struct kunit_case fabric_tests[] = {
 	KUNIT_CASE(fabric_t6030_clock_routes_test),
 	KUNIT_CASE(fabric_t6030_plan_test),
 	KUNIT_CASE(fabric_t6030_follow_test),
 	KUNIT_CASE(fabric_reclaim_transaction_test),
 	KUNIT_CASE_PARAM(fabric_shared_wiring_test, fabric_wiring_gen_params),
+	KUNIT_CASE(fabric_binding_cookie_test),
+	KUNIT_CASE(fabric_reconnect_session_test),
+	KUNIT_CASE(fabric_binding_drain_test),
 	KUNIT_CASE(fabric_rebind_presence_test),
 	KUNIT_CASE(fabric_nonhybrid_hdmi_resume_test),
 	KUNIT_CASE(fabric_resume_no_connect_test),
