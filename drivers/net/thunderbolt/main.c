@@ -420,6 +420,12 @@ static void tbnet_tear_down(struct tbnet *net, bool send_logout)
 		/* A poll may still own a completed frame or partial packet. */
 		tbnet_disable_napi(net);
 
+		/* Free any partially assembled packet; its fragments are
+		 * page pool pages that must go back before buffer teardown.
+		 */
+		dev_kfree_skb_any(net->skb);
+		net->skb = NULL;
+
 		tb_ring_stop(net->rx_ring.ring);
 		tb_ring_stop(net->tx_ring.ring);
 		net->rings_started = false;
