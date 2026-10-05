@@ -542,7 +542,7 @@ static int dptxport_call_set_link_rate(struct apple_epic_service *service,
 		 */
 		if (dptx->atcphy && service->ep->dcp->dptx_tunnel) {
 			ret = dcp_tunnel_set_rate(service->ep->dcp, dptx->atcphy,
-						 link_rate);
+						 dptx->unit, link_rate);
 			/* T6030 14.7: refuse a rate whose tunnel clock failed. */
 			if (ret && service->ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7) {
 				reply->retcode = cpu_to_le32(1);
@@ -635,7 +635,7 @@ dptxport_call_activate(struct apple_epic_service *service,
 	if (dptx->atcphy && !dcp->phy_managed_by_typec)
 		phy_set_mode_ext(dptx->atcphy, PHY_MODE_DP, dcp->index);
 	if (dcp->dptx_tunnel) {
-		ret = dcp_tunnel_dpin_activate(dcp, true);
+		ret = dcp_tunnel_dpin_activate(dcp, dptx->unit, true);
 		/* T6030 14.7: report a failed tunnel activation to DCP. */
 		if (ret && dcp->fw_compat == DCP_FIRMWARE_V_14_7) {
 			dev_err(dcp->dev, "DPTX tunnel activation failed: %d\n", ret);
@@ -665,7 +665,7 @@ dptxport_call_deactivate(struct apple_epic_service *service,
 	dcp_180hz_invalidate(dcp);
 	dev_dbg(dcp->dev, "DPTXPort: DEACTIVATE\n");
 	if (dcp->dptx_tunnel)
-		dcp_tunnel_dpin_activate(dcp, false);
+		dcp_tunnel_dpin_activate(dcp, dptx->unit, false);
 	else
 		dcp_direct_crossbar_link(dcp, false);
 	if (dptx->atcphy && !dcp->phy_managed_by_typec)
@@ -733,7 +733,7 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 	case DPTX_APCALL_WILL_CHANGE_LINKG_CONFIG:
 		/* A re-link takes an established tunnel's crossbar down first. */
 		if (service->ep->dcp->dptx_tunnel && dptx->link_rate)
-			dcp_tunnel_crossbar_down(service->ep->dcp);
+			dcp_tunnel_crossbar_down(service->ep->dcp, dptx->unit);
 		else if (dptx->link_rate)
 			dcp_direct_crossbar_link(service->ep->dcp, false);
 		return dptxport_call_will_change_link_config(service);
@@ -741,7 +741,7 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 		int ret = dptxport_call_did_change_link_config(service);
 
 		if (!ret && service->ep->dcp->dptx_tunnel && dptx->link_rate) {
-			int xret = dcp_tunnel_crossbar_up(service->ep->dcp);
+			int xret = dcp_tunnel_crossbar_up(service->ep->dcp, dptx->unit);
 
 			/* T6030 14.7: fail the link config without a crossbar. */
 			if (service->ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7)
