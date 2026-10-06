@@ -359,6 +359,8 @@ static int dcp_v14_map_piodma(struct apple_dcp_v14 *v14, u32 id)
 #define DCP_V14_DESC_ALL	(DCP_V14_DESC_TIMING | DCP_V14_DESC_COLOR | DCP_V14_DESC_ATTRS)
 /* How long a mode set waits for a description being (re)published. */
 #define DCP_V14_DESC_TIMEOUT_MS	3000
+/* A withdrawn description that is not back by then gets its link redone. */
+#define DCP_V14_DESC_RELINK_MS	2000
 
 /* An external processor's default stride; no framebuffer is allocated for it. */
 #define DCP_V14_EXT_STRIDE	(1920 * 4)
@@ -488,6 +490,15 @@ static void dcp_v14_external_published(struct apple_dcp_v14 *v14, const char *ke
 	if (!strcmp(key, "TimingElements")) {
 		if (removed) {
 			dcp_v14_external_hotplug(dcp, false);
+			/*
+			 * An HPD bounce withdraws the description, and the
+			 * firmware describes the display again once its link is
+			 * back. If that does not happen while the port still
+			 * holds the display, redo the link.
+			 */
+			if (READ_ONCE(dcp->typec_cable_connected) && !READ_ONCE(dcp->typec_crtc_off))
+				dcp_external_retry(dcp, "display withdrawn while its port has HPD",
+						   0, DCP_V14_DESC_RELINK_MS);
 			return;
 		}
 		ret = parse(raw->data, raw->size, &ctx);
@@ -1399,8 +1410,10 @@ static void dcpext_cancel(void *data)
 	struct apple_dcp *dcp = data;
 
 	cancel_work_sync(&dcp->external_work);
-	if (dcp->external_native)
+	if (dcp->external_native) {
 		cancel_work_sync(&dcp->external_ready_work);
+		cancel_delayed_work_sync(&dcp->external_retry_wq);
+	}
 }
 
 /* The manual diagnostic path: memory checks, then an explicit start. */
@@ -1448,9 +1461,13 @@ int iomfb_v14_7_external_prepare(struct apple_dcp *dcp)
 	int ret;
 
 	atomic_set(&dcp->external_requested, 0);
+	atomic_set(&dcp->external_retries, 0);
 	WRITE_ONCE(dcp->external_phase, DCPEXT_IDLE);
 	INIT_WORK(&dcp->external_work, dcpext_bringup);
 	INIT_WORK(&dcp->external_ready_work, dcpext_ready_work);
+	INIT_DELAYED_WORK(&dcp->external_retry_wq, dcp_external_retry_work);
+	/* Component bind enables it, once a connector can be retrained. */
+	disable_delayed_work(&dcp->external_retry_wq);
 	ret = devm_add_action_or_reset(dev, dcpext_cancel, dcp);
 	if (ret)
 		return ret;
@@ -1523,6 +1540,12 @@ bool iomfb_v14_7_external_busy(struct apple_dcp *dcp)
 	default:
 		return false;
 	}
+}
+
+bool iomfb_v14_7_external_failed(struct apple_dcp *dcp)
+{
+	return smp_load_acquire(&dcp->external_phase) == DCPEXT_FAILED ||
+	       (dcp->v14 && READ_ONCE(dcp->v14->failed));
 }
 
 /* Refuse startup unless both the hardware floor and PMP vote are in place. */
@@ -1843,8 +1866,10 @@ void iomfb_v14_7_remove(struct apple_dcp *dcp)
 	/* Bring-up creates the external session; a late start must not. */
 	if (dcp->external)
 		disable_work_sync(&dcp->external_work);
-	if (dcp->external_native)
+	if (dcp->external_native) {
 		disable_work_sync(&dcp->external_ready_work);
+		disable_delayed_work_sync(&dcp->external_retry_wq);
+	}
 	v14 = dcp->v14;
 	if (!v14)
 		return;
@@ -2290,8 +2315,12 @@ static int dcp_v14_external_modeset(struct apple_dcp *dcp, struct drm_crtc_state
 out:
 	dev_info(dcp->dev, "display mode " DRM_MODE_FMT " (timing %u, color %u): %d\n",
 		 DRM_MODE_ARG(&crtc_state->mode), mode.timing_mode_id, mode.color_mode_id, ret);
-	if (ret)
+	if (ret) {
+		/* A mode that is gone, or a description that never settled. */
+		dcp_external_retry(dcp, "display mode not set", ret, 500);
 		return ret;
+	}
+	atomic_set(&dcp->external_retries, 0);
 	scoped_guard(spinlock_irqsave, &dcp->mode_state.lock)
 		dcp->mode_state.valid = true;
 	return 0;
