@@ -702,13 +702,15 @@ static const struct of_device_id apple_dcp_id_tbl[] = {
 
 /*
  * A supported firmware-described external provider participates in component
- * matching. The T6030 external processor runs a separate session and never
- * joins this DRM device.
+ * matching. A T6030 external display processor is a pipe of this DRM device
+ * once the display gate gave it its display DART; on the manual diagnostic
+ * path it runs a separate session and never joins this DRM device.
  */
 static bool apple_dcp_usable(struct device_node *np)
 {
 	return of_device_is_available(np) &&
-	       !of_device_is_compatible(np, "apple,t6030-dcpext") &&
+	       (!of_device_is_compatible(np, "apple,t6030-dcpext") ||
+		dcp_t6030_ext_native(np)) &&
 	       (!of_device_is_compatible(np, "apple,t8140-dcpext") ||
 		dcp_h17p_external_supported(np));
 }

@@ -957,6 +957,9 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		dev_warn(dcp->dev, "dcp_dptx_connect: missing phy\n");
 		return -ENODEV;
 	}
+	/* A native external processor starts here; its start retries this. */
+	if (dcp->external_native && !iomfb_v14_7_external_ready(dcp))
+		return -EAGAIN;
 	/* @port selects the upstream RemotePort service/core. dptx_dfp_port
 	 * is the downstream address: dpphy=0, dpin0=1, dpin1=2.
 	 */
@@ -1035,6 +1038,15 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 	}
 
 	mutex_unlock(&dcp->hpd_mutex);
+	/*
+	 * The display interface of a native external processor opens once a
+	 * display is attached; the firmware then describes that display.
+	 */
+	if (dcp->external_native) {
+		ret = iomfb_v14_7_external_open(dcp);
+		if (ret)
+			goto out_withdraw;
+	}
 	timeout = dcp_uses_t6020_tunnel_flow(dcp) ?
 		  DPTX_TUNNEL_CONNECT_TIMEOUT : DPTX_CONNECT_TIMEOUT;
 	ret = wait_for_completion_timeout(&dcp->dptxport[port].linkcfg_completion,
@@ -1190,6 +1202,65 @@ static int dcp_external_start_locked(struct apple_dcp *dcp)
 	WRITE_ONCE(dcp->typec_crtc_off, false);
 	iomfb_pause_presentation(dcp, false);
 	return 0;
+}
+
+/*
+ * A T6030 external processor runs as a pipe of the main DRM device when the
+ * display gate handed it its display DART: a piodma child on stream 4 of
+ * that DART, and stream 0 among the display subsystem's iommus, so that
+ * framebuffers are mapped for it as for the panel.
+ */
+bool dcp_t6030_ext_native(const struct device_node *np)
+{
+	struct of_phandle_args dart, args;
+	struct device_node *piodma, *display;
+	bool native = false;
+	u32 marker;
+	int i, n;
+
+	if (!of_device_is_compatible(np, "apple,t6030-dcpext"))
+		return false;
+	piodma = of_get_child_by_name(np, "piodma");
+	if (!piodma || !of_device_is_available(piodma) ||
+	    of_property_read_u32(piodma, "apple,t6030-dispext-handoff", &marker) ||
+	    marker != 1 ||
+	    of_parse_phandle_with_args(piodma, "iommus", "#iommu-cells", 0, &dart)) {
+		of_node_put(piodma);
+		return false;
+	}
+	of_node_put(piodma);
+	if (dart.args_count != 1 || dart.args[0] != 4 || !of_device_is_available(dart.np))
+		goto out;
+	display = of_find_compatible_node(NULL, NULL, "apple,t6030-display-subsystem");
+	n = display && of_device_is_available(display) ?
+		of_count_phandle_with_args(display, "iommus", "#iommu-cells") : 0;
+	for (i = 0; i < n && !native; i++) {
+		if (of_parse_phandle_with_args(display, "iommus", "#iommu-cells", i, &args))
+			break;
+		native = args.np == dart.np && args.args_count == 1 && !args.args[0];
+		of_node_put(args.np);
+	}
+	of_node_put(display);
+out:
+	of_node_put(dart.np);
+	return native;
+}
+
+/*
+ * A native external processor is running, or has announced a DPTX port:
+ * connect the display that is already waiting for it.
+ */
+void dcp_external_ready(struct apple_dcp *dcp)
+{
+	if (READ_ONCE(dcp->typec_cable_connected)) {
+		guard(mutex)(&dcp->hpd_mutex);
+		dcp->typec_reconnect_tries = 0;
+		if (dcp->typec_cable_connected)
+			mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq, 0);
+	} else if (dcp->hdmi_hpd && dcp->active &&
+		   gpiod_get_value_cansleep(dcp->hdmi_hpd)) {
+		dcp_dptx_connect(dcp, 0);
+	}
 }
 
 int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
@@ -1681,6 +1752,9 @@ int dcp_start(struct platform_device *pdev)
 	 */
 	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7) {
 		if (dcp->external) {
+			/* A native pipe is usable now; its firmware starts on first use. */
+			if (dcp->external_native)
+				dcp->active = true;
 			complete(&dcp->start_done);
 			return 0;
 		}
@@ -2682,9 +2756,13 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	if (ret)
 		return ret;
 
-	dcp->coproc_reg = devm_platform_ioremap_resource_byname(to_platform_device(dev), "coproc");
-	if (IS_ERR(dcp->coproc_reg))
-		return PTR_ERR(dcp->coproc_reg);
+	/* A native external processor mapped these at probe, for its start work. */
+	if (!dcp->external_native) {
+		dcp->coproc_reg = devm_platform_ioremap_resource_byname(to_platform_device(dev),
+									"coproc");
+		if (IS_ERR(dcp->coproc_reg))
+			return PTR_ERR(dcp->coproc_reg);
+	}
 
 	/*
 	 * Display coprocessors running H17-generation firmware are left running
@@ -2749,6 +2827,13 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 
 	/* The running T6030 firmware is adopted as is. */
 	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7) {
+		if (dcp->external_native) {
+			enable_work(&dcp->vblank_wq);
+			enable_delayed_work(&dcp->swap_watchdog_wq);
+			enable_work(&dcp->dimensions_wq);
+			dcp_enable_typec_work(dcp);
+			return 0;
+		}
 		if (dcp->external)
 			return 0;
 		ret = iomfb_v14_7_bind(dcp);
@@ -2878,8 +2963,13 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 
 	disable_work_sync(&dcp->dimensions_wq);
 	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7) {
-		if (!dcp->external)
+		if (dcp->external_native) {
+			dcp_disable_typec_work(dcp, true);
+			disable_delayed_work_sync(&dcp->swap_watchdog_wq);
+			disable_work_sync(&dcp->vblank_wq);
+		} else if (!dcp->external) {
 			dcp_disable_typec_work(dcp, false);
+		}
 		iomfb_v14_7_unbind(dcp);
 		return;
 	}
@@ -3058,6 +3148,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 
 	dcp->fw_compat = fw_compat;
 	dcp->external = of_device_is_compatible(dev->of_node, "apple,t6030-dcpext");
+	dcp->external_native = dcp->external && dcp_t6030_ext_native(dev->of_node);
 	dcp->dev = dev;
 	/*
 	 * Type-C and Thunderbolt routes can be activated as soon as they are
@@ -3120,6 +3211,11 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	disable_delayed_work(&dcp->placeholder_edid_wq);
 	disable_delayed_work(&dcp->announce_wq);
 	dcp->announce.stopped = true;
+	if (dcp->external_native) {
+		/* Bind enables these; firmware callbacks may come before it. */
+		disable_work(&dcp->vblank_wq);
+		disable_delayed_work(&dcp->swap_watchdog_wq);
+	}
 
 	platform_set_drvdata(pdev, dcp);
 
@@ -3270,12 +3366,14 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		return ret;
 
 	/*
-	 * The T6030 external processor is not part of the panel's DRM device.
-	 * Joining that component set would hold the internal screen until
-	 * dcpext binds. Its tunnel bring-up runs the Type-C reconnect work,
-	 * which component bind would otherwise enable.
+	 * The manual T6030 external path is not part of the panel's DRM
+	 * device. Joining that component set would hold the internal screen
+	 * until dcpext binds. Its tunnel bring-up runs the Type-C reconnect
+	 * work, which component bind would otherwise enable. A native external
+	 * processor joins it, and probe completes for it even when its handoff
+	 * is unusable, so that the panel is never held up.
 	 */
-	if (dcp->external) {
+	if (dcp->external && !dcp->external_native) {
 		enable_delayed_work(&dcp->typec_reconnect_wq);
 		return iomfb_v14_7_external_start(dcp);
 	}
@@ -3289,6 +3387,11 @@ static int dcp_platform_probe(struct platform_device *pdev)
 			return ret;
 		}
 		WRITE_ONCE(dcp->external_prepared, true);
+	}
+	if (dcp->external_native) {
+		ret = iomfb_v14_7_external_prepare(dcp);
+		if (ret)
+			return ret;
 	}
 
 	ret = component_add(&pdev->dev, &dcp_comp_ops);
@@ -3305,7 +3408,7 @@ static void dcp_platform_remove(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
-	if (dcp && dcp->external) {
+	if (dcp && dcp->external && !dcp->external_native) {
 		/* Enabled for the external start at probe. */
 		disable_delayed_work_sync(&dcp->typec_reconnect_wq);
 		iomfb_v14_7_remove(dcp);
@@ -3321,7 +3424,7 @@ VISIBLE_IF_KUNIT void dcp_platform_shutdown(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
-	if (dcp && dcp->external)
+	if (dcp && dcp->external && !dcp->external_native)
 		return;
 
 	if (dcp && dcp->retain_dma && dcp->hw.iomfb_method_profile ==
@@ -3431,6 +3534,22 @@ static void dcp_release_after_sleep(struct apple_dcp *dcp)
 	iomfb_pause_presentation(dcp, false);
 }
 
+/*
+ * Whether an external processor must keep the system awake. The manual path
+ * refuses sleep once its firmware was ever started. A native processor
+ * refuses only while it starts or drives a display: idle, its firmware stays
+ * powered across s2idle like the panel's (the gate holds its CPU domain at
+ * the active floor) and the next attach reconnects through it.
+ */
+static bool dcp_external_sleep_vetoed(struct apple_dcp *dcp)
+{
+	if (dcp->external_native)
+		return iomfb_v14_7_external_busy(dcp);
+	return atomic_read(&dcp->external_requested) ||
+	       (dcp->rtk && apple_rtkit_is_running(dcp->rtk)) ||
+	       dcpext_scanout_requested(dcp);
+}
+
 /* dpm_prepare completes for every device before any dpm_suspend callback.
  * Veto early so Thunderbolt cannot tear down a working tunnel first. The
  * same HPD lock serializes this gate against explicit firmware startup.
@@ -3442,11 +3561,12 @@ static int dcp_platform_prepare(struct device *dev)
 	if (!dcp->external)
 		return 0;
 	mutex_lock(&dcp->hpd_mutex);
-	if (atomic_read(&dcp->external_requested) ||
-	    (dcp->rtk && apple_rtkit_is_running(dcp->rtk)) ||
-	    dcpext_scanout_requested(dcp)) {
+	if (dcp_external_sleep_vetoed(dcp)) {
 		mutex_unlock(&dcp->hpd_mutex);
-		dev_warn(dev, "external firmware/scanout attempted: refusing PM prepare; reboot required for retained DMA\n");
+		if (dcp->external_native)
+			dev_warn(dev, "external display attached or starting: refusing system sleep\n");
+		else
+			dev_warn(dev, "external firmware/scanout attempted: refusing PM prepare; reboot required for retained DMA\n");
 		return -EBUSY;
 	}
 	WRITE_ONCE(dcp->external_suspended, true);
@@ -3475,11 +3595,12 @@ static int dcp_platform_suspend(struct device *dev)
 	 */
 	if (dcp->external) {
 		mutex_lock(&dcp->hpd_mutex);
-		if (atomic_read(&dcp->external_requested) ||
-		    (dcp->rtk && apple_rtkit_is_running(dcp->rtk)) ||
-		    dcpext_scanout_requested(dcp)) {
+		if (dcp_external_sleep_vetoed(dcp)) {
 			mutex_unlock(&dcp->hpd_mutex);
-			dev_warn(dev, "external firmware/scanout attempted: suspend refused; retained DMA requires reboot\n");
+			if (dcp->external_native)
+				dev_warn(dev, "external display attached or starting: suspend refused\n");
+			else
+				dev_warn(dev, "external firmware/scanout attempted: suspend refused; retained DMA requires reboot\n");
 			return -EBUSY;
 		}
 		WRITE_ONCE(dcp->external_suspended, true);

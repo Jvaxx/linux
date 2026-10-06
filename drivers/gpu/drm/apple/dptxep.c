@@ -865,6 +865,9 @@ static void dptxport_init(struct apple_epic_service *service, const char *name,
 
 	dptx_service_publish(service);
 	complete(&port->enable_completion);
+	/* A connect that found no port yet is retried from process context. */
+	if (service->ep->dcp->external_native)
+		schedule_work(&service->ep->dcp->external_ready_work);
 	/* Publication may follow the startup wait or the bounded retry window. */
 	if (service->ep->dcp->hw.iomfb_method_profile ==
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL &&

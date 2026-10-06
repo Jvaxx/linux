@@ -68,6 +68,8 @@ void dcp_update_connector_dimensions(struct apple_dcp *dcp,
 void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message);
 
 int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port);
+bool dcp_t6030_ext_native(const struct device_node *np);
+void dcp_external_ready(struct apple_dcp *dcp);
 int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port);
 bool dcp_hold_resume_event(struct platform_device *pdev);
 
