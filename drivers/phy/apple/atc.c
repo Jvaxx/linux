@@ -685,6 +685,8 @@ struct atcphy_hw {
  * @dp_spread_spectrum: J700 main-link spread-spectrum state
  * @dp_presets: Firmware-derived per-rate drive presets
  * @dp_presets_valid: Firmware supplied each drive-preset table
+ * @dp_only: A DisplayPort-only instance without a USB side, such as the PHY
+ *           behind the T6030 HDMI port; it maps only its core window
  * @fixed_usb2: The USB2 pairs go to a fixed hub on the USB controller, which
  *              stays in host mode; the PHY provides USB2 from probe on
  * @typec_mode: Mode the Type-C mux last asked for; a fixed-hub port returns to
@@ -765,6 +767,7 @@ struct apple_atcphy {
 	bool dp_spread_spectrum;
 	u32 dp_presets[5][16];
 	bool dp_presets_valid[5];
+	bool dp_only;
 	bool fixed_usb2;
 	enum atcphy_mode typec_mode;
 	bool host_active;
@@ -2338,7 +2341,8 @@ static int atcphy_power_on(struct apple_atcphy *atcphy)
 	u32 reg;
 	int ret;
 
-	atcphy_usb2_power_on(atcphy);
+	if (!atcphy->dp_only)
+		atcphy_usb2_power_on(atcphy);
 
 	core_set32(atcphy, ATCPHY_MISC, ATCPHY_MISC_RESET_N);
 
@@ -3802,16 +3806,21 @@ EXPORT_SYMBOL_GPL(apple_atc_dp_tunnel_open);
 static struct phy *atcphy_xlate(struct device *dev, const struct of_phandle_args *args)
 {
 	struct apple_atcphy *atcphy = dev_get_drvdata(dev);
+	struct phy *phy = NULL;
 
 	switch (args->args[0]) {
 	case PHY_TYPE_USB2:
-		return atcphy->phys.usb2;
+		phy = atcphy->phys.usb2;
+		break;
 	case PHY_TYPE_USB3:
-		return atcphy->phys.usb3;
+		phy = atcphy->phys.usb3;
+		break;
 	case PHY_TYPE_DP:
-		return atcphy->phys.dp;
+		phy = atcphy->phys.dp;
+		break;
 	}
-	return ERR_PTR(-ENODEV);
+	/* a DisplayPort-only instance has no USB PHYs */
+	return phy ?: ERR_PTR(-ENODEV);
 }
 
 static int atcphy_probe_phy(struct apple_atcphy *atcphy)
@@ -3826,6 +3835,8 @@ static int atcphy_probe_phy(struct apple_atcphy *atcphy)
 	};
 
 	for (int i = 0; i < ARRAY_SIZE(phys); i++) {
+		if (atcphy->dp_only && phys[i].phy != &atcphy->phys.dp)
+			continue;
 		*phys[i].phy = devm_phy_create(atcphy->dev, NULL, phys[i].ops);
 		if (IS_ERR(*phys[i].phy))
 			return PTR_ERR(*phys[i].phy);
@@ -4338,6 +4349,10 @@ static bool atcphy_mux_is_noop(const struct apple_atcphy *atcphy, enum atcphy_mo
 /* Whether the PHY can run @mode at all, which needs no lane or PIPE work to tell */
 static int atcphy_mux_check(const struct apple_atcphy *atcphy, enum atcphy_mode mode)
 {
+	if (atcphy->dp_only && mode != APPLE_ATCPHY_MODE_OFF &&
+	    mode != APPLE_ATCPHY_MODE_DP)
+		return -EOPNOTSUPP;
+
 	switch (mode) {
 	case APPLE_ATCPHY_MODE_TBT:
 	case APPLE_ATCPHY_MODE_USB4:
@@ -4678,6 +4693,15 @@ static int atcphy_load_tunables(struct apple_atcphy *atcphy)
 			*tunables[i].tunable = NULL;
 			continue;
 		}
+		/* a DisplayPort-only instance has no USB lanes and maybe no axi2af window */
+		if (atcphy->dp_only && (!tunables[i].res ||
+		    tunables[i].tunable == &atcphy->tunables.lane_usb3[0] ||
+		    tunables[i].tunable == &atcphy->tunables.lane_usb3[1] ||
+		    tunables[i].tunable == &atcphy->tunables.lane_usb4[0] ||
+		    tunables[i].tunable == &atcphy->tunables.lane_usb4[1])) {
+			*tunables[i].tunable = NULL;
+			continue;
+		}
 
 		tunable = devm_apple_tunable_parse(atcphy->dev, atcphy->np, tunables[i].dt_name,
 						   tunables[i].res);
@@ -4690,7 +4714,8 @@ static int atcphy_load_tunables(struct apple_atcphy *atcphy)
 			continue;
 		}
 		if (IS_ERR(tunable)) {
-			if (PTR_ERR(tunable) != -ENOENT || !atcphy->hw->optional_tunables) {
+			if (PTR_ERR(tunable) != -ENOENT ||
+			    !(atcphy->hw->optional_tunables || atcphy->dp_only)) {
 				dev_err(atcphy->dev, "Failed to read tunable %s: %ld\n",
 					tunables[i].dt_name, PTR_ERR(tunable));
 				return PTR_ERR(tunable);
@@ -4723,7 +4748,9 @@ static int atcphy_load_tunables(struct apple_atcphy *atcphy)
 	}
 
 	atcphy->ss_tunables = !ss_missing;
-	if (ss_missing)
+	if (ss_missing && atcphy->dp_only)
+		dev_warn(atcphy->dev, "Calibration tunables missing, DisplayPort disabled\n");
+	else if (ss_missing)
 		dev_warn(atcphy->dev, "SuperSpeed tunables missing, USB2 only\n");
 
 	return 0;
@@ -4745,8 +4772,20 @@ static int atcphy_map_resources(struct platform_device *pdev, struct apple_atcph
 	struct resource *res;
 	void __iomem *addr;
 
+	/*
+	 * A T8122 generation PHY described without the USB2 PHY and PIPE
+	 * windows is DisplayPort-only, like the one behind the T6030 HDMI port.
+	 * Only its core window is required then.
+	 */
+	if (atcphy->hw->dp_t8122 &&
+	    !platform_get_resource_byname(pdev, IORESOURCE_MEM, "usb2phy") &&
+	    !platform_get_resource_byname(pdev, IORESOURCE_MEM, "pipehandler"))
+		atcphy->dp_only = true;
+
 	for (int i = 0; i < ARRAY_SIZE(resources); i++) {
 		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, resources[i].name);
+		if (!res && atcphy->dp_only && i)
+			continue;
 		addr = devm_ioremap_resource(&pdev->dev, res);
 		if (IS_ERR(addr))
 			return dev_err_probe(atcphy->dev, PTR_ERR(addr),
@@ -4790,11 +4829,40 @@ static bool atcphy_usb2_behind_fixed_hub(struct apple_atcphy *atcphy)
 	return hub;
 }
 
+/*
+ * A DisplayPort-only instance has no USB controller to reset and no PIPE: put
+ * the PHY in its off state and register the mux, switch and DP PHY.
+ */
+static int atcphy_probe_finalize_dp_only(struct apple_atcphy *atcphy)
+{
+	int ret;
+
+	lockdep_assert_held(&atcphy->lock);
+
+	atcphy_power_off(atcphy);
+
+	ret = atcphy_probe_mux(atcphy);
+	if (ret)
+		return dev_err_probe(atcphy->dev, ret, "Probing mux failed");
+	ret = atcphy_probe_switch(atcphy);
+	if (ret)
+		return dev_err_probe(atcphy->dev, ret, "Probing switch failed");
+	ret = atcphy_probe_phy(atcphy);
+	if (ret)
+		return dev_err_probe(atcphy->dev, ret, "Probing phy failed");
+
+	dev_info(atcphy->dev, "DisplayPort-only PHY\n");
+	return 0;
+}
+
 static int atcphy_probe_finalize(struct apple_atcphy *atcphy)
 {
 	int ret;
 
 	guard(mutex)(&atcphy->lock);
+
+	if (atcphy->dp_only)
+		return atcphy_probe_finalize_dp_only(atcphy);
 
 	/* Reset dwc3 on probe, let dwc3 (consumer) deassert it */
 	_atcphy_dwc3_reset_assert(atcphy);
