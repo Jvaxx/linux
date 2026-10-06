@@ -605,7 +605,7 @@ static struct apple_atcphy *atcphy_test_alloc_failed_handoff(struct kunit *test)
 
 	/* The running host has to acknowledge the PIPE lock */
 	scoped_guard(mutex, &atcphy->lock)
-		KUNIT_EXPECT_EQ(test, atcphy_park_pipehandler(atcphy), -ETIMEDOUT);
+		KUNIT_EXPECT_EQ(test, atcphy_park_pipehandler(atcphy, false), -ETIMEDOUT);
 	KUNIT_EXPECT_EQ(test, atcphy->pipe_state, ATCPHY_PIPEHANDLER_STATE_USB3);
 	KUNIT_EXPECT_TRUE(test, atcphy->pipe_pending);
 
