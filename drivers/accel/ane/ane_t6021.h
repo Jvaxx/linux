@@ -735,6 +735,7 @@ void ane_t6021_csne_ping_attempt(struct ane_t6021 *ane);
  * the staging half of the boot sequence: it provides the fw DVA that
  * the RVBAR fold uses; ane_t6021_boot.c consumes the staged surface.
  */
+int ane_t6021_fwload_check(struct device *dev);
 int ane_t6021_fwload_probe(struct ane_t6021 *ane);
 void ane_t6021_fwload_remove(struct ane_t6021 *ane);
 bool ane_t6021_fwload_options_ok(void);
