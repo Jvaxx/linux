@@ -10,6 +10,15 @@ struct apple_dcp_v14;
 struct drm_atomic_commit;
 struct drm_crtc;
 struct drm_crtc_state;
+struct device_node;
+
+/*
+ * Bounded DMA-region translation from drivers/of/address.c (42d7be2c9500,
+ * bucket 900-config-tooling, which owns include/linux/of_address.h).
+ */
+const __be32 *of_translate_dma_region_checked(struct device_node *dev,
+					      const __be32 *addr, size_t cells,
+					      phys_addr_t *start, size_t *length);
 
 /* Platform probe: firmware identity, boot loader handoff, PMP acknowledgment. */
 int iomfb_v14_7_probe(struct apple_dcp *dcp);
