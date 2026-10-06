@@ -1604,9 +1604,11 @@ int dcp_attributes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *handle,
 	 * Written once, so the hotplug work never sees a working display
 	 * without its backlight; a display whose attributes do not parse
 	 * gets none. The attributes can arrive after the hotplug work has
-	 * run, so sync the backlight when the answer changes.
+	 * run, so sync the backlight when the answer changes. 14.7 swaps
+	 * carry no external backlight level.
 	 */
-	ext = !ret && backlight_control && !dcp_has_panel(dcp);
+	ext = !ret && backlight_control && !dcp_has_panel(dcp) &&
+	      dcp->fw_compat != DCP_FIRMWARE_V_14_7;
 	if (ext != READ_ONCE(dcp->ext_backlight)) {
 		WRITE_ONCE(dcp->ext_backlight, ext);
 		if (dcp->connector)
