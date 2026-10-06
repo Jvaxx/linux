@@ -22,7 +22,6 @@ use kernel::{
         DmaMask, //
     },
     io::{
-        io_project,
         Io,
         IoBase,
         IoSysMap,
@@ -52,7 +51,7 @@ use kernel::{
     types::ForeignOwnable, //
 };
 
-const PMP_MMIO_SIZE: usize = 0x80000;
+const PMP_MIN_MMIO_SIZE: usize = 0x80000;
 const ASC_MMIO_SIZE: usize = 0x4000;
 const BOOTARGS_OFFSET: usize = 0x22c;
 const BOOTARGS_SIZE: usize = 0x230;
@@ -153,23 +152,25 @@ impl PmpData {
     }
     fn patch_bootargs(
         &self,
-        pmp_mmio: &Mmio<'_, Region<PMP_MMIO_SIZE>>,
+        pmp_mmio: &Mmio<'_, Region<PMP_MIN_MMIO_SIZE>>,
         patches: &[(u32, u32)],
     ) -> Result<()> {
         let io = pmp_mmio.as_view().relaxed();
         let offset = io.read32(BOOTARGS_OFFSET) as usize;
         let size = io.read32(BOOTARGS_SIZE) as usize;
-        if !pmp_bootargs::region_valid(offset, size, PMP_MMIO_SIZE) {
+        if !pmp_bootargs::region_valid(offset, size, io.size()) {
             return Err(EINVAL);
         }
         let mut arg_bytes = kvec![0u8; size]?;
-        let pmp_io_array: Mmio<'_, [u8; PMP_MMIO_SIZE]> = pmp_mmio.try_cast()?;
-        let bootargs = io_project!(pmp_io_array, [try: offset .. offset+size]);
-        bootargs.copy_to_slice(&mut arg_bytes);
+        for (idx, byte) in arg_bytes.iter_mut().enumerate() {
+            *byte = io.try_read8(offset + idx)?;
+        }
         if !pmp_bootargs::patch(&mut arg_bytes, patches) {
             return Err(EINVAL);
         }
-        bootargs.copy_from_slice(&arg_bytes);
+        for (idx, byte) in arg_bytes.iter().enumerate() {
+            io.try_write8(*byte, offset + idx)?;
+        }
         Ok(())
     }
     fn get_iova_table(&self) -> Result<u64> {
@@ -434,7 +435,7 @@ impl platform::Driver for PmpDriver {
             unsafe { pdev.dma_set_mask_and_coherent(mask)? };
         }
         let pmp_req = pdev.io_request_by_name(c"pmp").ok_or(EINVAL)?;
-        let pmp_mmio = pmp_req.iomap_sized::<PMP_MMIO_SIZE>()?;
+        let pmp_mmio = pmp_req.iomap_sized::<PMP_MIN_MMIO_SIZE>()?;
         let pmp_mmio = pmp_mmio.as_view();
         let asc_req = pdev.io_request_by_name(c"asc").ok_or(EINVAL)?;
         let asc_mmio = asc_req.iomap_sized::<ASC_MMIO_SIZE>()?;
