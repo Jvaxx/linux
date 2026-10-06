@@ -884,6 +884,35 @@ static int cd321x_dp_sid_replay(struct cd321x *cd321x,
 	return cd321x_typec_update_mode(&cd321x->tps, &edge, display_busy, held);
 }
 
+/*
+ * SN201202x: the display route in use is about to go (unplug, a new partner,
+ * or the partner leaving DP). Tell it HPD is low first, while the PHY still
+ * runs the link, so that the display is released and its link taken down
+ * before the PHY stops. The update that follows moves the PHY.
+ */
+static int cd321x_dp_release_first(struct cd321x *cd321x, bool *held)
+{
+	struct typec_displayport_data dp_data;
+	struct typec_mux_state state;
+	int ret;
+
+	if (!cd321x_uses_dp_sid(&cd321x->tps) || !cd321x->display_route_active ||
+	    !cd321x->state_valid || cd321x->state.alt != cd321x->port_altmode_dp ||
+	    !(cd321x->dp_status & DP_STATUS_HPD_STATE))
+		return 0;
+	dp_data.status = cd321x->dp_status & ~(DP_STATUS_HPD_STATE | DP_STATUS_IRQ_HPD);
+	dp_data.conf = cd321x->dp_conf;
+	state = cd321x->state;
+	state.data = &dp_data;
+	ret = typec_mux_set(cd321x->mux, &state);
+	*held = cd321x_mux_held(cd321x, ret);
+	if (ret)
+		dev_warn(cd321x->tps.dev, "display not released before the port changes: %d\n", ret);
+	else
+		cd321x->dp_status = dp_data.status;
+	return ret;
+}
+
 static void cd321x_retry_revalidation(struct cd321x *cd321x, bool reconnect)
 {
 	lockdep_assert_held(&cd321x->tps.lock);
@@ -1048,6 +1077,14 @@ static void cd321x_update_work(struct work_struct *work)
 		dp.changed |= CD321X_DATA_STATUS_HPD_LEVEL;
 	if (dp_hpd && cd321x_uses_dp_sid(tps))
 		dp.irq_hpd |= st.dp_sid_irq;
+
+	/* The display goes before anything else on the port changes. */
+	if (dp_route_was_active &&
+	    (!new_connected || was_disconnected || !dp_connected || dp_mode_changed)) {
+		ret = cd321x_dp_release_first(cd321x, &held);
+		if (ret)
+			goto retry;
+	}
 
 	/*
 	 * Report the sink as gone before any hardware transition that can fail:
