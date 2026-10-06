@@ -589,17 +589,16 @@ out:
 	return result;
 }
 
-/* Time to let the output writes land after the completion signal.
- * On some boots the fw ack, the TD counter and the TQ words all report
- * done ~0.13 ms before the output reaches DRAM (the output then reads
- * as zeros). The finish event arrives at the same time for short
- * programs. No signal for "output landed" is known, so the wait is a
- * fixed margin of about 8x the lag.
+/*
+ * Extra sleep after a CALL's finish event. 0 by default: the finish event
+ * already marks the output in DRAM (ane_rtclient_call_wait). The 1 ms
+ * default it replaces dated from a wait on dispatch signals; set it only
+ * to test a suspected late output write.
  */
-static unsigned int call_settle_us = 1000;
+static unsigned int call_settle_us;
 module_param(call_settle_us, uint, 0644);
 MODULE_PARM_DESC(call_settle_us,
-		 "Microseconds to wait after a CALL completes so its output lands (default 1000, 0 = none)");
+		 "Microseconds to sleep after a CALL's finish event (default 0: the event marks the output in DRAM)");
 
 /* trace_td: a read-only timeline of each CALL for performance work. Off
  * by default; switch it at runtime with
@@ -862,15 +861,12 @@ static int ane_rtclient_call_wait_traced(struct ane_rtclient *ane,
 	return ret;
 }
 
-/* Completion wait for one PROCEDURE_CALL: the finish event on IO_T2H
- * (channel 6). The ack, the eight TQ status words and the last-committed
- * TD word (TM +0x20458: the call's nid in bits 23:16 and the index of the
- * last task taken in bits 15:0) all report done once the last task has
- * been dispatched, not when it has run: a 20-task program can show its
- * last task index 0.22 ms after the ack but post its finish event 3.5 ms
- * after it, and a caller that returns at the first signal reads an
- * all-zero output. Returns 0 when the event
- * arrived, -ETIMEDOUT else.
+/*
+ * Wait for the PROCEDURE_CALL finish event on IO_T2H channel 6.
+ * Acknowledgment, TQ status and the last-committed TD word indicate
+ * dispatch rather than execution completion. The finish event marks
+ * completion and output visibility, so no extra settle delay is needed.
+ * Return zero on the event, or -ETIMEDOUT.
  */
 static int ane_rtclient_call_wait(struct ane_rtclient *ane,
 				  unsigned int timeout_ms)
@@ -955,8 +951,9 @@ static int ane_rtclient_command(struct ane_rtclient *ane,
 						   stats_ticket,
 						   ktime_get_ns(),
 						   (u32)ret, 0);
-			dev_info(ane->dev, "call completion wait failed %d\n",
-				 ret);
+			dev_err(ane->dev,
+				"call completion wait failed %d: no finish event in %u ms\n",
+				ret, timeout_ms);
 			atomic_set(&ane_t6021_quarantined, 1);
 			return ret;
 		}
