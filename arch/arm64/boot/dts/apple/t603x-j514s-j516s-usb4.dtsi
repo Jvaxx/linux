@@ -21,3 +21,25 @@
 	};
 };
 
+&typec1 {
+	ports {
+		port@3 {
+			reg = <3>;
+			typec1_dcpext: endpoint {
+				remote-endpoint = <&dcpext_typec1>;
+			};
+		};
+	};
+};
+
+&typec2 {
+	ports {
+		port@3 {
+			reg = <3>;
+			typec2_dcpext: endpoint {
+				remote-endpoint = <&dcpext_typec2>;
+			};
+		};
+	};
+};
+
