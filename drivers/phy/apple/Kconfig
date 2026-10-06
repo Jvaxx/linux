@@ -26,6 +26,9 @@ config PHY_APPLE_ATC_KUNIT_TEST
 	  SuperSpeed port off while its PIPE moves. The tests need no
 	  hardware and run when the driver is loaded.
 
+	  Also check tunnel qualification, T8122 link rates, drive presets
+	  and lane mapping using fixtures without PHY hardware.
+
 	  If unsure, say N.
 
 config PHY_APPLE_DPTX
