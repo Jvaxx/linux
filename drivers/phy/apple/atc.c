@@ -639,6 +639,7 @@ struct apple_atcphy;
  * @optional_tunables: The bootloader may leave out the common-a tunables (this
  *                     generation has none) and the SuperSpeed tunables; USB2
  *                     still works without the latter
+ * @dp_t8122: DisplayPort runs the T8122 AUX, AUSPLL and lane sequences
  */
 struct atcphy_hw {
 	void (*configure_post_tunable)(struct apple_atcphy *, enum atcphy_mode);
@@ -651,6 +652,7 @@ struct atcphy_hw {
 	bool has_usb2phy_reg;
 	bool optional_tunables;
 	bool has_t8140_dp;
+	bool dp_t8122;
 };
 
 /**
@@ -706,6 +708,12 @@ struct atcphy_hw {
  * @tunnel_rate: DP link rate code the t8103 tunnel pixel clock is set up for
  * @tunnel_users: T602X DP IN adapters (BIT(dpin)) whose tunnel pixel clock runs
  * @tunnel_dpin_rate: DP link rate code each T602X DP IN adapter's clock runs at
+ * @dp_t8122: DisplayPort state of a T8122 generation PHY
+ * @dp_t8122.aux: The AUX channel block is powered
+ * @dp_t8122.pll: The AUSPLL runs for the DisplayPort main link
+ * @dp_t8122.pairs: Lane pairs (bit mask) whose DisplayPort transmitters run
+ * @dp_t8122.rate: Main link rate in Mb/s per lane, 0 while stopped
+ * @pipe_state: Backend the PIPE mux ("pipehandler") is routed to
  * @regs: Memory-mapped registers
  * @regs.core: Core registers
  * @regs.axi2af: AXI to Apple Fabric interface registers
@@ -776,6 +784,13 @@ struct apple_atcphy {
 	u8 tunnel_rate;
 	u8 tunnel_users;
 	u8 tunnel_dpin_rate[2];
+
+	struct {
+		bool aux;
+		bool pll;
+		u8 pairs;
+		unsigned int rate;
+	} dp_t8122;
 
 	struct {
 		void __iomem *core;
@@ -1705,8 +1720,10 @@ static int atcphy_configure_lanes(struct apple_atcphy *atcphy, enum atcphy_mode 
 	else
 		core_clear32(atcphy, atcphy->hw->aciophy_crossbar, ACIOPHY_CROSSBAR_DP_BOTH_PMA);
 
-
-	/* unclear if we need the remainder for t8122 */
+	/*
+	 * The PMA FSM override below is for the T8103 generation. T8122 DP lanes
+	 * are started by the link rate sequence, see atcphy_dp_set_rate_t8122().
+	 */
 	if (atcphy->hw->gen == ATCPHY_GENERATION_T8122)
 		return 0;
 
@@ -1793,7 +1810,7 @@ static int atcphy_enable_dp_aux(struct apple_atcphy *atcphy)
 	if (atcphy->hw->has_t8140_dp)
 		return j700_aux_enable(atcphy);
 
-	/* FIXME */
+	/* T8122 PHYs with DP support enable AUX in atcphy_dp_aux_on_t8122() */
 	if (atcphy->hw->gen == ATCPHY_GENERATION_T8122)
 		return 0;
 
@@ -1856,7 +1873,7 @@ static int atcphy_disable_dp_aux(struct apple_atcphy *atcphy)
 		return ret ? ret : j700_aux_disable(atcphy);
 	}
 
-	/* FIXME */
+	/* T8122 PHYs with DP support stop AUX in atcphy_dp_stop_t8122() */
 	if (atcphy->hw->gen != ATCPHY_GENERATION_T8122) {
 		set32(atcphy->regs.lpdptx + LPDPTX_AUX_CONTROL, LPDPTX_AUX_PWN_DOWN);
 		set32(atcphy->regs.lpdptx + LPDPTX_AUX_CFG_BLK_AUX_CTRL, LPDPTX_BLK_AUX_CTRL_PWRDN);
@@ -2400,7 +2417,8 @@ static void atcphy_wake_common_t8122(struct apple_atcphy *atcphy)
 
 static void atcphy_configure_post_tunable_t8122(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 {
-	if (atcphy_modes[mode].pipehandler_state != ATCPHY_PIPEHANDLER_STATE_USB3)
+	if (atcphy_modes[mode].pipehandler_state != ATCPHY_PIPEHANDLER_STATE_USB3 &&
+	    !(atcphy->hw->dp_t8122 && atcphy_modes[mode].enable_dp_aux))
 		return;
 	atcphy_wake_common_t8122(atcphy);
 }
@@ -3040,6 +3058,193 @@ static int atc_tunnel_set_t602x(struct apple_atcphy *atcphy, unsigned int dpin,
 	return 0;
 }
 
+/* T6030 (M3 Pro): T8122-generation PHYs, only the DP IN0 route so far. */
+static bool apple_atc_tunnel_is_t6030(struct apple_atcphy *atcphy)
+{
+	return of_machine_is_compatible("apple,t6030") &&
+	       atcphy->hw->gen == ATCPHY_GENERATION_T8122;
+}
+
+/*
+ * DisplayPort on the T8122 generation. The AUX block sits in the core window
+ * and only comes up once the PHY reset is released and the common block has
+ * calibrated, so it is enabled at the end of atcphy_configure(). The main link
+ * runs from the AUSPLL: DCP sets the link rate through phy_configure(), which
+ * programs the PLL and starts the transmitters of the lane pairs the current
+ * mode gives to DisplayPort. The APB handshake is the one the tunnel clock
+ * above uses.
+ */
+#define T8122_APB_CMD(cmd, req)                                     \
+	(AUSPLL_APB_CMD_OVERRIDE_UNK28 |                             \
+	 FIELD_PREP(AUSPLL_APB_CMD_OVERRIDE_CMD, (cmd)) |            \
+	 ((req) ? AUSPLL_APB_CMD_OVERRIDE_REQ : 0))
+
+static void atcphy_dp_aux_on_t8122(struct apple_atcphy *atcphy)
+{
+	void __iomem *core = atcphy->regs.core;
+
+	lockdep_assert_held(&atcphy->lock);
+	atc_t8122_dp_aux_on(core);
+	atcphy->dp_t8122.aux = true;
+	if (atc_t8122_dp_aux_is_on(core))
+		dev_dbg(atcphy->dev, "DP AUX on (mode %d, swapped %d)\n", atcphy->mode,
+			atcphy->swap_lanes);
+	else
+		dev_warn(atcphy->dev, "DP AUX did not power up (ctrl=%08x pwr=%08x)\n",
+			 readl(core + ATC_T8122_AUX_CTRL), readl(core + ATC_T8122_AUX_PWR));
+}
+
+static int atcphy_dp_link_stop_t8122(struct apple_atcphy *atcphy)
+{
+	void __iomem *core = atcphy->regs.core;
+	u32 value;
+	int ret, err;
+
+	lockdep_assert_held(&atcphy->lock);
+	if (!atcphy->dp_t8122.pll && !atcphy->dp_t8122.pairs)
+		return 0;
+
+	atcphy->dp_t8122.rate = 0;
+	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DP_PMA_BYTECLK_RESET);
+	for (unsigned int pair = 0; pair < 2; pair++)
+		if (atcphy->dp_t8122.pairs & BIT(pair))
+			atc_t8122_dp_lane_stop(core, pair);
+	atcphy->dp_t8122.pairs = 0;
+	core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+		    DPTXPHY_PMA_LANE_RESET_N | DPTXPHY_PMA_LANE_RESET_N_OV,
+		    DPTXPHY_PMA_LANE_RESET_N_OV);
+
+	/* Power the PLL down: command 0, then command 3 with the request released */
+	ret = atc_t8122_tunnel_apb(atcphy, T8122_APB_CMD(0, true), true);
+	err = atc_t8122_tunnel_apb(atcphy, T8122_APB_CMD(3, false), false);
+	if (!ret)
+		ret = err;
+	err = readl_poll_timeout(core + T8122_DP_PCLK_STATUS, value,
+				 !(value & ACIOPHY_AUSPLL_LOCK), 1, 10000);
+	if (!ret)
+		ret = err;
+	core_clear32(atcphy, AUSPLL_CLKOUT_MASTER, T8122_AUSPLL_PCLK_DRIVER);
+	atcphy->dp_t8122.pll = false;
+	if (ret)
+		dev_err(atcphy->dev, "DP link shutdown incomplete: %d (PCLK_STAT=%08x)\n", ret,
+			readl(core + T8122_DP_PCLK_STATUS));
+	else
+		dev_dbg(atcphy->dev, "DP link stopped\n");
+	return ret;
+}
+
+static int atcphy_dp_link_start_t8122(struct apple_atcphy *atcphy,
+				      const struct atc_t8122_dp_rate *rate, u8 pairs)
+{
+	void __iomem *core = atcphy->regs.core;
+	u32 value;
+	int ret;
+
+	lockdep_assert_held(&atcphy->lock);
+
+	core_clear32(atcphy, T8122_AUSPLL_FREQ_CFG, AUSPLL_FREQ_REFCLK);
+	core_mask32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+		    DPTX_PCLK1_SELECT | DPTX_PCLK2_SELECT | DPRX_PCLK_SELECT,
+		    FIELD_PREP(DPTX_PCLK1_SELECT, 1) | FIELD_PREP(DPTX_PCLK2_SELECT, 1) |
+		    FIELD_PREP(DPRX_PCLK_SELECT, 1));
+	writel(rate->freq_desc[0], core + AUSPLL_FREQ_DESC_A);
+	writel(rate->freq_desc[1], core + AUSPLL_FREQ_DESC_B);
+	writel(rate->freq_desc[2], core + AUSPLL_FREQ_DESC_C);
+	core_mask32(atcphy, AUSPLL_CLKOUT_DIV, AUSPLL_CLKOUT_PLLA_REFBUFCLK_DI,
+		    FIELD_PREP(AUSPLL_CLKOUT_PLLA_REFBUFCLK_DI, 7));
+	core_set32(atcphy, T8122_AUSPLL_BGR, AUSPLL_BGR_CTRL_AVAIL);
+	core_set32(atcphy, AUSPLL_CLKOUT_MASTER, T8122_AUSPLL_PCLK_DRIVER);
+	atcphy->dp_t8122.pll = true;
+
+	ret = atc_t8122_tunnel_apb(atcphy, T8122_APB_CMD(0, true), true);
+	if (ret) {
+		dev_err(atcphy->dev, "DP PLL start was not acknowledged\n");
+		return ret;
+	}
+	ret = readl_poll_timeout(core + T8122_DP_PCLK_STATUS, value,
+				 value & ACIOPHY_AUSPLL_LOCK, 1, 10000);
+	if (ret) {
+		dev_err(atcphy->dev, "DP PLL did not lock at %u Mb/s (PCLK_STAT=%08x)\n",
+			rate->link_rate, value);
+		return ret;
+	}
+	ret = atc_t8122_tunnel_apb(atcphy, T8122_APB_CMD(0x2800, false), false);
+	if (ret) {
+		dev_err(atcphy->dev, "DP PLL release was not acknowledged\n");
+		return ret;
+	}
+
+	for (unsigned int pair = 0; pair < 2; pair++)
+		if (pairs & BIT(pair))
+			atc_t8122_dp_lane_pre_reset(core, pair);
+	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
+		   DPTXPHY_PMA_LANE_RESET_N | DPTXPHY_PMA_LANE_RESET_N_OV);
+	udelay(1);
+
+	atcphy->dp_t8122.pairs = pairs;
+	for (unsigned int pair = 0; pair < 2; pair++)
+		if (pairs & BIT(pair))
+			atc_t8122_dp_lane_start(core, pair, rate->div2);
+	core_clear32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DP_PMA_BYTECLK_RESET);
+
+	return 0;
+}
+
+static int atcphy_dp_set_rate_t8122(struct apple_atcphy *atcphy, unsigned int link_rate)
+{
+	const struct atcphy_mode_configuration *mode_cfg;
+	const struct atc_t8122_dp_rate *rate;
+	u8 pairs;
+	int ret;
+
+	lockdep_assert_held(&atcphy->lock);
+
+	if (!link_rate)
+		return atcphy_dp_link_stop_t8122(atcphy);
+
+	rate = atc_t8122_dp_rate(link_rate);
+	if (!rate) {
+		dev_err(atcphy->dev, "Unsupported link rate: %u\n", link_rate);
+		return -EINVAL;
+	}
+	if (!atcphy_modes[atcphy->mode].enable_dp_aux || !atcphy->dp_t8122.aux)
+		return -ENOLINK;
+	/* the AUSPLL is in use as the Thunderbolt DP tunnel pixel clock */
+	if (atcphy->tunnel_clock_on)
+		return -EBUSY;
+	if (atcphy->dp_t8122.rate == link_rate)
+		return 0;
+
+	mode_cfg = atcphy_get_mode_config(atcphy, atcphy->mode);
+	pairs = (mode_cfg->dp_lane[0] ? BIT(0) : 0) | (mode_cfg->dp_lane[1] ? BIT(1) : 0);
+
+	ret = atcphy_dp_link_stop_t8122(atcphy);
+	if (ret)
+		return ret;
+	ret = atcphy_dp_link_start_t8122(atcphy, rate, pairs);
+	if (ret) {
+		atcphy_dp_link_stop_t8122(atcphy);
+		return ret;
+	}
+	atcphy->dp_t8122.rate = link_rate;
+	dev_dbg(atcphy->dev, "DP link at %u Mb/s on lane pairs %#x (PCLK_STAT=%08x)\n",
+		link_rate, pairs, readl(atcphy->regs.core + T8122_DP_PCLK_STATUS));
+	return 0;
+}
+
+/* Stop the main link and the AUX channel ahead of a mode change */
+static void atcphy_dp_stop_t8122(struct apple_atcphy *atcphy)
+{
+	lockdep_assert_held(&atcphy->lock);
+
+	atcphy_dp_link_stop_t8122(atcphy);
+	if (atcphy->dp_t8122.aux) {
+		atc_t8122_dp_aux_off(atcphy->regs.core);
+		atcphy->dp_t8122.aux = false;
+		dev_dbg(atcphy->dev, "DP AUX off\n");
+	}
+}
+
 static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 {
 	int ret = 0;
@@ -3091,6 +3296,8 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 		atc_tunnel_stop_t8103(atcphy);
 	}
 	atc_tunnel_restore(atcphy);
+	if (atcphy->hw->dp_t8122)
+		atcphy_dp_stop_t8122(atcphy);
 
 	if (mode == APPLE_ATCPHY_MODE_OFF) {
 		if (atcphy->hw->has_t8140_dp && atcphy->fixed_usb2 &&
@@ -3169,7 +3376,8 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 	 */
 	if (atcphy->hw->gen == ATCPHY_GENERATION_T8122 &&
 	    (atcphy_modes[mode].pipehandler_state == ATCPHY_PIPEHANDLER_STATE_USB3 ||
-	     atcphy->hw->configure_post_tunable == atcphy_configure_post_tunable_all_modes)) {
+	     atcphy->hw->configure_post_tunable == atcphy_configure_post_tunable_all_modes ||
+	     (atcphy->hw->dp_t8122 && atcphy_modes[mode].enable_dp_aux))) {
 		ret = readl_poll_timeout(atcphy->regs.core + AUS_COMMON_DIG_RCAL1, reg,
 					 (reg & AUS_COMMON_DIG_RCAL1_ALL_CODES_DONE), 10, 100000);
 		if (ret) {
@@ -3180,6 +3388,10 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 
 	atcphy->mode = mode;
 	atcphy->mode_dirty = false;
+
+	/* T8122: the AUX block needs the PHY out of reset and calibrated */
+	if (atcphy->hw->dp_t8122 && atcphy_modes[mode].enable_dp_aux)
+		atcphy_dp_aux_on_t8122(atcphy);
 
 	return 0;
 }
@@ -3383,6 +3595,20 @@ static int atcphy_dpphy_validate(struct phy *phy, enum phy_mode mode, int submod
 	return 0;
 }
 
+static int atcphy_dpphy_configure_t8122(struct apple_atcphy *atcphy,
+					struct phy_configure_opts_dp *opts)
+{
+	guard(mutex)(&atcphy->lock);
+
+	if (opts->set_lanes)
+		return -EINVAL;
+	if (opts->set_rate)
+		return atcphy_dp_set_rate_t8122(atcphy, opts->link_rate);
+	if (opts->set_voltages)
+		return -EINVAL;
+	return 0;
+}
+
 static int atcphy_dpphy_configure(struct phy *phy, union phy_configure_opts *opts_)
 {
 	struct phy_configure_opts_dp *opts = &opts_->dp;
@@ -3391,6 +3617,9 @@ static int atcphy_dpphy_configure(struct phy *phy, union phy_configure_opts *opt
 
 	if (atcphy->hw->has_t8140_dp)
 		return j700_dp_configure(atcphy, opts);
+
+	if (atcphy->hw->dp_t8122)
+		return atcphy_dpphy_configure_t8122(atcphy, opts);
 
 	if (opts->set_voltages)
 		return -EINVAL;
@@ -3441,11 +3670,6 @@ static bool apple_atc_tunnel_is_t8103_style(void)
 	return of_machine_is_compatible("apple,t8103") || apple_atc_tunnel_is_t600x();
 }
 
-static bool apple_atc_tunnel_is_t6030(struct apple_atcphy *atcphy)
-{
-	return of_machine_is_compatible("apple,t6030") &&
-	       atcphy->hw->gen == ATCPHY_GENERATION_T8122;
-}
 
 int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 {
@@ -4650,6 +4874,7 @@ static const struct atcphy_hw atcphy_hw_t8122 = {
 	.pipe_mux_clk = PIPEHANDLER_MUX_CTRL_CLK_T8103,
 	.pipe_mux_data = PIPEHANDLER_MUX_CTRL_DATA_T8103,
 	.has_usb4 = true,
+	.dp_t8122 = true,
 };
 
 static const struct atcphy_hw atcphy_hw_t8140 = {
