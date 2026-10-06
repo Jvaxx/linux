@@ -723,6 +723,14 @@ EXPORT_SYMBOL_GPL(drm_gem_shmem_dumb_create);
 static pgoff_t drm_gem_shmem_object_offset(struct drm_gem_object *obj, pgoff_t pgoff)
 {
 	return pgoff - drm_vma_node_start(&obj->vma_node);
+/* GEM and PRIME add the object's fake offset; VMA splits retain it.
+ * Direct helper callers may instead supply an object-relative offset.
+ */
+static pgoff_t drm_gem_shmem_object_offset(struct drm_gem_object *obj, pgoff_t pgoff)
+{
+	pgoff_t base = drm_vma_node_start(&obj->vma_node);
+
+	return pgoff >= base ? pgoff - base : pgoff;
 }
 
 static void drm_gem_shmem_record_mkwrite(struct vm_fault *vmf)
@@ -763,7 +771,10 @@ static vm_fault_t try_insert_pfn(struct vm_fault *vmf, unsigned int order,
 	vm_fault_t ret = VM_FAULT_FALLBACK;
 
 	if (!order) {
-		ret = vmf_insert_pfn_mkwrite(vmf->vma, vmf->address, pfn, write);
+		struct vm_page_offset pos = vma_page_offset_at(vmf->vma, vmf->address);
+
+		ret = vmf_insert_pfn_prot_mkwrite_offset(vmf->vma, vmf->address,
+			pfn, pos.offset, vmf->vma->vm_page_prot, write);
 #ifdef CONFIG_ARCH_SUPPORTS_PMD_PFNMAP
 	} else if (order == PMD_ORDER) {
 		unsigned long paddr = pfn << PAGE_SHIFT;
@@ -800,7 +811,7 @@ static vm_fault_t drm_gem_shmem_any_fault(struct vm_fault *vmf, unsigned int ord
 	struct folio *folio;
 	unsigned long pfn;
 
-	if (order && order != PMD_ORDER)
+	if (order && (order != PMD_ORDER || mm_page_size(vma->vm_mm) != PAGE_SIZE))
 		return VM_FAULT_FALLBACK;
 
 	dma_resv_lock(obj->resv, NULL);
@@ -960,6 +971,16 @@ int drm_gem_shmem_mmap(struct drm_gem_shmem_object *shmem, struct vm_area_struct
 	if (shmem->reclaimable_cpu_mappings &&
 	    (!vma->vm_file || vma->vm_file->f_mapping != obj->dev->anon_inode->i_mapping))
 		return -EINVAL;
+	/* Validate bytes, including a partial native-page offset from PRIME. */
+	{
+		pgoff_t index = drm_gem_shmem_object_offset(obj, vma->vm_pgoff);
+		unsigned long offset, length = vma->vm_end - vma->vm_start;
+
+		if (check_mul_overflow(index, PAGE_SIZE, &offset) ||
+		    check_add_overflow(offset, (unsigned long)vma_subpage_offset(vma), &offset) ||
+		    offset > obj->size || length > obj->size - offset)
+			return -EINVAL;
+	}
 
 	dma_resv_lock(shmem->base.resv, NULL);
 	if (shmem->reclaimable_cpu_mappings) {
