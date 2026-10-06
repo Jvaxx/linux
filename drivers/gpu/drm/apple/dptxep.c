@@ -15,6 +15,7 @@
 
 #include "afk.h"
 #include "dcp.h"
+#include "dcp-hdmi.h"
 #include "dptxep.h"
 #include "dcp-180hz.h"
 #include "dptx-service.h"
@@ -742,6 +743,8 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 		} else if (!ret && dptx->link_rate) {
 			dcp_direct_crossbar_link(service->ep->dcp, true);
 		}
+		if (!ret)
+			dcp_hdmi_link_configured(service->ep->dcp, dptx->link_rate);
 		if (ret && service->ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7 &&
 		    service->ep->dcp->dptx_tunnel && reply_size >= sizeof(__le32)) {
 			put_unaligned_le32(1, reply);

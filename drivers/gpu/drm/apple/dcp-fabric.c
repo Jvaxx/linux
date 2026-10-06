@@ -21,6 +21,7 @@
 #include "dcp.h"
 #include "dcp-fabric.h"
 #include "dcp-fabric-effects.h"
+#include "dcp-hdmi.h"
 #include "dcpext_scanout.h"
 #include "ibootep.h"
 #include "dcp-internal.h"
@@ -2283,6 +2284,7 @@ static int dcp_fixed_output_select(struct apple_dcp *dcp)
  */
 irqreturn_t dcp_dp2hdmi_hpd_edge(int irq, void *data)
 {
+	dcp_hdmi_hpd_edge(data);
 	dcp_hdmi_edge(data);
 
 	return IRQ_WAKE_THREAD;

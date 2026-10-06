@@ -203,6 +203,7 @@ enum dcp_test_point {
 
 /* TODO: move IOMFB members to its own struct */
 struct dcpext_scanout;
+struct dcp_hdmi;
 
 struct apple_dcp {
 	/* An adopted session has no confirmed firmware DMA stop boundary. */
@@ -557,6 +558,8 @@ struct apple_dcp {
 	struct dcp_fabric_presence hdmi_presence;
 	struct delayed_work hdmi_settle_wq;
 	struct delayed_work hdmi_recheck_wq;
+	/* T6030 HDMI converter service requests, see dcp-hdmi.c */
+	struct dcp_hdmi *hdmi;
 };
 
 void dcp_firmware_metadata_connection(struct apple_dcp *dcp, u64 generation, bool connected);
