@@ -73,6 +73,7 @@ void dcp_external_ready(struct apple_dcp *dcp);
 void dcp_external_retry(struct apple_dcp *dcp, const char *why, int error,
 			unsigned int base_ms);
 void dcp_external_retry_work(struct work_struct *work);
+void dcp_external_sink_irq(struct apple_dcp *dcp);
 int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port);
 bool dcp_hold_resume_event(struct platform_device *pdev);
 
