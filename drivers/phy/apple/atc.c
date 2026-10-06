@@ -673,7 +673,7 @@ struct atcphy_hw {
  * @tunables.usb2phy_reg_dflt: Defaults for the secondary eUSB2 register bank
  * @hw: SoC-specific PHY description
  * @ss_tunables: The complete SuperSpeed tunable set was supplied
- * @dp_tunables: The complete T8140 DisplayPort bundle was supplied
+ * @dp_tunables: T8140 has its complete DP bundle, or T8122 its common calibration
  * @aux_power_requested: AUX power-up began and needs matching shutdown
  * @mode_dirty: Mode transition needs cleanup before it can be retried
  * @dp_idle_pmas: J700 PMAs with an incomplete routing idle sequence
@@ -4372,8 +4372,14 @@ static int atcphy_mux_check(const struct apple_atcphy *atcphy, enum atcphy_mode 
 		if (atcphy->hw->has_t8140_dp && atcphy_modes[mode].enable_dp_aux &&
 		    !atcphy->dp_tunables)
 			return -EOPNOTSUPP;
-		/* Without the lane tunables the SuperSpeed lanes are not calibrated */
-		if (!atcphy->ss_tunables)
+		/*
+		 * Without the lane tunables the SuperSpeed lanes are not calibrated.
+		 * T8122 four-lane DP programs its lanes itself and needs only the
+		 * common calibration.
+		 */
+		if (!atcphy->ss_tunables &&
+		    !(mode == APPLE_ATCPHY_MODE_DP && atcphy->hw->dp_t8122 &&
+		      atcphy->dp_tunables))
 			return -EOPNOTSUPP;
 		break;
 	case APPLE_ATCPHY_MODE_OFF:
@@ -4666,7 +4672,7 @@ static int atcphy_load_t8140_dp(struct apple_atcphy *atcphy)
 static int atcphy_load_tunables(struct apple_atcphy *atcphy)
 {
 	size_t tunable_count;
-	bool ss_missing = false;
+	bool ss_missing = false, common_missing = false;
 	struct {
 		const char *dt_name;
 		struct apple_tunable **tunable;
@@ -4721,8 +4727,13 @@ static int atcphy_load_tunables(struct apple_atcphy *atcphy)
 			continue;
 		}
 		if (IS_ERR(tunable)) {
+			/*
+			 * The bootloader drops every tunable of a T8122 PHY when
+			 * one entry is missing from its source. Probe anyway, so
+			 * that the PHY's consumers do not defer forever.
+			 */
 			if (PTR_ERR(tunable) != -ENOENT ||
-			    !(atcphy->hw->optional_tunables || atcphy->dp_only)) {
+			    !(atcphy->hw->optional_tunables || atcphy->hw->dp_t8122)) {
 				dev_err(atcphy->dev, "Failed to read tunable %s: %ld\n",
 					tunables[i].dt_name, PTR_ERR(tunable));
 				return PTR_ERR(tunable);
@@ -4730,6 +4741,9 @@ static int atcphy_load_tunables(struct apple_atcphy *atcphy)
 			/* The common-a tunables do not exist on this generation */
 			if (tunables[i].tunable != &atcphy->tunables.common[0])
 				ss_missing = true;
+			if (tunables[i].tunable == &atcphy->tunables.axi2af ||
+			    tunables[i].tunable == &atcphy->tunables.common[1])
+				common_missing = true;
 			tunable = NULL;
 		}
 		*tunables[i].tunable = tunable;
@@ -4755,9 +4769,14 @@ static int atcphy_load_tunables(struct apple_atcphy *atcphy)
 	}
 
 	atcphy->ss_tunables = !ss_missing;
-	if (ss_missing && atcphy->dp_only)
+	if (atcphy->hw->dp_t8122)
+		atcphy->dp_tunables = !common_missing;
+	if (atcphy->dp_only && !atcphy->dp_tunables)
 		dev_warn(atcphy->dev, "Calibration tunables missing, DisplayPort disabled\n");
-	else if (ss_missing)
+	else if (ss_missing && atcphy->dp_tunables && !atcphy->dp_only)
+		dev_warn(atcphy->dev,
+			 "SuperSpeed tunables missing, USB2 only; DisplayPort stays available\n");
+	else if (ss_missing && !atcphy->dp_only)
 		dev_warn(atcphy->dev, "SuperSpeed tunables missing, USB2 only\n");
 
 	return 0;
