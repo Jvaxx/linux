@@ -1071,13 +1071,15 @@ static inline pgoff_t folio_pgoff(const struct folio *folio)
  *
  * The result is identical for both file-backed and anonymous mappings and
  * simply determines how many pages @address lies from @vma->vm_start.
+ * A VMA of a smaller user granule may start within a native page; the
+ * delta is then counted from the native page containing @vma->vm_start.
  *
  * Returns: The number of pages @address is offset by within @vma.
  */
 static inline pgoff_t linear_page_delta(const struct vm_area_struct *vma,
 					const unsigned long address)
 {
-	return (address - vma->vm_start) >> PAGE_SHIFT;
+	return (address - vma->vm_start + vma_subpage_offset(vma)) >> PAGE_SHIFT;
 }
 
 /**

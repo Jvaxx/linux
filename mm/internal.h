@@ -379,6 +379,50 @@ static inline pte_t __pte_batch_clear_ignored(pte_t pte, fpb_t flags)
 	return pte_mkold(pte);
 }
 
+#ifdef CONFIG_MM_SUBPAGE
+/* Batch contiguous user leaves without confusing their offsets with PFNs. */
+static inline unsigned int folio_subpage_pte_batch_flags(struct vm_area_struct *vma,
+		struct folio *folio, pte_t *ptep, pte_t *ptentp, unsigned int max_nr, fpb_t flags)
+{
+	struct mm_struct *mm = vma->vm_mm;
+	pte_t pte = *ptentp;
+	phys_addr_t offset = pte_phys_mm(mm, pte) - PFN_PHYS(folio_pfn(folio));
+	pte_t expected;
+	unsigned int nr;
+
+	VM_BUG_ON_FOLIO(offset >= folio_size(folio), folio);
+	max_nr = min_t(unsigned long, max_nr, (folio_size(folio) - offset) >> mm_page_shift(mm));
+	VM_BUG_ON_FOLIO(!max_nr, folio);
+	nr = min(max_nr, pte_batch_hint(ptep, pte));
+	expected = pte_advance_pfn_mm(mm, __pte_batch_clear_ignored(pte, flags), nr);
+	while (nr < max_nr) {
+		unsigned int batch;
+
+		pte = ptep_get(ptep + nr);
+		if (!pte_same(__pte_batch_clear_ignored(pte, flags), expected))
+			break;
+		if ((flags & FPB_MERGE_WRITE) && pte_write(pte))
+			*ptentp = pte_mkwrite(*ptentp, vma);
+		if (flags & FPB_MERGE_YOUNG_DIRTY) {
+			if (pte_young(pte))
+				*ptentp = pte_mkyoung(*ptentp);
+			if (pte_dirty(pte))
+				*ptentp = pte_mkdirty(*ptentp);
+		}
+		batch = min(max_nr - nr, pte_batch_hint(ptep + nr, pte));
+		nr += batch;
+		expected = pte_advance_pfn_mm(mm, expected, batch);
+	}
+	return nr;
+}
+
+static inline unsigned int folio_subpage_pte_batch(struct vm_area_struct *vma,
+		struct folio *folio, pte_t *ptep, pte_t pte, unsigned int max_nr, fpb_t flags)
+{
+	return folio_subpage_pte_batch_flags(vma, folio, ptep, &pte, max_nr, flags);
+}
+#endif
+
 /**
  * folio_pte_batch_flags - detect a PTE batch for a large folio
  * @folio: The large folio to detect a PTE batch for.
@@ -489,6 +533,10 @@ static inline pte_t pte_move_swp_offset(pte_t pte, long delta)
 		new = pte_swp_mkexclusive(new);
 	if (pte_swp_uffd(pte))
 		new = pte_swp_mkuffd(new);
+
+#ifdef CONFIG_MM_SUBPAGE
+	new = pte_swp_set_subpage_offset(new, pte_swp_subpage_offset(pte));
+#endif
 
 	return new;
 }
@@ -951,6 +999,14 @@ folio_within_range(struct folio *folio, struct vm_area_struct *vma,
 	if (end > vma->vm_end)
 		end = vma->vm_end;
 
+	if (mm_page_size(vma->vm_mm) != PAGE_SIZE) {
+		/* Anonymous and file page offsets share the VMA's subpage offset. */
+		addr = vma_address_at_offset(vma, (struct vm_page_offset) {
+			.index = pgoff_folio - pgoff_vma_start + vma_start_pgoff(vma),
+		});
+		return !IS_ERR_VALUE(addr) && addr >= start && addr <= end &&
+			end - addr >= folio_size(folio);
+	}
 	/* if folio start address is not in vma range */
 	if (!in_range(pgoff_folio, pgoff_vma_start, vma_pglen))
 		return false;
@@ -1023,6 +1079,8 @@ static inline unsigned long __vma_address(const struct vm_area_struct *vma,
 	if (pgoff >= pgoff_start) {
 		address = vma->vm_start +
 			((pgoff - pgoff_start) << PAGE_SHIFT);
+		if (pgoff != pgoff_start)
+			address -= vma_subpage_offset(vma);
 		/* Check for address beyond vma (or wrapped through 0?) */
 		if (address < vma->vm_start || address >= vma->vm_end)
 			address = -EFAULT;
@@ -1084,9 +1142,15 @@ static inline unsigned long vma_address_end(struct page_vma_mapped_walk *pvmw)
 	pgoff_t pgoff_vma_start;
 	unsigned long address;
 
+#ifdef CONFIG_MM_SUBPAGE
+	if (pvmw->flags & PVMW_SUBPAGE)
+		return min(pvmw->address + mm_page_size(vma->vm_mm), vma->vm_end);
+#endif
+
 	/* Common case, plus ->pgoff is invalid for KSM */
-	if (pvmw->nr_pages == 1)
-		return pvmw->address + PAGE_SIZE;
+	if (pvmw->nr_pages == 1 && mm_page_size(vma->vm_mm) >= PAGE_SIZE)
+		return min((pvmw->address & mm_page_mask(vma->vm_mm)) +
+			   mm_page_size(vma->vm_mm), vma->vm_end);
 
 	if (pvmw->pgoff_is_anon)
 		pgoff_vma_start = vma_start_anon_pgoff(vma);
@@ -1095,9 +1159,12 @@ static inline unsigned long vma_address_end(struct page_vma_mapped_walk *pvmw)
 
 	address = vma->vm_start +
 		((pgoff_end - pgoff_vma_start) << PAGE_SHIFT);
+	address -= vma_subpage_offset(vma);
 	/* Check for address beyond vma (or wrapped through 0?) */
 	if (address < vma->vm_start || address > vma->vm_end)
 		address = vma->vm_end;
+	if (mm_page_size(vma->vm_mm) > PAGE_SIZE)
+		address = min(mm_page_align(vma->vm_mm, address), vma->vm_end);
 	return address;
 }
 
@@ -1259,11 +1326,11 @@ static inline bool vma_is_single_threaded_private(struct vm_area_struct *vma)
 
 #ifdef CONFIG_NUMA_BALANCING
 bool folio_can_map_prot_numa(struct folio *folio, struct vm_area_struct *vma,
-		bool is_private_single_threaded);
+		bool is_private_single_threaded, bool shared);
 
 #else
 static inline bool folio_can_map_prot_numa(struct folio *folio,
-		struct vm_area_struct *vma, bool is_private_single_threaded)
+		struct vm_area_struct *vma, bool is_private_single_threaded, bool shared)
 {
 	return false;
 }
@@ -1569,7 +1636,7 @@ static inline bool clear_flush_young_ptes_notify(struct vm_area_struct *vma,
 
 	young = clear_flush_young_ptes(vma, addr, ptep, nr);
 	young |= mmu_notifier_clear_flush_young(vma->vm_mm, addr,
-						addr + nr * PAGE_SIZE);
+						addr + nr * mm_page_size(vma->vm_mm));
 	return young;
 }
 
@@ -1589,7 +1656,8 @@ static inline bool test_and_clear_young_ptes_notify(struct vm_area_struct *vma,
 	bool young;
 
 	young = test_and_clear_young_ptes(vma, addr, ptep, nr);
-	young |= mmu_notifier_clear_young(vma->vm_mm, addr, addr + nr * PAGE_SIZE);
+	young |= mmu_notifier_clear_young(vma->vm_mm, addr,
+					addr + nr * mm_page_size(vma->vm_mm));
 	return young;
 }
 
@@ -1653,5 +1721,15 @@ static inline bool can_spin_trylock(void)
 
 	return true;
 }
+
+#ifdef CONFIG_MM_SUBPAGE
+struct iov_iter;
+int process_vm_rw_fragments(struct mm_struct *mm, unsigned long addr,
+		unsigned long len, struct iov_iter *iter, bool write);
+#endif
+
+#if defined(CONFIG_MM_SUBPAGE) && defined(CONFIG_SWAP)
+vm_fault_t do_swap_coarse_page(struct vm_fault *vmf);
+#endif
 
 #endif	/* __MM_INTERNAL_H */
