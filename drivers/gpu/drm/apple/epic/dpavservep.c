@@ -168,6 +168,7 @@ static void dcpavserv_teardown(struct apple_epic_service *service)
 		dcp->dcpavserv.enabled = false;
 		dcp->dcpavserv.service = NULL;
 		dcp->dcpavserv.epoch++;
+		dcp->dcpavserv.opened = NULL;
 		dcpavserv_invalidate_edid(dcp);
 		reinit_completion(&dcp->dcpavserv.enable_completion);
 		owned = true;
@@ -187,6 +188,7 @@ void dpavservep_detach(struct apple_dcp *dcp)
 	dcp->dcpavserv.enabled = false;
 	/* Also reject an in-flight prepare/OPEN with no published owner yet. */
 	dcp->dcpavserv.epoch++;
+	dcp->dcpavserv.opened = NULL;
 	reinit_completion(&dcp->dcpavserv.enable_completion);
 	if (service) {
 		afk_service_retire(service);
@@ -416,6 +418,21 @@ const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *dcp, u64 generation
 	mutex_unlock(&dcp->dcpavserv.lock);
 	if (!service)
 		return ERR_PTR(-ENODEV);
+
+	/*
+	 * The 14.7 firmware of an external processor answers EDID requests
+	 * once its service has been opened; open each announced instance once.
+	 */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7 &&
+	    READ_ONCE(dcp->dcpavserv.opened) != service) {
+		int ret = afk_service_call(service, 4, 6, NULL, 0, 32, NULL, 0, 32);
+
+		if (ret) {
+			afk_service_put(service);
+			return ERR_PTR(ret);
+		}
+		WRITE_ONCE(dcp->dcpavserv.opened, service);
+	}
 
 	edid = service->ep->wire_v2 ? dcpavserv_read_edid_inline(service) :
 		dcpavserv_read_edid_legacy(service);
