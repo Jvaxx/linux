@@ -630,6 +630,59 @@ static bool cd321x_mux_still_held(struct cd321x *cd321x, bool held)
 	return held && cd321x->pm.mux_retry_ms;
 }
 
+/*
+ * The HPD level of a DisplayPort partner. DATA_STATUS reports it. An
+ * SN201202x also signals every new DP status of the partner, and a DP-to-HDMI
+ * converter can keep DATA_STATUS at HPD high while the display behind it is
+ * unplugged, and report that only in its DP status. Once the controller has
+ * signalled a DP status for this connection, that status must show HPD too.
+ */
+static bool cd321x_uses_dp_sid(const struct tps6598x *tps)
+{
+	return device_is_compatible(tps->dev, "apple,sn201202x") &&
+	       !of_machine_is_compatible("apple,t8140") &&
+	       !of_machine_is_compatible("apple,t8142");
+}
+
+static u64 cd321x_irq_mask(const struct tps6598x *tps)
+{
+	u64 mask = tps->data->irq_mask1;
+
+	if (device_is_compatible(tps->dev, "apple,sn201202x") &&
+	    !cd321x_uses_dp_sid(tps))
+		mask &= ~SN201202X_INT_DP_SID_UPDATE;
+	return mask;
+}
+
+static bool cd321x_dp_hpd(const struct cd321x *cd321x, const struct cd321x_status *st)
+{
+	if (!(st->data_status & CD321X_DATA_STATUS_HPD_LEVEL))
+		return false;
+	return !cd321x->dp_sid_valid ||
+	       (le32_to_cpu(st->dp_sid_status.status_rx) & DP_STATUS_HPD_STATE);
+}
+
+/*
+ * SN201202x, from the interrupt: the partner sent a new DP status. Note what
+ * it shows for the next update, which may come after several of these: HPD
+ * low (the display behind a converter went away, and maybe came back before
+ * the update), or IRQ_HPD with HPD high (the sink asks the source to look).
+ */
+static void cd321x_dp_sid_event(struct cd321x *cd321x)
+{
+	u32 rx = le32_to_cpu(cd321x->dp_sid_status.status_rx);
+
+	if (!cd321x_uses_dp_sid(&cd321x->tps) ||
+	    !(cd321x->tps.data_status & TPS_DATA_STATUS_DP_CONNECTION))
+		return;
+	cd321x->update_status.dp_sid_event = true;
+	if (!(rx & DP_STATUS_HPD_STATE))
+		cd321x->update_status.dp_sid_hpd_low = true;
+	else if (rx & DP_STATUS_IRQ_HPD)
+		cd321x->update_status.dp_sid_irq = true;
+	dev_dbg(cd321x->tps.dev, "DP status %#x\n", rx);
+}
+
 static int cd321x_typec_update_mode(struct tps6598x *tps,
 				    struct cd321x_status *st, bool *display_busy,
 				    bool *held)
@@ -740,7 +793,7 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 
 		dp_data.status = le32_to_cpu(st->dp_sid_status.status_rx);
 		dp_data.conf = le32_to_cpu(st->dp_sid_status.configure);
-		if (st->data_status & CD321X_DATA_STATUS_HPD_LEVEL)
+		if (cd321x_dp_hpd(cd321x, st))
 			dp_data.status |= DP_STATUS_HPD_STATE;
 		else
 			dp_data.status &= ~DP_STATUS_HPD_STATE;
@@ -796,6 +849,39 @@ out:
 	}
 
 	return ret;
+}
+
+/*
+ * SN201202x with a display route in use and HPD staying high: pass on what
+ * only the DP status showed since the last update, as the edge the final
+ * state hides. The normal update that follows sends the final state.
+ *  - HPD went low: the display behind the converter was unplugged, and
+ *    maybe another one plugged in. Send HPD low first, so that the display
+ *    is released and read anew.
+ *  - IRQ_HPD: send the status without it first, so that the request reaches
+ *    the display route even when the status it had already carried it.
+ */
+static int cd321x_dp_sid_replay(struct cd321x *cd321x,
+				const struct cd321x_status *st, bool *display_busy, bool *held)
+{
+	struct device *dev = cd321x->tps.dev;
+	struct cd321x_status edge = *st;
+	u32 rx = le32_to_cpu(st->dp_sid_status.status_rx);
+
+	if (!cd321x_uses_dp_sid(&cd321x->tps) || !cd321x->state_valid ||
+	    cd321x->state.alt != cd321x->port_altmode_dp ||
+	    !(cd321x->dp_status & DP_STATUS_HPD_STATE) || !cd321x_dp_hpd(cd321x, st))
+		return 0;
+	if (st->dp_sid_hpd_low) {
+		dev_info(dev, "DP partner reported its display gone and back: HPD low, then high\n");
+		edge.data_status &= ~CD321X_DATA_STATUS_HPD_LEVEL;
+	} else if (st->dp_sid_irq && (rx & DP_STATUS_IRQ_HPD)) {
+		dev_info(dev, "DP partner raised IRQ_HPD\n");
+		edge.dp_sid_status.status_rx = cpu_to_le32(rx & ~DP_STATUS_IRQ_HPD);
+	} else {
+		return 0;
+	}
+	return cd321x_typec_update_mode(&cd321x->tps, &edge, display_busy, held);
 }
 
 static void cd321x_retry_revalidation(struct cd321x *cd321x, bool reconnect)
@@ -876,6 +962,9 @@ static void cd321x_update_work(struct work_struct *work)
 	st = cd321x->update_status;
 	cd321x->update_status.status_changed = 0;
 	cd321x->update_status.data_status_changed = 0;
+	cd321x->update_status.dp_sid_event = false;
+	cd321x->update_status.dp_sid_hpd_low = false;
+	cd321x->update_status.dp_sid_irq = false;
 
 	bool old_connected = !!tps->partner;
 	bool new_connected = st.status & TPS_STATUS_PLUG_PRESENT;
@@ -897,6 +986,8 @@ static void cd321x_update_work(struct work_struct *work)
 			      (TPS_DATA_STATUS_USB2_CONNECTION | TPS_DATA_STATUS_USB3_CONNECTION);
 	bool dp_mode_changed = cd321x_dp_mode_changed(st.data_status,
 						       st.data_status_changed);
+	bool dp_connected = st.data_status & TPS_DATA_STATUS_DP_CONNECTION;
+	bool dp_route_was_active = cd321x->display_route_active;
 	struct cd321x_dp_update dp = {
 		.data_status = st.data_status,
 		.changed = st.data_status_changed,
@@ -908,6 +999,8 @@ static void cd321x_update_work(struct work_struct *work)
 	bool usb4_started =
 		(st.data_status_changed & CD321X_DATA_STATUS_USB4_CONNECTION) &&
 		(st.data_status & CD321X_DATA_STATUS_USB4_CONNECTION);
+
+	bool dp_hpd;
 
 	enum usb_role old_role = usb_role_switch_get_role(tps->role_sw);
 	enum usb_role new_role = USB_ROLE_NONE;
@@ -941,6 +1034,20 @@ static void cd321x_update_work(struct work_struct *work)
 		reset |= CD321X_DP_RESET_PARTNER;
 	if (!new_connected)
 		reset |= CD321X_DP_RESET_UNPLUG;
+
+	/* A new DP connection: its DP status counts once one is signalled. */
+	if (!new_connected || was_disconnected || !dp_connected || dp_mode_changed)
+		cd321x->dp_sid_valid = false;
+	if (dp_connected && st.dp_sid_event)
+		cd321x->dp_sid_valid = true;
+	dp_hpd = cd321x_dp_hpd(cd321x, &st);
+	/* Feed the effective legacy sink level into the shared HPD policy. */
+	if (!dp_hpd)
+		dp.data_status &= ~CD321X_DATA_STATUS_HPD_LEVEL;
+	if (st.dp_sid_hpd_low)
+		dp.changed |= CD321X_DATA_STATUS_HPD_LEVEL;
+	if (dp_hpd && cd321x_uses_dp_sid(tps))
+		dp.irq_hpd |= st.dp_sid_irq;
 
 	/*
 	 * Report the sink as gone before any hardware transition that can fail:
@@ -1053,6 +1160,12 @@ static void cd321x_update_work(struct work_struct *work)
 	}
 
 	/* Update the TypeC MUX/PHY state */
+	if (dp_route_was_active && dp_connected && !was_disconnected && !dp_mode_changed &&
+	    st.dp_sid_event) {
+		ret = cd321x_dp_sid_replay(cd321x, &st, &display_busy, &held);
+		if (ret && !display_busy)
+			goto retry;
+	}
 	ret = cd321x_typec_update_mode(tps, &st, &display_busy, &held);
 	if (ret && !display_busy)
 		goto retry;
@@ -1097,6 +1210,10 @@ static void cd321x_update_work(struct work_struct *work)
 	return;
 
 retry:
+	/* A held mux must not consume a coalesced partner edge. */
+	cd321x->update_status.dp_sid_event |= st.dp_sid_event;
+	cd321x->update_status.dp_sid_hpd_low |= st.dp_sid_hpd_low;
+	cd321x->update_status.dp_sid_irq |= st.dp_sid_irq;
 	if (held) {
 		cd321x_retry_held_mux(cd321x);
 		return;
@@ -1312,9 +1429,12 @@ static irqreturn_t cd321x_interrupt(int irq, void *data)
 		}
 	}
 
-	if (event & APPLE_CD_REG_INT_DATA_STATUS_UPDATE)
+	if (event & (APPLE_CD_REG_INT_DATA_STATUS_UPDATE |
+		     (cd321x_irq_mask(tps) & SN201202X_INT_DP_SID_UPDATE)))
 		if (!tps->data->read_data_status(tps))
 			goto err_lost;
+	if (event & cd321x_irq_mask(tps) & SN201202X_INT_DP_SID_UPDATE)
+		cd321x_dp_sid_event(container_of(tps, struct cd321x, tps));
 
 	/* Can be called uncondtionally since it will check for any changes itself */
 	cd321x_connect(tps, status);
@@ -2384,7 +2504,7 @@ int tipd_init(struct tps6598x *tps)
 	if (tps->dbma_at_probe)
 		dev_info(tps->dev, "controller in debug mode \"DBMa\", leaving it there\n");
 
-	ret = tps6598x_write64(tps, TPS_REG_INT_MASK1, tps->data->irq_mask1);
+	ret = tps6598x_write64(tps, TPS_REG_INT_MASK1, cd321x_irq_mask(tps));
 	if (ret)
 		goto err_reset_controller;
 
@@ -2681,7 +2801,8 @@ static const struct tipd_data tipd_sn201202x_data = {
 	.irq_handler = cd321x_interrupt,
 	.irq_mask1 = APPLE_CD_REG_INT_POWER_STATUS_UPDATE |
 		     APPLE_CD_REG_INT_DATA_STATUS_UPDATE |
-		     APPLE_CD_REG_INT_PLUG_EVENT,
+		     APPLE_CD_REG_INT_PLUG_EVENT |
+		     SN201202X_INT_DP_SID_UPDATE,
 	.tps_struct_size = sizeof(struct sn201202x),
 	.remove = cd321x_remove,
 	.register_port = cd321x_register_port,
