@@ -3155,6 +3155,9 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 	disable_work_sync(&dcp->dimensions_wq);
 	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7) {
 		if (dcp->external_native) {
+			/* Bind's wait_ready enabled it, as for any HDMI port. */
+			if (dcp->hdmi_hpd_irq)
+				disable_irq(dcp->hdmi_hpd_irq);
 			dcp_disable_typec_work(dcp, true);
 			disable_delayed_work_sync(&dcp->external_retry_wq);
 			disable_delayed_work_sync(&dcp->swap_watchdog_wq);
