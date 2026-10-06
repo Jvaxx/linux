@@ -61,9 +61,12 @@ config DRM_APPLE_PARSER_KUNIT_TEST
 config DRM_APPLE_DISPLAY_KUNIT_TEST
 	bool "KUnit tests for Apple display mode probing" if !KUNIT_ALL_TESTS
 	depends on KUNIT && DRM_APPLE
+	select DRM_KUNIT_TEST_HELPERS
+	select DRM_CLIENT
 	default KUNIT_ALL_TESTS
 	help
 	  Test the production timing parser and display reply bounds without
 	  Apple display hardware, including incomplete records and stable
 	  preferred mode selection. Exercise mode list replacement and
-	  catalog admission for each display attachment.
+	  catalog admission for each display attachment. Check connector
+	  status updates before hotplug notifications and same-state retrains.
