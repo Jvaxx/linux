@@ -140,7 +140,9 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 					 bool internal, bool external_sdr);
 int parse_display_metadata(struct dcp_parse_ctx *handle, struct dcp_display_metadata *out);
 void dcp_modes_begin_attachment(struct apple_dcp *dcp);
-int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *handle);
+u64 dcp_modes_transfer_begin(struct apple_dcp *dcp);
+int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *handle,
+		      u64 generation);
 
 /* Caller serializes readers against replacement. */
 int replace_modes(struct dcp_parse_ctx *handle,

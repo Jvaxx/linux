@@ -1390,15 +1390,24 @@ void dcp_modes_begin_attachment(struct apple_dcp *dcp)
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		return;
 	guard(mutex)(&dcp->modes_lock);
+	dcp->modes_generation++;
 	dcp->modes_admitted = false;
+}
+
+u64 dcp_modes_transfer_begin(struct apple_dcp *dcp)
+{
+	guard(mutex)(&dcp->modes_lock);
+	return dcp->modes_generation;
 }
 
 /*
  * Publish a TimingElements catalog. Replaced arrays stay allocated, as
  * readers may still hold a snapshot. A failed parse keeps an admitted
- * catalog, except on H17P external, which publishes an empty one.
+ * catalog, except on H17P external, which publishes an empty one. A
+ * transfer started before the current attachment is never published.
  */
-int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx)
+int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
+		      u64 generation)
 {
 	bool h17p_external = dcp->hw.iomfb_method_profile ==
 		DCP_IOMFB_METHODS_H17P_EXTERNAL;
@@ -1436,6 +1445,11 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx)
 	}
 
 	mutex_lock(&dcp->modes_lock);
+	if (generation != dcp->modes_generation) {
+		mutex_unlock(&dcp->modes_lock);
+		kfree(modes);
+		return -ESTALE;
+	}
 	/* Publish one catalog revision with its immutable receipt tickets. */
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
 	dcp->rate_proof.catalog_sequence++;

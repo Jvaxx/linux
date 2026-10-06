@@ -90,6 +90,7 @@ enum {
 
 /* Temporary backing for a chunked transfer via setDCPAVPropStart/Chunk/End */
 struct dcp_chunks {
+	u64 modes_generation;
 	size_t length;
 	void *data;
 	size_t received;
@@ -372,6 +373,7 @@ struct apple_dcp {
 	struct mutex modes_lock;
 	struct dcp_display_mode *modes;
 	unsigned int nr_modes;
+	u64 modes_generation;
 	bool modes_admitted;
 
 	/* Attributes of the connector */
