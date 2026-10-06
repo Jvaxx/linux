@@ -1121,18 +1121,43 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 	return modes;
 }
 
+/* Entries of the array at the cursor, which is not consumed. */
+int parse_array_count(const struct dcp_parse_ctx *handle, u32 *count)
+{
+	struct dcp_parse_ctx extent = *handle;
+	struct iterator it;
+	int ret;
+
+	ret = iterator_begin(&extent, &it, false);
+	if (ret)
+		return ret;
+	*count = it.len;
+	return 0;
+}
+
 int replace_modes(struct dcp_parse_ctx *handle,
 		  struct dcp_display_mode **modes, unsigned int *count,
 		  int width_mm, int height_mm, unsigned int notch_height,
 		  bool internal)
 {
 	struct dcp_display_mode *next;
+	struct dcp_parse_ctx extent = *handle;
+	struct iterator it;
 	unsigned int next_count;
+	int ret;
+
+	ret = iterator_begin(&extent, &it, false);
+	if (ret)
+		return ret;
 
 	next = enumerate_modes(handle, &next_count, width_mm, height_mm,
 			       notch_height, internal, false);
 	if (IS_ERR(next))
 		return PTR_ERR(next);
+	if (it.len && !next_count) {
+		kfree(next);
+		return -EINVAL;
+	}
 
 	kfree(*modes);
 	*modes = next;
@@ -1159,9 +1184,9 @@ int parse_display_attributes(struct dcp_parse_ctx *handle, int *width_mm,
 		if (IS_ERR(key))
 			ret = PTR_ERR(key);
 		else if (!strcmp(key, "MaxHorizontalImageSize"))
-			ret = parse_int(it.handle, &width_cm);
+			ret = parse_int_bound(it.handle, &width_cm, 0, INT_MAX / 10);
 		else if (!strcmp(key, "MaxVerticalImageSize"))
-			ret = parse_int(it.handle, &height_cm);
+			ret = parse_int_bound(it.handle, &height_cm, 0, INT_MAX / 10);
 		else if (!strcmp(key, "SupportsBacklightControl"))
 			ret = parse_bool_or_skip(it.handle, backlight_control);
 		else

@@ -374,6 +374,8 @@ struct apple_dcp {
 	struct dcp_display_mode *modes;
 	unsigned int nr_modes;
 	u64 modes_generation;
+	u64 dimensions_generation;
+	struct work_struct dimensions_wq;
 	bool modes_admitted;
 
 	/* Attributes of the connector */

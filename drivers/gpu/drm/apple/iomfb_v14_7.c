@@ -1379,7 +1379,7 @@ int iomfb_v14_7_start(struct apple_dcp *dcp)
 	/* Never removed, like the session it describes. */
 	debugfs_create_file("dcp-t6030", 0400, NULL, v14, &dcp_v14_status_fops);
 	dcp->connector->connected = true;
-	dcp_set_dimensions(dcp);
+	dcp_set_dimensions(dcp, dcp_modes_transfer_begin(dcp));
 	scoped_guard(spinlock_irqsave, &dcp->mode_state.lock)
 		dcp->mode_state.valid = true;
 	dcp->active = true;

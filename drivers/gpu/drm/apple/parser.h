@@ -11,6 +11,8 @@
 #include "dcp-metadata-epoch.h"
 
 struct apple_dcp;
+struct apple_connector;
+struct apple_dcp_typec_route;
 
 struct dcp_parse_ctx {
 	struct apple_dcp *dcp;
@@ -139,10 +141,20 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 					 int height_mm, unsigned notch_height,
 					 bool internal, bool external_sdr);
 int parse_display_metadata(struct dcp_parse_ctx *handle, struct dcp_display_metadata *out);
+/* Caller holds modes_lock while checking connector ownership. */
+bool dcp_modes_for_connector(struct apple_dcp *dcp,
+			     struct apple_connector *connector);
 void dcp_modes_begin_attachment(struct apple_dcp *dcp);
+bool dcp_modes_end_typec(struct apple_dcp *dcp, struct apple_dcp_typec_route *route);
+void dcp_modes_init(struct apple_dcp *dcp);
+void dcp_modes_release(void *data);
+int dcp_attributes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *handle,
+			   u64 generation);
 u64 dcp_modes_transfer_begin(struct apple_dcp *dcp);
 int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *handle,
 		      u64 generation);
+
+int parse_array_count(const struct dcp_parse_ctx *handle, u32 *count);
 
 /* Caller serializes readers against replacement. */
 int replace_modes(struct dcp_parse_ctx *handle,

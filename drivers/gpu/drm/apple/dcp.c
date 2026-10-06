@@ -543,36 +543,36 @@ const struct drm_edid *dcp_firmware_edid(struct apple_dcp *dcp, u64 *generation)
 	return edid;
 }
 
-void dcp_set_dimensions(struct apple_dcp *dcp)
+void dcp_set_dimensions(struct apple_dcp *dcp, u64 generation)
 {
-	int i;
-	int width_mm = dcp->width_mm;
-	int height_mm = dcp->height_mm;
+	struct apple_connector *apple_connector = READ_ONCE(dcp->connector);
+	struct drm_connector *connector = apple_connector ? &apple_connector->base : NULL;
+	int width_mm, height_mm, i;
 
-	if (width_mm == 0 || height_mm == 0) {
+	if (connector)
+		mutex_lock(&connector->dev->mode_config.mutex);
+	mutex_lock(&dcp->modes_lock);
+	if (generation != dcp->modes_generation ||
+	    apple_connector != READ_ONCE(dcp->connector))
+		goto out_unlock;
+	width_mm = dcp->width_mm;
+	height_mm = dcp->height_mm;
+	if (!width_mm || !height_mm) {
 		width_mm = dcp->panel.width_mm;
 		height_mm = dcp->panel.height_mm;
 	}
-
-	/*
-	 * This callback runs on the ordered RTKit RX worker. A mode probe
-	 * can hold mode_config.mutex while waiting for an AFK reply which
-	 * that same worker still has to dispatch. Defer the DRM update.
-	 */
-	if (dcp->connector && !READ_ONCE(dcp->quiescing))
-		schedule_work(&dcp->connector->hotplug_wq);
-
-	/*
-	 * Fix up any probed modes. Modes are created when parsing
-	 * TimingElements, dimensions are calculated when parsing
-	 * DisplayAttributes, and TimingElements may be sent first
-	 */
-	mutex_lock(&dcp->modes_lock);
+	if (connector) {
+		connector->display_info.width_mm = width_mm;
+		connector->display_info.height_mm = height_mm;
+	}
 	for (i = 0; i < dcp->nr_modes; ++i) {
 		dcp->modes[i].mode.width_mm = width_mm;
 		dcp->modes[i].mode.height_mm = height_mm;
 	}
+out_unlock:
 	mutex_unlock(&dcp->modes_lock);
+	if (connector)
+		mutex_unlock(&connector->dev->mode_config.mutex);
 }
 
 void dcp_update_connector_dimensions(struct apple_dcp *dcp,
@@ -2753,8 +2753,10 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 			return 0;
 		ret = iomfb_v14_7_bind(dcp);
 		/* Balances the disable at probe, as below. */
-		if (!ret)
+		if (!ret) {
+			enable_work(&dcp->dimensions_wq);
 			dcp_enable_typec_work(dcp);
+		}
 		return ret;
 	}
 
@@ -2853,6 +2855,8 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 		ret = dev_err_probe(dev, ret, "Failed to boot RTKit: %d\n", ret);
 		goto err_piodma;
 	}
+	enable_work(&dcp->dimensions_wq);
+	schedule_work(&dcp->dimensions_wq);
 	dcp_enable_typec_work(dcp);
 	return 0;
 
@@ -2872,6 +2876,7 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 	if (!dcp)
 		return;
 
+	disable_work_sync(&dcp->dimensions_wq);
 	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7) {
 		if (!dcp->external)
 			dcp_disable_typec_work(dcp, false);
@@ -3058,7 +3063,11 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	 * Type-C and Thunderbolt routes can be activated as soon as they are
 	 * registered below, before the DRM device binds.
 	 */
-	mutex_init(&dcp->modes_lock);
+	dcp_modes_init(dcp);
+	/* Registered before callback resources, so they drain before the catalog. */
+	ret = devm_add_action_or_reset(dev, dcp_modes_release, dcp);
+	if (ret)
+		return ret;
 	mutex_init(&dcp->hpd_mutex);
 	mutex_init(&dcp->external_lock);
 	INIT_WORK(&dcp->external_stop_work, dcp_external_stop_work);

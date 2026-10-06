@@ -1364,8 +1364,36 @@ static void dcpep_got_msg(struct apple_dcp *dcp, u64 message)
 		dcpep_handle_cb(dcp, ctx_id, data, length, offset);
 }
 
-/* Retained arrays are not freed while mode readers can still refer to them. */
+static void dcp_modes_dimensions_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(work, struct apple_dcp, dimensions_wq);
+	u64 generation;
+
+	scoped_guard(mutex, &dcp->modes_lock)
+		generation = dcp->dimensions_generation;
+	dcp_set_dimensions(dcp, generation);
+}
+
+void dcp_modes_init(struct apple_dcp *dcp)
+{
+	mutex_init(&dcp->modes_lock);
+	INIT_WORK(&dcp->dimensions_wq, dcp_modes_dimensions_work);
+	disable_work(&dcp->dimensions_wq);
+}
+
+bool dcp_modes_for_connector(struct apple_dcp *dcp,
+			     struct apple_connector *connector)
+{
+	lockdep_assert_held(&dcp->modes_lock);
+	return dcp->modes_admitted && READ_ONCE(dcp->connector) == connector;
+}
+
+/*
+ * Retained arrays are not freed while mode readers can still refer to them.
+ * With @connector, only the connector that owns the admitted catalog sees it.
+ */
 static struct dcp_display_mode *dcp_modes_snapshot(struct apple_dcp *dcp,
+						 struct apple_connector *connector,
 						 unsigned int *count)
 {
 	struct dcp_display_mode *modes;
@@ -1373,7 +1401,8 @@ static struct dcp_display_mode *dcp_modes_snapshot(struct apple_dcp *dcp,
 
 	/* An attachment sees no catalog until one is admitted for it. */
 	guard(mutex)(&dcp->modes_lock);
-	if (!dcp->modes_admitted) {
+	if (!dcp->modes_admitted ||
+	    (connector && !dcp_modes_for_connector(dcp, connector))) {
 		*count = 0;
 		return NULL;
 	}
@@ -1383,7 +1412,6 @@ static struct dcp_display_mode *dcp_modes_snapshot(struct apple_dcp *dcp,
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 	return modes;
 }
-
 void dcp_modes_begin_attachment(struct apple_dcp *dcp)
 {
 	/* H17P external catalogs are fenced by their connection receipt. */
@@ -1392,6 +1420,19 @@ void dcp_modes_begin_attachment(struct apple_dcp *dcp)
 	guard(mutex)(&dcp->modes_lock);
 	dcp->modes_generation++;
 	dcp->modes_admitted = false;
+}
+
+bool dcp_modes_end_typec(struct apple_dcp *dcp, struct apple_dcp_typec_route *route)
+{
+	guard(mutex)(&dcp->modes_lock);
+	if (READ_ONCE(dcp->active_typec_route) != route)
+		return false;
+	/* H17P external catalogs are fenced by their connection receipt. */
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17P_EXTERNAL) {
+		dcp->modes_generation++;
+		dcp->modes_admitted = false;
+	}
+	return true;
 }
 
 u64 dcp_modes_transfer_begin(struct apple_dcp *dcp)
@@ -1416,6 +1457,7 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 	u64 rate_service_epoch = 0;
 	unsigned int nr_modes = 0, i;
 	unsigned long flags;
+	u32 entries = 0;
 	int ret = 0;
 
 	if (h17p_external && dcp->chunks.payload_complete &&
@@ -1423,6 +1465,11 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 		ctx->automatic_1080p180_rgb8 = true;
 		rate_ticket = dcp->chunks.mode_ticket;
 		rate_service_epoch = dcp->chunks.av_service_epoch;
+	}
+	if (!h17p_external) {
+		ret = parse_array_count(ctx, &entries);
+		if (ret)
+			return ret;
 	}
 	modes = enumerate_modes(ctx, &nr_modes, dcp->width_mm, dcp->height_mm,
 				dcp->notch_height,
@@ -1434,6 +1481,10 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 			return ret;
 		modes = NULL;
 		nr_modes = 0;
+	} else if (!h17p_external && entries && !nr_modes) {
+		/* No valid record: keep an admitted catalog, as for a parse error. */
+		kfree(modes);
+		return -EINVAL;
 	} else {
 		for (i = 0; i < nr_modes; i++)
 			if (modes[i].automatic_rgb8_quirk) {
@@ -1509,6 +1560,72 @@ static bool dcp_publish_mode(struct apple_dcp *dcp, struct drm_connector *connec
 	return eligible;
 }
 
+/* Apply DisplayAttributes only for the attachment its transfer started on. */
+int dcp_attributes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *handle,
+			   u64 generation)
+{
+	int width_mm, height_mm, ret, i;
+	bool backlight_control = false, ext;
+
+	scoped_guard(mutex, &dcp->modes_lock) {
+		if (generation != dcp->modes_generation)
+			return -ESTALE;
+		ret = parse_display_attributes(handle, &width_mm, &height_mm,
+					       &backlight_control);
+		if (!ret) {
+			dcp->width_mm = width_mm;
+			dcp->height_mm = height_mm;
+			if (!width_mm || !height_mm) {
+				width_mm = dcp->panel.width_mm;
+				height_mm = dcp->panel.height_mm;
+			}
+			for (i = 0; i < dcp->nr_modes; ++i) {
+				dcp->modes[i].mode.width_mm = width_mm;
+				dcp->modes[i].mode.height_mm = height_mm;
+			}
+			dcp->dimensions_generation = generation;
+			schedule_work(&dcp->dimensions_wq);
+		}
+	}
+
+	/*
+	 * Written once, so the hotplug work never sees a working display
+	 * without its backlight; a display whose attributes do not parse
+	 * gets none. The attributes can arrive after the hotplug work has
+	 * run, so sync the backlight when the answer changes.
+	 */
+	ext = !ret && backlight_control && !dcp_has_panel(dcp);
+	if (ext != READ_ONCE(dcp->ext_backlight)) {
+		WRITE_ONCE(dcp->ext_backlight, ext);
+		if (dcp->connector)
+			schedule_work(&dcp->connector->bl_sync_wq);
+	}
+	if (ret)
+		return ret;
+
+	/*
+	 * This callback runs on the ordered RTKit RX worker. A mode probe
+	 * can hold mode_config.mutex while waiting for an AFK reply which
+	 * that same worker still has to dispatch. The hotplug work
+	 * publishes the connector dimensions.
+	 */
+	if (dcp->connector && !READ_ONCE(dcp->quiescing))
+		schedule_work(&dcp->connector->hotplug_wq);
+	return 0;
+}
+
+void dcp_modes_release(void *data)
+{
+	struct apple_dcp *dcp = data;
+
+	disable_work_sync(&dcp->dimensions_wq);
+	guard(mutex)(&dcp->modes_lock);
+	dcp->modes_generation++;
+	dcp->modes_admitted = false;
+	kfree(dcp->modes);
+	dcp->modes = NULL;
+	dcp->nr_modes = 0;
+}
 int dcp_get_modes(struct drm_connector *connector)
 {
 	struct apple_connector *apple_connector = to_apple_connector(connector);
@@ -1538,7 +1655,7 @@ int dcp_get_modes(struct drm_connector *connector)
 		return 0;
 	}
 	dcp = platform_get_drvdata(pdev);
-	modes = dcp_modes_snapshot(dcp, &nr_modes);
+	modes = dcp_modes_snapshot(dcp, apple_connector, &nr_modes);
 
 	physical_edid = dcp->hw.iomfb_method_profile ==
 		DCP_IOMFB_METHODS_H17P_EXTERNAL;
@@ -1704,7 +1821,7 @@ bool lookup_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode,
 	unsigned long flags;
 	bool eligible;
 
-	modes = dcp_modes_snapshot(dcp, &count);
+	modes = dcp_modes_snapshot(dcp, NULL, &count);
 	for (i = 0; i < count; ++i) {
 		if (drm_mode_match(mode, &modes[i].mode,
 				   DRM_MODE_MATCH_TIMINGS |
@@ -1766,6 +1883,9 @@ enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
 		return MODE_ERROR;
 	dcp = platform_get_drvdata(pdev);
 
+	scoped_guard(mutex, &dcp->modes_lock)
+		if (!dcp_modes_for_connector(dcp, apple_connector))
+			return MODE_BAD;
 	return dcp_mode_settable(dcp, mode) ? MODE_OK : MODE_BAD;
 }
 
