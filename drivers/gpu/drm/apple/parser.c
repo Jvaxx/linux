@@ -375,7 +375,8 @@ static int parse_dimension(struct dcp_parse_ctx *handle, struct dimension *dim, 
 		else if (!strcmp(key, "SyncWidth"))
 			ret = parse_int_bound(it.handle, &dim->sync_width, 0, U16_MAX);
 		else if (!strcmp(key, "PreciseSyncRate"))
-			ret = parse_int_bound(it.handle, &dim->precise_sync_rate, 1, U32_MAX);
+			/* Horizontal may be 0; parse_mode() requires the vertical rate. */
+			ret = parse_int_bound(it.handle, &dim->precise_sync_rate, 0, U32_MAX);
 		else if (polarity && !strcmp(key, "SyncPolarity")) {
 			if (dim->sync_polarity >= 0)
 				ret = -EINVAL;
@@ -627,7 +628,8 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 		}
 
 		/* Skip virtual or partial entries */
-		if (is_virtual || cmode.score < 0 || cmode.id < 0)
+		if (is_virtual || cmode.score < 0 || cmode.id < 0 ||
+		    cmode.id > U32_MAX)
 			continue;
 
 		trace_iomfb_color_mode(handle->dcp, cmode.id, cmode.score,
@@ -690,8 +692,8 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
  */
 static u64 calculate_clock(struct dimension *horiz, struct dimension *vert)
 {
-	u32 pixels = horiz->total * vert->total;
-	u64 clock = mul_u32_u32(pixels, vert->precise_sync_rate);
+	u64 pixels = (u64)horiz->total * vert->total;
+	u64 clock = pixels * vert->precise_sync_rate;
 
 	return DIV_ROUND_CLOSEST_ULL(clock >> 16, 1000);
 }
@@ -1117,6 +1119,25 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 		*count = kept;
 	}
 	return modes;
+}
+
+int replace_modes(struct dcp_parse_ctx *handle,
+		  struct dcp_display_mode **modes, unsigned int *count,
+		  int width_mm, int height_mm, unsigned int notch_height,
+		  bool internal)
+{
+	struct dcp_display_mode *next;
+	unsigned int next_count;
+
+	next = enumerate_modes(handle, &next_count, width_mm, height_mm,
+			       notch_height, internal, false);
+	if (IS_ERR(next))
+		return PTR_ERR(next);
+
+	kfree(*modes);
+	*modes = next;
+	*count = next_count;
+	return 0;
 }
 
 int parse_display_attributes(struct dcp_parse_ctx *handle, int *width_mm,

@@ -400,6 +400,7 @@ static int apple_connector_create(struct drm_device *drm,
 		return -ENOMEM;
 
 	mutex_init(&connector->chunk_lock);
+	apple_connector_edid_init(connector);
 	apple_connector_backlight_init(connector);
 	/* before anything can fail: cleanup cancels it */
 	INIT_WORK(&connector->hotplug_wq, dcp_hotplug);
@@ -418,7 +419,7 @@ static int apple_connector_create(struct drm_device *drm,
 
 	connector->base.polled = DRM_CONNECTOR_POLL_HPD;
 	connector->connected = false;
-	connector->dcp = dcp;
+	apple_connector_set_pipeline(connector, dcp);
 
 	ret = drm_connector_attach_encoder(&connector->base, &encoder->base);
 	if (ret)
@@ -581,6 +582,7 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 			return -ENOMEM;
 
 		mutex_init(&connector->chunk_lock);
+		apple_connector_edid_init(connector);
 		apple_connector_backlight_init(connector);
 		/* before anything can fail: cleanup cancels it */
 		INIT_WORK(&connector->hotplug_wq, dcp_hotplug);

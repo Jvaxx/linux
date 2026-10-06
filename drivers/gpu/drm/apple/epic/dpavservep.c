@@ -313,6 +313,7 @@ static const struct drm_edid *dcpavserv_read_edid_legacy(struct apple_epic_servi
 	struct dpavserv_copy_edid_cmd cmd;
 	struct dpavserv_copy_edid_resp *resp __free(kfree) = NULL;
 	size_t resp_size = sizeof(*resp) + EDID_BUF_SIZE;
+	size_t reply_size;
 	int num_blocks;
 	u64 data_size;
 	int ret;
@@ -323,20 +324,20 @@ static const struct drm_edid *dcpavserv_read_edid_legacy(struct apple_epic_servi
 	if (!resp)
 		return ERR_PTR(-ENOMEM);
 
-	ret = afk_service_call(service, 1, 7, &cmd, sizeof(cmd), EDID_BUF_SIZE, resp,
-			       resp_size, 0);
+	ret = afk_service_call_with_reply_len(service, 1, 7, &cmd, sizeof(cmd),
+					      EDID_BUF_SIZE, resp, resp_size, 0,
+					      &reply_size);
 	if (ret < 0)
 		return ERR_PTR(ret);
 
-	if (le64_to_cpu(resp->max_size) != EDID_BUF_SIZE)
+	if (reply_size < sizeof(*resp) ||
+	    le64_to_cpu(resp->max_size) != EDID_BUF_SIZE)
 		return ERR_PTR(-EIO);
 
-	// print_hex_dump(KERN_DEBUG, "dpavserv EDID cmd: ", DUMP_PREFIX_NONE,
-	// 	       16, 1, resp, 192, true);
-
+	/* Only complete EDID blocks within the received reply may be copied. */
 	data_size = le64_to_cpu(resp->used_size);
 	if (data_size < EDID_LEADING_DATA_SIZE + EDID_BLOCK_SIZE ||
-	    data_size > EDID_BUF_SIZE)
+	    data_size > EDID_BUF_SIZE || data_size > reply_size - sizeof(*resp))
 		return ERR_PTR(-EIO);
 
 	/*

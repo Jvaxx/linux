@@ -24,6 +24,7 @@
 #include "dcpext_scanout.h"
 #include "ibootep.h"
 #include "dcp-internal.h"
+#include "parser.h"
 struct apple_dcp_typec_port {
 	struct dcp_fabric_port core;
 	struct dcp_fabric_plan plan;
@@ -249,12 +250,13 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 		return ret;
 	}
 
+	dcp_modes_begin_attachment(dcp);
 	dcp->phy = route->phy;
 	dcp->dptx_phy = route->dptx_phy;
 	dcp->connector_type = DRM_MODE_CONNECTOR_USB;
 	WRITE_ONCE(dcp->ext_backlight, false);
 	if (connector) {
-		WRITE_ONCE(connector->dcp, to_platform_device(dcp->dev));
+		apple_connector_set_pipeline(connector, to_platform_device(dcp->dev));
 		dcp->typec_connector = connector;
 		dcp->connector = connector;
 
@@ -374,7 +376,7 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 		 */
 		WRITE_ONCE(connector->connected, false);
 		/* hotplug work queued before this checks for it */
-		WRITE_ONCE(connector->dcp, NULL);
+		apple_connector_set_pipeline(connector, NULL);
 		/* no pipeline, so no backlight */
 		schedule_work(&connector->bl_sync_wq);
 
@@ -1929,7 +1931,7 @@ void dcp_typec_port_set_connector(unsigned int idx, bool secondary,
 							  drm_crtc_index(&dcp->crtc->base),
 							  connector->candidate_crtcs);
 
-		connector->dcp = to_platform_device(dcp->dev);
+		apple_connector_set_pipeline(connector, to_platform_device(dcp->dev));
 		dcp->typec_connector = connector;
 		dcp->connector = connector;
 		dcp->connector_type = DRM_MODE_CONNECTOR_USB;

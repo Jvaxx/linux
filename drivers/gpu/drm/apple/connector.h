@@ -51,6 +51,8 @@ struct apple_connector {
 	const struct drm_edid *drm_edid;
 	bool drm_edid_firmware_derived;
 	bool edid_invalidation_pending;
+	/* The sink is live on this pipeline; a change invalidates its EDID. */
+	bool edid_live;
 	u64 drm_edid_generation;
 	u64 drm_edid_service_epoch;
 
@@ -82,6 +84,12 @@ struct apple_connector {
 };
 
 #define to_apple_connector(x) container_of(x, struct apple_connector, base)
+
+void apple_connector_edid_init(struct apple_connector *connector);
+void apple_connector_invalidate_edid(struct apple_connector *connector);
+void apple_connector_edid_set_live(struct apple_connector *connector, bool live);
+void apple_connector_set_pipeline(struct apple_connector *connector,
+				  struct platform_device *pdev);
 
 void apple_connector_debugfs_init(struct drm_connector *connector, struct dentry *root);
 

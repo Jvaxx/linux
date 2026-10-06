@@ -1371,11 +1371,93 @@ static struct dcp_display_mode *dcp_modes_snapshot(struct apple_dcp *dcp,
 	struct dcp_display_mode *modes;
 	unsigned long flags;
 
+	/* An attachment sees no catalog until one is admitted for it. */
+	guard(mutex)(&dcp->modes_lock);
+	if (!dcp->modes_admitted) {
+		*count = 0;
+		return NULL;
+	}
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
 	modes = dcp->modes;
 	*count = dcp->nr_modes;
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 	return modes;
+}
+
+void dcp_modes_begin_attachment(struct apple_dcp *dcp)
+{
+	/* H17P external catalogs are fenced by their connection receipt. */
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL)
+		return;
+	guard(mutex)(&dcp->modes_lock);
+	dcp->modes_admitted = false;
+}
+
+/*
+ * Publish a TimingElements catalog. Replaced arrays stay allocated, as
+ * readers may still hold a snapshot. A failed parse keeps an admitted
+ * catalog, except on H17P external, which publishes an empty one.
+ */
+int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx)
+{
+	bool h17p_external = dcp->hw.iomfb_method_profile ==
+		DCP_IOMFB_METHODS_H17P_EXTERNAL;
+	struct dcp_display_mode *modes;
+	struct dcp_metadata_ticket rate_ticket = {};
+	u64 rate_service_epoch = 0;
+	unsigned int nr_modes = 0, i;
+	unsigned long flags;
+	int ret = 0;
+
+	if (h17p_external && dcp->chunks.payload_complete &&
+	    dcp->chunks.mode_ticket.associated) {
+		ctx->automatic_1080p180_rgb8 = true;
+		rate_ticket = dcp->chunks.mode_ticket;
+		rate_service_epoch = dcp->chunks.av_service_epoch;
+	}
+	modes = enumerate_modes(ctx, &nr_modes, dcp->width_mm, dcp->height_mm,
+				dcp->notch_height,
+				dcp->fixed_connector_type == DRM_MODE_CONNECTOR_eDP,
+				h17p_external);
+	if (IS_ERR(modes)) {
+		ret = PTR_ERR(modes);
+		if (!h17p_external)
+			return ret;
+		modes = NULL;
+		nr_modes = 0;
+	} else {
+		for (i = 0; i < nr_modes; i++)
+			if (modes[i].automatic_rgb8_quirk) {
+				modes[i].unsafe_rgb8_ticket = rate_ticket;
+				modes[i].unsafe_rgb8_service_epoch = rate_service_epoch;
+				modes[i].automatic_connection_sequence = dcp->chunks.automatic_connection_sequence;
+				modes[i].automatic_service_pending = dcp->chunks.automatic_service_pending;
+			}
+	}
+
+	mutex_lock(&dcp->modes_lock);
+	/* Publish one catalog revision with its immutable receipt tickets. */
+	spin_lock_irqsave(&dcp->metadata.lock, flags);
+	dcp->rate_proof.catalog_sequence++;
+	for (i = 0; i < nr_modes; i++)
+		if (modes[i].automatic_rgb8_quirk)
+			modes[i].automatic_catalog_sequence = dcp->rate_proof.catalog_sequence;
+	dcp->modes = modes;
+	dcp->nr_modes = nr_modes;
+	/* Only a complete receipt for a current cable is that cable's catalogue. */
+	dcp->metadata.catalog_ticket = rate_ticket;
+	dcp->metadata.catalog_ticket.associated &= nr_modes > 0;
+	dcp->metadata.catalog_connection_sequence =
+		dcp->chunks.automatic_connection_sequence;
+	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+	dcp->modes_admitted = !ret;
+	mutex_unlock(&dcp->modes_lock);
+
+	if (!ret && !h17p_external)
+		apple_connector_invalidate_edid(dcp->connector);
+	/* Notify removals as well as newly eligible modes, outside the lock. */
+	dcp_180hz_catalog_changed(dcp);
+	return ret;
 }
 
 /* Caller holds hpd_mutex -> dcpavserv.lock -> metadata.lock. */
@@ -1600,8 +1682,8 @@ modes_done:
 }
 
 /* The user may own drm_display_mode, so we need to search for our copy */
-struct dcp_display_mode *lookup_mode(struct apple_dcp *dcp,
-					    const struct drm_display_mode *mode)
+bool lookup_mode(struct apple_dcp *dcp, const struct drm_display_mode *mode,
+		 struct dcp_display_mode *out)
 {
 	struct dcp_display_mode *modes;
 	unsigned int count, i;
@@ -1614,7 +1696,7 @@ struct dcp_display_mode *lookup_mode(struct apple_dcp *dcp,
 				   DRM_MODE_MATCH_TIMINGS |
 					   DRM_MODE_MATCH_CLOCK)) {
 			if (!modes[i].automatic_rgb8_quirk)
-				return &modes[i];
+				goto found;
 			mutex_lock(&dcp->hpd_mutex);
 			mutex_lock(&dcp->dcpavserv.lock);
 			spin_lock_irqsave(&dcp->metadata.lock, flags);
@@ -1623,11 +1705,17 @@ struct dcp_display_mode *lookup_mode(struct apple_dcp *dcp,
 			mutex_unlock(&dcp->dcpavserv.lock);
 			mutex_unlock(&dcp->hpd_mutex);
 			if (eligible)
-				return &modes[i];
+				goto found;
 		}
 	}
 
-	return NULL;
+	return false;
+
+found:
+	/* Callers keep a copy, never a pointer into the catalog. */
+	if (out)
+		*out = modes[i];
+	return true;
 }
 
 /*
@@ -1640,15 +1728,15 @@ struct dcp_display_mode *lookup_mode(struct apple_dcp *dcp,
 static bool dcp_mode_settable(struct apple_dcp *dcp,
 			      const struct drm_display_mode *mode)
 {
-	struct dcp_display_mode *dcp_mode = lookup_mode(dcp, mode);
+	struct dcp_display_mode dcp_mode;
 
-	if (!dcp_mode)
+	if (!lookup_mode(dcp, mode, &dcp_mode))
 		return false;
 
 	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
 	    dcp->hw.iomfb_method_profile !=
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
-		return dcp_mode->mode.type & DRM_MODE_TYPE_PREFERRED;
+		return dcp_mode.mode.type & DRM_MODE_TYPE_PREFERRED;
 
 	return true;
 }

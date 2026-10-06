@@ -16,6 +16,39 @@
 
 #include "dcp-internal.h"
 
+void apple_connector_edid_init(struct apple_connector *connector)
+{
+	connector->edid_live = false;
+	connector->edid_invalidation_pending = false;
+}
+
+/*
+ * The EDID cache is generation fenced and owned under mode_config.mutex:
+ * mark it stale here, and the hotplug work or the next get_modes() clears it.
+ */
+void apple_connector_invalidate_edid(struct apple_connector *connector)
+{
+	if (connector)
+		WRITE_ONCE(connector->edid_invalidation_pending, true);
+}
+
+void apple_connector_edid_set_live(struct apple_connector *connector, bool live)
+{
+	if (!connector)
+		return;
+	if (!live || READ_ONCE(connector->edid_live) != live)
+		apple_connector_invalidate_edid(connector);
+	WRITE_ONCE(connector->edid_live, live);
+}
+
+void apple_connector_set_pipeline(struct apple_connector *connector,
+				  struct platform_device *pdev)
+{
+	apple_connector_invalidate_edid(connector);
+	WRITE_ONCE(connector->edid_live, !!pdev);
+	WRITE_ONCE(connector->dcp, pdev);
+}
+
 enum dcp_chunk_type {
 	DCP_CHUNK_COLOR_ELEMENTS,
 	DCP_CHUNK_TIMING_ELELMENTS,

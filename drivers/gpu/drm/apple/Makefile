@@ -37,3 +37,5 @@ obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-announce-test.o
 obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += afk-service-test.o
 
 obj-$(CONFIG_DRM_APPLE_PARSER_KUNIT_TEST) += afkv2-test.o
+
+appledrm-$(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST) += parser-test.o

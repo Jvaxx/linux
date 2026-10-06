@@ -31,6 +31,7 @@
 #include "iomfb.h"
 #include "iomfb_internal.h"
 #include "parser.h"
+#include "dcp-property.h"
 #include "trace.h"
 #include "version_utils.h"
 
@@ -946,6 +947,9 @@ static u8 dcpep_cb_prop_start(struct apple_dcp *dcp, u32 *length)
 	}
 #endif
 
+	if (!dcp_property_size_valid(*length))
+		return false;
+
 	dcp->chunks.length = *length;
 	dcp->chunks.av_service_epoch = 0;
 	dcp->chunks.automatic_service_pending = false;
@@ -1021,9 +1025,6 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 			dcp_property_complete(dcp->chunks.data, dcp->chunks.received,
 					      dcp->chunks.length);
 
-	/* used just as opaque pointer for tracing */
-	ctx.dcp = dcp;
-
 	ret = parse(dcp->chunks.data, dcp->chunks.length, &ctx);
 
 	if (ret) {
@@ -1042,61 +1043,17 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 		return false;
 	}
 
+	/* parse() resets the context: set the tracing pointer afterwards. */
+	ctx.dcp = dcp;
+
 	if (!strcmp(req->key, "TimingElements")) {
-		struct dcp_display_mode *modes;
-		struct dcp_metadata_ticket rate_ticket = {};
-		u64 rate_service_epoch = 0;
-		unsigned int nr_modes = 0, i;
-		unsigned long flags;
-
-		if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL &&
-		    dcp->chunks.payload_complete && dcp->chunks.mode_ticket.associated) {
-			ctx.automatic_1080p180_rgb8 = true;
-			rate_ticket = dcp->chunks.mode_ticket;
-			rate_service_epoch = dcp->chunks.av_service_epoch;
-		}
-		modes = enumerate_modes(&ctx, &nr_modes,
-					     dcp->width_mm, dcp->height_mm,
-					     dcp->notch_height,
-					     dcp->fixed_connector_type ==
-						     DRM_MODE_CONNECTOR_eDP,
-					     dcp->hw.iomfb_method_profile ==
-						     DCP_IOMFB_METHODS_H17P_EXTERNAL);
-
-		if (IS_ERR(modes)) {
+		ret = dcp_modes_replace(dcp, &ctx);
+		if (ret) {
 			dev_warn(dcp->dev, "failed to parse modes\n");
-			modes = NULL;
-			nr_modes = 0;
-		} else {
-			for (i = 0; i < nr_modes; i++)
-				if (modes[i].automatic_rgb8_quirk) {
-					modes[i].unsafe_rgb8_ticket = rate_ticket;
-					modes[i].unsafe_rgb8_service_epoch = rate_service_epoch;
-					modes[i].automatic_connection_sequence = dcp->chunks.automatic_connection_sequence;
-					modes[i].automatic_service_pending = dcp->chunks.automatic_service_pending;
-				}
-		}
-		/* Publish one catalog revision with its immutable receipt tickets. */
-		spin_lock_irqsave(&dcp->metadata.lock, flags);
-		dcp->rate_proof.catalog_sequence++;
-		for (i = 0; i < nr_modes; i++)
-			if (modes[i].automatic_rgb8_quirk)
-				modes[i].automatic_catalog_sequence = dcp->rate_proof.catalog_sequence;
-		dcp->modes = modes;
-		dcp->nr_modes = nr_modes;
-		/* Only a complete receipt for a current cable is that cable's catalogue. */
-		dcp->metadata.catalog_ticket = rate_ticket;
-		dcp->metadata.catalog_ticket.associated &= nr_modes > 0;
-		dcp->metadata.catalog_connection_sequence =
-			dcp->chunks.automatic_connection_sequence;
-		spin_unlock_irqrestore(&dcp->metadata.lock, flags);
-		/* Notify removals as well as newly eligible modes, outside the lock. */
-		dcp_180hz_catalog_changed(dcp);
-		if (!modes) {
 			dcp_firmware_metadata_timing(dcp);
 			return false;
 		}
-		if (nr_modes == 0)
+		if (!READ_ONCE(dcp->nr_modes))
 			dev_warn(dcp->dev, "TimingElements without valid modes!\n");
 		dcp_180hz_notify(dcp);
 		dcp_firmware_metadata_timing(dcp);
@@ -1140,7 +1097,15 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 static u8 dcpep_cb_prop_end(struct apple_dcp *dcp,
 			    struct dcp_set_dcpav_prop_end_req *req)
 {
-	u8 resp = dcpep_process_chunks(dcp, req);
+	u8 resp;
+
+	if (!dcp_property_key_valid(req->key, sizeof(req->key))) {
+		kfree(dcp->chunks.data);
+		dcp->chunks.data = NULL;
+		dcp->chunks.length = 0;
+		return false;
+	}
+	resp = dcpep_process_chunks(dcp, req);
 
 	if (dcp->fixed_connector_type != DRM_MODE_CONNECTOR_eDP)
 		dev_dbg(dcp->dev,
@@ -2007,6 +1972,7 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 		return;
 
 	dcp_firmware_metadata_hotplug(dcp, !!(*connected));
+	apple_connector_edid_set_live(connector, !!(*connected));
 	action = dcp_mode_hotplug(&dcp->mode_state, !!(*connected),
 				  connector ? &connector->connected : NULL);
 	/*
@@ -2317,13 +2283,12 @@ static void dcp_set_adaptive_sync(struct apple_dcp *dcp, u32 min_vrr,
 int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 			       struct drm_crtc_state *crtc_state)
 {
-	struct dcp_display_mode *mode;
+	struct dcp_display_mode selected, *mode = &selected;
 	struct dcp_wait_cookie *cookie;
 	struct dcp_color_mode *cmode = NULL;
 	int ret;
 
-	mode = lookup_mode(dcp, &crtc_state->mode);
-	if (!mode) {
+	if (!lookup_mode(dcp, &crtc_state->mode, mode)) {
 		dev_err(dcp->dev, "no match for " DRM_MODE_FMT "\n",
 			DRM_MODE_ARG(&crtc_state->mode));
 		return -EIO;

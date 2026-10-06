@@ -139,6 +139,14 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 					 int height_mm, unsigned notch_height,
 					 bool internal, bool external_sdr);
 int parse_display_metadata(struct dcp_parse_ctx *handle, struct dcp_display_metadata *out);
+void dcp_modes_begin_attachment(struct apple_dcp *dcp);
+int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *handle);
+
+/* Caller serializes readers against replacement. */
+int replace_modes(struct dcp_parse_ctx *handle,
+		  struct dcp_display_mode **modes, unsigned int *count,
+		  int width_mm, int height_mm, unsigned int notch_height,
+		  bool internal);
 int parse_display_attributes(struct dcp_parse_ctx *handle, int *width_mm,
 			     int *height_mm, bool *backlight_control);
 int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
