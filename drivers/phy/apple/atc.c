@@ -49,6 +49,7 @@
 
 #include "atc-dp-tunables.h"
 
+#include "atc-t8122-dp.h"
 #include "atc-tunnel.h"
 
 #define AUSPLL_FSM_CTRL 0x1014
