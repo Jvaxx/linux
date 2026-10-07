@@ -588,13 +588,23 @@ int drm_gem_shmem_dumb_create(struct drm_file *file, struct drm_device *dev,
 }
 EXPORT_SYMBOL_GPL(drm_gem_shmem_dumb_create);
 
+/* GEM and PRIME add the object's fake offset; VMA splits retain it.
+ * Direct helper callers may instead supply an object-relative offset.
+ */
+static pgoff_t drm_gem_shmem_object_offset(struct drm_gem_object *obj, pgoff_t pgoff)
+{
+	pgoff_t base = drm_vma_node_start(&obj->vma_node);
+
+	return pgoff >= base ? pgoff - base : pgoff;
+}
+
 static void drm_gem_shmem_record_mkwrite(struct vm_fault *vmf)
 {
 	struct vm_area_struct *vma = vmf->vma;
 	struct drm_gem_object *obj = vma->vm_private_data;
 	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
 	loff_t num_pages = obj->size >> PAGE_SHIFT;
-	pgoff_t page_offset = vmf->pgoff - vma->vm_pgoff; /* page offset within VMA */
+	pgoff_t page_offset = drm_gem_shmem_object_offset(obj, vmf->pgoff);
 
 	if (drm_WARN_ON(obj->dev, !shmem->pages || page_offset >= num_pages))
 		return;
@@ -653,7 +663,7 @@ static vm_fault_t drm_gem_shmem_any_fault(struct vm_fault *vmf, unsigned int ord
 	loff_t num_pages = obj->size >> PAGE_SHIFT;
 	vm_fault_t ret = VM_FAULT_SIGBUS;
 	struct page **pages = shmem->pages;
-	pgoff_t page_offset = vmf->pgoff - vma->vm_pgoff; /* page offset within VMA */
+	pgoff_t page_offset = drm_gem_shmem_object_offset(obj, vmf->pgoff);
 	struct page *page;
 	struct folio *folio;
 	unsigned long pfn;
