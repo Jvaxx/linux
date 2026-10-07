@@ -1268,6 +1268,7 @@ static int magicmouse_setup_input_mtp(struct input_dev *input,
 	struct magicmouse_sc *msc = hid_get_drvdata(hdev);
 
 	__set_bit(INPUT_PROP_BUTTONPAD, input->propbit);
+	/* The C1FE controller reports no force: it is not a pressure pad. */
 	if (!msc->mtp_c1fe)
 		__set_bit(INPUT_PROP_PRESSUREPAD, input->propbit);
 	__clear_bit(BTN_0, input->keybit);
@@ -2203,6 +2204,13 @@ static int magicmouse_init_haptics(struct magicmouse_sc *msc, struct hid_device 
 	 */
 	if ((trackpad_hdev->bus != BUS_HOST && trackpad_hdev->bus != BUS_SPI) ||
 	    trackpad_hdev->type != HID_TYPE_SPI_MOUSE)
+		return 0;
+
+	/*
+	 * The C1FE trackpad reports no force, so the button cannot be derived
+	 * while the host holds an actuator: offer no force feedback there.
+	 */
+	if (msc->mtp_c1fe)
 		return 0;
 
 	haptics = devm_kzalloc(&trackpad_hdev->dev, sizeof(*haptics), GFP_KERNEL);
