@@ -390,9 +390,11 @@ unsigned long page_mapped_in_vma(const struct page *page,
 	unsigned long address;
 	struct page_vma_mapped_walk pvmw = {
 		.pfn = page_to_pfn(page),
+		.pgoff = page_pgoff(folio, page),
 		.nr_pages = 1,
 		.vma = vma,
 		.flags = PVMW_SYNC,
+		.pgoff_is_anon = folio_test_anon(folio),
 	};
 
 	if (folio_test_anon(folio))
@@ -404,9 +406,12 @@ unsigned long page_mapped_in_vma(const struct page *page,
 		goto out;
 	if (!page_vma_mapped_walk(&pvmw))
 		return -EFAULT;
+	/* A smaller leaf can map the page after an unmapped leading fragment. */
+	if (mm_page_size(vma->vm_mm) < PAGE_SIZE)
+		address = pvmw.address;
 	page_vma_mapped_walk_done(&pvmw);
 out:
-	/* Report this native page's byte address, not the covering leaf start. */
+	/* Coarser leaves retain this native page's byte address within the leaf. */
 	return address;
 }
 #endif
