@@ -241,6 +241,15 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 				   struct DCP_FW_NAME(dc_swap_complete_resp) *resp)
 {
 	ktime_t now = ktime_get();
+
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
+	    !dcp_present_complete_h17p(&dcp->present_state_h17p, resp->swap_id)) {
+		dev_err(dcp->dev, "unexpected present completion %u\n", resp->swap_id);
+		dcp->crashed = true;
+		return;
+	}
+#endif
 	trace_iomfb_swap_complete(dcp, resp->swap_id);
 	dcp->last_swap_id = resp->swap_id;
 	dcp_swap_watchdog_complete(dcp);
@@ -1288,6 +1297,32 @@ static void dcp_h17p_prepare_swap(struct apple_dcp *dcp)
 static void dcp_h17p_prepare_swap(struct apple_dcp *dcp) { }
 #endif
 
+static bool dcp_present_begin(struct apple_dcp *dcp, u32 swap_id)
+{
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
+	    !dcp_present_begin_h17p(&dcp->present_state_h17p, swap_id)) {
+		dev_err(dcp->dev, "overlapping present %u\n", swap_id);
+		dcp->crashed = true;
+		return false;
+	}
+#endif
+	return true;
+}
+
+static bool dcp_present_submit(struct apple_dcp *dcp, u32 swap_id, bool accepted)
+{
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
+	    !dcp_present_submit_h17p(&dcp->present_state_h17p, swap_id, accepted)) {
+		dev_err(dcp->dev, "unexpected present submission %u\n", swap_id);
+		dcp->crashed = true;
+		return false;
+	}
+#endif
+	return true;
+}
+
 static void dcp_swap_cleared(struct apple_dcp *dcp, void *data, void *cookie)
 {
 	struct DCP_FW_NAME(dcp_swap_submit_resp) *resp = data;
@@ -1775,6 +1810,12 @@ TRAMPOLINE_OUT(trampoline_create_backlight_service, dcpep_cb_create_backlight_se
 static void dcp_swapped(struct apple_dcp *dcp, void *data, void *cookie)
 {
 	struct DCP_FW_NAME(dcp_swap_submit_resp) *resp = data;
+	u32 swap_id = DCP_FW_UNION(dcp->swap).swap.swap_id;
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	u32 status = resp ? resp->ret : ~0U;
+#else
+	u32 status = resp->ret;
+#endif
 
 	if (resp->ret) {
 		dev_err(dcp->dev, "swap failed! status %u\n", resp->ret);
@@ -1804,6 +1845,10 @@ static void dcp_swap_started(struct apple_dcp *dcp, void *data, void *cookie)
 
 	if (!resp || resp->ret) {
 		dev_err(dcp->dev, "swap_start was rejected\n");
+		dcp_drm_crtc_vblank(dcp->crtc);
+		return;
+	}
+	if (!dcp_present_begin(dcp, resp->swap_id)) {
 		dcp_drm_crtc_vblank(dcp->crtc);
 		return;
 	}
