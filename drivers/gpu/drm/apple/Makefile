@@ -32,3 +32,4 @@ appledrm-$(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST) += hotplug-test.o
 appledrm-$(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST) += external-hold-test.o
 appledrm-$(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST) += v14-board-test.o
 obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += afk_test.o
+obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_backlight_test.o
