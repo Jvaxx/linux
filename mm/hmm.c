@@ -701,6 +701,9 @@ static int hmm_range_fault_locked(struct hmm_range *range, bool *locked)
 	int ret;
 
 	mmap_assert_locked(mm);
+	/* Each output PFN describes a whole native page, without a byte offset. */
+	if (mm_page_size(mm) != PAGE_SIZE)
+		return -EOPNOTSUPP;
 
 	do {
 		/* If range is no longer valid force retry. */
@@ -750,6 +753,7 @@ static int hmm_range_fault_locked(struct hmm_range *range, bool *locked)
  *		the invalidation to finish.
  * -EFAULT:     A page was requested to be valid and could not be made valid
  *              ie it has no backing VMA or it is illegal to access
+ * -EOPNOTSUPP: The MM uses a non-native mapping granule.
  *
  * This is similar to get_user_pages(), except that it can read the page tables
  * without mutating them (ie causing faults).
