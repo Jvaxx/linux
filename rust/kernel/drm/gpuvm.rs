@@ -36,7 +36,7 @@ use crate::{
 
 use core::cell::UnsafeCell;
 use core::marker::{PhantomData, PhantomPinned};
-use core::mem::ManuallyDrop;
+use core::mem::{ManuallyDrop, MaybeUninit};
 use core::ops::{Deref, DerefMut, Range};
 use core::ptr::NonNull;
 use pin_init;
@@ -402,7 +402,10 @@ pub(super) unsafe extern "C" fn vm_bo_alloc_callback<T: DriverGpuVm>() -> *mut b
 {
     let obj: Result<Pin<KBox<GpuVmBo<T>>>> = KBox::try_pin_init(
         try_pin_init!(GpuVmBo::<T> {
-            bo <- pin_init::default(),
+            // The bindgen `Default` implementation is exactly a zero fill, but its
+            // out-of-line symbol is not exported to loadable modules. `drm_gpuvm_bo`
+            // is `Zeroable`, so initialize it directly without a cross-crate call.
+            bo <- pin_init::zeroed::<bindings::drm_gpuvm_bo>(),
             inner <- T::GpuVmBo::new(),
             _p: PhantomPinned
         }),
@@ -594,13 +597,20 @@ impl<T: DriverGpuVm> GpuVm<T> {
                     } else {
                         0
                     },
-                    exec: Default::default(),
+                    // SAFETY: bindgen's `Default` for this C structure is exactly
+                    // `MaybeUninit::zeroed().assume_init()`. Spell that out here so
+                    // external modules do not import its unexported trait method.
+                    exec: unsafe { MaybeUninit::<bindings::drm_exec>::zeroed().assume_init() },
                     extra: match (is_ext, obj) {
                         (true, Some(obj)) => bindings::drm_gpuvm_exec__bindgen_ty_1 {
                             fn_: Some(exec_lock_gem_object),
                             priv_: obj.as_raw() as *const _ as *mut _,
                         },
-                        _ => Default::default(),
+                        // SAFETY: as above, this bindgen C structure is zero-valid.
+                        _ => unsafe {
+                            MaybeUninit::<bindings::drm_gpuvm_exec__bindgen_ty_1>::zeroed()
+                                .assume_init()
+                        },
                     },
                     num_fences: 0,
                 }),
@@ -611,6 +621,59 @@ impl<T: DriverGpuVm> GpuVm<T> {
 
         // SAFETY: The object is valid and was initialized above
         to_result(unsafe { bindings::drm_gpuvm_exec_lock(&mut *guard.vm_exec) })?;
+
+        Ok(ManuallyDrop::into_inner(guard))
+    }
+
+    /// Lock the GPUVM and an array of additional GEM objects in one
+    /// wound/wait transaction.
+    pub fn exec_lock_array<'a, 'b>(
+        &'a self,
+        objects: &'b [ARef<Object<T>>],
+        interruptible: bool,
+    ) -> Result<LockedGpuVm<'a, 'b, T>> {
+        let count = u32::try_from(objects.len()).map_err(|_| EINVAL)?;
+        let mut raw_objects = KVec::with_capacity(objects.len(), GFP_KERNEL)?;
+        for object in objects {
+            raw_objects.push(object.as_raw(), GFP_KERNEL)?;
+        }
+
+        let mut guard = ManuallyDrop::new(LockedGpuVm {
+            gpuvm: self,
+            // vm_exec needs to be pinned, so stick it in a Box.
+            vm_exec: KBox::init(
+                init!(bindings::drm_gpuvm_exec {
+                    vm: self.gpuvm() as *mut _,
+                    flags: (if interruptible {
+                        bindings::DRM_EXEC_INTERRUPTIBLE_WAIT
+                    } else {
+                        0
+                    }) | bindings::DRM_EXEC_IGNORE_DUPLICATES,
+                    // SAFETY: both bindgen C structures are zero-valid; their generated
+                    // `Default` methods perform the same zero initialization but are not
+                    // exported from the kernel crate to loadable modules.
+                    exec: unsafe { MaybeUninit::<bindings::drm_exec>::zeroed().assume_init() },
+                    extra: unsafe {
+                        MaybeUninit::<bindings::drm_gpuvm_exec__bindgen_ty_1>::zeroed()
+                            .assume_init()
+                    },
+                    num_fences: 0,
+                }),
+                GFP_KERNEL,
+            )?,
+            objects: LockedObjects::Array(objects),
+        });
+
+        // SAFETY: Every raw pointer is backed by an ARef in `objects`, which
+        // outlives the returned guard. The helper consumes the temporary
+        // pointer array before returning and keeps its own object references.
+        to_result(unsafe {
+            bindings::drm_gpuvm_exec_lock_array(
+                &mut *guard.vm_exec,
+                raw_objects.as_mut_ptr(),
+                count,
+            )
+        })?;
 
         Ok(ManuallyDrop::into_inner(guard))
     }
@@ -745,7 +808,55 @@ impl<T: DriverGpuVm> LockedGpuVm<'_, '_, T> {
         req_gem_range: u32,
         flags: GpuVaFlags,
     ) -> Result {
-        let obj = self.obj.ok_or(EINVAL)?;
+        let obj = self.objects.single().ok_or(EINVAL)?.as_raw();
+        self.sm_map_raw(
+            obj,
+            ctx,
+            req_addr,
+            req_range,
+            req_offset,
+            req_gem_range,
+            flags,
+        )
+    }
+
+    /// Map with an object acquired by [`GpuVm::exec_lock_array`].
+    pub fn sm_map_indexed(
+        &mut self,
+        object_index: usize,
+        ctx: &mut T::StepContext,
+        req_addr: u64,
+        req_range: u64,
+        req_offset: u64,
+        req_gem_range: u32,
+        flags: GpuVaFlags,
+    ) -> Result {
+        let obj = self
+            .objects
+            .indexed(object_index)
+            .ok_or(EINVAL)?
+            .as_raw();
+        self.sm_map_raw(
+            obj,
+            ctx,
+            req_addr,
+            req_range,
+            req_offset,
+            req_gem_range,
+            flags,
+        )
+    }
+
+    fn sm_map_raw(
+        &mut self,
+        obj: *mut bindings::drm_gem_object,
+        ctx: &mut T::StepContext,
+        req_addr: u64,
+        req_range: u64,
+        req_offset: u64,
+        req_gem_range: u32,
+        flags: GpuVaFlags,
+    ) -> Result {
         let mut ctx = StepContext {
             ctx,
             gpuvm: self.gpuvm,
