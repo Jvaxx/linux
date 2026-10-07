@@ -3370,6 +3370,13 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8112 = {
 	.num_dptx_ports = 2,
 };
 
+/* The internal T8140 endpoint uses the measured H17P method profile. */
+static const struct apple_dcp_hw_data apple_dcp_hw_t8140 = {
+	.num_dptx_ports = 0,
+	.adopt_live_session = true,
+	.firmware_compat = DCP_FIRMWARE_H17P,
+};
+
 /*
  * M5 (T8142) runs H17-generation DCP firmware with the H17G method numbering
  * and is left running by the bootloader.
@@ -3419,6 +3426,7 @@ static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t8122-dcp", .data = &apple_dcp_hw_t8122, },
 	{ .compatible = "apple,t6031-dcp", .data = &apple_dcp_hw_t6031, },
 	{ .compatible = "apple,t8122-dcpext", .data = &apple_dcp_hw_t8122_dcpext, },
+	{ .compatible = "apple,t8140-dcp", .data = &apple_dcp_hw_t8140,  },
 	{ .compatible = "apple,t8142-dcp", .data = &apple_dcp_hw_t8142,  },
 	{ .compatible = "apple,dcp",       .data = &apple_dcp_hw_dcp,    },
 	{ .compatible = "apple,dcpext",    .data = &apple_dcp_hw_dcpext, },
