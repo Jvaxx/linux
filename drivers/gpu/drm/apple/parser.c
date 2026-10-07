@@ -378,15 +378,15 @@ static int parse_dimension(struct dcp_parse_ctx *handle, struct dimension *dim,
 			ret = skip(it.handle);
 		}
 		else if (!strcmp(key, "Active"))
-			ret = parse_int(it.handle, &dim->active);
+			ret = parse_int_bound(it.handle, &dim->active, 0, U16_MAX);
 		else if (!strcmp(key, "Total"))
-			ret = parse_int(it.handle, &dim->total);
+			ret = parse_int_bound(it.handle, &dim->total, 0, U16_MAX);
 		else if (!strcmp(key, "FrontPorch"))
-			ret = parse_int(it.handle, &dim->front_porch);
+			ret = parse_int_bound(it.handle, &dim->front_porch, 0, U16_MAX);
 		else if (!strcmp(key, "SyncWidth"))
-			ret = parse_int(it.handle, &dim->sync_width);
+			ret = parse_int_bound(it.handle, &dim->sync_width, 0, U16_MAX);
 		else if (!strcmp(key, "PreciseSyncRate"))
-			ret = parse_int(it.handle, &dim->precise_sync_rate);
+			ret = parse_int_bound(it.handle, &dim->precise_sync_rate, 1, U32_MAX);
 		else
 			ret = skip(it.handle);
 
@@ -418,6 +418,9 @@ struct color_mode {
 static int fill_color_mode(struct dcp_color_mode *color,
 			   struct color_mode *cmode)
 {
+	if (cmode->id < 0 || cmode->id > U32_MAX)
+		return -EINVAL;
+
 	if (color->score >= cmode->score)
 		return 0;
 
@@ -548,6 +551,7 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 	struct dimension horiz = {}, vert = {};
 	u64 clock;
 	s64 min_vrr = 0, max_vrr = 0;
+	u64 clock;
 	s64 id = -1;
 	s64 best_color_mode = -1;
 	bool is_virtual = false;
@@ -648,6 +652,10 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		out->max_vrr = max_vrr;
 		out->vrr = true;
 	}
+
+	clock = calculate_clock(&horiz, &vert);
+	if (!clock || clock > INT_MAX)
+		return -EINVAL;
 
 	vert.active -= notch_height;
 	vert.sync_width += notch_height;
