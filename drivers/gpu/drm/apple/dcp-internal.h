@@ -224,8 +224,6 @@ struct apple_dcp {
 		struct dcp_swap_submit_req_v14_7_0 v14_7_0;
 		struct dcp_swap_submit_req_h17p h17p;
 	} swap;
-	/* Staging wire record; serialization never mutates the atomic inputs. */
-	struct dcp_present_h17p present_h17p;
 
 	/* swap id of the last completed swap */
 	u32 last_swap_id;
@@ -347,6 +345,10 @@ struct apple_dcp {
 		struct dcp_backlight_state state;
 		void (*kick)(struct apple_dcp *dcp);
 	} backlight;
+
+	/* Staging wire record; serialization never mutates the atomic inputs. */
+	struct dcp_present_h17p present_h17p;
+	struct dcp_present_state_h17p present_state_h17p;
 };
 
 void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);
