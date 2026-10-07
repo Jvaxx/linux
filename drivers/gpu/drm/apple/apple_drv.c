@@ -406,8 +406,13 @@ static int apple_probe_per_dcp(struct device *dev,
 	u32 surf;
 	int zpos = 0;
 	bool supports_l10r = !dcp_fw_compat_is_12_x(dcp);
+	struct apple_dcp *dcp_data = platform_get_drvdata(dcp);
+	bool supports_xrgb2101010;
 	enum drm_plane_type plane_type;
 	bool interchange;
+
+	supports_xrgb2101010 = dcp_data->fw_compat != DCP_FIRMWARE_H17P ||
+		dcp_data->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G;
 
 	/*
 	 * BUG:
@@ -422,7 +427,9 @@ static int apple_probe_per_dcp(struct device *dev,
 		plane_type = (zpos == 0) ? DRM_PLANE_TYPE_PRIMARY : DRM_PLANE_TYPE_OVERLAY;
 		interchange = (zpos <= 1 || surf != top_surf);
 
-		planes[zpos] = apple_plane_init(drm, 1U << num, surf, supports_l10r,
+		planes[zpos] = apple_plane_init(drm, 1U << num, surf,
+						supports_l10r,
+						supports_xrgb2101010,
 						plane_type, interchange);
 
 		if (IS_ERR(planes[zpos]))
