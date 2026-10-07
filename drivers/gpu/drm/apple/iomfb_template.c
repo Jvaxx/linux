@@ -1594,6 +1594,12 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	struct dcp_swap_start_req swap_req = { 0 };
 	struct DCP_FW_NAME(dcp_swap_submit_req) *swap = &DCP_FW_UNION(dcp->swap);
 
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	/* The measured profile has no safe pipe-off or surface-free transition. */
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
+		return;
+#endif
+
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
 	if (!cookie)
 		return;
@@ -1676,6 +1682,11 @@ void DCP_FW_NAME(iomfb_sleep)(struct apple_dcp *dcp)
 	};
 
 	struct dcp_wait_cookie *cookie;
+
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
+		return;
+#endif
 
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
 	if (!cookie)
