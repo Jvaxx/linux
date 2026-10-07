@@ -1560,11 +1560,13 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 {
 	bool h17p_external = dcp->hw.iomfb_method_profile ==
 		DCP_IOMFB_METHODS_H17P_EXTERNAL;
+	struct apple_connector *ready = NULL;
 	struct dcp_display_mode *modes;
 	struct dcp_metadata_ticket rate_ticket = {};
 	u64 rate_service_epoch = 0;
 	unsigned int nr_modes = 0, i;
 	unsigned long flags;
+	bool provisional;
 	u32 entries = 0;
 	int ret = 0;
 
@@ -1609,6 +1611,7 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 		kfree(modes);
 		return -ESTALE;
 	}
+	provisional = dcp->modes_provisional;
 	/* Publish one catalog revision with its immutable receipt tickets. */
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
 	dcp->rate_proof.catalog_sequence++;
@@ -1625,12 +1628,20 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 	dcp->modes_admitted = !ret;
 	dcp->modes_provisional = false;
+	/* A fresh catalog replaced one adopted across a route move. */
+	if (!ret && provisional && dcp->connector && dcp->dev &&
+	    dcp_modes_for_connector(dcp, dcp->connector) &&
+	    READ_ONCE(dcp->connector->dcp) == to_platform_device(dcp->dev))
+		ready = dcp->connector;
 	mutex_unlock(&dcp->modes_lock);
 
 	if (!ret && !h17p_external)
 		apple_connector_invalidate_edid(dcp->connector);
 	/* Notify removals as well as newly eligible modes, outside the lock. */
 	dcp_180hz_catalog_changed(dcp);
+	/* RX lifetime is drained before connector cleanup; work rechecks ownership. */
+	if (ready)
+		dcp_queue_hotplug(ready);
 	return ret;
 }
 
@@ -2088,10 +2099,11 @@ bool dcp_crtc_route_ready(struct drm_crtc *crtc, struct drm_atomic_commit *state
 			  bool fresh)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(to_apple_crtc(crtc)->dcp);
-	struct drm_connector_state *conn_state;
+	struct drm_connector_list_iter iter;
 	struct drm_crtc_state *crtc_state;
 	struct drm_connector *conn;
-	int i;
+	u64 mask, seen = 0;
+	bool ready = true, owned = false;
 
 	if (!dcp_typec_follows_crtc(dcp))
 		return true;
@@ -2099,30 +2111,37 @@ bool dcp_crtc_route_ready(struct drm_crtc *crtc, struct drm_atomic_commit *state
 	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
 	if (!crtc_state)
 		crtc_state = crtc->state;
-	/* Plane-only updates need the complete effective assignment as well. */
-	if (crtc_state && crtc_state->connector_mask && dcp->active_typec_route &&
-	    (!dcp->connector ||
-	     !(crtc_state->connector_mask & drm_connector_mask(&dcp->connector->base)) ||
-	     READ_ONCE(dcp->connector->dcp) != to_apple_crtc(crtc)->dcp))
-		return false;
-	for_each_new_connector_in_state(state, conn, conn_state, i) {
+	mask = crtc_state ? crtc_state->connector_mask : 0;
+	if (!mask)
+		return !dcp->connector || !dcp->connector->port_encoder;
+	/* The mask is the complete assignment, even on a plane-only commit. */
+	drm_connector_list_iter_begin(crtc->dev, &iter);
+	drm_for_each_connector_iter(conn, &iter) {
 		struct apple_connector *connector = to_apple_connector(conn);
-		struct platform_device *owner = READ_ONCE(connector->dcp);
+		struct platform_device *owner;
+		struct drm_connector_state *assignment;
 
-		if (conn_state->crtc != crtc || !connector->port_encoder)
+		if (!(mask & drm_connector_mask(conn)))
 			continue;
-		/* Unrouted resume retains its existing deferred-flush behaviour. */
+		seen |= drm_connector_mask(conn);
+		owner = READ_ONCE(connector->dcp);
+		/* Preserve the unrouted, disconnected resume/deferred-flush path. */
 		if (!owner && !READ_ONCE(connector->connected))
 			continue;
-		if (owner != to_apple_crtc(crtc)->dcp ||
-		    READ_ONCE(dcp->connector) != connector)
-			return false;
+		owned = true;
+		assignment = drm_atomic_get_new_connector_state(state, conn);
+		if (!assignment)
+			assignment = conn->state;
+		if (!assignment || assignment->crtc != crtc ||
+		    owner != to_apple_crtc(crtc)->dcp || dcp->connector != connector)
+			ready = false;
 	}
-	if (fresh && dcp->typec_follow_start &&
-	    dcp->typec_follow_gen == dcp->typec_generation &&
-	    !dcp_modes_for_connector(dcp, dcp->connector))
+	drm_connector_list_iter_end(&iter);
+	if (!ready || seen != mask)
 		return false;
-	return !fresh || !dcp->modes_provisional;
+	if (fresh && owned)
+		return dcp_modes_for_connector(dcp, dcp->connector) && !dcp->modes_provisional;
+	return true;
 }
 
 /* Does the display @dcp drives offer @mode? */
