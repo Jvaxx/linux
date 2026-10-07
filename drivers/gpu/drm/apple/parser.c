@@ -87,14 +87,19 @@ static const struct dcp_parse_tag *parse_tag_of_type(struct dcp_parse_ctx *ctx,
 static int skip_depth(struct dcp_parse_ctx *handle, unsigned int depth)
 {
 	const struct dcp_parse_tag *tag;
-	int ret = 0;
-	int i;
+	const void *data;
+	unsigned int count, i;
+	int ret;
+
+	if (depth >= DCP_PARSE_MAX_DEPTH)
+		return -EINVAL;
 
 	if (depth > 64)
 		return -E2BIG;
 
 	tag = parse_tag(handle);
 
+	tag = parse_tag(handle);
 	if (IS_ERR(tag))
 		return PTR_ERR(tag);
 
@@ -118,7 +123,12 @@ static int skip_depth(struct dcp_parse_ctx *handle, unsigned int depth)
 				return ret;
 		}
 
-		return ret;
+		for (i = 0; i < count; ++i) {
+			ret = skip_value(handle, depth + 1);
+			if (ret)
+				return ret;
+		}
+		return 0;
 
 	case DCP_TYPE_INT64:
 		return PTR_ERR_OR_ZERO(parse_bytes(handle, sizeof(s64)));
@@ -133,6 +143,13 @@ static int skip_depth(struct dcp_parse_ctx *handle, unsigned int depth)
 	default:
 		return -EINVAL;
 	}
+
+	return IS_ERR(data) ? PTR_ERR(data) : 0;
+}
+
+static int skip(struct dcp_parse_ctx *handle)
+{
+	return skip_value(handle, 0);
 }
 
 static int skip(struct dcp_parse_ctx *handle)
@@ -156,7 +173,6 @@ static bool consume_string(struct dcp_parse_ctx *ctx, const char *specimen)
 {
 	const struct dcp_parse_tag *tag;
 	const char *key;
-	ctx->pos = round_up(ctx->pos, 4);
 
 	if (ctx->pos + sizeof(*tag) + strlen(specimen) - 1 > ctx->len)
 		return false;
@@ -308,6 +324,7 @@ int parse(const void *blob, size_t size, struct dcp_parse_ctx *ctx)
 
 	if (size > U32_MAX)
 		return -E2BIG;
+		return -EINVAL;
 
 	*ctx = (struct dcp_parse_ctx) {
 		.blob = blob,
@@ -332,7 +349,11 @@ static int parse_dimension(struct dcp_parse_ctx *handle, struct dimension *dim,
 	unsigned int fields = 0;
 	int ret = 0;
 
-	dcp_parse_foreach_in_dict(handle, it) {
+	ret = iterator_begin(handle, &it, true);
+	if (ret)
+		return ret;
+
+	for (; it.idx < it.len; ++it.idx) {
 		char *key = parse_string(it.handle);
 
 		if (IS_ERR(key)) {
@@ -356,6 +377,18 @@ static int parse_dimension(struct dcp_parse_ctx *handle, struct dimension *dim,
 		} else {
 			ret = skip(it.handle);
 		}
+		else if (!strcmp(key, "Active"))
+			ret = parse_int(it.handle, &dim->active);
+		else if (!strcmp(key, "Total"))
+			ret = parse_int(it.handle, &dim->total);
+		else if (!strcmp(key, "FrontPorch"))
+			ret = parse_int(it.handle, &dim->front_porch);
+		else if (!strcmp(key, "SyncWidth"))
+			ret = parse_int(it.handle, &dim->sync_width);
+		else if (!strcmp(key, "PreciseSyncRate"))
+			ret = parse_int(it.handle, &dim->precise_sync_rate);
+		else
+			ret = skip(it.handle);
 
 		if (!IS_ERR_OR_NULL(key))
 			kfree(key);
@@ -420,7 +453,11 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 	out->sdr.score = -1;
 	out->best.score = -1;
 
-	dcp_parse_foreach_in_array(handle, outer_it) {
+	ret = iterator_begin(handle, &outer_it, false);
+	if (ret)
+		return ret;
+
+	for (; outer_it.idx < outer_it.len; ++outer_it.idx) {
 		struct iterator it;
 		bool is_virtual = true;
 		struct color_mode cmode = {
@@ -428,7 +465,11 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 			.eotf = -1, .id = -1, .pixel_encoding = -1, .score = -1,
 		};
 
-		dcp_parse_foreach_in_dict(handle, it) {
+		ret = iterator_begin(handle, &it, true);
+		if (ret)
+			return ret;
+
+		for (; it.idx < it.len; ++it.idx) {
 			char *key = parse_string(it.handle);
 
 			if (IS_ERR(key))
@@ -519,13 +560,17 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 	out->best.score = -1;
 	*score = -1;
 
-	dcp_parse_foreach_in_dict(handle, it) {
+	ret = iterator_begin(handle, &it, true);
+	if (ret)
+		return ret;
+
+	for (; it.idx < it.len; ++it.idx) {
 		char *key = parse_string(it.handle);
 
 		if (IS_ERR(key))
 			ret = PTR_ERR(key);
 		else if (is_virtual)
-			skip(it.handle);
+			ret = skip(it.handle);
 		else if (!strcmp(key, "HorizontalAttributes"))
 			ret = parse_dimension(it.handle, &horiz, false);
 		else if (!strcmp(key, "VerticalAttributes"))
@@ -543,7 +588,7 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		else if (!strcmp(key, "Score"))
 			ret = parse_int(it.handle, score);
 		else
-			skip(it.handle);
+			ret = skip(it.handle);
 
 		if (!IS_ERR_OR_NULL(key))
 			kfree(key);
@@ -749,6 +794,10 @@ int parse_display_attributes(struct dcp_parse_ctx *handle, int *width_mm,
 	ret = iterator_begin(handle, &it, true);
 	if (ret)
 		return ret;
+	ret = iterator_begin(handle, &it, true);
+	if (ret)
+		return ret;
+
 	for (; it.idx < it.len; ++it.idx) {
 		char *key = parse_string(it.handle);
 
@@ -789,7 +838,11 @@ int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
 	*name = ERR_PTR(-ENOENT);
 	*class = ERR_PTR(-ENOENT);
 
-	dcp_parse_foreach_in_dict(handle, it) {
+	ret = iterator_begin(handle, &it, true);
+	if (ret)
+		return ret;
+
+	for (; it.idx < it.len; ++it.idx) {
 		char *key = parse_string(it.handle);
 
 		if (IS_ERR(key)) {
@@ -831,7 +884,7 @@ int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
 			if (!ret)
 				parsed_unit = true;
 		} else {
-			skip(it.handle);
+			ret = skip(it.handle);
 		}
 
 		kfree(key);
@@ -951,7 +1004,11 @@ static int parse_chmap(struct dcp_parse_ctx *handle, struct snd_pcm_chmap_elem *
 
 	chmap->channels = 0;
 
-	dcp_parse_foreach_in_array(handle, it) {
+	ret = iterator_begin(handle, &it, false);
+	if (ret)
+		return ret;
+
+	for (; it.idx < it.len; ++it.idx) {
 		for (i = 0; i < ARRAY_SIZE(chan_position_names); i++)
 			if (consume_string(it.handle, chan_position_names[i].label))
 				break;
@@ -979,7 +1036,11 @@ static int parse_chan_layout_element(struct dcp_parse_ctx *handle,
 	int ret;
 	s64 nchans = 0;
 
-	dcp_parse_foreach_in_dict(handle, it) {
+	ret = iterator_begin(handle, &it, true);
+	if (ret)
+		return ret;
+
+	for (; it.idx < it.len; ++it.idx) {
 		if (consume_string(it.handle, "ActiveChannelCount"))
 			ret = parse_int(it.handle, &nchans);
 		else if (consume_string(it.handle, "ChannelLayout"))
@@ -1004,7 +1065,11 @@ static int parse_nchans_mask(struct dcp_parse_ctx *handle, unsigned int *mask)
 
 	*mask = 0;
 
-	dcp_parse_foreach_in_array(handle, it) {
+	ret = iterator_begin(handle, &it, false);
+	if (ret)
+		return ret;
+
+	for (; it.idx < it.len; ++it.idx) {
 		int nchans;
 
 		ret = parse_chan_layout_element(it.handle, &nchans, NULL);
@@ -1024,7 +1089,11 @@ static int parse_avep_element(struct dcp_parse_ctx *handle,
 	struct iterator it;
 	int ret;
 
-	dcp_parse_foreach_in_dict(handle, it) {
+	ret = iterator_begin(handle, &it, true);
+	if (ret)
+		return ret;
+
+	for (; it.idx < it.len; ++it.idx) {
 		if (consume_string(handle, "StreamSampleRate"))
 			ret = parse_sample_rate_bit(it.handle, &mask.rates);
 		else if (consume_string(handle, "SampleSize"))
@@ -1062,12 +1131,20 @@ static int parse_mode_in_avep_element(struct dcp_parse_ctx *handle,
 	struct dcp_parse_ctx save_handle;
 	int ret;
 
-	dcp_parse_foreach_in_dict(handle, it) {
+	ret = iterator_begin(handle, &it, true);
+	if (ret)
+		return ret;
+
+	for (; it.idx < it.len; ++it.idx) {
 		if (consume_string(it.handle, "AudioChannelLayoutElements")) {
 			struct iterator inner_it;
 			int nchans;
 
-			dcp_parse_foreach_in_array(it.handle, inner_it) {
+			ret = iterator_begin(it.handle, &inner_it, false);
+			if (ret)
+				return ret;
+
+			for (; inner_it.idx < inner_it.len; ++inner_it.idx) {
 				save_handle = *it.handle;
 				ret = parse_chan_layout_element(inner_it.handle,
 								&nchans, NULL);
@@ -1120,7 +1197,11 @@ int parse_sound_constraints(struct dcp_parse_ctx *handle,
 		hits->nchans = 0;
 	}
 
-	dcp_parse_foreach_in_array(handle, it) {
+	ret = iterator_begin(handle, &it, false);
+	if (ret)
+		return ret;
+
+	for (; it.idx < it.len; ++it.idx) {
 		ret = parse_avep_element(it.handle, sieve, hits);
 
 		if (ret < 0)
@@ -1139,7 +1220,11 @@ int parse_sound_mode(struct dcp_parse_ctx *handle,
 	struct iterator it;
 	int ret;
 
-	dcp_parse_foreach_in_array(handle, it) {
+	ret = iterator_begin(handle, &it, false);
+	if (ret)
+		return ret;
+
+	for (; it.idx < it.len; ++it.idx) {
 		save_handle = *it.handle;
 		ret = parse_avep_element(it.handle, sieve, NULL);
 
@@ -1169,7 +1254,11 @@ int parse_system_log_mnits(struct dcp_parse_ctx *handle, struct dcp_system_ev_mn
 	s64 timestamp = -1;
 	bool type_match = false;
 
-	dcp_parse_foreach_in_dict(handle, it) {
+	ret = iterator_begin(handle, &it, true);
+	if (ret)
+		return ret;
+
+	for (; it.idx < it.len; ++it.idx) {
 		char *key = parse_string(it.handle);
 		if (IS_ERR(key)) {
 			ret = PTR_ERR(key);
@@ -1186,7 +1275,7 @@ int parse_system_log_mnits(struct dcp_parse_ctx *handle, struct dcp_system_ev_mn
 		} else if (!strcmp(key, "timestamp")) {
 			ret = parse_int(it.handle, &timestamp);
 		} else {
-			skip(it.handle);
+			ret = skip(it.handle);
 		}
 
 		if (!IS_ERR_OR_NULL(key))
