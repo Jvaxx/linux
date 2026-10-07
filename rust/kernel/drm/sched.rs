@@ -44,6 +44,10 @@ pub enum Priority {
 
 /// Trait to be implemented by driver job objects.
 pub trait JobImpl: Sized {
+    /// Module implementing the callbacks. Its caller must retain the module
+    /// through entity destruction; the core pins detached kill-job callbacks.
+    const MODULE: Option<&'static crate::ThisModule> = None;
+
     /// Handle a scoped timeout without resetting the C scheduler.
     ///
     /// The backend must settle/quarantine its exact hardware work, or retain
@@ -477,6 +481,10 @@ impl<T: JobImpl> Scheduler<T> {
         timedout_job: Some(timedout_job_cb::<T>),
         free_job: Some(free_job_cb::<T>),
         cancel_job: Some(cancel_job_cb::<T>),
+        owner: match T::MODULE {
+            Some(module) => module.as_ptr(),
+            None => core::ptr::null_mut(),
+        },
         owner: core::ptr::null_mut(),
         retain_job_on_enodev: false,
     };
