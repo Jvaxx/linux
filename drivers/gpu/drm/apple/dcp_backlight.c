@@ -162,23 +162,34 @@ static int drm_crtc_set_brightness(struct apple_dcp *dcp)
 		goto done;
 
 	state = drm_atomic_state_alloc(crtc->dev);
-	if (!state) {
-		ret = -ENOMEM;
-		goto done;
-	}
+	if (!state)
+		return -ENOMEM;
 
+	drm_modeset_acquire_init(&ctx, DRM_MODESET_ACQUIRE_INTERRUPTIBLE);
 	state->acquire_ctx = &ctx;
+
+retry:
 	crtc_state = drm_atomic_get_crtc_state(state, crtc);
 	if (IS_ERR(crtc_state)) {
 		ret = PTR_ERR(crtc_state);
-		goto fail;
+		goto out;
 	}
+
+	if (!dcp->brightness.update)
+		goto out;
 
 	crtc_state->color_mgmt_changed |= true;
 
 	ret = drm_atomic_commit(state);
 
-fail:
+out:
+	if (ret == -EDEADLK) {
+		drm_atomic_state_clear(state);
+		ret = drm_modeset_backoff(&ctx);
+		if (!ret)
+			goto retry;
+	}
+
 	drm_atomic_state_put(state);
 done:
 	drm_modeset_drop_locks(&ctx);
@@ -209,9 +220,11 @@ static int dcp_set_brightness(struct backlight_device *bd)
 {
 	int ret = 0;
 	struct apple_dcp *dcp = bl_get_data(bd);
-	struct drm_modeset_acquire_ctx ctx;
 	int brightness = backlight_get_brightness(bd);
 
+	ret = drm_modeset_lock_single_interruptible(&dcp->crtc->base.mutex);
+	if (ret)
+		return ret;
 	drm_modeset_acquire_init(&ctx, DRM_MODESET_ACQUIRE_INTERRUPTIBLE);
 	ret = drm_modeset_lock(&dcp->crtc->base.mutex, &ctx);
 	if (ret == -EDEADLK) {
@@ -228,6 +241,7 @@ static int dcp_set_brightness(struct backlight_device *bd)
 
 	drm_modeset_drop_locks(&ctx);
 	drm_modeset_acquire_fini(&ctx);
+	drm_modeset_unlock(&dcp->crtc->base.mutex);
 
 	return dcp_backlight_update(dcp);
 }
