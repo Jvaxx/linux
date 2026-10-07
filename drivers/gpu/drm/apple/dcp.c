@@ -1657,6 +1657,12 @@ int dcp_typec_prepare_route(struct apple_dcp *dcp)
 	if (generation != dcp->typec_generation || !dcp->typec_cable_connected)
 		return -ESTALE;
 	return ready ? 0 : -ETIMEDOUT;
+static bool dcp_uses_soft_dpms(struct apple_dcp *dcp)
+{
+	return (dcp_backlight_active(dcp) && dcp_has_panel(dcp)) ||
+	       (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+		dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
+		dcp->connector_type == DRM_MODE_CONNECTOR_eDP);
 }
 
 void dcp_poweron(struct platform_device *pdev)
@@ -1666,7 +1672,7 @@ void dcp_poweron(struct platform_device *pdev)
 	unsigned long remaining;
 	int ret;
 
-	if (dcp_backlight_active(dcp) && dcp_has_panel(dcp)) {
+	if (dcp_uses_soft_dpms(dcp)) {
 		ret = dcp_backlight_dpms(dcp, true);
 		if (ret)
 			dev_warn(dcp->dev, "backlight restore unavailable: %d\n", ret);
@@ -1744,7 +1750,7 @@ void dcp_poweroff(struct platform_device *pdev)
 	int ret;
 
 	/* Internal H17P DPMS is a brightness present, never a pipe stop. */
-	if (dcp_backlight_active(dcp) && dcp_has_panel(dcp)) {
+	if (dcp_uses_soft_dpms(dcp)) {
 		ret = dcp_backlight_dpms(dcp, false);
 		if (ret)
 			dev_warn(dcp->dev, "backlight blank unavailable: %d\n", ret);

@@ -70,6 +70,11 @@ static void dcp_swap_submit(struct apple_dcp *dcp, bool oob,
 
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
 		iomfb_serialize_present_h17p(&dcp->present_h17p, request);
+		if (!iomfb_apply_backlight_h17p(dcp, request, &dcp->present_h17p)) {
+			if (cb)
+				cb(dcp, NULL, cookie);
+			return;
+		}
 		data = &dcp->present_h17p;
 	}
 
@@ -1297,6 +1302,23 @@ static void dcp_h17p_prepare_swap(struct apple_dcp *dcp)
 static void dcp_h17p_prepare_swap(struct apple_dcp *dcp) { }
 #endif
 
+static bool dcp_present_retires(struct apple_dcp *dcp)
+{
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
+		return !iomfb_present_brightness_only_h17p(dcp);
+#endif
+	return true;
+}
+
+static void dcp_present_failed(struct apple_dcp *dcp)
+{
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
+		iomfb_present_failed_h17p(dcp);
+#endif
+}
+
 static bool dcp_present_begin(struct apple_dcp *dcp, u32 swap_id)
 {
 #if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
@@ -1321,6 +1343,43 @@ static bool dcp_present_submit(struct apple_dcp *dcp, u32 swap_id, bool accepted
 	}
 #endif
 	return true;
+}
+
+static void dcp_prepare_clear_swap(struct apple_dcp *dcp, void *request)
+{
+	typeof(DCP_FW_UNION(dcp->swap)) *swap = request;
+
+	/* Clear surfaces. */
+	memset(swap, 0, sizeof(*swap));
+
+	swap->swap.swap_enabled =
+		swap->swap.swap_completed = IOMFB_SET_BACKGROUND | 0x7;
+	swap->swap.bg_color = 0xFF000000;
+
+	/*
+	 * Turn off the backlight. This matters because the DCP's idea of
+	 * backlight brightness gets desynced after a power change, and it
+	 * needs to be told it's going to turn off so it will consider the
+	 * subsequent update on poweron an actual change and restore the
+	 * brightness.
+	 */
+	if (dcp_has_panel(dcp)) {
+		swap->swap.bl_unk = 1;
+		swap->swap.bl_value = 0;
+		swap->swap.bl_power = 0;
+	}
+
+	/* Null all surfaces */
+	for (int l = 0; l < SWAP_SURFACES; l++)
+		swap->surf_null[l] = true;
+#if DCP_FW_VERSION(13, 2, 0) <= DCP_FW_VER
+#if DCP_FW_VERSION(26, 0, 0) > DCP_FW_VER
+	for (int l = 0; l < 5; l++)
+		swap->surf2_null[l] = true;
+#endif
+	swap->unknown_pointer_null = true;
+	swap->unknown_output_null = true;
+#endif
 }
 
 static void dcp_swap_cleared(struct apple_dcp *dcp, void *data, void *cookie)
@@ -1362,7 +1421,8 @@ static void dcp_swap_clear_started(struct apple_dcp *dcp, void *data,
 {
 	struct dcp_swap_start_resp *resp = data;
 	DCP_FW_UNION(dcp->swap).swap.swap_id = resp->swap_id;
-	dcp_arm_retained_framebuffers(dcp, resp->swap_id);
+	if (dcp_present_retires(dcp))
+		dcp_arm_retained_framebuffers(dcp, resp->swap_id);
 
 	if (cookie) {
 		struct dcp_swap_cookie *info = cookie;
@@ -1521,35 +1581,11 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	/* increase refcount to ensure the receiver has a reference */
 	kref_get(&cookie->refcount);
 
-	// clear surfaces
-	memset(swap, 0, sizeof(*swap));
-
-	swap->swap.swap_enabled =
-		swap->swap.swap_completed = IOMFB_SET_BACKGROUND | 0x7;
-	swap->swap.bg_color = 0xFF000000;
-
-	/*
-	 * Turn off the backlight. This matters because the DCP's idea of
-	 * backlight brightness gets desynced after a power change, and it
-	 * needs to be told it's going to turn off so it will consider the
-	 * subsequent update on poweron an actual change and restore the
-	 * brightness.
-	 */
-	if (dcp_has_panel(dcp)) {
-		swap->swap.bl_unk = 1;
-		swap->swap.bl_value = 0;
-		swap->swap.bl_power = 0;
-	}
-
-	/* Null all surfaces */
-	for (int l = 0; l < SWAP_SURFACES; l++)
-		swap->surf_null[l] = true;
-#if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-	for (int l = 0; l < 5; l++)
-		swap->surf2_null[l] = true;
-#endif
-	swap->unkU32Ptr_null = true;
-	swap->unkU32out_null = true;
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G)
+		dcp_prepare_clear_swap(dcp, swap);
+#else
+	dcp_prepare_clear_swap(dcp, swap);
 #endif
 
 	dcp_swap_start(dcp, false, &swap_req, dcp_swap_clear_started, cookie);
@@ -1853,7 +1889,8 @@ static void dcp_swap_started(struct apple_dcp *dcp, void *data, void *cookie)
 		return;
 	}
 	DCP_FW_UNION(dcp->swap).swap.swap_id = resp->swap_id;
-	dcp_arm_retained_framebuffers(dcp, resp->swap_id);
+	if (dcp_present_retires(dcp))
+		dcp_arm_retained_framebuffers(dcp, resp->swap_id);
 
 	trace_iomfb_swap_submit(dcp, resp->swap_id);
 	dcp_h17p_prepare_swap(dcp);
