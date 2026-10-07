@@ -396,6 +396,11 @@ static void iomfb_cb_pr_publish(struct apple_dcp *dcp, struct iomfb_property *pr
 	case IOMFB_PROPERTY_NITS_V13_3:
 	case IOMFB_PROPERTY_NITS_V14_7:
 	{
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+		/* Configured H17P takeover uses only the admitted sample interface. */
+		if (dcp_backlight_active(dcp))
+			break;
+#endif
 		if (dcp_has_panel(dcp)) {
 			dcp->brightness.nits = prop->value / dcp->brightness.scale;
 			/* notify backlight device of the initial brightness */
@@ -1934,6 +1939,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	struct DCP_FW_NAME(dcp_swap_submit_req) *req = &DCP_FW_UNION(dcp->swap);
 	int plane_idx, l;
 	int has_surface = 0;
+	bool update_brightness;
 
 	crtc_state = drm_atomic_get_new_crtc_state(commit, crtc);
 
@@ -2042,7 +2048,11 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	req->swap.swap_completed = req->swap.swap_enabled;
 
 	/* update brightness if changed */
-	if (dcp_has_panel(dcp) && dcp->brightness.update) {
+	update_brightness = dcp_has_panel(dcp) && dcp->brightness.update;
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	update_brightness = update_brightness && !dcp_backlight_active(dcp);
+#endif
+	if (update_brightness) {
 #if DCP_FW_LAYOUT_14_7(DCP_FW_VER)
 		req->swap.bl_update = 1;
 #else
