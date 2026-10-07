@@ -2035,6 +2035,16 @@ int dcp_dptx_park(struct apple_dcp *dcp)
 	cancel_delayed_work(&dcp->placeholder_edid_wq);
 	if (dcp->avep)
 		av_service_disconnect(dcp);
+	if (READ_ONCE(dcp->split.active) &&
+	    dptx_service_available(&dcp->dptxport[1]) &&
+	    dcp->dptxport[1].connected) {
+		ret = dptxport_set_hpd(dcp->dptxport[1].service, false);
+		if (ret)
+			return ret;
+		ret = dcp_dptx_disconnect(dcp, 1);
+		if (ret)
+			return ret;
+	}
 	if (dptx_service_available(&dcp->dptxport[0]) && dcp->dptxport[0].connected) {
 		ret = dptxport_set_hpd(dcp->dptxport[0].service, false);
 		if (ret) {
