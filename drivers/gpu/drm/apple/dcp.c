@@ -2143,6 +2143,24 @@ static int dcp_get_disp_regs(struct apple_dcp *dcp)
 		dcp->disp_registers[i] = res;
 	}
 
+	if (dcp->hw.firmware_clock) {
+		/* The internal firmware's last aperture follows five display windows. */
+		if (count != 5 || resource_size(dcp->hw.firmware_clock) < 4 ||
+		    dcp->hw.firmware_scratch > resource_size(dcp->hw.firmware_clock) - 4 ||
+		    dcp->hw.firmware_request > resource_size(dcp->hw.firmware_clock) - 4)
+			return -EINVAL;
+
+		dcp->disp_bw_scratch_res = *dcp->hw.firmware_clock;
+		dcp->disp_bw_scratch_index = count;
+		dcp->disp_bw_scratch_offset = dcp->hw.firmware_scratch;
+		dcp->disp_bw_doorbell_res = dcp->disp_bw_scratch_res;
+		dcp->disp_bw_doorbell_res.start += dcp->hw.firmware_request;
+		dcp->disp_bw_doorbell_res.end = dcp->disp_bw_doorbell_res.start + 3;
+		dcp->disp_registers[count] = &dcp->disp_bw_scratch_res;
+		dcp->nr_disp_registers = count + 1;
+		return 0;
+	}
+
 	/* load pmgr bandwidth scratch resource and offset */
 	ret = dcp_get_bw_scratch_reg(dcp, count);
 	if (ret < 0)
@@ -2772,6 +2790,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	if (of_machine_is_compatible("apple,t8140"))
 		return -ENODEV;
 
+	const struct apple_dcp_hw_data *hw = of_device_get_match_data(&pdev->dev);
 	enum dcp_firmware_version fw_compat;
 	struct device *dev = &pdev->dev;
 	struct apple_dcp *dcp;
@@ -2791,6 +2810,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	if (fw_compat != DCP_FIRMWARE_V_14_7 &&
 	    fw_compat != DCP_FIRMWARE_V_26_6 &&
 	    !of_property_present(dev->of_node, "apple,bw-scratch"))
+	if (!of_property_present(dev->of_node, "apple,bw-scratch") &&
+	    !hw->firmware_clock)
 		return dev_err_probe(dev, -ENODEV, "Incompatible devicetree! "
 			"Use devicetree matching this kernel.\n");
 
@@ -3371,10 +3392,16 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8112 = {
 };
 
 /* The internal T8140 endpoint uses the measured H17P method profile. */
+static const struct resource t8140_firmware_clock =
+	DEFINE_RES_MEM(0x302800000, 0xbc000);
+
 static const struct apple_dcp_hw_data apple_dcp_hw_t8140 = {
 	.num_dptx_ports = 0,
 	.adopt_live_session = true,
 	.firmware_compat = DCP_FIRMWARE_H17P,
+	.firmware_clock = &t8140_firmware_clock,
+	.firmware_scratch = 0x20000,
+	.firmware_request = 0x68000,
 };
 
 /*
