@@ -1102,7 +1102,8 @@ static void swap_reclaim_work(struct work_struct *work)
 	swap_reclaim_full_clusters(si, true);
 }
 
-static bool swap_folio_alloc_allowed(struct swap_info_struct *si, struct folio *folio)
+static bool swap_folio_alloc_allowed(struct swap_info_struct *si, struct folio *folio,
+				    bool mandatory)
 {
 	unsigned int flags;
 
@@ -1112,7 +1113,7 @@ static bool swap_folio_alloc_allowed(struct swap_info_struct *si, struct folio *
 	if (flags & SWP_BLKDEV)
 		return true;
 	/* Filesystem swap_rw implementations retain their existing contract. */
-	return si->bdev && !(flags & SWP_FS_OPS) && folio_anon_min_order(folio);
+	return si->bdev && !(flags & SWP_FS_OPS) && mandatory;
 }
 
 /*
@@ -1120,13 +1121,13 @@ static bool swap_folio_alloc_allowed(struct swap_info_struct *si, struct folio *
  * cluster for current CPU too.
  */
 static unsigned long cluster_alloc_swap_entry(struct swap_info_struct *si,
-					      struct folio *folio)
+					      struct folio *folio, bool mandatory)
 {
 	struct swap_cluster_info *ci;
 	unsigned int order = likely(folio) ? folio_order(folio) : 0;
 	unsigned int offset = SWAP_ENTRY_INVALID, found = SWAP_ENTRY_INVALID;
 
-	if (!swap_folio_alloc_allowed(si, folio))
+	if (!swap_folio_alloc_allowed(si, folio, mandatory))
 		return 0;
 
 	if (!(si->flags & SWP_SOLIDSTATE)) {
@@ -1384,7 +1385,7 @@ static bool get_swap_device_info(struct swap_info_struct *si)
  * Fast path try to get swap entries with specified order from current
  * CPU's swap entry pool (a cluster).
  */
-static bool swap_alloc_fast(struct folio *folio)
+static bool swap_alloc_fast(struct folio *folio, bool mandatory)
 {
 	unsigned int order = folio_order(folio);
 	struct swap_cluster_info *ci;
@@ -1399,7 +1400,7 @@ static bool swap_alloc_fast(struct folio *folio)
 	offset = this_cpu_read(percpu_swap_cluster.offset[order]);
 	if (!si || !offset || !get_swap_device_info(si))
 		return false;
-	if (!swap_folio_alloc_allowed(si, folio)) {
+	if (!swap_folio_alloc_allowed(si, folio, mandatory)) {
 		put_swap_device(si);
 		return false;
 	}
@@ -1418,7 +1419,7 @@ static bool swap_alloc_fast(struct folio *folio)
 }
 
 /* Rotate the device and switch to a new cluster */
-static void swap_alloc_slow(struct folio *folio)
+static void swap_alloc_slow(struct folio *folio, bool mandatory)
 {
 	struct swap_info_struct *si, *next;
 
@@ -1429,7 +1430,7 @@ start_over:
 		plist_requeue(&si->avail_list, &swap_avail_head);
 		spin_unlock(&swap_avail_lock);
 		if (get_swap_device_info(si)) {
-			cluster_alloc_swap_entry(si, folio);
+			cluster_alloc_swap_entry(si, folio, mandatory);
 			put_swap_device(si);
 			if (folio_test_swapcache(folio))
 				return;
@@ -1847,7 +1848,7 @@ static void swap_alloc_required_from_device(struct swap_info_struct *si,
 	unsigned int order = folio_order(folio), nr = folio_nr_pages(folio);
 	unsigned long start;
 
-	if (!swap_folio_alloc_allowed(si, folio))
+	if (!swap_folio_alloc_allowed(si, folio, true))
 		return;
 	for (start = 0; start < si->max; start += SWAPFILE_CLUSTER) {
 		struct swap_cluster_info *ci = __swap_offset_to_cluster(si, start);
@@ -1925,10 +1926,12 @@ int folio_alloc_swap(struct folio *folio)
 {
 	unsigned int order = folio_order(folio);
 	unsigned int size = 1 << order;
-	bool mandatory = order && folio_anon_min_order(folio);
+	bool mandatory;
 
 	VM_BUG_ON_FOLIO(!folio_test_locked(folio), folio);
 	VM_BUG_ON_FOLIO(!folio_test_uptodate(folio), folio);
+	/* The temporary anon-vma reference may require sleepable final release. */
+	mandatory = order && folio_anon_min_order(folio);
 
 	if (order) {
 		/*
@@ -1950,8 +1953,8 @@ int folio_alloc_swap(struct folio *folio)
 
 again:
 	local_lock(&percpu_swap_cluster.lock);
-	if (!swap_alloc_fast(folio))
-		swap_alloc_slow(folio);
+	if (!swap_alloc_fast(folio, mandatory))
+		swap_alloc_slow(folio, mandatory);
 	local_unlock(&percpu_swap_cluster.lock);
 
 	if (mandatory && unlikely(!folio_test_swapcache(folio)))
@@ -2385,7 +2388,7 @@ swp_entry_t swap_alloc_hibernation_slot(int type)
 			swap_cluster_unlock(ci);
 	}
 	if (!offset)
-		offset = cluster_alloc_swap_entry(si, NULL);
+		offset = cluster_alloc_swap_entry(si, NULL, false);
 	local_unlock(&percpu_swap_cluster.lock);
 	if (offset)
 		entry = swp_entry(si->type, offset);
