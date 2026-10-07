@@ -64,6 +64,7 @@ const LEGACY_VM_USER_RANGE: Range<u64> = mmu::IOVA_USER_BASE..mmu::IOVA_UNK_PAGE
 
 /// A client instance of an `mmu::Vm` address space.
 struct Vm {
+    shrinker: Option<KBox<mmu::VmShrinker>>,
     ualloc: Arc<Mutex<alloc::DefaultAllocator>>,
     ualloc_priv: Arc<Mutex<alloc::DefaultAllocator>>,
     vm: mmu::Vm,
@@ -616,6 +617,11 @@ impl File {
         let profile_vm_id = vm.id();
         resv.fill(KBox::new(
             Vm {
+                shrinker: if vm.residency_reclaim_enabled() {
+                    Some(mmu::VmShrinker::new(&vm)?)
+                } else {
+                    None
+                },
                 ualloc,
                 ualloc_priv,
                 vm,
@@ -675,21 +681,19 @@ impl File {
         }
 
         let resv_gem;
+        let mut reclaim_cpu = false;
         let resv_obj = if data.flags & uapi::drm_asahi_gem_flags_DRM_ASAHI_GEM_VM_PRIVATE != 0 {
-            resv_gem = file
-                .inner()
-                .vms()
-                .lock()
-                .get(data.vm_id.try_into()?)
-                .ok_or(ENOENT)?
-                .vm
-                .get_resv_obj();
+            let vms = file.inner().vms();
+            let vms = vms.lock();
+            let vm = &vms.get(data.vm_id.try_into()?).ok_or(ENOENT)?.vm;
+            reclaim_cpu = vm.residency_reclaim_enabled();
+            resv_gem = vm.get_resv_obj();
             Some(resv_gem.deref())
         } else {
             None
         };
 
-        let gem = gem::new_object(device, data.size.try_into()?, data.flags, resv_obj)?;
+        let gem = gem::new_object(device, data.size.try_into()?, data.flags, resv_obj, reclaim_cpu)?;
 
         let handle = gem.create_handle(file)?;
         data.handle = handle;

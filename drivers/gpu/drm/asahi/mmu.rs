@@ -99,6 +99,8 @@ mod bind;
 mod context;
 mod shared;
 mod lifetime;
+mod residency;
+pub(crate) use residency::VmShrinker;
 pub(crate) use bind::PreparedUserBindBatch;
 pub(crate) use lifetime::VmJobGuard;
 
@@ -478,6 +480,13 @@ impl gpuvm::DriverGpuVmBo for VmBo {
     }
 }
 
+/// Per-mapping metadata that survives backing eviction and GPUVA splits.
+#[derive(Default, Clone)]
+struct VmGpuVa {
+    prot: Option<Prot>,
+}
+impl gpuvm::DriverGpuVa for VmGpuVa {}
+
 #[derive(Default)]
 struct StepContext {
     new_va: Option<Pin<KBox<gpuvm::GpuVa<VmInner>>>>,
@@ -490,6 +499,7 @@ struct StepContext {
 impl gpuvm::DriverGpuVm for VmInner {
     type Driver = driver::AsahiDriver;
     type GpuVmBo = VmBo;
+    type GpuVa = VmGpuVa;
     type StepContext = StepContext;
 
     fn step_map(
@@ -595,7 +605,8 @@ impl gpuvm::DriverGpuVm for VmInner {
             }
         }
 
-        let gpuva = ctx.new_va.take().expect("Multiple step_map calls");
+        let mut gpuva = ctx.new_va.take().expect("Multiple step_map calls");
+        gpuva.as_mut().inner_mut().get_mut().prot = Some(ctx.prot);
 
         if op
             .map_and_link_va(
@@ -643,6 +654,8 @@ impl gpuvm::DriverGpuVm for VmInner {
         let va = op.unmap().va().expect("No previous VA");
         let orig_addr = va.addr();
         let orig_range = va.range();
+        let orig_prot = va.inner().prot.ok_or(EINVAL)?;
+        let orig_invalidated = va.flags().contains(gpuvm::GpuVaFlags::INVALIDATED);
 
         // Only unmap the hole between prev/next, if they exist
         let unmap_start = if let Some(op) = op.prev_map() {
@@ -669,7 +682,11 @@ impl gpuvm::DriverGpuVm for VmInner {
         let unmap_range = unmap_end - unmap_start;
 
         let _mutation = self.mapping_mutation();
-        self.page_table.unmap_pages(unmap_start..unmap_end)?;
+        if orig_invalidated {
+            self.page_table.discard_partial_map(unmap_start..unmap_end)?;
+        } else {
+            self.page_table.unmap_pages(unmap_start..unmap_end)?;
+        }
 
         if let Some(asid) = self.slot() {
             fence(Ordering::SeqCst);
@@ -691,10 +708,11 @@ impl gpuvm::DriverGpuVm for VmInner {
         }
 
         if let Some(prev_op) = op.prev_map() {
-            let prev_gpuva = ctx
+            let mut prev_gpuva = ctx
                 .prev_va
                 .take()
                 .expect("Multiple step_remap calls with prev_op");
+            prev_gpuva.as_mut().inner_mut().get_mut().prot = Some(orig_prot);
             if prev_op.map_and_link_va(self, prev_gpuva, vm_bo).is_err() {
                 dev_err!(self.dev.as_ref(), "step_remap: could not relink prev gpuva");
                 return Err(EINVAL);
@@ -702,10 +720,11 @@ impl gpuvm::DriverGpuVm for VmInner {
         }
 
         if let Some(next_op) = op.next_map() {
-            let next_gpuva = ctx
+            let mut next_gpuva = ctx
                 .next_va
                 .take()
                 .expect("Multiple step_remap calls with next_op");
+            next_gpuva.as_mut().inner_mut().get_mut().prot = Some(orig_prot);
             if next_op.map_and_link_va(self, next_gpuva, vm_bo).is_err() {
                 dev_err!(self.dev.as_ref(), "step_remap: could not relink next gpuva");
                 return Err(EINVAL);
@@ -722,8 +741,11 @@ impl VmInner {
         mod_dev_dbg!(self.dev, "MMU: unmap: {:#x}:{:#x}\n", va.addr(), va.range());
 
         let _mutation = self.mapping_mutation();
-        self.page_table
-            .unmap_pages(va.addr()..(va.addr() + va.range()))?;
+        if va.flags().contains(gpuvm::GpuVaFlags::INVALIDATED) {
+            self.page_table.discard_partial_map(va.addr()..(va.addr() + va.range()))?;
+        } else {
+            self.page_table.unmap_pages(va.addr()..(va.addr() + va.range()))?;
+        }
 
         if let Some(asid) = self.slot() {
             fence(Ordering::SeqCst);
@@ -904,6 +926,10 @@ impl VmInner {
         }
 
         let contexts = self.uat_inner.lock().contexts_naming_root(self.ttb());
+        self.tlbi_context_mask(iova, size, contexts);
+    }
+
+    fn tlbi_context_mask(&self, iova: u64, size: usize, contexts: u64) {
         if contexts == 0 {
             return;
         }
@@ -1012,6 +1038,7 @@ pub(crate) struct Vm {
     id: u64,
     mapping_epoch: Option<Arc<MappingEpoch>>,
     lifetime: Option<Arc<lifetime::VmLifetime>>,
+    residency: Option<Arc<residency::Gate>>,
     context_bindings: Option<Arc<context::ContextBindings>>,
     shared_bindings: Option<Arc<shared::SharedBindings>>,
     status: Option<Arc<crate::g17::status::VmStatus>>,
@@ -1293,7 +1320,7 @@ pub(crate) struct KernelMappingInner {
     // - Drop the GEM BO next, since BO free can take the resv lock itself
     // - Drop the owner GpuVm last, since that again can take resv locks when the refcount drops to 0
     bo: Option<MappingBo>,
-    _gem: Option<ARef<gem::Object>>,
+    _gem: Option<gem::KernelMappingPin>,
     owner: ARef<gpuvm::GpuVm<VmInner>>,
     uat_inner: Arc<UatInner>,
     prot: Prot,
@@ -2302,6 +2329,7 @@ impl Vm {
             id,
             mapping_epoch: mapping_epoch.clone(),
             lifetime: None,
+            residency: None,
             context_bindings: None,
             shared_bindings: None,
             status: None,
@@ -2348,6 +2376,7 @@ impl Vm {
     pub(crate) fn with_status(mut self) -> Result<Self> {
         self.status = Some(Arc::new(crate::g17::status::VmStatus::new(), GFP_KERNEL)?);
         self.lifetime = Some(lifetime::VmLifetime::new()?);
+        self.residency = Some(residency::Gate::new()?);
         self.context_bindings = Some(context::ContextBindings::new()?);
         self.shared_bindings = Some(shared::SharedBindings::new()?);
         Ok(self)
@@ -2681,6 +2710,7 @@ impl Vm {
             return Err(EINVAL);
         }
         let reserved_size = size.checked_add(guard_size).ok_or(EOVERFLOW)?;
+        let _residency = self.enter_residency()?;
         let sgt = gem.owned_sg_table()?;
         let mut inner = self.inner.exec_lock(Some(gem), false)?;
         let vm_bo = self.inner.obtain_bo(gem)?;
@@ -2762,6 +2792,7 @@ impl Vm {
         let reserved_size = size
             .checked_add(if guard { UAT_PGSZ } else { 0 })
             .ok_or(EOVERFLOW)?;
+        let _residency = self.enter_residency()?;
         let sgt = gem.owned_sg_table()?;
         let mut inner = self.inner.exec_lock(Some(&gem), false)?;
 
@@ -2838,6 +2869,7 @@ impl Vm {
         prot: Prot,
         single_page: bool,
     ) -> Result {
+        let _residency = self.enter_residency_metadata()?;
         gem::validate_vm_binding(gem, self)?;
         self.wait_for_user_map_admission()?;
         // Mapping needs a complete context
@@ -3025,6 +3057,7 @@ impl Vm {
     }
 
     fn unmap_range_commit(&self, iova: u64, size: u64, user: bool) -> Result {
+        let _residency = self.enter_retirement_residency();
         // Unmapping a range can only do a single split, so just preallocate
         // the prev and next GpuVas
         let mut ctx = StepContext {
@@ -3068,6 +3101,7 @@ impl Vm {
         }
 
     fn drop_mappings_now(&self, gem: &gem::Object) -> Result {
+        let _residency = self.enter_retirement_residency();
         // Removing whole mappings only does unmaps, so no preallocated VAs
         let mut ctx = Default::default();
 
