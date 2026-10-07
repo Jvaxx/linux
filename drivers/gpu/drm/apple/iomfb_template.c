@@ -494,6 +494,7 @@ static struct dcp_map_buf_resp dcpep_cb_map_piodma(struct apple_dcp *dcp,
 {
 	struct dcp_mem_descriptor *memdesc;
 	struct sg_table *map;
+	size_t size;
 	ssize_t ret;
 
 	if (req->buffer >= ARRAY_SIZE(dcp->memdesc))
@@ -501,6 +502,7 @@ static struct dcp_map_buf_resp dcpep_cb_map_piodma(struct apple_dcp *dcp,
 
 	memdesc = &dcp->memdesc[req->buffer];
 	map = &memdesc->map;
+	size = ALIGN(memdesc->size, SZ_16K);
 
 	if (!map->sgl)
 		goto reject;
@@ -518,29 +520,86 @@ static struct dcp_map_buf_resp dcpep_cb_map_piodma(struct apple_dcp *dcp,
 	}
 
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
-	/* remembered so release_mem_desc() can tear a stale mapping down */
 	memdesc->piodma_mapped = true;
 
 	/* the H17P reply echoes the buffer index */
-	return (struct DCP_FW_NAME(dcp_map_buf_resp)){
+	*resp = (struct DCP_FW_NAME(dcp_map_buf_resp)) {
 		.buffer = req->buffer,
 		.dva = memdesc->dva,
 	};
 #else
-	return (struct DCP_FW_NAME(dcp_map_buf_resp)){ .dva = memdesc->dva };
+	*resp = (struct DCP_FW_NAME(dcp_map_buf_resp)) { .dva = memdesc->dva };
 #endif
+	return true;
 
 reject:
 	dev_err(dcp->dev, "denying map of invalid buffer %llx for piodma\n",
 		req->buffer);
+	return false;
+}
+
+static struct DCP_FW_NAME(dcp_map_buf_resp) dcpep_cb_map_piodma(struct apple_dcp *dcp,
+						   struct dcp_map_buf_req *req)
+{
+	struct DCP_FW_NAME(dcp_map_buf_resp) resp = { 0 };
+
+	if (dcpep_map_piodma(dcp, req, &resp))
+		return resp;
+
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
-	return (struct DCP_FW_NAME(dcp_map_buf_resp)){
-		.buffer = req->buffer,
-		.dva = 0,
-	};
+	resp.buffer = req->buffer;
 #else
-	return (struct DCP_FW_NAME(dcp_map_buf_resp)){ .ret = EINVAL };
+	resp.ret = EINVAL;
 #endif
+	return resp;
+}
+
+static bool dcpep_unmap_piodma(struct apple_dcp *dcp,
+			       struct dcp_unmap_buf_resp *request)
+{
+	struct dcp_mem_descriptor *memdesc;
+	size_t size, unmapped;
+
+	if (request->buffer >= ARRAY_SIZE(dcp->memdesc)) {
+		dev_warn(dcp->dev, "unmap request for out of range buffer %llu\n",
+			 request->buffer);
+		return false;
+	}
+
+	memdesc = &dcp->memdesc[request->buffer];
+
+	if (!test_bit(request->buffer, dcp->memdesc_map) || !memdesc->buf ||
+	    !dcp->iommu_dom)
+		goto not_mapped;
+#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+	if (!memdesc->piodma_mapped)
+		goto not_mapped;
+#endif
+
+	if (memdesc->dva != request->dva) {
+		dev_warn(dcp->dev,
+			 "unmap buffer %llu address mismatch memdesc.dva:%llx dva:%llx\n",
+			 request->buffer,
+			 memdesc->dva, request->dva);
+		return false;
+	}
+
+	/* use the piodma iommu domain to unmap from the right IOMMU */
+	size = ALIGN(memdesc->size, SZ_16K);
+	unmapped = iommu_unmap(dcp->iommu_dom, memdesc->dva, size);
+	if (unmapped != size) {
+		dev_err(dcp->dev, "iommu_unmap() returned %zu instead of %zu\n",
+			unmapped, size);
+		return false;
+	}
+	memdesc->piodma_mapped = false;
+	return true;
+
+not_mapped:
+	dev_warn(dcp->dev,
+		 "unmap for non-mapped buffer %llu iova:0x%08llx\n",
+		 request->buffer, request->dva);
+	return false;
 }
 
 static void dcpep_cb_unmap_piodma(struct apple_dcp *dcp,
@@ -683,7 +742,15 @@ static u8 dcpep_cb_release_mem_desc(struct apple_dcp *dcp, u32 *mem_desc_id)
 		dev_warn(dcp->dev,
 			 "releasing buffer %u while still mapped for piodma; unmapping first\n",
 			 id);
-		iommu_unmap(dcp->iommu_dom, memdesc->dva, size);
+		if (!dcp->iommu_dom)
+			return 0;
+		unmapped = iommu_unmap(dcp->iommu_dom, memdesc->dva, size);
+		if (unmapped != size) {
+			dev_err(dcp->dev,
+				"failed to unmap buffer %u before release: %zu of %zu\n",
+				id, unmapped, size);
+			return 0;
+		}
 		memdesc->piodma_mapped = false;
 	}
 
