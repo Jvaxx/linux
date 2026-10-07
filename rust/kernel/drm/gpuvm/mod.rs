@@ -27,7 +27,10 @@ use kernel::{
         ARef,
         AlwaysRefCounted, //
     },
-    types::Opaque, //
+    types::{
+        NotThreadSafe,
+        Opaque, //
+    }, //
 };
 
 use core::{
@@ -301,6 +304,95 @@ impl<T: DriverGpuVm> GpuVm<T> {
     fn raw_resv(&self) -> *mut bindings::dma_resv {
         // SAFETY: `r_obj` is immutable and valid for duration of GPUVM.
         unsafe { (*(*self.as_raw()).r_obj).resv }
+    }
+}
+
+impl<T: DriverGpuVm> GpuVm<T> {
+    /// HACK: added for the asahi downstream driver. Lock only the VM's shared reservation.
+    ///
+    /// This takes the same shared reservation as [`GpuVm::exec_lock`], but does not lock
+    /// external BO reservations or allocate an exec context. The returned guard exposes only the
+    /// driver data, not GPUVA operations requiring those other reservations. Callers must not
+    /// already hold a reservation lock.
+    pub fn lock_inner(&self) -> GpuVmInnerGuard<'_, T> {
+        // SAFETY: The borrowed GPUVM retains `r_obj` and its reservation for the guard's lifetime.
+        // A non-interruptible single-reservation lock without a ww context cannot fail.
+        unsafe { bindings::dma_resv_lock(self.raw_resv(), ptr::null_mut()) };
+        GpuVmInnerGuard {
+            gpuvm: self,
+            _not_send: NotThreadSafe,
+        }
+    }
+}
+
+/// HACK: added for the asahi downstream driver. Access to the VM driver data under its shared
+/// reservation, without external BO locks.
+pub struct GpuVmInnerGuard<'a, T: DriverGpuVm> {
+    gpuvm: &'a GpuVm<T>,
+    // Reservation locks must be released by the task that acquired them.
+    _not_send: NotThreadSafe,
+}
+
+impl<T: DriverGpuVm> GpuVmInnerGuard<'_, T> {
+    /// Remove every driver GPUVA of this immediate-mode VM, preserving its kernel cutout.
+    ///
+    /// `unmap` must remove the GPU translation of each complete GPUVA before returning success.
+    /// Only the VM's shared reservation is held: no external BO reservation is taken and no split
+    /// node or operation list is allocated. Call [`GpuVm::deferred_cleanup`] after releasing this
+    /// guard, including when a callback failed after earlier mappings were removed.
+    pub fn unmap_all(&mut self, mut unmap: impl FnMut(&mut T, &GpuVa<T>) -> Result) -> Result {
+        let vm = self.gpuvm.as_raw();
+        // SAFETY: The guard owns this live VM's shared reservation, and the VM is in immediate
+        // mode, so unlinking takes the GEM GPUVA mutex independently of its reservation. Every
+        // listed GPUVA other than the kernel cutout is a `GpuVa<T>` owned by this VM.
+        unsafe {
+            if (*vm).flags & bindings::drm_gpuvm_flags_DRM_GPUVM_IMMEDIATE_MODE == 0 {
+                return Err(EINVAL);
+            }
+            let head = &raw mut (*vm).rb.list;
+            let mut entry = (*head).next;
+            while entry != head {
+                let va = kernel::container_of!(entry, bindings::drm_gpuva, rb.entry);
+                // Save the successor before removing and freeing this GPUVA.
+                entry = (*entry).next;
+                // This node is embedded in the C GPUVM, not a driver `GpuVa<T>`.
+                if ptr::eq(va, &raw const (*vm).kernel_alloc_node) {
+                    continue;
+                }
+                unmap(&mut *self.gpuvm.data.get(), GpuVa::<T>::from_raw(va))?;
+                // Remove it as `OpUnmap::remove()` does.
+                let op = bindings::drm_gpuva_op_unmap { va, keep: false };
+                bindings::drm_gpuva_unmap(&op);
+                bindings::drm_gpuva_unlink_defer(va);
+                drop(GpuVaRemoved::<T>::from_raw(va));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<T: DriverGpuVm> Deref for GpuVmInnerGuard<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        // SAFETY: The shared reservation excludes every other access to the driver data,
+        // including `GpuVm::exec_lock()` and its callbacks.
+        unsafe { &*self.gpuvm.data.get() }
+    }
+}
+
+impl<T: DriverGpuVm> DerefMut for GpuVmInnerGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: As above, with exclusive access to this guard.
+        unsafe { &mut *self.gpuvm.data.get() }
+    }
+}
+
+impl<T: DriverGpuVm> Drop for GpuVmInnerGuard<'_, T> {
+    fn drop(&mut self) {
+        // SAFETY: This non-Send guard owns the reservation on this task, and its GPUVM borrow
+        // keeps `r_obj` alive until after the unlock.
+        unsafe { bindings::dma_resv_unlock(self.gpuvm.raw_resv()) };
     }
 }
 
