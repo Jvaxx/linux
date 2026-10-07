@@ -590,18 +590,40 @@ dcpep_cb_allocate_buffer(struct apple_dcp *dcp,
 	struct dcp_mem_descriptor *memdesc;
 	size_t size;
 	u32 id;
+	int ret;
 
-	resp.dva_size = ALIGN(req->size, 4096);
-	resp.mem_desc_id =
-		find_first_zero_bit(dcp->memdesc_map, DCP_MAX_MAPPINGS);
+	/* Validate both wire-size and IOMMU-page rounding before allocating. */
+	if (!req->size || req->size > SIZE_MAX ||
+	    check_add_overflow((size_t)req->size, (size_t)4095, &rounded))
+		return resp;
+	allocated.size = round_down(rounded, 4096);
+	if (check_add_overflow(allocated.size, (size_t)SZ_16K - 1, &rounded))
+		return resp;
+	size = round_down(rounded, SZ_16K);
 
-	if (resp.mem_desc_id >= DCP_MAX_MAPPINGS) {
+	id = find_first_zero_bit(dcp->memdesc_map, DCP_MAX_MAPPINGS);
+
+	if (id >= DCP_MAX_MAPPINGS) {
 		dev_warn(dcp->dev, "DCP overflowed mapping table, ignoring\n");
 		resp.dva_size = 0;
 		resp.mem_desc_id = 0;
 		return resp;
 	}
-	id = resp.mem_desc_id;
+
+	allocated.buf = dma_alloc_coherent(dcp->dev, size, &allocated.dva,
+					   GFP_KERNEL);
+	if (!allocated.buf)
+		return resp;
+
+	ret = dma_get_sgtable(dcp->dev, &allocated.map, allocated.buf,
+			      allocated.dva, size);
+	if (ret) {
+		dma_free_coherent(dcp->dev, size, allocated.buf, allocated.dva);
+		return resp;
+	}
+
+	/* Callbacks are serialized; publish only a fully initialized descriptor. */
+	dcp->memdesc[id] = allocated;
 	set_bit(id, dcp->memdesc_map);
 
 	memdesc = &dcp->memdesc[id];
@@ -622,8 +644,8 @@ dcpep_cb_allocate_buffer(struct apple_dcp *dcp,
 	 * microcode through it, and with a zero paddr the timing sequencer
 	 * comes up and is powered straight back down.
 	 */
-	if (memdesc->map.sgl)
-		resp.paddr = sg_phys(memdesc->map.sgl);
+	if (allocated.map.sgl)
+		resp.paddr = sg_phys(allocated.map.sgl);
 #endif
 
 	return resp;
