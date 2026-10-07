@@ -164,6 +164,11 @@ retry:
 		goto out;
 	}
 
+	/* Re-present the current scanout when brightness is the only change. */
+	ret = drm_atomic_add_affected_planes(commit, crtc);
+	if (ret)
+		goto out;
+
 	crtc_state->color_mgmt_changed |= true;
 
 	ret = drm_atomic_commit(commit);
