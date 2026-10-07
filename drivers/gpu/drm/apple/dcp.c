@@ -1666,6 +1666,13 @@ void dcp_poweron(struct platform_device *pdev)
 	unsigned long remaining;
 	int ret;
 
+	if (dcp_backlight_active(dcp) && dcp_has_panel(dcp)) {
+		ret = dcp_backlight_dpms(dcp, true);
+		if (ret)
+			dev_warn(dcp->dev, "backlight restore unavailable: %d\n", ret);
+		return;
+	}
+
 	if (dcp_is_typec_output(dcp)) {
 		/* T8122 dcpext only, see dcp_poweroff() */
 		if (dcp->ext_failsafe) {
@@ -1735,6 +1742,14 @@ void dcp_poweroff(struct platform_device *pdev)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	bool display_gone = false;
 	int ret;
+
+	/* Internal H17P DPMS is a brightness present, never a pipe stop. */
+	if (dcp_backlight_active(dcp) && dcp_has_panel(dcp)) {
+		ret = dcp_backlight_dpms(dcp, false);
+		if (ret)
+			dev_warn(dcp->dev, "backlight blank unavailable: %d\n", ret);
+		return;
+	}
 
 	cancel_delayed_work(&dcp->swap_watchdog_wq);
 	if (dcp->avep)
@@ -1833,6 +1848,8 @@ static void dcp_work_register_backlight(struct work_struct *work)
 
 	/* try to register backlight device, */
 	ret = dcp_backlight_register(dcp);
+	if (ret == -ENODATA)
+		goto out_unlock;
 	if (ret) {
 		dev_err(dcp->dev, "Unable to register backlight device\n");
 		dcp->brightness.maximum = 0;
@@ -2776,6 +2793,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 
 	INIT_LIST_HEAD(&dcp->swapped_out_fbs);
 	mutex_init(&dcp->swapped_out_fbs_lock);
+	spin_lock_init(&dcp->backlight.lock);
 
 	dcp->fw_compat = fw_compat;
 	dcp->ext_failsafe = of_device_is_compatible(dev->of_node, "apple,t8122-dcpext");

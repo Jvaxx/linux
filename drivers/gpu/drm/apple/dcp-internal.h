@@ -19,6 +19,7 @@
 #include "dcp-fabric.h"
 #include "dcp-fabric-session.h"
 #include "dptxep.h"
+#include "dcp_backlight.h"
 #include "iomfb.h"
 #include "iomfb_h17p.h"
 #include "iomfb-state.h"
@@ -462,6 +463,14 @@ struct apple_dcp {
 	struct apple_connector *fixed_connector;
 	struct apple_connector *typec_connector;
 	int hdmi_hpd_irq;
+
+	/* H17P policy shared by backlight, commit, and reply workers. */
+	struct {
+		/* Protects state and callback installation. */
+		spinlock_t lock;
+		struct dcp_backlight_state state;
+		void (*kick)(struct apple_dcp *dcp);
+	} backlight;
 	/* Hardirq, resume and expiry share one generation under this lock. */
 	spinlock_t hdmi_presence_lock;
 	struct dcp_fabric_presence hdmi_presence;
