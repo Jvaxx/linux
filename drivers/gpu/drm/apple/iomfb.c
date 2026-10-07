@@ -1635,7 +1635,13 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 		ready = dcp->connector;
 	mutex_unlock(&dcp->modes_lock);
 
-	if (!ret && !h17p_external)
+	/*
+	 * Described again after a withdrawal it was kept connected through,
+	 * the same display keeps its EDID, unless that is a placeholder being
+	 * retried.
+	 */
+	if (!ret && !h17p_external &&
+	    (!atomic_read(&dcp->external_held) || READ_ONCE(dcp->placeholder_retried)))
 		apple_connector_invalidate_edid(dcp->connector);
 	/* Notify removals as well as newly eligible modes, outside the lock. */
 	dcp_180hz_catalog_changed(dcp);

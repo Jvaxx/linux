@@ -475,6 +475,49 @@ static void parser_replacement(struct kunit *test)
 	kfree(dcp->modes);
 }
 
+/*
+ * Described again after a withdrawal it was kept connected through, the same
+ * display keeps its EDID; any other replacement, or a placeholder being
+ * retried, drops it.
+ */
+static void parser_held_keeps_edid(struct kunit *test)
+{
+	struct parser_record record = valid_record(7, 10);
+	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
+	struct apple_connector *connector = kunit_kzalloc(test, sizeof(*connector), GFP_KERNEL);
+	struct platform_device *pipeline = kunit_kzalloc(test, sizeof(*pipeline), GFP_KERNEL);
+	struct dcp_parse_ctx ctx;
+	struct parser_blob *blob;
+	unsigned int pass;
+
+	KUNIT_ASSERT_NOT_NULL(test, dcp);
+	KUNIT_ASSERT_NOT_NULL(test, connector);
+	KUNIT_ASSERT_NOT_NULL(test, pipeline);
+	dcp_modes_init(dcp);
+	spin_lock_init(&dcp->metadata.lock);
+	apple_connector_edid_init(connector);
+	apple_connector_set_pipeline(connector, pipeline);
+	dcp->connector = connector;
+	blob = make_blob(test, &record, 1);
+	KUNIT_ASSERT_NOT_NULL(test, blob);
+	/* Pass 0: not held. Pass 1: held. Pass 2: held, placeholder retried. */
+	for (pass = 0; pass < 3; pass++) {
+		/* The cached EDID is dropped by marking it stale for get_modes(). */
+		WRITE_ONCE(connector->edid_invalidation_pending, false);
+		atomic_set(&dcp->external_held, pass != 0);
+		dcp->placeholder_retried = pass == 2;
+		KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
+		ctx.dcp = &parser_dcp;
+		KUNIT_ASSERT_EQ(test, dcp_modes_replace(dcp, &ctx,
+							dcp_modes_transfer_begin(dcp)), 0);
+		if (pass == 1)
+			KUNIT_EXPECT_FALSE(test, connector->edid_invalidation_pending);
+		else
+			KUNIT_EXPECT_TRUE(test, connector->edid_invalidation_pending);
+	}
+	kfree(dcp->modes);
+}
+
 static void parser_attachment_admission(struct kunit *test)
 {
 	struct parser_record record = valid_record(7, 10);
@@ -1203,6 +1246,7 @@ static struct kunit_case parser_cases[] = {
 	KUNIT_CASE(parser_bad_score),
 	KUNIT_CASE(parser_notch_vrr),
 	KUNIT_CASE(parser_replacement),
+	KUNIT_CASE(parser_held_keeps_edid),
 	KUNIT_CASE(parser_attachment_admission),
 	KUNIT_CASE(parser_stale_transfer),
 	KUNIT_CASE(parser_route_catalog_handoff),
