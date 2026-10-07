@@ -149,21 +149,51 @@ static void apple_connector_oob_hotplug(struct drm_connector *connector,
 static void apple_crtc_atomic_enable(struct drm_crtc *crtc,
 				     struct drm_atomic_commit *commit)
 {
+	struct apple_crtc *apple_crtc = to_apple_crtc(crtc);
+	struct apple_dcp *dcp = platform_get_drvdata(apple_crtc->dcp);
 	struct drm_crtc_state *crtc_state;
-	crtc_state = drm_atomic_get_new_crtc_state(commit, crtc);
+	bool locked;
+	int ret;
 
-	if (crtc_state->active_changed && crtc_state->active) {
-		struct apple_crtc *apple_crtc = to_apple_crtc(crtc);
+	crtc_state = drm_atomic_get_new_crtc_state(commit, crtc);
+	locked = false;
+	ret = to_apple_atomic_state(commit)->failed_routes & drm_crtc_mask(crtc) ?
+		-EIO : dcp_typec_follow_crtc(crtc, commit, &locked);
+	/* A failed move must never power or program another sink's pipeline. */
+	if (ret || !dcp_crtc_route_ready(crtc, commit, false))
+		goto failed;
+
+	if (crtc_state->active && dcp_crtc_needs_route_start(dcp)) {
+		/* Establish the link/catalog before powering the assigned IOMFB. */
+		ret = dcp_typec_prepare_route(dcp);
+		if (ret)
+			goto failed;
+	}
+	if (crtc_state->active && !dcp_crtc_route_ready(crtc, commit, true))
+		goto failed;
+	if (crtc_state->active &&
+	    (crtc_state->active_changed || dcp_crtc_needs_route_start(dcp))) {
 		dcp_poweron(apple_crtc->dcp);
-		/* Force the CTM to be set on first swap */
 		crtc_state->color_mgmt_changed = true;
 	} else if (crtc_state->active && drm_atomic_crtc_needs_modeset(crtc_state)) {
 		/* A cable generation can change while the CRTC stays active. */
 		dcp_external_recover(to_apple_crtc(crtc)->dcp);
 	}
-
 	if (crtc_state->active)
 		dcp_crtc_atomic_modeset(crtc, commit);
+	dcp_typec_follow_done(locked);
+	return;
+
+failed:
+	if (!ret)
+		ret = -EAGAIN;
+	dcp_mode_invalidate(&dcp->mode_state);
+	dev_err(dcp->dev, "CRTC route unavailable (%d); modeset deferred\n", ret);
+	/* Flush completes any pending flip without issuing a firmware swap. */
+	schedule_work(&dcp->vblank_wq);
+	if (dcp->connector)
+		dcp_route_failure_notify(dcp->connector);
+	dcp_typec_follow_done(locked);
 }
 
 static void apple_crtc_atomic_disable(struct drm_crtc *crtc,
@@ -273,7 +303,35 @@ static const struct drm_crtc_funcs apple_crtc_funcs = {
 
 };
 
+static struct drm_atomic_commit *apple_atomic_state_alloc(struct drm_device *dev)
+{
+	struct apple_atomic_state *state = kzalloc_obj(*state);
+
+	if (!state)
+		return NULL;
+	if (drm_atomic_commit_init(dev, &state->base)) {
+		kfree(state);
+		return NULL;
+	}
+	return &state->base;
+}
+
+static void apple_atomic_state_clear(struct drm_atomic_commit *state)
+{
+	drm_atomic_commit_default_clear(state);
+	to_apple_atomic_state(state)->failed_routes = 0;
+}
+
+static void apple_atomic_state_free(struct drm_atomic_commit *state)
+{
+	drm_atomic_commit_default_release(state);
+	kfree(to_apple_atomic_state(state));
+}
+
 static const struct drm_mode_config_funcs apple_mode_config_funcs = {
+	.atomic_state_alloc	= apple_atomic_state_alloc,
+	.atomic_state_clear	= apple_atomic_state_clear,
+	.atomic_state_free	= apple_atomic_state_free,
 	.atomic_check		= drm_atomic_helper_check,
 	.atomic_commit		= drm_atomic_helper_commit,
 	.fb_create		= drm_gem_fb_create,
@@ -358,13 +416,18 @@ apple_connector_atomic_best_encoder(struct drm_connector *conn,
 
 	/*
 	 * Type-C tunnels are routed before the modeset and cannot move here.
-	 * Reject stale topology and explicit assignments to another pipeline.
+	 * Reject stale topology and explicit assignments to another pipeline,
+	 * except for a direct route that follows its CRTC (12.3/13.5, see
+	 * dcp_typec_follow_crtc()): dcp_crtc_atomic_check() decides there.
 	 */
 	if (apple_connector->port_encoder) {
+		struct platform_device *pdev = READ_ONCE(apple_connector->dcp);
+
 		conn_state = drm_atomic_get_new_connector_state(state, conn);
-		if (!conn_state || !conn_state->crtc ||
-		    READ_ONCE(apple_connector->dcp) !=
-		    to_apple_crtc(conn_state->crtc)->dcp)
+		if (!conn_state || !conn_state->crtc || !pdev)
+			return NULL;
+		if (pdev != to_apple_crtc(conn_state->crtc)->dcp &&
+		    !dcp_typec_follows_crtc(platform_get_drvdata(pdev)))
 			return NULL;
 		return apple_connector->port_encoder;
 	}

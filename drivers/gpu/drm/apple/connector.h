@@ -16,6 +16,8 @@ struct apple_connector;
 
 void dcp_hotplug(struct work_struct *work);
 bool dcp_connector_connected(struct apple_connector *connector);
+void dcp_queue_hotplug(struct apple_connector *connector);
+void dcp_route_failure_notify(struct apple_connector *connector);
 void dcp_retrain_oob(struct apple_connector *connector);
 enum drm_connector_status apple_connector_detect(struct drm_connector *connector, bool force);
 
@@ -59,6 +61,7 @@ struct apple_connector {
 
 	/* Workqueue for sending hotplug events to the associated device */
 	struct work_struct hotplug_wq;
+	atomic_t hotplug_reasons;
 
 	struct mutex chunk_lock;
 
