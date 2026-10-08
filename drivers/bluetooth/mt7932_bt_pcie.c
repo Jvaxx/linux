@@ -1083,6 +1083,8 @@ static int bt7932_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	ret = pci_disable_link_state(pdev, PCIE_LINK_STATE_ALL);
 	if (ret)
 		dev_warn(&pdev->dev, "link power management left as found: %d\n", ret);
+	/* Admission was qualified with ASPM and clock PM off on this link. */
+	pci_disable_link_state(pdev, PCIE_LINK_STATE_ALL);
 	bt = kzalloc_obj(*bt);
 	if (!bt)
 		return -ENOMEM;
@@ -1423,6 +1425,8 @@ module_pci_driver(bt7932_driver);
 
 MODULE_DESCRIPTION("Experimental standalone J700 MT7932 Bluetooth PCIe transport");
 MODULE_LICENSE("GPL");
+/* Admission was qualified after the Wi-Fi function had started its firmware. */
+MODULE_SOFTDEP("pre: mt7932_fullmac");
 MODULE_FIRMWARE(BT7932_FW_B0);
 MODULE_FIRMWARE(BT7932_FW_B1);
 MODULE_FIRMWARE(BT7932_FW_B1_FALLBACK);
