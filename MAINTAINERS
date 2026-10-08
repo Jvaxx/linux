@@ -2078,6 +2078,9 @@ M:	Ryan Murray <ryan@aurorasilicon.org>
 W:	https://aurora-silicon.github.io
 S:	Maintained
 F:	Documentation/devicetree/bindings/cpu/apple,t8140-cpuidle.yaml
+F:	drivers/pmdomain/apple/pmp-report.c
+F:	drivers/soc/apple/pmp.rs
+F:	include/linux/soc/apple/pmp-report.h
 F:	Documentation/devicetree/bindings/chosen/apple,dcp-rtkit-quiesced.yaml
 F:	Documentation/devicetree/bindings/display/apple,dcp.yaml
 F:	Documentation/devicetree/bindings/display/apple,display-subsystem.yaml
