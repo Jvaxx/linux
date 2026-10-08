@@ -286,6 +286,26 @@ void mt_retry_missing_policy(struct mt7932 *m)
 		schedule_work(&m->startup_work);
 	}
 	spin_unlock_irqrestore(&m->response_lock, flags);
+/* Keep cfg80211's channel list in step with the channels the country
+ * package leaves out of the firmware domain. cfg80211 recomputes the flags
+ * on its next regulatory change, which runs this again.
+ */
+static void mt_policy_disable(struct mt7932 *m, const struct mt7932_policy *policy)
+{
+	unsigned int i;
+
+	rtnl_lock();
+	wiphy_lock(m->wiphy);
+	for (i = 0; i < MT7932_CHANNELS; i++) {
+		struct ieee80211_channel *channel = i < MT7932_CHANNELS_2G ?
+			&m->channels[i] : &m->channels5[i - MT7932_CHANNELS_2G];
+
+		if (!(channel->flags & IEEE80211_CHAN_DISABLED) &&
+		    !mt7932_policy_permits(policy, channel->hw_value))
+			channel->flags |= IEEE80211_CHAN_DISABLED;
+	}
+	wiphy_unlock(m->wiphy);
+	rtnl_unlock();
 }
 
 static void mt_startup_work(struct work_struct *work)
@@ -351,6 +371,9 @@ static void mt_startup_work(struct work_struct *work)
 		if (!ret) {
 			mt7932_policy_filter(&reg, &policy);
 			mt_policy_disable(m, &policy, generation);
+		if (!ret) {
+			mt7932_policy_filter(&reg, &policy);
+			mt_policy_disable(m, &policy);
 		}
 		mutex_lock(&m->command_mutex);
 		if (READ_ONCE(m->stopping) || generation != READ_ONCE(m->reg_generation))
