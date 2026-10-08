@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 // Copyright 2026 Dj
+// Copyright 2026 Ryan Murray
 
 //! Typed platform profiles for the SEP driver.
 //!
@@ -146,6 +147,8 @@ pub(crate) struct PlatformProfile {
     pub(crate) firmware_region: &'static CStr,
     /// Identity keybag CREATE_KEYBAG field encoding (per-SoC; see [`KeybagCreate`]).
     pub(crate) keybag_create: KeybagCreate,
+    /// Require nonce authentication and signed sensor material before capture.
+    pub(crate) nonce_session: bool,
     /// Key-store protocol generation (see [`KeyStore`]).
     pub(crate) key_store: KeyStore,
     /// Platforms with reboot-tested owner export and user-before-master saves.
@@ -219,6 +222,7 @@ const T6000: PlatformProfile = PlatformProfile {
         cpx_encryption_mode: 2,
     },
     persistent_enrol: true,
+    nonce_session: false,
 };
 
 const T6020: PlatformProfile = PlatformProfile {
@@ -266,6 +270,7 @@ const T6020_SEPOS13: PlatformProfile = PlatformProfile {
         cpx_encryption_mode: 2,
     },
     ..T6020
+    nonce_session: false,
 };
 
 /// MacBook Neo. The J700 ADT records a pre-booted SEP, a spi2 Mesa sensor
@@ -299,6 +304,7 @@ const T8140: PlatformProfile = PlatformProfile {
         bag_type: 0,
         arg: -1,
     },
+    nonce_session: true,
 };
 
 /// MacBook Air M2 (J413, J415). iBoot leaves the SEP running and the Mesa
