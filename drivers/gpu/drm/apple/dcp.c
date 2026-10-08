@@ -3223,6 +3223,8 @@ int dcp_typec_prepare_route(struct apple_dcp *dcp)
 	if (generation != dcp->typec_generation || !dcp->typec_cable_connected)
 		return -ESTALE;
 	return ready ? 0 : -ETIMEDOUT;
+#define DCP_BL_FALLBACK_DELAY msecs_to_jiffies(2000)
+
 static bool dcp_uses_soft_dpms(struct apple_dcp *dcp)
 {
 	return (dcp_backlight_active(dcp) && dcp_has_panel(dcp)) ||
@@ -3248,6 +3250,10 @@ void dcp_poweron(struct platform_device *pdev)
 				WRITE_ONCE(dcp->crashed, true);
 				return;
 			}
+			/* The powerlog takeover report normally precedes this. */
+			if (dcp_has_panel(dcp))
+				schedule_delayed_work(&dcp->bl_fallback_wq,
+						      DCP_BL_FALLBACK_DELAY);
 		}
 		ret = dcp_backlight_dpms(dcp, true);
 		if (ret)
@@ -3450,6 +3456,34 @@ static void dcp_work_update_backlight(struct work_struct *work)
 	dcp = container_of(work, struct apple_dcp, bl_update_wq);
 
 	dcp_backlight_update(dcp);
+}
+
+/*
+ * H17P never publishes the panel level, and the loader's level arrives only
+ * as an optional powerlog report.  Without one, register the backlight at
+ * the middle of the panel range.  That value is only reported: no level is
+ * presented until userspace writes one, so the panel keeps the loader's
+ * level.
+ */
+static void dcp_work_backlight_fallback(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(to_delayed_work(work),
+					     struct apple_dcp, bl_fallback_wq);
+	u32 nits = dcp->brightness.maximum / 2;
+	int ret;
+
+	if (READ_ONCE(dcp->quiescing) || READ_ONCE(dcp->crashed) ||
+	    dcp_backlight_active(dcp))
+		return;
+
+	ret = iomfb_configure_backlight_h17p(dcp, dcp->brightness.maximum,
+					     false, 0, true, nits);
+	if (!ret)
+		dev_info(dcp->dev,
+			 "no loader brightness reported; backlight starts at %u nits without a panel change\n",
+			 nits);
+	else if (ret != -EBUSY)
+		dev_warn(dcp->dev, "backlight registration failed: %d\n", ret);
 }
 
 static void dcp_release_piodma_iommu_dev(struct apple_dcp *dcp)
@@ -4288,6 +4322,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 		afk_quiesce(dcp->ibootep);
 		afk_quiesce(dcp->systemep);
 		afk_quiesce(dcp->dcpavservep);
+		cancel_delayed_work_sync(&dcp->bl_fallback_wq);
 		if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP) {
 			cancel_work_sync(&dcp->bl_register_wq);
 			cancel_work_sync(&dcp->bl_update_wq);
@@ -4358,6 +4393,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 	iomfb_queue_stop(dcp);
 	dcp_release_piodma_iommu_dev(dcp);
 
+	cancel_delayed_work_sync(&dcp->bl_fallback_wq);
 	if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP) {
 		cancel_work_sync(&dcp->bl_register_wq);
 		cancel_work_sync(&dcp->bl_update_wq);
@@ -4547,6 +4583,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 		disable_work(&dcp->vblank_wq);
 		disable_delayed_work(&dcp->swap_watchdog_wq);
 	}
+	INIT_DELAYED_WORK(&dcp->bl_fallback_wq, dcp_work_backlight_fallback);
 	/* Balanced by enable at successful component bind. */
 	disable_delayed_work(&dcp->typec_reconnect_wq);
 	disable_delayed_work(&dcp->placeholder_edid_wq);
@@ -4916,6 +4953,7 @@ static void dcp_platform_shutdown(struct platform_device *pdev)
 		 * its DMA resources alive until the system resets.
 		 */
 		iomfb_queue_stop(dcp);
+		cancel_delayed_work_sync(&dcp->bl_fallback_wq);
 		cancel_work_sync(&dcp->bl_register_wq);
 		cancel_work_sync(&dcp->bl_update_wq);
 		return;
