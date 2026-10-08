@@ -17,10 +17,9 @@ Platform and configuration
 --------------------------
 
 Use the separately reviewed T8140 PCIe bootstrap described in
-``Documentation/PCI/controller/apple-t8140.rst``. Enumeration is enabled by
-default only on the J700/T8140; ``pcie_apple_piodma_diag.enumerate=0`` disables
-it. Public m1n1 must populate the J700 ``wifi0`` endpoint's own
-``local-mac-address``; a zero placeholder is rejected.
+``Documentation/PCI/controller/apple-t8140.rst``. It runs during boot when
+``CONFIG_PCIE_APPLE_PIODMA_DIAG=y``. Public m1n1 must populate the J700
+``wifi0`` endpoint's own ``local-mac-address``; a zero placeholder is rejected.
 
 The original hardware-tested configuration included ``CONFIG_MT7932_FULLMAC=m``,
 ``CONFIG_CFG80211=y``, ``CONFIG_BT_MTK7932_PCIE=y``, ``CONFIG_BT_BREDR=y``,
