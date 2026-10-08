@@ -898,6 +898,8 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 	struct drm_crtc_state *crtc_state;
 	bool needs_modeset;
 
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6)
+		return iomfb_v26_6_atomic_check(dcp, crtc, commit);
 	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7)
 		return iomfb_v14_7_atomic_check(dcp, crtc, commit);
 
@@ -1948,7 +1950,8 @@ bool dcp_fw_compat_is_14_7(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
-	return dcp->fw_compat == DCP_FIRMWARE_V_14_7;
+	return dcp->fw_compat == DCP_FIRMWARE_V_14_7 ||
+	       dcp->fw_compat == DCP_FIRMWARE_V_26_6;
 }
 
 unsigned long* dcp_get_iomfb_surfaces(struct platform_device *pdev)
@@ -1965,6 +1968,8 @@ int dcp_start(struct platform_device *pdev)
 
 	/* Even if nothing starts, dcp_wait_ready() must find it initialised. */
 	init_completion(&dcp->start_done);
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6)
+		return iomfb_v26_6_start(dcp);
 
 	/*
 	 * The T6030 firmware session is adopted for the internal panel.
@@ -2079,6 +2084,9 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 	case DCP_FIRMWARE_V_14_7_TEMPLATE:
 		iomfb_poweroff_v14_7_0(dcp);
 		break;
+	case DCP_FIRMWARE_V_26_6:
+		iomfb_v26_6_poweroff(dcp);
+		break;
 	case DCP_FIRMWARE_V_14_7:
 		iomfb_v14_7_poweroff(dcp);
 		break;
@@ -2166,6 +2174,9 @@ static void __maybe_unused dcp_sleep(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_V_14_7_TEMPLATE:
 		iomfb_sleep_v14_7_0(dcp);
+		break;
+	case DCP_FIRMWARE_V_26_6:
+		iomfb_v26_6_poweroff(dcp);
 		break;
 	case DCP_FIRMWARE_V_14_7:
 		iomfb_v14_7_poweroff(dcp);
@@ -2297,6 +2308,9 @@ void dcp_poweron(struct platform_device *pdev)
 		break;
 	case DCP_FIRMWARE_V_14_7_TEMPLATE:
 		iomfb_poweron_v14_7_0(dcp);
+		break;
+	case DCP_FIRMWARE_V_26_6:
+		iomfb_v26_6_poweron(dcp);
 		break;
 	case DCP_FIRMWARE_V_14_7:
 		iomfb_v14_7_poweron(dcp);
@@ -2856,6 +2870,21 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 		return DCP_FIRMWARE_UNKNOWN;
 	}
 
+	/* J613 25G83 has a distinct callback table, never a v14 fallback. */
+	if (of_device_is_compatible(dev->of_node, "apple,t8122-dcp") &&
+	    of_property_present(dev->of_node, "apple,j613-25g83-profile")) {
+		const char *uuid;
+		u32 profile;
+
+		if (of_machine_is_compatible("apple,j613") &&
+		    !of_property_read_u32(dev->of_node, "apple,j613-25g83-profile", &profile) &&
+		    profile == 1 && !strcmp(compat_str, "26.6.2") &&
+		    !of_property_read_string(dev->of_node, "apple,firmware-uuid", &uuid) &&
+		    !strcmp(uuid, "C042E95C-B9D8-3F0E-94B3-582A08AA6FDD"))
+			return DCP_FIRMWARE_V_26_6;
+		return DCP_FIRMWARE_UNKNOWN;
+	}
+
 	/*
 	 * T6030 and the internal panels with a board record (T6030, J613) run
 	 * the 14.7 firmware session handed over by the boot loader natively
@@ -3095,6 +3124,13 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 		dcp->connector_type = DRM_MODE_CONNECTOR_eDP;
 	}
 
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6) {
+		ret = iomfb_v26_6_bind(dcp);
+		if (!ret)
+			enable_work(&dcp->dimensions_wq);
+		return ret;
+	}
+
 	/* The running T6030 firmware is adopted as is. */
 	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7) {
 		if (dcp->external_native) {
@@ -3234,6 +3270,10 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 		return;
 
 	disable_work_sync(&dcp->dimensions_wq);
+	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6) {
+		iomfb_v26_6_unbind(dcp);
+		return;
+	}
 	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7) {
 		if (dcp->external_native) {
 			/* Bind's wait_ready enabled it, as for any HDMI port. */
@@ -3463,6 +3503,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	 * display.
 	 */
 	if (fw_compat != DCP_FIRMWARE_V_14_7 &&
+	    fw_compat != DCP_FIRMWARE_V_26_6 &&
 	    !of_property_present(dev->of_node, "apple,bw-scratch") &&
 	    !hw->firmware_clock)
 		return dev_err_probe(dev, -ENODEV, "Incompatible devicetree! "
@@ -3547,14 +3588,22 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	disable_delayed_work(&dcp->placeholder_edid_wq);
 	disable_delayed_work(&dcp->announce_wq);
 	dcp->announce.stopped = true;
-	if (dcp->external_native) {
-		/* Bind enables these; firmware callbacks may come before it. */
+	/*
+	 * A native external pipe's bind enables these; firmware callbacks may
+	 * come before it. The 26.6 panel never uses them.
+	 */
+	if (dcp->external_native || fw_compat == DCP_FIRMWARE_V_26_6) {
 		disable_work(&dcp->vblank_wq);
 		disable_delayed_work(&dcp->swap_watchdog_wq);
 	}
 
 	platform_set_drvdata(pdev, dcp);
 
+	if (fw_compat == DCP_FIRMWARE_V_26_6) {
+		ret = iomfb_v26_6_probe(dcp);
+		if (ret)
+			return ret;
+	}
 	if (fw_compat == DCP_FIRMWARE_V_14_7 && !dcp->external) {
 		ret = iomfb_v14_7_probe(dcp);
 		if (ret)
@@ -3583,7 +3632,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 						    "apple,iomfb-surfaces",
 						    sizeof(u32));
 
-	if (fw_compat == DCP_FIRMWARE_V_14_7) {
+	if (fw_compat == DCP_FIRMWARE_V_14_7 || fw_compat == DCP_FIRMWARE_V_26_6) {
 		set_bit(0, dcp->iomfb_surfaces);
 	} else if (num_surfs == 0 || num_surfs == -ENODATA) {
 		set_bit(0, dcp->iomfb_surfaces);
@@ -3785,6 +3834,8 @@ fixed_done:
 	if (ret && dcp->external_prepared) {
 		dcp_disable_typec_work(dcp, true);
 	}
+	if (ret && dcp->fw_compat == DCP_FIRMWARE_V_26_6)
+		iomfb_v26_6_unbind(dcp);
 	/* A failed bind run from here may already have started RTKit. */
 	if (ret && dcp->fw_compat == DCP_FIRMWARE_V_14_7)
 		iomfb_v14_7_remove(dcp);
@@ -3802,6 +3853,8 @@ static void dcp_platform_remove(struct platform_device *pdev)
 		return;
 	}
 	component_del(&pdev->dev, &dcp_comp_ops);
+	if (dcp && dcp->fw_compat == DCP_FIRMWARE_V_26_6)
+		iomfb_v26_6_unbind(dcp);
 	/* Unbind does not wait for RTKit callbacks, or run if bind failed late. */
 	if (dcp && dcp->fw_compat == DCP_FIRMWARE_V_14_7)
 		iomfb_v14_7_remove(dcp);
@@ -4190,9 +4243,9 @@ static struct platform_driver apple_platform_driver = {
 	},
 };
 
-void __init dcp_register(void)
+int __init dcp_register(void)
 {
-	platform_driver_register(&apple_platform_driver);
+	return platform_driver_register(&apple_platform_driver);
 }
 
 void __exit dcp_unregister(void)

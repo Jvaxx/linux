@@ -30,6 +30,7 @@
 #include "iomfb_v13_3.h"
 #include "iomfb_v14_7.h"
 #include "iomfb_v14_7_tpl.h"
+#include "iomfb_v26_6.h"
 #include "epic/dpavservep.h"
 #include "version_utils.h"
 
@@ -287,6 +288,7 @@ struct apple_dcp {
 
 	/* DCP_FIRMWARE_V_14_7 state; outlives this device once RTKit runs. */
 	struct apple_dcp_v14 *v14;
+	struct apple_dcp_v26 *v26;
 
 	/* Coprocessor control register */
 	void __iomem *coproc_reg;
