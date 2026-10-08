@@ -558,6 +558,7 @@
 			compatible = "apple,t8140-cluster-cpufreq";
 			reg = <0x2 0x10e20000 0x0 0x1000>;
 			#performance-domain-cells = <0>;
+			/* E lane follows the ADT ordering; no changing sample yet. */
 			apple,fast-die-effort = <&pmp_report 0>;
 		};
 
@@ -565,6 +566,7 @@
 			compatible = "apple,t8140-cluster-cpufreq";
 			reg = <0x2 0x11e20000 0x0 0x1000>;
 			#performance-domain-cells = <0>;
+			/* P lane has been observed under Linux CPU load. */
 			apple,fast-die-effort = <&pmp_report 1>;
 		};
 
@@ -612,6 +614,7 @@
 			reg = <0x3 0x700000 0 0x14000>;
 			/* child nodes are added in t8140-pmgr.dtsi */
 		};
+
 
 		aic: interrupt-controller@301000000 {
 			compatible = "apple,t8140-aic3", "apple,t8122-aic3";
