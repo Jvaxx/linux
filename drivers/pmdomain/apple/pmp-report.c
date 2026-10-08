@@ -141,6 +141,42 @@ static void apple_pmp_report_release(void *data)
 	debugfs_remove(rep->debugfs);
 }
 
+/* The native 25G83 PMP starts through its supplier topology, after requests
+ * are seeded. Its report is pinned against removal while readiness is read.
+ */
+int apple_pmp_report_wait_supplier_ready(struct device *supplier, unsigned int timeout_ms)
+{
+	struct device_node *np = of_parse_phandle(supplier->of_node, "apple,pmp-report", 0);
+	struct platform_device *pdev;
+	struct apple_pmp_report *rep;
+	u64 status;
+	int ret;
+
+	if (!np || !of_device_is_compatible(np, "apple,j613-25g83-pmp-report")) {
+		of_node_put(np);
+		return -ENODEV;
+	}
+	pdev = of_find_device_by_node(np);
+	of_node_put(np);
+	if (!pdev)
+		return -EPROBE_DEFER;
+	/* Never wait behind supplier removal while the command bridge is locked. */
+	if (!device_trylock(&pdev->dev)) {
+		put_device(&pdev->dev);
+		return -EPROBE_DEFER;
+	}
+	rep = device_is_bound(&pdev->dev) ? platform_get_drvdata(pdev) : NULL;
+	if (!rep)
+		ret = -EPROBE_DEFER;
+	else
+		ret = readq_poll_timeout(rep->base + rep->offsets->status, status,
+					status == PMP_REPORT_READY, 1000, timeout_ms * 1000);
+	device_unlock(&pdev->dev);
+	put_device(&pdev->dev);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_wait_supplier_ready);
+
 static int apple_pmp_report_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -158,6 +194,7 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 	if (IS_ERR(rep->base))
 		return PTR_ERR(rep->base);
 	rep->offsets = of_device_get_match_data(dev);
+	platform_set_drvdata(pdev, rep);
 
 	INIT_LIST_HEAD(&rep->list);
 	ret = devm_add_action_or_reset(dev, apple_pmp_report_release, rep);
@@ -227,6 +264,7 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t8140 = {
 };
 
 static const struct of_device_id apple_pmp_report_of_match[] = {
+	{ .compatible = "apple,j613-25g83-pmp-report", .data = &apple_pmp_offsets_t8122 },
 	{ .compatible = "apple,t6000-pmp-v2-report", .data = &apple_pmp_offsets_t600x },
 	{ .compatible = "apple,t6020-pmp-v2-report", .data = &apple_pmp_offsets_t602x },
 	{ .compatible = "apple,t6030-pmp-v2-report", .data = &apple_pmp_offsets_t6030 },
