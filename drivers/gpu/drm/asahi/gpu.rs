@@ -554,6 +554,11 @@ pub(crate) struct GpuManager {
 
 /// Operations the DRM driver performs on a GPU, independent of its firmware interface.
 pub(crate) trait Gpu: Send + Sync {
+    /// Return a snapshot only for firmware families with a supported decoder.
+    fn stats_snapshot(&self) -> Option<Arc<stats::StatsSnapshot>> {
+        None
+    }
+
     /// Cast as an Any type.
     fn as_any(&self) -> &dyn Any;
     /// Cast Arc<Self> as an Any type.
@@ -1565,7 +1570,12 @@ impl GpuManager::ver {
                 )?,
                 fw_log: channel::FwLogChannel::new(dev, alloc_ref)?,
                 ktrace: channel::KTraceChannel::new(dev, alloc_ref)?,
-                stats: channel::StatsChannel::ver::new(dev, alloc_ref)?,
+                stats: channel::StatsChannel::ver::new(
+                    dev,
+                    alloc_ref,
+                    stats_snap_clone,
+                    u64::from(cfg.base_clock_hz),
+                )?,
             }),
             GFP_KERNEL,
         )?;
