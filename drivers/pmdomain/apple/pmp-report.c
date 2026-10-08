@@ -10,6 +10,7 @@
 #include <linux/delay.h>
 #include <linux/hwmon.h>
 #include <linux/io.h>
+#include <linux/debugfs.h>
 #include <linux/iopoll.h>
 #include <linux/jiffies.h>
 #include <linux/mfd/syscon.h>
@@ -20,6 +21,9 @@
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
+#include <linux/rculist.h>
+#include <linux/seq_file.h>
+#include <linux/soc/apple/pmp-report.h>
 #include <linux/regmap.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/pmp-report.h>
@@ -34,6 +38,16 @@
 
 #define PMP_REPORT_READY 0x1
 
+/**
+ * struct apple_pmp_report_offsets - per-SoC layout of the report region
+ * @tgt_read: power state request, read side
+ * @tgt_write: power state request, write side
+ * @actual: power state acknowledgment
+ * @status: PMP status; bit 0 is set while the PMP is running
+ * @fast_die: 32-bit word holding the fast die-temperature effort of each
+ *	CPU cluster, one byte per lane; 0 if the SoC has none
+ * @fast_die_lanes: number of lanes at @fast_die, at most 4
+ */
 struct apple_pmp_report_offsets {
 	u32 tgt_read;
 	u32 tgt_write;
@@ -48,6 +62,8 @@ struct apple_pmp_report_offsets {
 	bool temps;
 	/* With starts_pmp: soc-device record i holds device id i + 1. */
 	bool devices_ordered;
+	u32 fast_die;
+	u32 fast_die_lanes;
 };
 
 struct apple_pmp_report {
@@ -601,6 +617,7 @@ static const struct {
 	{ "tp000m", "Tp000m", 0x6937c },
 	{ "tp001m", "Tp001m", 0x69420 },
 	{ "tp002m", "Tp002m", 0x694c4 },
+	struct list_head list;
 };
 
 #define T6030_PMP_TEMP_CHANNELS		(1 + ARRAY_SIZE(apple_pmp_t6030_temps))
@@ -1085,6 +1102,85 @@ int apple_pmp_report_wait_supplier_ready(struct device *supplier, unsigned int t
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_pmp_report_wait_supplier_ready);
+/*
+ * Bound report regions, for apple_pmp_report_fast_die_effort().  Regions are
+ * added once they are set up and never removed: the driver cannot be unbound.
+ */
+static LIST_HEAD(apple_pmp_reports);
+static DEFINE_MUTEX(apple_pmp_reports_lock);
+static struct dentry *apple_pmp_report_debugfs;
+
+/**
+ * apple_pmp_report_fast_die_effort() - read the fast die-temperature effort
+ *	of a CPU cluster
+ * @np: device tree node of the report region
+ * @lane: lane of the cluster in the fast die-temperature report
+ * @effort: set to the effort on success
+ *
+ * The PMP of some SoCs runs a control loop on its own die-temperature sensors
+ * and publishes an 8-bit effort for each CPU cluster: 0 requests no limit,
+ * and the effort rises towards 255 as the die exceeds the firmware's target.
+ * The effort is only valid while the PMP reports that it is running; a
+ * stopped PMP reads 0.
+ *
+ * Context: Any context.
+ * Return: 0 on success, -EPROBE_DEFER if the region is not bound (yet),
+ * -EOPNOTSUPP if the SoC's PMP publishes no such effort, -EINVAL if @lane is
+ * out of range, or -EAGAIN if the PMP does not report that it is running.
+ */
+int apple_pmp_report_fast_die_effort(const struct device_node *np,
+				     unsigned int lane, u8 *effort)
+{
+	const struct apple_pmp_report_offsets *offs;
+	const struct apple_pmp_report *rep;
+	int ret = -EPROBE_DEFER;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
+		if (rep->dev->of_node != np)
+			continue;
+
+		offs = rep->offsets;
+		if (!offs->fast_die) {
+			ret = -EOPNOTSUPP;
+		} else if (lane >= offs->fast_die_lanes) {
+			ret = -EINVAL;
+		} else if (!(readl(rep->base + offs->status) & PMP_REPORT_READY)) {
+			ret = -EAGAIN;
+		} else {
+			*effort = readl(rep->base + offs->fast_die) >>
+				  (lane * BITS_PER_BYTE);
+			ret = 0;
+		}
+		break;
+	}
+	rcu_read_unlock();
+
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_fast_die_effort);
+
+/* Read only the documented status and fast-die entries, never the aperture. */
+static int apple_pmp_report_status_show(struct seq_file *s, void *unused)
+{
+	struct apple_pmp_report *rep = s->private;
+	const struct apple_pmp_report_offsets *offs = rep->offsets;
+	u32 status = readl(rep->base + offs->status);
+	unsigned int lane;
+	u32 effort;
+
+	seq_printf(s, "running: %u\n", !!(status & PMP_REPORT_READY));
+	if (!(status & PMP_REPORT_READY) || !offs->fast_die)
+		return 0;
+
+	effort = readl(rep->base + offs->fast_die);
+	for (lane = 0; lane < offs->fast_die_lanes; lane++)
+		seq_printf(s, "lane%u: %u\n", lane,
+			   (effort >> (lane * BITS_PER_BYTE)) & 0xff);
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(apple_pmp_report_status);
 
 static int apple_pmp_report_probe(struct platform_device *pdev)
 {
@@ -1139,6 +1235,13 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 	if (ret && !rep->offsets->starts_pmp)
 		return dev_err_probe(dev, ret, "failed to create child devices\n");
 
+	mutex_lock(&apple_pmp_reports_lock);
+	list_add_tail_rcu(&rep->list, &apple_pmp_reports);
+	mutex_unlock(&apple_pmp_reports_lock);
+
+	if (rep->offsets->fast_die)
+		debugfs_create_file(dev_name(dev), 0400, apple_pmp_report_debugfs,
+				    rep, &apple_pmp_report_status_fops);
 	if (rep->offsets->starts_pmp) {
 		/* 4: the always-on entries have seeded their requests */
 		request = readq(rep->base + rep->offsets->tgt_read);
@@ -1240,6 +1343,14 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_j613_25g83 = {
 	.tgt_write = 0x10800,
 	.actual = 0x1080,
 	.status = 0x10,
+/* The fast die-temperature report is the low two bytes of entry 0x1c1. */
+static const struct apple_pmp_report_offsets apple_pmp_offsets_t8140 = {
+	.tgt_read = 0x1880,
+	.tgt_write = 0x10c40,
+	.actual = 0x18c0,
+	.status = 0x10,
+	.fast_die = 0x1c10,
+	.fast_die_lanes = 2,
 };
 
 static const struct of_device_id apple_pmp_report_of_match[] = {
@@ -1251,6 +1362,7 @@ static const struct of_device_id apple_pmp_report_of_match[] = {
 	{ .compatible = "apple,t6030-pmp-v2-report", .data = &apple_pmp_offsets_t6030 },
 	{ .compatible = "apple,t8122-pmp-v2-report", .data = &apple_pmp_offsets_t8122 },
 	{ .compatible = "apple,t6031-pmp-v2-report", .data = &apple_pmp_offsets_t6031 },
+	{ .compatible = "apple,t8140-pmp-v2-report", .data = &apple_pmp_offsets_t8140 },
 	{}
 };
 
@@ -1407,6 +1519,7 @@ static int __init apple_pmp_report_init(void)
 
 static void __exit apple_pmp_report_exit(void)
 {
+	debugfs_remove_recursive(apple_pmp_report_debugfs);
 	platform_driver_unregister(&apple_pmp_report_entry_driver);
 	platform_driver_unregister(&apple_pmp_report_driver);
 }
