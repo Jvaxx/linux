@@ -1833,6 +1833,12 @@ static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_
 
 	dcp->crashed = true;
 	dev_err(dcp->dev, "DCP has crashed\n");
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
+		/* No in-place restart exists; the last scanout stays retained. */
+		dev_err(dcp->dev, "a reboot is required to restore the display\n");
+		/* Nothing will complete a present that was in flight. */
+		schedule_work(&dcp->vblank_wq);
+	}
 	if (dcp->connector) {
 		dcp->connector->connected = 0;
 		apple_connector_edid_set_live(dcp->connector, false);
