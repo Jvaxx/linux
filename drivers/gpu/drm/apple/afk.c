@@ -128,6 +128,9 @@ void afk_shutdown(struct apple_dcp_afkep *afkep)
 		dev_err(afkep->dcp->dev, "Timed out shutting down AFK endpoint %02x", afkep->endpoint);
 	}
 
+	spin_lock_irqsave(&afkep->lock, flags);
+	afkep->stopping = true;
+	spin_unlock_irqrestore(&afkep->lock, flags);
 	afk_quiesce(afkep);
 	spin_lock_irqsave(&afkep->lock, flags);
 	afkep->stopping = true;
@@ -173,6 +176,10 @@ static int afk_start_polled(struct apple_dcp_afkep *ep)
 		"RTKit AFK endpoint %02x did not acknowledge init\n",
 		ep->endpoint);
 	return -ETIMEDOUT;
+	if (afkep->rx_scratch) {
+		devm_kfree(afkep->dcp->dev, afkep->rx_scratch);
+		afkep->rx_scratch = NULL;
+	}
 }
 
 int afk_start(struct apple_dcp_afkep *ep)
@@ -1134,6 +1141,16 @@ static int afk_send_command_full(struct apple_epic_service *service, u8 type,
 				 void *output, size_t output_len, u32 *retcode,
 				 size_t *reply_len, unsigned int timeout_ms)
 {
+	return afk_send_command_timeout(service, type, payload, payload_len,
+					output, output_len, retcode,
+					MSEC_PER_SEC);
+}
+
+int afk_send_command_timeout(struct apple_epic_service *service, u8 type,
+			     const void *payload, size_t payload_len,
+			     void *output, size_t output_len, u32 *retcode,
+			     unsigned int timeout_ms)
+{
 	struct epic_cmd cmd;
 	void *rxbuf, *txbuf;
 	dma_addr_t rxbuf_dma, txbuf_dma;
@@ -1153,7 +1170,14 @@ static int afk_send_command_full(struct apple_epic_service *service, u8 type,
 		return -ENODEV;
 	ep = service->ep;
 	if (READ_ONCE(ep->dcp->quiescing))
+	service = afk_service_get(service);
+	if (!service)
 		return -ENODEV;
+	ep = service->ep;
+	if (READ_ONCE(ep->dcp->quiescing)) {
+		ret = -ENODEV;
+		goto err_put_service;
+	}
 
 	rxbuf = dma_alloc_coherent(ep->dcp->dev, output_len, &rxbuf_dma,
 				   GFP_KERNEL);
@@ -1323,6 +1347,16 @@ static int afk_service_call_full(struct apple_epic_service *service, u16 group,
 				 size_t output_pad, size_t *reply_len,
 				 unsigned int timeout_ms)
 {
+	return afk_service_call_timeout(service, group, command, data, data_len,
+					data_pad, output, output_len,
+					output_pad, MSEC_PER_SEC);
+}
+
+int afk_service_call_timeout(struct apple_epic_service *service, u16 group,
+			     u32 command, const void *data, size_t data_len,
+			     size_t data_pad, void *output, size_t output_len,
+			     size_t output_pad, unsigned int timeout_ms)
+{
 	struct epic_service_call *call;
 	void *bfr;
 	size_t bfr_len, input_size, output_size, received = 0;
@@ -1339,6 +1373,8 @@ static int afk_service_call_full(struct apple_epic_service *service, u16 group,
 	    check_add_overflow(max(input_size, output_size), sizeof(*call),
 			       &bfr_len) || bfr_len > U32_MAX)
 		return -EOVERFLOW;
+	if (!service)
+		return -ENODEV;
 
 	bfr = kzalloc(bfr_len, GFP_KERNEL);
 	if (!bfr)

@@ -68,7 +68,6 @@ static int apple_drm_gem_dumb_create(struct drm_file *file_priv,
 	return drm_gem_dma_dumb_create_internal(file_priv, drm, args);
 }
 
-#ifdef CONFIG_DRM_FBDEV_EMULATION
 static int apple_drm_fbdev_probe(struct drm_fb_helper *helper,
 				 struct drm_fb_helper_surface_size *sizes)
 {
@@ -98,11 +97,20 @@ static void apple_drm_postclose(struct drm_device *drm, struct drm_file *file)
 	if (file->was_master)
 		dcp_typec_reorder();
 }
-#endif
+
+/*
+ * A compositor or boot splash is closing the device.  drm_release() has
+ * already taken its file off the file list, so the Type-C fabric can tell
+ * whether any other one still has the device open.
+ */
+static void apple_drm_postclose(struct drm_device *drm, struct drm_file *file)
+{
+	if (file->was_master)
+		dcp_typec_reorder();
+}
 
 static const struct drm_driver apple_drm_driver = {
 	DRM_GEM_DMA_DRIVER_OPS_WITH_DUMB_CREATE(apple_drm_gem_dumb_create),
-#ifdef CONFIG_DRM_FBDEV_EMULATION
 	.fbdev_probe		= apple_drm_fbdev_probe,
 #else
 	DRM_FBDEV_DMA_DRIVER_OPS,
@@ -420,6 +428,7 @@ apple_connector_atomic_best_encoder(struct drm_connector *conn,
 				    struct drm_atomic_state *state)
 {
 	struct apple_connector *apple_connector = to_apple_connector(conn);
+	struct drm_connector_state *conn_state;
 	struct drm_encoder *encoder;
 
 	/*
@@ -429,8 +438,14 @@ apple_connector_atomic_best_encoder(struct drm_connector *conn,
 	 * route follows the CRTC (see dcp_typec_follow_crtc()).  So it is the
 	 * only answer there is.
 	 */
-	if (apple_connector->port_encoder)
+	if (apple_connector->port_encoder) {
+		conn_state = drm_atomic_get_new_connector_state(state, conn);
+		if (!conn_state || !conn_state->crtc ||
+		    READ_ONCE(apple_connector->dcp) !=
+		    to_apple_crtc(conn_state->crtc)->dcp)
+			return NULL;
 		return apple_connector->port_encoder;
+	}
 
 	drm_connector_for_each_possible_encoder(conn, encoder)
 		return encoder;

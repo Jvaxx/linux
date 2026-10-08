@@ -1531,7 +1531,7 @@ static void iomfb_backlight_start(struct apple_dcp *dcp,
 	bool have_surface = false;
 	unsigned int i;
 
-	if (!dcp_backlight_pending(dcp) || !dcp->valid_mode || !scanout ||
+	if (!dcp_backlight_pending(dcp) || !READ_ONCE(dcp->mode_state.valid) || !scanout ||
 	    !dcp->connector || !dcp->connector->connected)
 		return;
 	for (i = 0; i < SWAP_SURFACES; i++)
@@ -1586,7 +1586,7 @@ static void iomfb_atomic_start(struct apple_dcp *dcp,
 	struct iomfb_atomic_transaction *atomic = container_of(transaction,
 					 struct iomfb_atomic_transaction, transaction);
 
-	if (!dcp->valid_mode || !dcp->connector || !dcp->connector->connected) {
+	if (!READ_ONCE(dcp->mode_state.valid) || !dcp->connector || !dcp->connector->connected) {
 		schedule_work(&dcp->vblank_wq);
 		return;
 	}
