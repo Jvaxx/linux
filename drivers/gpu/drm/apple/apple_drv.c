@@ -804,6 +804,14 @@ static void apple_drm_quiesce_connectors(struct drm_device *drm)
 		disable_work_sync(&apple_connector->bl_commit_wq);
 	}
 	drm_connector_list_iter_end(&iter);
+ * The T8140 external display coprocessor needs firmware support this driver
+ * does not have yet.  Leave it out of the display subsystem, so that an
+ * enabled node cannot hold back the internal panel's component master.
+ */
+static bool apple_dcp_usable(struct device_node *np)
+{
+	return of_device_is_available(np) &&
+	       !of_device_is_compatible(np, "apple,t8140-dcpext");
 }
 
 static int apple_drm_init_dcp(struct device *dev)
