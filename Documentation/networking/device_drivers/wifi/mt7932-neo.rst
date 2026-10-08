@@ -28,17 +28,21 @@ Use the separately reviewed T8140 PCIe bootstrap described in
 ``wifi0`` endpoint's own ``local-mac-address``; a zero placeholder is rejected.
 
 The tested configuration includes ``CONFIG_MT7932_FULLMAC=m``,
-``CONFIG_CFG80211=y``, ``CONFIG_BT_MTK7932_PCIE=y``, ``CONFIG_BT_BREDR=y``,
+``CONFIG_CFG80211=y``, ``CONFIG_BT_MTK7932_PCIE=m``, ``CONFIG_BT_BREDR=y``,
 ``CONFIG_BT_LE=y``, ``CONFIG_CRYPTO_AES=y`` and ``CONFIG_CRYPTO_CMAC=y``.
-The bootstrap and Bluetooth experiment exclude suspend and kexec.
+The Bluetooth transport can be built with modular Bluetooth and system
+sleep. The separately selected bootstrap provider has its own lifecycle
+restrictions. Kexec is excluded while either retained experiment is enabled.
 Use the ordinary cfg80211 regulatory database and applicable country policy.
 The validated first-admission fallback is kernel country 00 with firmware XZ.
 
 After the root filesystem and the local firmware packages are available,
 select PCIe ASPM performance policy before loading ``mt7932-fullmac``. This
 matches the tested admission sequence. Bluetooth's gate defaults closed;
-validate the cold, unbound ``14c3:793b`` function, enable
-``/sys/module/mt7932_bt_pcie/parameters/enable``, then request its PCI probe.
+validate the cold, unbound ``14c3:793b`` function, then load
+``mt7932_bt_pcie`` with ``enable=1`` after its local inputs are installed.
+A built-in transport can instead open its enable parameter before requesting
+the PCI probe.
 Do not reprobe after a failed or uncertain Bluetooth admission. The tested
 Wi-Fi driver owns function 0 and Bluetooth owns function 1.
 
@@ -106,34 +110,18 @@ from the result. A successful host serial command is not a test pass: require
 Qualification and remaining work
 --------------------------------
 
-The :download:`qualification artifact <mt7932-neo-qualification.json>` records the exact Image,
-module and source identities and the physical results from 2026-10-02.
-Both 2.4 and 5 GHz passed scan, WPA2, DHCP, gateway, DNS and verified HTTPS.
-Switching bands performed normal peer retirement and fresh authentication.
-Wi-Fi's checked module removal/reset/reload also passed before Bluetooth
-admission. Five-GHz traffic concurrent with Bluetooth discovery and HCI
-off/on passed 54/54 gateway replies and 18 HTTPS downloads with no driver or
-kernel faults. The longer 2.4-GHz coexistence run recorded 53/54 replies;
-it is explicitly not a zero-loss pass. The lost ping coincided with a
-background scan; that timing does not establish a root cause.
-
-The earlier Bluetooth candidate passed two bonded AirPods reconnects and
-30 seconds of AAC output, including a user-confirmed audible tone. Concurrent
-headset audio was not repeated on the combined candidate because no AirPods
-appeared during its discovery runs.
-
-The experimental implementation has concrete production merge blockers:
-
-* PCI bootstrap memory remains retained until external reset; controller
-  removal, suspend, kexec and reusable-arena lifetime are not qualified.
-* Bluetooth lacks a complete PCI removal/quiescence contract. Suppressed
-  bind/unbind attributes do not make PCI device removal safe.
-* Bluetooth's finite software queue limit is not HCI backpressure. Saturation
-  can drop a frame already accounted by the HCI scheduler; that path needs
-  correction and saturation qualification before production use.
-* Arbitrary caller scan IEs, WPA3/SAE, required MFP, AP/P2P modes, general
-  country-package generation, roaming and long-duration reliability remain
-  outside this qualification. Broad compatibility must not be inferred from
-  the tested station and firmware combination.
-* SCO/headset microphone, LE Audio/ISO and simultaneous headset audio remain
-  unqualified. These limitations are separate from the demonstrated A2DP path.
+* PCI bootstrap memory remains retained until external reset. Controller
+  removal, memory reuse, suspend and kexec are unqualified.
+* Bluetooth system sleep uses a bounded firmware quiesce/restore handshake
+  around HCI suspend/resume, preserving its DMA arena. Hibernation is rejected.
+  Removal first quiesces firmware, then stops work and interrupts, disables
+  bus mastering and drains pending
+  PCI transactions before freeing DMA. An unconfirmed drain retains storage
+  until reset. Firmware recovery and warm reprobe are unsupported; use a fresh
+  cold boot after removing or faulting an active transport.
+* The Bluetooth software queue limit does not provide HCI backpressure;
+  saturation can drop an accounted frame.
+* Arbitrary scan IEs, WPA3/SAE, required MFP, AP/P2P, general country-package
+  generation, roaming and long-duration reliability are unqualified.
+* SCO/headset microphone, LE Audio/ISO and simultaneous headset audio are
+  unqualified.
