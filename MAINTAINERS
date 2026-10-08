@@ -1955,9 +1955,11 @@ F:	Documentation/devicetree/bindings/display/apple,dcp-typec-routes.yaml
 F:	Documentation/devicetree/bindings/chosen/apple,dcp-rtkit-quiesced.yaml
 F:	Documentation/devicetree/bindings/display/apple,dcp.yaml
 F:	Documentation/devicetree/bindings/display/apple,display-subsystem.yaml
+F:	Documentation/gpu/apple-dcp-backlight.rst
 F:	drivers/gpu/drm/apple/
 F:	drivers/gpu/drm/apple/dcp-fabric*
 F:	include/linux/soc/apple/dp-tunnel.h
+F:	tools/testing/apple/
 
 APPLE PCIE CONTROLLER DRIVER
 M:	Marc Zyngier <maz@kernel.org>
