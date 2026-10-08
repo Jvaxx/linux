@@ -1056,6 +1056,21 @@ static int bt7932_wait_for_wifi(struct pci_dev *pdev)
 	else if (!mt7932_fullmac_ready(wifi))
 		ret = dev_err_probe(&pdev->dev, -ENODEV,
 				    "the Wi-Fi function failed to initialize\n");
+ * Admission was only qualified with the Wi-Fi function already running its
+ * firmware. Wait until mt7932-fullmac is bound to function 0, then link the
+ * two functions so that the driver core unbinds this one first.
+ */
+static int bt7932_wait_for_wifi(struct pci_dev *pdev)
+{
+	struct pci_dev *wifi = pci_get_slot(pdev->bus, PCI_DEVFN(0, 0));
+	int ret = 0;
+
+	if (!wifi)
+		return -ENODEV;
+	if (!device_is_bound(&wifi->dev) ||
+	    strcmp(dev_driver_string(&wifi->dev), "mt7932-fullmac"))
+		ret = dev_err_probe(&pdev->dev, -EPROBE_DEFER,
+				    "waiting for the Wi-Fi function\n");
 	else if (!device_link_add(&pdev->dev, &wifi->dev, DL_FLAG_AUTOREMOVE_CONSUMER))
 		ret = -EINVAL;
 	pci_dev_put(wifi);
@@ -1084,7 +1099,9 @@ static int bt7932_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (ret)
 		dev_warn(&pdev->dev, "link power management left as found: %d\n", ret);
 	/* Admission was qualified with ASPM and clock PM off on this link. */
-	pci_disable_link_state(pdev, PCIE_LINK_STATE_ALL);
+	ret = pci_disable_link_state(pdev, PCIE_LINK_STATE_ALL);
+	if (ret)
+		dev_warn(&pdev->dev, "link power management left as found: %d\n", ret);
 	bt = kzalloc_obj(*bt);
 	if (!bt)
 		return -ENOMEM;
@@ -1425,8 +1442,6 @@ module_pci_driver(bt7932_driver);
 
 MODULE_DESCRIPTION("Experimental standalone J700 MT7932 Bluetooth PCIe transport");
 MODULE_LICENSE("GPL");
-/* Admission was qualified after the Wi-Fi function had started its firmware. */
-MODULE_SOFTDEP("pre: mt7932_fullmac");
 MODULE_FIRMWARE(BT7932_FW_B0);
 MODULE_FIRMWARE(BT7932_FW_B1);
 MODULE_FIRMWARE(BT7932_FW_B1_FALLBACK);
