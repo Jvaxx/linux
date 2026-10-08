@@ -335,11 +335,14 @@ static int sep_apply_cs_timing(struct spi_device *spi)
 	 * select. spi_setup() takes the controller io_mutex, not the bus lock,
 	 * so no deadlock.
 	 */
+	if (sep_sensor_mode != ~0U && sep_sensor_mode > SPI_MODE_3)
+		return -EINVAL;
+
 	rc = spi_bus_lock(ctlr);
 	if (rc)
 		return rc;
 
-	if (sep_sensor_mode <= SPI_MODE_3)
+	if (sep_sensor_mode != ~0U)
 		spi->mode = sep_sensor_mode;
 	spi->bits_per_word = SEP_SENSOR_BITS;
 	spi->max_speed_hz = SEP_SENSOR_HZ;
