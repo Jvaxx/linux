@@ -798,6 +798,7 @@ fwnode_typec_thunderbolt_switch_get(struct fwnode_handle *fwnode)
 	struct typec_thunderbolt_switch_dev *sw_dev;
 	struct typec_thunderbolt_switch *sw;
 	void *match;
+	int ret = 0;
 
 	match = fwnode_connection_find_match(fwnode, "thunderbolt-switch", NULL,
 					     typec_thunderbolt_switch_match);
@@ -814,10 +815,14 @@ fwnode_typec_thunderbolt_switch_get(struct fwnode_handle *fwnode)
 	}
 
 	sw->sw_dev = sw_dev;
-	if (!try_module_get(sw_dev->owner)) {
+	scoped_guard(rwsem_read, &sw_dev->set_lock) {
+		if (!sw_dev->set || !try_module_get(sw_dev->owner))
+			ret = -ENODEV;
+	}
+	if (ret) {
 		put_device(&sw_dev->dev);
 		kfree(sw);
-		return ERR_PTR(-ENODEV);
+		return ERR_PTR(ret);
 	}
 
 	return sw;
@@ -960,7 +965,7 @@ typec_thunderbolt_switch_register(struct device *parent,
 		return ERR_PTR(-ENOMEM);
 
 	init_rwsem(&sw_dev->set_lock);
-	sw_dev->owner = parent->driver->owner;
+	sw_dev->owner = parent->driver ? parent->driver->owner : NULL;
 	sw_dev->set = desc->set;
 
 	device_initialize(&sw_dev->dev);
