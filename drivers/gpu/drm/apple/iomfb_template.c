@@ -802,6 +802,18 @@ dcpep_cb_map_physical(struct apple_dcp *dcp, struct dcp_map_physical_req *req)
 	}
 
 	id = find_first_zero_bit(dcp->memdesc_map, DCP_MAX_MAPPINGS);
+	if (id >= DCP_MAX_MAPPINGS) {
+		dev_warn(dcp->dev, "DCP overflowed mapping table, ignoring\n");
+		return (struct dcp_map_physical_resp){};
+	}
+
+	dva = dma_map_resource(dcp->dev, req->paddr, size, DMA_BIDIRECTIONAL, 0);
+	if (dma_mapping_error(dcp->dev, dva)) {
+		dev_err(dcp->dev, "failed to map phys address %llx size %llx\n",
+			req->paddr, size);
+		return (struct dcp_map_physical_resp){};
+	}
+
 	set_bit(id, dcp->memdesc_map);
 	dcp->memdesc[id].size = size;
 	dcp->memdesc[id].reg = req->paddr;
