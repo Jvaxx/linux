@@ -68,6 +68,7 @@ static int apple_drm_gem_dumb_create(struct drm_file *file_priv,
 	return drm_gem_dma_dumb_create_internal(file_priv, drm, args);
 }
 
+#ifdef CONFIG_DRM_FBDEV_EMULATION
 static int apple_drm_fbdev_probe(struct drm_fb_helper *helper,
 				 struct drm_fb_helper_surface_size *sizes)
 {
@@ -97,6 +98,7 @@ static void apple_drm_postclose(struct drm_device *drm, struct drm_file *file)
 	if (file->was_master)
 		dcp_typec_reorder();
 }
+#endif
 
 /*
  * A compositor or boot splash is closing the device.  drm_release() has
@@ -111,6 +113,7 @@ static void apple_drm_postclose(struct drm_device *drm, struct drm_file *file)
 
 static const struct drm_driver apple_drm_driver = {
 	DRM_GEM_DMA_DRIVER_OPS_WITH_DUMB_CREATE(apple_drm_gem_dumb_create),
+#ifdef CONFIG_DRM_FBDEV_EMULATION
 	.fbdev_probe		= apple_drm_fbdev_probe,
 #else
 	DRM_FBDEV_DMA_DRIVER_OPS,
