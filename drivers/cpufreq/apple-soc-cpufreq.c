@@ -245,6 +245,8 @@ static const struct apple_soc_cpufreq_info soc_t8112_info = {
  */
 static const struct apple_soc_cpufreq_info soc_t8140_info = {
 	.verify_transition = true,
+	.needs_thermal_policy = true,
+	.max_unmanaged_pstate = 2,
 	.min_pstate = 1,
 	.max_pstate = 31,
 	.ps1_mask = APPLE_DVFS_CMD_PS1,
@@ -646,7 +648,8 @@ static int apple_fast_die_init(struct cpufreq_policy *policy,
 
 	parsed = of_parse_phandle_with_fixed_args(cluster, "apple,fast-die-effort",
 						  1, 0, &args);
-	if (parsed == -ENOENT)
+	/* Required thermal admission must fail closed with an older DT. */
+	if (parsed == -ENOENT && !priv->info->needs_thermal_policy)
 		return 0;
 
 	while (policy->freq_table[n].frequency != CPUFREQ_TABLE_END)
@@ -868,8 +871,8 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 		priv->expected_pstate = state;
 	}
 
-	/* Unqualified SoCs still require protection above their safe ceiling. */
-	if (info->needs_thermal_policy) {
+	/* T8140 has IPA and the PMP limit; other SoCs keep their safe ceiling. */
+	if (info->needs_thermal_policy && info != &soc_t8140_info) {
 		cpufreq_for_each_valid_entry(p, freq_table) {
 			if (p->driver_data <= info->max_unmanaged_pstate)
 				continue;
