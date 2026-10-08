@@ -1914,6 +1914,58 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 }
 
 /*
+ * A delivered sink IRQ can follow a firmware unplug with cable HPD still high.
+ * This tree has no fabric session: the route is revoked by a typec_generation
+ * bump, and recovery is refused unless the Type-C work is enabled, the cable
+ * is routed and no follow handoff is retiring the attachment.
+ */
+int dcp_dptx_recover_irq(struct apple_dcp *dcp)
+{
+	int ret;
+
+	mutex_lock(&dcp->hpd_mutex);
+	if (dcp->external_native || dcp_is_external_h17p(dcp) ||
+	    !dcp_is_typec_output(dcp) || dcp_is_usb4_output(dcp) ||
+	    !dcp->typec_connector ||
+	    READ_ONCE(dcp->typec_connector->connected) ||
+	    READ_ONCE(dcp->typec_crtc_off)) {
+		ret = 0;
+		goto out_unlock;
+	}
+	if (!dcp->typec_work_enabled || READ_ONCE(dcp->crashed) ||
+	    !READ_ONCE(dcp->typec_cable_connected) ||
+	    READ_ONCE(dcp->typec_follow_retiring) ||
+	    !dcp->dptxport[0].enabled ||
+	    !dptx_service_available(&dcp->dptxport[0])) {
+		ret = -EAGAIN;
+		goto out_unlock;
+	}
+
+	/* Revoke older reconnect waits without changing physical cable state. */
+	dcp->typec_generation++;
+	cancel_delayed_work(&dcp->typec_reconnect_wq);
+	cancel_delayed_work(&dcp->placeholder_edid_wq);
+	if (dcp->avep)
+		av_service_disconnect(dcp);
+	ret = dptxport_set_hpd(dcp->dptxport[0].service, false);
+	if (ret)
+		goto out_unlock;
+	/* A failed earlier connect may also have left an unconfirmed release. */
+	ret = dptxport_release_display(dcp->dptxport[0].service);
+	if (ret)
+		goto out_unlock;
+	dcp->dptxport[0].connected = false;
+	mutex_unlock(&dcp->hpd_mutex);
+
+	/* Another delivered IRQ must confirm release before a failed attempt retries. */
+	return dcp_dptx_connect_raw(dcp, 0, NULL);
+
+out_unlock:
+	mutex_unlock(&dcp->hpd_mutex);
+	return ret;
+}
+
+/*
  * Release the display link of a Type-C output while its display stays
  * attached, as a CRTC power-off does (see dcp_poweroff()): the firmware's
  * unplug for it is ignored, and dcp_poweron() connects the link again.
@@ -2969,6 +3021,7 @@ static void dcp_release_fixed_route(void *data)
 VISIBLE_IF_KUNIT void dcp_disable_typec_work(struct apple_dcp *dcp, bool release_cable)
 {
 	scoped_guard(mutex, &dcp->hpd_mutex) {
+		dcp->typec_work_enabled = false;
 		if (release_cable)
 			WRITE_ONCE(dcp->typec_cable_connected, false);
 		dcp->typec_generation++;
@@ -2997,6 +3050,8 @@ VISIBLE_IF_KUNIT void dcp_enable_typec_work(struct apple_dcp *dcp)
 	enable_delayed_work(&dcp->hdmi_settle_wq);
 	enable_delayed_work(&dcp->hdmi_recheck_wq);
 	dcp_hdmi_enable(dcp);
+	scoped_guard(mutex, &dcp->hpd_mutex)
+		dcp->typec_work_enabled = true;
 	/* A cable can be routed before the DRM component binds. */
 	if (READ_ONCE(dcp->typec_cable_connected))
 		mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq, 0);

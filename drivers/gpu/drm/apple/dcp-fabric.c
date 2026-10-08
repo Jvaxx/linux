@@ -1440,11 +1440,18 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 		/*
 		 * A T6030 external processor services the request itself, and
 		 * reads the display again if it changed; elsewhere the active
-		 * mode is applied again.
+		 * mode is applied again. H17P always applies it again.
 		 */
-		if (dcp->typec_connector && dcp->external_native)
+		if (dcp->typec_connector && dcp->fw_compat == DCP_FIRMWARE_H17P)
+			dcp_retrain_oob(dcp->typec_connector);
+		else if (dcp->typec_connector && dcp->external_native)
 			dcp_external_sink_irq(dcp);
-		else if (dcp->typec_connector)
+		else if (dcp->typec_connector &&
+			 !READ_ONCE(dcp->typec_connector->connected)) {
+			ret = dcp_dptx_recover_irq(dcp);
+			if (ret)
+				return ret;
+		} else if (dcp->typec_connector)
 			dcp_retrain_oob(dcp->typec_connector);
 	}
 	port->hpd = hpd;

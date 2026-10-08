@@ -510,6 +510,7 @@ struct apple_dcp {
 	/* hpd_mutex: what DRM reports for the external display, and when */
 	struct dcp_announce announce;
 	struct delayed_work announce_wq;
+	bool typec_work_enabled; /* hpd_mutex; IRQ recovery admission */
 #if IS_ENABLED(CONFIG_DRM_APPLE_KUNIT_TEST)
 	/* Lets a test stop work where it races, see dcp_test_point(). */
 	void (*test_point)(struct apple_dcp *dcp, enum dcp_test_point point);
