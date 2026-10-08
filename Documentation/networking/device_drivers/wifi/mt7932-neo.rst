@@ -25,21 +25,9 @@ it. Public m1n1 must populate the J700 ``wifi0`` endpoint's own
 The original hardware-tested configuration included ``CONFIG_MT7932_FULLMAC=m``,
 ``CONFIG_CFG80211=y``, ``CONFIG_BT_MTK7932_PCIE=y``, ``CONFIG_BT_BREDR=y``,
 ``CONFIG_BT_LE=y``, ``CONFIG_CRYPTO_AES=y`` and ``CONFIG_CRYPTO_CMAC=y``.
-The shared build supports ``CONFIG_PCIE_APPLE=y`` or ``m``,
-``CONFIG_PCIE_APPLE_PIODMA_DIAG=y``, ``CONFIG_PCIEASPM=y``,
-``CONFIG_MT7932_FULLMAC=m`` and ``CONFIG_BT_MTK7932_PCIE=m`` with modular
-Bluetooth/rfkill and sleep/kexec enabled. The active J700 bootstrap refuses sleep
-and kexec at runtime while its arena is retained; other Macs keep their normal
-behavior. Firmware loading is selected by both radio drivers. This shared
-build still requires physical Neo qualification.
-
-``CONFIG_CRYPTO_CMAC=m`` is supported with the modular Bluetooth core. Generic
-Bluetooth SMP allocates ``cmac(aes)`` through the crypto API. Install the crypto
-modules and preserve algorithm autoload; if Bluetooth starts in the initramfs,
-include its crypto providers there. With ``CONFIG_CRYPTO_AES=y``, this kernel
-also registers its AES CMAC implementation when CMAC is configured as a module.
-The earlier tested ``CONFIG_CRYPTO_CMAC=y`` is not a Wi-Fi driver requirement.
-
+The Bluetooth transport can be built with modular Bluetooth and system
+sleep. The separately selected bootstrap provider has its own lifecycle
+restrictions. Kexec is excluded while either retained experiment is enabled.
 Use the ordinary cfg80211 regulatory database and applicable country policy.
 Kernel country 00 uses firmware XZ and its mandatory ``world-XZ.bin`` package.
 An explicit country requires its own package; there is no world fallback.
@@ -158,44 +146,17 @@ samples and response hashes, omitting network names, addresses and credentials.
 Limitations
 -----------
 
-* Wi-Fi station operation is limited to 2.4 GHz channels 1--13 and 5 GHz
-  channels 36, 40, 44 and 48, subject to the applicable regulatory rules.
-  5 GHz supports 20/40/80 MHz channel layouts within this range. Channels
-  149--165 and 6 GHz are not exposed. Authentication supports open networks
-  and WPA2-PSK with CCMP; WPA3/SAE, 802.1X, required MFP and other ciphers
-  are unsupported. AP/P2P and roaming are unsupported.
-* Sleep is not supported on the MacBook Neo yet. With radio support active
-  (the default), the retained bootstrap makes the kernel refuse suspend:
-  lid close and ``systemctl suspend`` do not put it to sleep. Shut down before
-  putting it in a bag. Booting with ``pcie_apple_piodma_diag.enumerate=0``
-  removes this refusal and disables Wi-Fi and Bluetooth; sleep and wake are
-  still unproven on this hardware without the radios.
-* PCI bootstrap memory remains retained until external reset. Sleep and kexec
-  are refused while it is retained; they are not hardware-qualified on the Neo.
-  Standard PCI sysfs removal of the root and radio functions is refused;
-  arbitrary controller/IOMMU teardown and memory reuse remain unqualified.
-  Wi-Fi shutdown joins host producers before disabling bus mastering and
-  retains device-visible memory until reset.
-  Userspace PCI ``reset`` and ``reset_subordinate`` are also refused, and
-  native slot hot-plug is disabled for this host. Per-link sysfs ASPM/Clock PM
-  writes can lift the power-state restrictions; they are reapplied only at
-  probe. Do not enable those link power states while the radios are active.
-  These guards protect against accidental teardown, not privileged access.
-  Root can still reset through raw PCI configuration writes (SBR, FLR or Link
-  Disable), override link power states, or unbind the root port's ``pcieport``
-  driver. None of these actions is supported while the retained host is active.
-* The Wi-Fi module pins itself before publishing its first DMA ring and cannot
-  be unloaded normally while DMA is retained. A checked reset during probe
-  failure may release that pin; a failed reset retains it. Never unload or
-  reprobe Wi-Fi while Bluetooth is active. Shutdown quiesces host producers
-  without freeing retained memory; use a full shutdown and external reset
-  after a failed or uncertain admission.
-* Bluetooth PCI removal/quiescence is incomplete. Its software queue limit
-  does not provide HCI backpressure; saturation can drop an accounted frame.
-  Both require correction before production use. An activated Bluetooth module
-  cannot be unloaded normally; forced PCI removal only retires software
-  callbacks, including the threaded IRQ and MSI vectors, and does not establish
-  DMA quiescence or release retained ownership.
+* PCI bootstrap memory remains retained until external reset. Controller
+  removal, memory reuse, suspend and kexec are unqualified.
+* Bluetooth system sleep uses a bounded firmware quiesce/restore handshake
+  around HCI suspend/resume, preserving its DMA arena. Hibernation is rejected.
+  Removal first quiesces firmware, then stops work and interrupts, disables
+  bus mastering and drains pending
+  PCI transactions before freeing DMA. An unconfirmed drain retains storage
+  until reset. Firmware recovery and warm reprobe are unsupported; use a fresh
+  cold boot after removing or faulting an active transport.
+* The Bluetooth software queue limit does not provide HCI backpressure;
+  saturation can drop an accounted frame.
 * Arbitrary scan IEs, WPA3/SAE, required MFP, AP/P2P, general country-package
   generation, roaming and long-duration reliability are unqualified.
 * SCO/headset microphone, LE Audio/ISO and simultaneous headset audio are
