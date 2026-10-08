@@ -909,6 +909,16 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 	policy->dvfs_possible_from_any_cpu = true;
 	policy->fast_switch_possible = !info->verify_transition;
 	policy->suspend_freq = freq_table[0].frequency;
+	/* Unqualified SoCs still require protection above their safe ceiling. */
+	if (info->needs_thermal_policy) {
+		cpufreq_for_each_valid_entry(p, policy->freq_table) {
+			if (p->driver_data <= info->max_unmanaged_pstate)
+				continue;
+			dev_err(cpu_dev, "higher P-states require a qualified thermal policy\n");
+			ret = -ENODEV;
+			goto out_free_cpufreq_table;
+		}
+	}
 
 	return 0;
 
