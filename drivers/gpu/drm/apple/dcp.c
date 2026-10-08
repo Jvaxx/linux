@@ -5043,6 +5043,27 @@ static void dcp_platform_complete(struct device *dev)
 	mutex_lock(&dcp->hpd_mutex);
 	WRITE_ONCE(dcp->external_suspended, false);
 	mutex_unlock(&dcp->hpd_mutex);
+ * The display stays powered across system sleep, and the blanking present
+ * queued by the DRM and backlight suspend handlers must reach the firmware
+ * before its mailbox interrupt is suspended.
+ */
+static void dcp_drain_for_sleep(struct apple_dcp *dcp)
+{
+	int pass;
+
+	if (!dcp->hw.adopt_live_session || dcp->fw_compat != DCP_FIRMWARE_H17P ||
+	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G)
+		return;
+
+	/* A completed present can schedule one more brightness present. */
+	for (pass = 0; pass < 2; pass++) {
+		if (dcp_has_panel(dcp))
+			flush_work(&dcp->bl_update_wq);
+		if (!iomfb_queue_drain(dcp, msecs_to_jiffies(500))) {
+			dev_warn(dcp->dev, "display updates still pending at suspend\n");
+			return;
+		}
+	}
 }
 
 static int dcp_platform_suspend(struct device *dev)
@@ -5086,6 +5107,7 @@ static int dcp_platform_suspend(struct device *dev)
 	cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
 	cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
 	cancel_delayed_work_sync(&dcp->typec_fabric_retrain_wq);
+	dcp_drain_for_sleep(dcp);
 	/*
 	 * The Type-C route reports cable removal through
 	 * dcp_dptx_disconnect_oob(). A DP tunnel kept through the sleep stays
