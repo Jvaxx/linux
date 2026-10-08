@@ -1642,9 +1642,15 @@ static void dcp_delayed_vblank(struct work_struct *work)
 {
 	struct apple_dcp *dcp;
 
+	struct apple_crtc *crtc;
+
 	dcp = container_of(work, struct apple_dcp, vblank_wq);
+	/* RTKit can report a crash before the pipeline has a CRTC. */
+	crtc = READ_ONCE(dcp->crtc);
+	if (!crtc)
+		return;
 	mdelay(5);
-	dcp_drm_crtc_vblank(dcp->crtc);
+	dcp_drm_crtc_vblank(crtc);
 }
 
 #define DCP_SWAP_WATCHDOG_MS		1000
@@ -1833,11 +1839,16 @@ static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_
 
 	dcp->crashed = true;
 	dev_err(dcp->dev, "DCP has crashed\n");
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
 		/* No in-place restart exists; the last scanout stays retained. */
 		dev_err(dcp->dev, "a reboot is required to restore the display\n");
-		/* Nothing will complete a present that was in flight. */
-		schedule_work(&dcp->vblank_wq);
+		/*
+		 * Nothing will complete a present that was in flight.  Before
+		 * the pipeline is linked there is no event to complete.
+		 */
+		if (READ_ONCE(dcp->crtc))
+			schedule_work(&dcp->vblank_wq);
 	}
 	if (dcp->connector) {
 		dcp->connector->connected = 0;
