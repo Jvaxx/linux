@@ -517,6 +517,9 @@ struct apple_dcp {
 		spinlock_t lock;
 		struct dcp_backlight_state state;
 		void (*kick)(struct apple_dcp *dcp);
+		/* Rate limit for firmware re-send requests. */
+		unsigned long resent_at;
+		bool resent;
 	} backlight;
 	/* Hardirq, resume and expiry share one generation under this lock. */
 	spinlock_t hdmi_presence_lock;
