@@ -114,6 +114,9 @@ static int dcp_get_brightness(struct backlight_device *bd)
 	unsigned long flags;
 	u32 actual;
 
+	if (READ_ONCE(dcp->quiescing))
+		return -ENODEV;
+
 	if (dcp_backlight_active(dcp)) {
 		spin_lock_irqsave(&dcp->backlight.lock, flags);
 		actual = dcp->backlight.state.actual;
@@ -337,6 +340,8 @@ done:
 
 int dcp_backlight_update(struct apple_dcp *dcp)
 {
+	if (READ_ONCE(dcp->quiescing))
+		return -ENODEV;
 	if (dcp_backlight_active(dcp)) {
 		dcp_backlight_kick(dcp);
 		return 0;
@@ -367,6 +372,9 @@ static int dcp_set_brightness(struct backlight_device *bd)
 	struct apple_dcp *dcp = bl_get_data(bd);
 	int brightness = backlight_get_brightness(bd);
 	unsigned long flags;
+
+	if (READ_ONCE(dcp->quiescing))
+		return -ENODEV;
 
 	if (dcp_backlight_active(dcp)) {
 		/* Preserve the requested level even while the core forces zero. */

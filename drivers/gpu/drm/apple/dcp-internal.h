@@ -192,6 +192,10 @@ struct dcp_hdmi;
 
 struct apple_dcp {
 	struct dcp_fabric_pipeline fabric;
+	/* An adopted session has no confirmed firmware DMA stop boundary. */
+	bool retain_dma;
+	bool quiescing;
+	bool drm_retained;
 	struct device *dev;
 	struct platform_device *piodma;
 	bool piodma_created;
