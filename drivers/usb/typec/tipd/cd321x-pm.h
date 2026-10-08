@@ -48,6 +48,8 @@ struct cd321x_pm_state {
 	unsigned int mux_since_ms;
 	bool force_reconnect;
 	bool provider_busy;
+	bool setup_pending;
+	unsigned int setup_attempts_left;
 };
 
 static inline void cd321x_pm_new_connection(struct cd321x_pm_state *pm)
@@ -73,7 +75,8 @@ static inline bool cd321x_pm_ready(struct cd321x_pm_state *pm)
 
 static inline bool cd321x_pm_can_update(const struct cd321x_pm_state *pm)
 {
-	return pm->phase == CD321X_PM_RUNNING || pm->phase == CD321X_PM_APPLY;
+	return !pm->setup_pending &&
+	       (pm->phase == CD321X_PM_RUNNING || pm->phase == CD321X_PM_APPLY);
 }
 
 /*
@@ -97,6 +100,7 @@ static inline void cd321x_pm_prepare(struct cd321x_pm_state *pm)
 	pm->attempts_left = 0;
 	/* The resume read applies the state afresh. */
 	cd321x_pm_mux_done(pm);
+	pm->setup_attempts_left = 0;
 	pm->provider_busy = false;
 }
 
@@ -106,6 +110,8 @@ static inline bool cd321x_pm_resume(struct cd321x_pm_state *pm)
 		return false;
 	pm->phase = CD321X_PM_REVALIDATE;
 	pm->attempts_left = CD321X_RESUME_ATTEMPTS;
+	if (pm->setup_pending)
+		pm->setup_attempts_left = CD321X_RESUME_ATTEMPTS;
 	cd321x_pm_new_connection(pm);
 	return true;
 }
