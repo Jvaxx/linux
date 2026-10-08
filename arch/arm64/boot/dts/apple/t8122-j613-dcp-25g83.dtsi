@@ -50,3 +50,16 @@
 	apple,pmp-report = <&pmp_report>;
 	status = "disabled";
 };
+
+/* The 25G83 GPU uses the native ASC mailbox and the same PMP supplier.
+ * Firmware mappings and calibration are supplied by the boot loader.
+ */
+&agx_mbox {
+	compatible = "apple,t8122-agx-asc-mailbox", "apple,asc-mailbox-v4";
+	status = "disabled";
+};
+
+&gpu {
+	apple,pmp = <&pmp>;
+	status = "disabled";
+};
