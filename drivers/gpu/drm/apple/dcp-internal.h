@@ -47,6 +47,7 @@ struct iomfb_transaction {
 	void (*release)(struct iomfb_transaction *transaction);
 	struct dcp_backlight_present backlight;
 	bool backlight_reserved;
+	bool backlight_failed;
 	bool brightness_only;
 	bool completed;
 };
@@ -523,6 +524,7 @@ struct apple_dcp {
 		struct task_struct *owner;
 		struct work_struct work;
 		struct delayed_work timeout;
+		struct delayed_work backlight_retry;
 		unsigned long deadline;
 		unsigned int queued;
 		bool stopped;
