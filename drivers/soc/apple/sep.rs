@@ -2262,7 +2262,7 @@ impl WorkItem<ENROL_WORK_ID> for SepData {
 
     fn run(this: Arc<SepData>) {
         let epoch = this.capture_epoch.load(Relaxed);
-        if !this.shutting_down.load(Relaxed) {
+        if !this.shutting_down.load(Relaxed) && this.capture_begin() {
             this.run_enrolment();
         }
         this.run_enrolment();
@@ -2275,7 +2275,7 @@ impl WorkItem<VERIFY_WORK_ID> for SepData {
 
     fn run(this: Arc<SepData>) {
         let epoch = this.capture_epoch.load(Relaxed);
-        if !this.shutting_down.load(Relaxed) {
+        if !this.shutting_down.load(Relaxed) && this.capture_begin() {
             this.run_verify();
         }
         this.run_verify();

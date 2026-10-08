@@ -1036,14 +1036,20 @@ impl SepData {
         self.register_ool(&self.ool_sbio)?;
 
         self.sbio_ready.store(true, Relaxed);
-        if self.profile.nonce_session {
-            let word = 6u32;
-            // Communication must be initialized before restoring biometric state.
+        let init_word = if self.profile.nonce_session {
+            Some(6u32)
+        } else if matches!(self.profile.key_store, profile::KeyStore::Sepos13 { .. }) {
+            Some(1u32)
+        } else {
+            None
+        };
+        if let Some(word) = init_word {
             let result = self.sbio_transfer_raw(
                 0x73, c"INIT_SBIO_COMMUNICATION", &word.to_le_bytes(),
             );
             match result {
-                Ok(done) if done.status.is_ok() => {
+                Ok(done) if done.status.is_ok()
+                    && (self.profile.nonce_session || done.payload.is_empty()) => {
                     dev_info!(self.dev, "sbio: communication initialization accepted\n");
                 }
                 Ok(done) => {
@@ -1483,7 +1489,9 @@ impl SepData {
             }
             CaptureWait::Abandon => {
                 // A cancelled verify also abandons; only a live one is a fault.
-                if bio::verify_is_live(&self.bio_session.lock()) {
+                if bio::verify_is_live(
+                    &self.bio_session.lock(), self.capture_epoch.load(Relaxed),
+                ) {
                     dev_err!(
                         self.dev,
                         "verify: the sensor status became unreadable during the capture\n"
@@ -2907,6 +2915,59 @@ impl SepData {
             kernel::time::delay::fsleep(kernel::time::Delta::from_millis(10));
             waited += 10;
         }
+    /// Called by the enrol and verify work items before they touch the sensor.
+    /// Returns false if the system is going to sleep; the session has then
+    /// been ended and the capture must not start. A true return must be
+    /// paired with [`Self::capture_end`].
+    pub(crate) fn capture_begin(&self) -> bool {
+        let mut session = self.bio_session.lock();
+        if self.suspending.load(Relaxed) {
+            let woke = bio::abort_capture(&mut session);
+            drop(session);
+            if woke {
+                self.bio_wake();
+            }
+            return false;
+        }
+        self.captures_running.fetch_add(1, Relaxed);
+        true
+    }
+
+    pub(crate) fn capture_end(&self) {
+        self.captures_running.fetch_sub(1, Relaxed);
+    }
+
+    /// The system is about to suspend. End any capture in progress, hold new
+    /// ones, and wait for the enrol or verify work to stop touching the sensor
+    /// before devices go down.
+    pub(crate) fn sleep_prepare(&self) -> Result<()> {
+        let woke = {
+            let mut session = self.bio_session.lock();
+            self.suspending.store(true, Relaxed);
+            bio::abort_capture(&mut session)
+        };
+        if woke {
+            dev_info!(
+                self.dev,
+                "Touch ID: ending the capture in progress before sleep\n"
+            );
+            self.bio_wake();
+        }
+
+        let mut waited: u32 = 0;
+        while self.captures_running.load(Relaxed) != 0 {
+            if waited >= SLEEP_DRAIN_MS {
+                dev_warn!(
+                    self.dev,
+                    "Touch ID: capture did not drain within {} ms; aborting suspend\n",
+                    SLEEP_DRAIN_MS
+                );
+                return Err(EBUSY);
+            }
+            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(10));
+            waited += 10;
+        }
+        Ok(())
     }
 
     /// The system has resumed, or the suspend was aborted.
