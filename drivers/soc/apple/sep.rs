@@ -686,6 +686,7 @@ struct SepData {
     registered: Atomic<bool>,
 
     shutting_down: Atomic<bool>,
+    capture_epoch: Atomic<u64>,
 
     // The system is going to sleep: no capture may start. Changed under the
     // bio session lock; `sleep_over` is signalled when it clears.
@@ -878,6 +879,7 @@ impl SepData {
                 settle_idle_ticks: Atomic::new(0),
                 registered: Atomic::new(false),
                 shutting_down: Atomic::new(false),
+                capture_epoch: Atomic::new(0),
                 suspending: Atomic::new(false),
                 sleep_over <- new_condvar!("SepData::sleep_over"),
                 captures_running: Atomic::new(0),
@@ -2256,8 +2258,9 @@ impl WorkItem<ENROL_WORK_ID> for SepData {
     type Pointer = Arc<SepData>;
 
     fn run(this: Arc<SepData>) {
-        if this.shutting_down.load(Relaxed) {
-            return;
+        let epoch = this.capture_epoch.load(Relaxed);
+        if !this.shutting_down.load(Relaxed) {
+            this.run_enrolment();
         }
         this.run_enrolment();
         this.capture_end();
@@ -2268,8 +2271,9 @@ impl WorkItem<VERIFY_WORK_ID> for SepData {
     type Pointer = Arc<SepData>;
 
     fn run(this: Arc<SepData>) {
-        if this.shutting_down.load(Relaxed) {
-            return;
+        let epoch = this.capture_epoch.load(Relaxed);
+        if !this.shutting_down.load(Relaxed) {
+            this.run_verify();
         }
         this.run_verify();
         this.capture_end();
