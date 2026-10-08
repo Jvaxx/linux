@@ -28,27 +28,22 @@ The Bluetooth transport can be built with modular Bluetooth and system
 sleep. The separately selected bootstrap provider has its own lifecycle
 restrictions. Kexec is excluded while either retained experiment is enabled.
 Use the ordinary cfg80211 regulatory database and applicable country policy.
-Kernel country 00 uses firmware XZ and its mandatory ``world-XZ.bin`` package.
-An explicit country requires its own package; there is no world fallback.
+The validated first-admission fallback is kernel country 00 with firmware XZ.
+A modular cfg80211 loads ``regulatory.db`` from the root filesystem; a
+built-in one tries before the root filesystem is mounted and then needs
+``iw reg reload``.
 
-The host now disables link power states on the two radio endpoints before
-driver binding; no global PCIe ASPM performance policy is required. Load
-``mt7932-fullmac`` after the root filesystem and local firmware packages are
-available. Bluetooth's gate defaults closed; load ``mt7932_bt_pcie`` with the
-default ``enable=0``, validate the cold, unbound ``14c3:793b`` function, enable
-``/sys/module/mt7932_bt_pcie/parameters/enable``, then request its PCI probe::
-
-  echo 1 > /sys/module/mt7932_bt_pcie/parameters/enable
-  echo YOUR_BT_PCI_BDF > /sys/bus/pci/drivers_probe
-
-Use the actual ``14c3:793b`` PCI address for ``YOUR_BT_PCI_BDF``. The driver
-suppresses its individual bind/unbind attributes, so there is no driver
-``bind`` file. For an intentionally enabled cold boot, a file under
-``/etc/modprobe.d/`` may instead contain::
-
-  options mt7932_bt_pcie enable=1
-
-Install the target unit's Bluetooth inputs before opening the gate.
+The radio functions appear while the kernel boots, before the root
+filesystem is mounted, and ``mt7932-fullmac`` reads its firmware while
+probing. Build it as a module so that udev loads it from the root
+filesystem, or provide its firmware in the initramfs. The driver disables
+ASPM and clock power management on its link before starting the device,
+matching the tested admission sequence, which used the PCIe ASPM
+performance policy. Bluetooth's gate defaults closed;
+validate the cold, unbound ``14c3:793b`` function, then load
+``mt7932_bt_pcie`` with ``enable=1`` after its local inputs are installed.
+A built-in transport can instead open its enable parameter before requesting
+the PCI probe.
 Do not reprobe after a failed or uncertain Bluetooth admission. The tested
 Wi-Fi driver owns function 0 and Bluetooth owns function 1.
 
