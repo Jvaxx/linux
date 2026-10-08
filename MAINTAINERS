@@ -2093,6 +2093,7 @@ F:	Documentation/devicetree/bindings/mailbox/apple,ascwrap-v6.yaml
 F:	Documentation/devicetree/bindings/media/apple,t8140-isp.yaml
 F:	Documentation/devicetree/bindings/mux/apple,display-crossbar.yaml
 F:	Documentation/devicetree/bindings/reserved-memory/apple,asc-mem.yaml
+F:	Documentation/devicetree/bindings/rtc/apple,j700-pmu-rtc.yaml
 F:	Documentation/devicetree/bindings/serial/apple,dockchannel-uart.yaml
 F:	Documentation/devicetree/bindings/soc/apple/apple,dockchannel.yaml
 F:	Documentation/devicetree/bindings/soc/apple/apple,rtk-helper-asc4.yaml
@@ -2106,6 +2107,7 @@ F:	arch/arm64/include/asm/apple-idle.h
 F:	arch/arm64/kernel/idle-apple.S
 F:	drivers/hid/dockchannel-hid/dockchannel-hid-protocol*
 F:	drivers/iio/common/aop_sensors/
+F:	drivers/rtc/rtc-apple-pmu.c
 F:	drivers/soc/apple/aop.rs
 F:	drivers/tty/serial/apple_dockchannel*
 F:	rust/kernel/iio/common/aop_sensors.rs
@@ -2708,7 +2710,6 @@ F:	Documentation/devicetree/bindings/power/apple*
 F:	Documentation/devicetree/bindings/power/reset/apple,smc-reboot.yaml
 F:	Documentation/devicetree/bindings/pwm/apple,s5l-fpwm.yaml
 F:	Documentation/devicetree/bindings/reset/apple,t8103-cio-reset.yaml
-F:	Documentation/devicetree/bindings/rtc/apple,j700-pmu-rtc.yaml
 F:	Documentation/devicetree/bindings/rtc/apple,smc-rtc.yaml
 F:	Documentation/devicetree/bindings/soc/apple/apple,t6000-pmgr-misc.yaml
 F:	Documentation/devicetree/bindings/soc/apple/apple,sep.yaml
@@ -2749,7 +2750,6 @@ F:	drivers/power/reset/macsmc-reboot.c
 F:	drivers/power/supply/macsmc-power.c
 F:	drivers/pwm/pwm-apple.c
 F:	drivers/reset/reset-apple-cio.c
-F:	drivers/rtc/rtc-apple-pmu.c
 F:	drivers/rtc/rtc-macsmc.c
 F:	drivers/soc/apple/*
 F:	tools/asahi/pmp-bootargs-tests.rs
