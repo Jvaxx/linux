@@ -2021,11 +2021,7 @@ static void dcp_swapped(struct apple_dcp *dcp, void *data, void *cookie)
 {
 	struct DCP_FW_NAME(dcp_swap_submit_resp) *resp = data;
 	u32 swap_id = DCP_FW_UNION(dcp->swap).swap.swap_id;
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
 	u32 status = resp ? resp->ret : ~0U;
-#else
-	u32 status = resp->ret;
-#endif
 
 	if (resp->ret) {
 		dev_err(dcp->dev, "swap failed! status %u\n", resp->ret);
