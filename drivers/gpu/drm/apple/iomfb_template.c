@@ -1459,7 +1459,12 @@ static bool dcp_present_begin(struct apple_dcp *dcp, u32 swap_id)
 	return true;
 }
 
-static bool dcp_present_submit(struct apple_dcp *dcp, u32 swap_id, bool accepted)
+/*
+ * Returns 0 if the submitted present stands, -ECANCELED if the firmware
+ * aborted it before replying (already reported), or -EPROTO if no present
+ * was expecting this reply.
+ */
+static int dcp_present_submit(struct apple_dcp *dcp, u32 swap_id, bool accepted)
 {
 #if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
@@ -1476,7 +1481,7 @@ static bool dcp_present_submit(struct apple_dcp *dcp, u32 swap_id, bool accepted
 		return false;
 	}
 #endif
-	return true;
+	return 0;
 }
 
 static void dcp_prepare_clear_swap(struct apple_dcp *dcp, void *request)
@@ -2019,6 +2024,7 @@ TRAMPOLINE_OUT(trampoline_create_backlight_service, dcpep_cb_create_backlight_se
 
 static void dcp_swapped(struct apple_dcp *dcp, void *data, void *cookie)
 {
+	int ret;
 	struct DCP_FW_NAME(dcp_swap_submit_resp) *resp = data;
 	u32 swap_id = DCP_FW_UNION(dcp->swap).swap.swap_id;
 	u32 status = resp ? resp->ret : ~0U;
