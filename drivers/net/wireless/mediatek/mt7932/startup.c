@@ -236,10 +236,15 @@ static int mt_startup_once(struct mt7932 *m)
 
 static struct ieee80211_channel *mt_channel(struct mt7932 *m, unsigned int i)
 {
-	return i < 13 ? &m->channels[i] :
-	       &m->channels5[i - 13];
+	return i < MT7932_CHANNELS_2G ? &m->channels[i] :
+	       &m->channels5[i - MT7932_CHANNELS_2G];
 }
 
+/* Keep cfg80211's channel list in step with the channels the country
+ * package leaves out of the firmware domain. cfg80211 rebuilds the flags
+ * on every regulatory update; the notifier applies the recorded set again
+ * when the update keeps this package, or starts a new pass otherwise.
+ */
 static void mt_policy_disable(struct mt7932 *m, const struct mt7932_policy *policy,
 			      u32 generation)
 {
@@ -297,11 +302,11 @@ static void mt_policy_disable(struct mt7932 *m, const struct mt7932_policy *poli
 	rtnl_lock();
 	wiphy_lock(m->wiphy);
 	for (i = 0; i < MT7932_CHANNELS; i++) {
-		struct ieee80211_channel *channel = i < MT7932_CHANNELS_2G ?
-			&m->channels[i] : &m->channels5[i - MT7932_CHANNELS_2G];
+		struct ieee80211_channel *channel = mt_channel(m, i);
+		bool forbidden = !mt7932_policy_permits(policy, channel->hw_value);
 
-		if (!(channel->flags & IEEE80211_CHAN_DISABLED) &&
-		    !mt7932_policy_permits(policy, channel->hw_value))
+		__assign_bit(i, m->policy_disabled, forbidden);
+		if (forbidden)
 			channel->flags |= IEEE80211_CHAN_DISABLED;
 	}
 	wiphy_unlock(m->wiphy);
@@ -485,13 +490,17 @@ static void mt_regulatory_notify(struct wiphy *wiphy, struct regulatory_request 
 	}
 	if (!memcmp(&reg, &m->reg_desired, sizeof(reg)) && !m->reg_pending) {
 		spin_unlock_irqrestore(&m->response_lock, irqflags);
-		for_each_set_bit(i, m->policy_disabled, 17)
+		/* The applied package still holds, but cfg80211 has just
+		 * rebuilt the channel flags without its disables.
+		 */
+		for_each_set_bit(i, m->policy_disabled, MT7932_CHANNELS)
 			mt_channel(m, i)->flags |= IEEE80211_CHAN_DISABLED;
 		return;
 	}
 	m->reg_desired = reg;
 	m->reg_generation++;
-	bitmap_zero(m->policy_disabled, 17);
+	/* The next package pass records its own set. */
+	bitmap_zero(m->policy_disabled, MT7932_CHANNELS);
 	WRITE_ONCE(m->reg_pending, true);
 	if (m->netdev) {
 		netif_stop_queue(m->netdev);
