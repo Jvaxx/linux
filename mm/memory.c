@@ -1442,6 +1442,7 @@ static struct mm_subpage *cow_subpage_prealloc(struct mm_struct *mm,
 	struct mm_subpage *slot;
 	struct folio *folio;
 	unsigned int offset = vma_page_offset_at(vma, addr).offset;
+	unsigned int retired_retries = 0;
 	int err;
 
 retry_private:
@@ -1509,6 +1510,11 @@ retry_private:
 	if (!*pooled)
 		mm_subpage_pool_close(pool);
 	mm_subpage_pool_put(pool);
+	if (*pooled && IS_ERR(slot) && PTR_ERR(slot) == -ESHUTDOWN) {
+		if (++retired_retries > 1)
+			force_private = true;
+		goto retry_private;
+	}
 	return slot;
 }
 
@@ -6540,6 +6546,7 @@ static int anon_subpage_prealloc_mask(struct mm_struct *mm,
 	struct mm_subpage_pool *pool;
 	struct folio *folio;
 	unsigned int count = hweight_long(mask);
+	unsigned int retired_retries = 0;
 	bool arbitrary;
 	int err;
 
@@ -6604,6 +6611,11 @@ retry_private:
 	if (!*pooled)
 		mm_subpage_pool_close(pool);
 	mm_subpage_pool_put(pool);
+	if (*pooled && err == -ESHUTDOWN) {
+		if (++retired_retries > 1)
+			use_pool = false;
+		goto retry_private;
+	}
 	return err;
 }
 
