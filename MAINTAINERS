@@ -2015,6 +2015,7 @@ F:	drivers/iio/common/aop_sensors/
 F:	drivers/rtc/rtc-apple-pmu.c
 F:	drivers/pci/controller/pcie-apple-piodma*
 F:	drivers/soc/apple/aop.rs
+F:	drivers/soc/apple/mcc.c
 F:	drivers/tty/serial/apple_dockchannel*
 F:	include/linux/soc/apple/pci-apple-piodma.h
 F:	include/uapi/linux/apple-sep.h
