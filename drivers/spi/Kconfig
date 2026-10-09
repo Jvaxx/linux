@@ -138,6 +138,10 @@ config SPI_APPLE_QSPI
 	  Unlike the ordinary Apple SPIMC block, QSPIMC accepts packed SPI
 	  memory descriptors and is used for the boot NOR on T8140 systems.
 
+	  T8122/T8132 controllers default to read-only access. Only the pinned
+	  J613 NVRAM layout admits bounded writes after a runtime opt-in.
+	  T8140 retains unrestricted SPI memory operations.
+
 config SPI_AR934X
 	tristate "Qualcomm Atheros AR934X/QCA95XX SPI controller driver"
 	depends on ATH79 || COMPILE_TEST
