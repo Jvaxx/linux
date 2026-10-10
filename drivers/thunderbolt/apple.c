@@ -321,6 +321,8 @@ MODULE_PARM_DESC(dp_display, "Drive displays behind qualified Thunderbolt DP tun
  */
 static const struct of_device_id apple_dpin_qualified_soc[] = {
 	{ .compatible = "apple,t8103" },
+	/* The M2 (t8112) ACIO, NHI and display crossbar are t8103-compatible. */
+	{ .compatible = "apple,t8112" },
 	{ .compatible = "apple,t6000" },
 	{ .compatible = "apple,t6001" },
 	{ .compatible = "apple,t6020" },
