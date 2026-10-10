@@ -1311,7 +1311,7 @@ bool mt7932_fullmac_ready(struct pci_dev *pdev)
 	if (!device_is_bound(&pdev->dev) || pdev->dev.driver != &mt_driver.driver)
 		return false;
 	m = pci_get_drvdata(pdev);
-	return m && READ_ONCE(m->ready);
+	return m && READ_ONCE(m->ready) && !READ_ONCE(m->stopping);
 }
 EXPORT_SYMBOL_GPL(mt7932_fullmac_ready);
 
