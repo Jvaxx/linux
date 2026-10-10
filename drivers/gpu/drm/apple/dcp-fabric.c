@@ -1088,6 +1088,7 @@ static bool dcp_rebalance_deactivate(void *data, void *entry)
 	struct apple_dcp_typec_route *owner = port->owner;
 	struct apple_dcp *dcp;
 	struct dcp_deactivate_context ctx;
+	int ret;
 
 	/* A port in SAFE keeps its owner until the set phase completes. */
 	if (port->safe_pending)
@@ -1100,8 +1101,12 @@ static bool dcp_rebalance_deactivate(void *data, void *entry)
 		 port->connector_np, dev_name(dcp->dev),
 		 port->target ? dev_name(port->target->dcp->dev) : "none");
 	if (port->hpd || dcp->typec_cable_connected ||
-	    (dcp->typec_connector && dcp->typec_connector->connected))
-		dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0);
+	    (dcp->typec_connector && dcp->typec_connector->connected)) {
+		ret = dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0);
+		/* H17P external pipes keep their own stop recovery, as before. */
+		if (ret && !dcp_is_external_h17p(dcp))
+			return true;
+	}
 	port->hpd = false;
 	ctx.port = port;
 	ctx.owner = owner;
@@ -1299,7 +1304,8 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 	struct typec_displayport_data *dp_data = is_dp ? state->data : NULL;
 	u32 dp_status = dp_data ? dp_data->status : 0;
 	u32 dp_conf = dp_data ? dp_data->conf : 0;
-	bool hpd, was_counted;
+	bool hpd = dp_data && (dp_data->status & DP_STATUS_HPD_STATE);
+	bool was_counted;
 	int ret = 0;
 
 	guard(mutex)(&dcp_typec_fabric_lock);
@@ -1330,6 +1336,18 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 	port->applied_conf = dp_conf;
 	/* Failed route acquisition must remain retryable on the next update. */
 	port->applied_valid = false;
+	/* Keep a direct route until DCP acknowledges release of its display. */
+	if (!hpd && port->owner && !port->owner->tunnel) {
+		struct apple_dcp *dcp = port->owner->dcp;
+
+		if (port->hpd || dcp->typec_cable_connected ||
+		    (dcp->typec_connector && dcp->typec_connector->connected)) {
+			ret = dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0);
+			/* H17P external pipes keep their own stop recovery, as before. */
+			if (ret && !dcp_is_external_h17p(dcp))
+				return ret;
+		}
+	}
 
 	/* did the pairing pass count this port's direct stream so far? */
 	was_counted = port->dp_wanted && port->dp_hpd;
@@ -1347,10 +1365,6 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 			struct apple_dcp *dcp = port->owner->dcp;
 
 			port->preferred_route = port->owner;
-			if (port->hpd || dcp->typec_cable_connected ||
-			    (dcp->typec_connector &&
-			     dcp->typec_connector->connected))
-				dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0);
 			port->hpd = false;
 			ret = dcp_typec_route_deactivate(port->owner);
 			if (ret)
@@ -1382,7 +1396,6 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 		return 0;
 	}
 
-	hpd = dp_data && (dp_data->status & DP_STATUS_HPD_STATE);
 	port->dp_wanted = true;
 	port->dp_hpd = hpd;
 
@@ -1425,10 +1438,7 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 
 	}
 
-
-	if (!hpd && port->hpd) {
-		dcp_dptx_disconnect_oob(to_platform_device(port->owner->dcp->dev), 0);
-	} else if (hpd && !port->hpd) {
+	if (hpd && !port->hpd) {
 		struct apple_dcp *dcp = port->owner->dcp;
 
 		WRITE_ONCE(dcp->typec_cable_connected, true);
@@ -2243,7 +2253,9 @@ static int dcp_follow_release(struct apple_dcp_typec_route *route)
 	int ret;
 
 	/* Revoked sessions cannot touch the new route after a reconnect wait. */
-	dcp_dptx_park(dcp);
+	ret = dcp_dptx_park(dcp);
+	if (ret)
+		return ret;
 	apple_connector_edid_set_live(dcp->typec_connector, false);
 	dcp_modes_begin_attachment(dcp);
 	dcp->typec_connector = NULL;
@@ -2269,6 +2281,20 @@ static int dcp_follow_detach(void *data, unsigned int index, bool destination)
 	struct dcp_typec_follow_slot *slot = &ctx->slots[index];
 
 	return dcp_follow_release(destination ? slot->to : slot->from);
+}
+
+static bool dcp_follow_owned(struct apple_dcp_typec_route *route)
+{
+	return route->port->owner == route && route->selected &&
+	       route->dcp->active_typec_route == route;
+}
+
+static bool dcp_follow_retained(void *data, unsigned int index, bool destination)
+{
+	struct dcp_typec_follow_context *ctx = data;
+	struct dcp_typec_follow_slot *slot = &ctx->slots[index];
+
+	return dcp_follow_owned(destination ? slot->to : slot->from);
 }
 
 /* Route @slot's display through @route, a tunnel with its binding. */
@@ -2314,6 +2340,8 @@ static int dcp_follow_attach(void *data, unsigned int index, bool restore)
 	struct apple_dcp *dcp = route->dcp;
 	int ret;
 
+	if (restore && dcp->active_typec_route && dcp->active_typec_route != route)
+		return -EBUSY;
 	ret = dcp_follow_activate(route, slot);
 	if (ret)
 		return ret;
@@ -2359,6 +2387,7 @@ static const struct dcp_fabric_follow_ops dcp_follow_ops = {
 	.prepare = dcp_follow_prepare,
 	.validate = dcp_follow_validate,
 	.detach = dcp_follow_detach,
+	.retained = dcp_follow_retained,
 	.attach = dcp_follow_attach,
 	.publish = dcp_follow_publish,
 	.lost = dcp_follow_lost,
@@ -3163,6 +3192,13 @@ static int dcp_reclaim_release(void *data)
 	return dcp_follow_release(ctx->owner);
 }
 
+static bool dcp_reclaim_retained(void *data)
+{
+	struct dcp_hdmi_reclaim_context *ctx = data;
+
+	return dcp_follow_owned(ctx->owner);
+}
+
 static void dcp_reclaim_unplug(void *data)
 {
 	struct dcp_hdmi_reclaim_context *ctx = data;
@@ -3229,6 +3265,7 @@ static void dcp_reclaim_lost(void *data)
 
 static const struct dcp_fabric_reclaim_ops dcp_reclaim_ops = {
 	.release = dcp_reclaim_release,
+	.retained = dcp_reclaim_retained,
 	.unplug = dcp_reclaim_unplug,
 	.connect_hdmi = dcp_reclaim_connect_hdmi,
 	.activate = dcp_reclaim_activate,
@@ -3314,7 +3351,11 @@ void dcp_fabric_hdmi_retry(struct apple_dcp *dcp)
 	}
 	dev_info(dcp->dev, "display retry: connecting the HDMI display again\n");
 	/* Releases a half-made connection; a no-op otherwise. */
-	dcp_dptx_disconnect(dcp, 0);
+	ret = dcp_dptx_disconnect(dcp, 0);
+	if (ret) {
+		dcp_hdmi_connect_failed(dcp, ret);
+		return;
+	}
 	dcp_fixed_hdmi_reinit_locked(dcp, "its display link did not come up");
 	ret = dcp_fixed_output_select(dcp);
 	if (!ret)
