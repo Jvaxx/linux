@@ -1262,6 +1262,16 @@ static int __init apple_t6030_display_gate(void)
 	if (!gate_soc)
 		return 0;
 
+	/* The exact 25G83 tree has its own firmware and PMP admission gate. */
+	if (of_machine_is_compatible("apple,j613")) {
+		struct device_node *dcp = of_find_node_by_path("/soc/dcp@28ec00000");
+		bool native = dcp && of_property_present(dcp, "apple,j613-25g83-profile");
+
+		of_node_put(dcp);
+		if (native)
+			return 0;
+	}
+
 	if (!gate_requested) {
 		gate_info("disabled on the command line, display stays on the boot framebuffer\n");
 		if (gate_soc->dcpext)
