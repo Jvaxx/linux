@@ -410,7 +410,7 @@
 	 * the simple-bus.
 	 */
 	display: display-subsystem {
-		compatible = "apple,display-subsystem";
+		compatible = "apple,t8140-display-subsystem", "apple,display-subsystem";
 		/* disp0_dart is locked by the bootloader and must come first */
 		iommus = <&disp0_dart 0>;
 		/* generate a phandle for the loader */
