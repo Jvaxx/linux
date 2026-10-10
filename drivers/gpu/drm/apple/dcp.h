@@ -113,5 +113,7 @@ void dcp_audio_unregister(void);
 
 int apple_j613_25g83_coldplug(void);
 unsigned int apple_j613_25g83_clock_hz(void);
+/* A J613, or a J615 whose boot loader carries the experimental opt-in. */
+bool apple_t8122_25g83_board(void);
 
 #endif
