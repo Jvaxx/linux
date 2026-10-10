@@ -1462,7 +1462,8 @@ static int dcp_dptx_connect_tile(struct apple_dcp *dcp)
 	int ret;
 
 	scoped_guard(mutex, &dcp->tb_lock)
-		split = dcp->split.active;
+		split = dcp->split.active && dcp->split.ready &&
+			dcp->split.set_active;
 	if (!split)
 		return 0;
 	ret = dcp_dptx_connect(dcp, 1);
