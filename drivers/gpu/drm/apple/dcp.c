@@ -4324,7 +4324,7 @@ int __init dcp_register(void)
 	return platform_driver_register(&apple_platform_driver);
 }
 
-void __exit dcp_unregister(void)
+void dcp_unregister(void)
 {
 	platform_driver_unregister(&apple_platform_driver);
 }
