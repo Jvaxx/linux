@@ -689,7 +689,7 @@ impl gpuvm::DriverGpuVm for VmInner {
         }
 
         if let Some(asid) = self.slot() {
-            fence(Ordering::SeqCst);
+            mem::sync();
             self.tlbi_range(asid as u8, unmap_start, unmap_range as usize);
             mod_dev_dbg!(
                 self.dev,
@@ -748,7 +748,7 @@ impl VmInner {
         }
 
         if let Some(asid) = self.slot() {
-            fence(Ordering::SeqCst);
+            mem::sync();
             self.tlbi_range(asid as u8, va.addr(), va.range() as usize);
             mod_dev_dbg!(
                 self.dev,
@@ -773,7 +773,7 @@ impl VmInner {
         let result = self.page_table.discard_partial_map(addr..addr + size);
         if self.uat_inner.firmware == UatFirmware::Handoff {
             if let Some(asid) = self.slot() {
-                fence(Ordering::SeqCst);
+                mem::sync();
                 self.tlbi_range(asid as u8, addr, size as usize);
                 mem::sync();
             }
@@ -922,6 +922,7 @@ impl VmInner {
     /// already invalidate.
     fn tlbi_contexts_naming_root(&self, iova: u64, size: usize) {
         if self.uat_inner.firmware == UatFirmware::Handoff {
+            mem::sync();
             return;
         }
 
@@ -930,11 +931,14 @@ impl VmInner {
     }
 
     fn tlbi_context_mask(&self, iova: u64, size: usize, contexts: u64) {
+        // Complete new leaves even if no context currently names this root:
+        // a later context can publish it without repeating the map operation.
+        // DMB orders accesses but does not complete stores before TLBI; the
+        // GPU uses outer-shareable invalidation and the barrier covers it.
+        mem::sync();
         if contexts == 0 {
             return;
         }
-
-        fence(Ordering::SeqCst);
         for ctx in 0..UAT_NUM_CTX {
             if contexts & (1 << ctx) != 0 {
                 mem::tlbi_range_or_asid(ctx as u8, iova as usize, size);
@@ -1182,7 +1186,7 @@ impl ExecutionRoot {
             owned || (low == 0 && high == 0)
         };
         if release {
-            fence(Ordering::SeqCst);
+            mem::sync();
             mem::tlbi_asid(self.id);
             mem::sync();
             self.inner.lock().execution_contexts &= !(1u64 << id);
@@ -1440,7 +1444,7 @@ impl KernelMapping {
                 self.iova()..self.iova() + prefix as u64,
                 PROT_GPU_FW_PRIV_RW,
             )?;
-            fence(Ordering::SeqCst);
+            mem::sync();
             mem::tlbi_all();
             mem::sync();
             let mut after = [0; MAX_PAGES];
@@ -1495,7 +1499,7 @@ impl KernelMapping {
                 self.size()
             );
         }
-        fence(Ordering::SeqCst);
+        mem::sync();
 
         // If we don't have (and have never had) a VM slot, just return
         let slot = match owner.slot() {
@@ -1642,7 +1646,7 @@ impl KernelMapping {
         }
 
         if let Some(asid) = owner.slot() {
-            fence(Ordering::SeqCst);
+            mem::sync();
             owner.tlbi_range(asid as u8, self.iova(), self.size());
             mod_dev_dbg!(
                 owner.dev,
@@ -3218,6 +3222,7 @@ impl Drop for VmInner {
                     self.id,
                     idx
                 );
+                mem::sync();
                 mem::tlbi_asid(idx as u8);
                 mem::sync();
             }
@@ -3306,7 +3311,7 @@ impl Uat {
         if contexts == 0 {
             return Err(ENOENT);
         }
-        fence(Ordering::SeqCst);
+        mem::sync();
         for context in 0..UAT_NUM_CTX {
             if contexts & (1u64 << context) != 0 {
                 mem::tlbi_asid(context as u8);
@@ -3422,6 +3427,7 @@ impl Uat {
                 core::mem::drop(uat_inner);
 
                 // Make sure all TLB entries from the previous owner of this ASID are gone
+                mem::sync();
                 mem::tlbi_asid(idx as u8);
                 mem::sync();
                 slot.generation = slot.generation.wrapping_add(1).max(1);
@@ -3490,7 +3496,7 @@ impl Uat {
             roots.ttb0.store(low, Ordering::Release);
             roots.ttb1.store(high, Ordering::Release);
         }
-        fence(Ordering::SeqCst);
+        mem::sync();
         mem::tlbi_asid(id as u8);
         mem::sync();
         Ok(context)
@@ -3537,7 +3543,7 @@ impl Uat {
             })
         }?;
 
-        fence(Ordering::SeqCst);
+        mem::sync();
         mem::tlbi_all();
         mem::sync();
         Ok(snapshot)
@@ -3582,7 +3588,7 @@ impl Uat {
             })
         }??;
 
-        fence(Ordering::SeqCst);
+        mem::sync();
         mem::tlbi_all();
         mem::sync();
         Ok(())
@@ -3607,7 +3613,7 @@ impl Uat {
             .store(tagged_root(vm.ttb(), KERNEL_ALIAS_CTX), Ordering::Release);
         inner.handoff().unlock();
         core::mem::drop(inner);
-        fence(Ordering::SeqCst);
+        mem::sync();
         mem::tlbi_asid(KERNEL_ALIAS_CTX as u8);
         mem::sync();
         Ok(())
@@ -3916,7 +3922,7 @@ impl Drop for Uat {
         }
 
         // Make sure we flush the TLBs
-        fence(Ordering::SeqCst);
+        mem::sync();
         mem::tlbi_all();
         mem::sync();
     }
