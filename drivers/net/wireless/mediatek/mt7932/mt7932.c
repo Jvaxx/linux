@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* J700 firmware-owned Wi-Fi: native transport and cfg80211 station support.
+ * Covers firmware download and the NIC capability exchange.
  * All addresses here are BAR0 offsets, never chip/CPU physical addresses.
  */
 #include <linux/soc/apple/pci-apple-piodma.h>

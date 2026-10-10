@@ -124,11 +124,11 @@ pub(crate) enum KeyStore {
     /// `cpx-encryption-mode`.
 /// firmware hands the SEP, not the SoC alone: the T8103 stub boots macOS 13.5
 /// (22G74)'s sepOS, whose request shapes are those of the 13.5
-/// `AppleSEPKeyStore`; the T6020 sepOS is newer.
+/// key store; the T6020 sepOS is newer.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum KeyStore {
     /// macOS 13.5's key store. Before any other request the endpoint is
-    /// initialised as `AppleKeyStore::init_sep_endpoint` does it: `0x4d`, then
+    /// initialised with `0x4d`, then
     /// `set_env` carrying the ADT's `/defaults` `cpx-encryption-mode`.
     Sepos13 { cpx_encryption_mode: u32 },
     /// The hardware-verified T6020 encoding (variant-5 create).
