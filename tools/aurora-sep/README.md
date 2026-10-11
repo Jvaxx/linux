@@ -53,32 +53,13 @@ window shifted 90 APFS blocks beyond the actual `.gl` extent. This proves the
 locator can misidentify the extent; it does not identify the historical cause
 of any particular damaged container.
 
-For fingerprint support, apply
-`patches/libfprint-1.94.100-apple-sep.patch` to libfprint 1.94.100, build and
-install libfprint, then install the fprintd device policy:
+For fingerprint support, install libfprint with the aurora driver, then the
+fprintd device policy below. The userspace driver is maintained in
+https://github.com/aurora-silicon/aurora-sep-userspace (libfprint with the
+aurora driver, as source and as distribution packages); this tree carries only
+the kernel driver, its loader and its service. The driver behaviour fprintd
+sees:
 
-```sh
-git clone --depth 1 --branch v1.94.100 \
-    https://gitlab.freedesktop.org/libfprint/libfprint.git libfprint-aurora
-cd libfprint-aurora
-git apply ../linux/tools/aurora-sep/patches/libfprint-1.94.100-apple-sep.patch
-meson setup build -Dprefix=/usr -Ddrivers=default -Dintrospection=false \
-    -Dgtk-examples=false -Ddoc=false -Dinstalled-tests=false
-ninja -C build
-meson test -C build --print-errorlogs
-```
-
-Adjust the patch path for your checkout. The patch includes a fix for an
-upstream Meson test loop when introspection is disabled. In the Aurora
-`linux-build` guest, the additional packages needed for this build are
-`libgudev libgusb pixman cairo glib2-devel`; `meson` and `ninja` are already
-in the release image. The default driver set retains all normal libfprint
-drivers and adds Aurora. This build was checked on aarch64: the shared library
-and all default drivers compiled, with 0 test failures (most device tests
-skip without their optional mocks/hardware). That does **not** prove Touch ID
-works on m2. The patched library is installed privately under
-`/opt/aurora-sep` there, with fprintd loading it via a service drop-in while
-the distro libfprint remains untouched. fprintd discovers one Apple SEP sensor.
 The Aurora driver now reports stage progress only when the kernel's stage
 number increases; guidance and stage-zero events are not captured samples.
 fprintd 1.94.5 itself emits an initial `enroll-stage-passed` after its
@@ -146,35 +127,26 @@ by the Quickshell lock screen.
 
 ## Packages
 
-`packaging/` builds the same pieces as distribution packages: libfprint with
-the aurora driver, which replaces the distribution's libfprint so fprintd needs
-no library path, and `aurora-sep` with the loader, its service and the fprintd
-policy. Installing `aurora-sep` lets fprintd load the driver with xART writes
-on, as above.
+`packaging/` builds `aurora-sep`, with the loader, its service and the fprintd
+policy, as a distribution package. libfprint with the aurora driver comes from
+https://github.com/aurora-silicon/aurora-sep-userspace; install both. Installing
+`aurora-sep` lets fprintd load the driver with xART writes on, as above.
 
-On Fedora, `packaging/fedora/build.sh` rebuilds the release's own libfprint
-source package with the patch added (1.94.100 on Fedora 45) and builds
-`aurora-sep`. It installs build dependencies, so run it in a throwaway
-container from the top of this tree:
+On Fedora, `packaging/fedora/build.sh` builds `aurora-sep`. It installs build
+dependencies, so run it in a throwaway container from the top of this tree:
 
 ```sh
 mkdir rpms
 podman run --rm -v "$PWD":/src:ro,z -v "$PWD/rpms":/out:z \
     registry.fedoraproject.org/fedora:45 \
     /src/tools/aurora-sep/packaging/fedora/build.sh /out
-sudo dnf install rpms/libfprint-1.94.100-*.aurora1.*.rpm \
-    rpms/aurora-sep-1-*.noarch.rpm
+sudo dnf install rpms/aurora-sep-1-*.noarch.rpm
 ```
 
-A later Fedora libfprint update replaces the rebuilt one; rebuild after it, or
-hold it with `dnf versionlock add libfprint`.
-
-On Arch Linux and Arch Linux ARM, build `libfprint-aurora` (it replaces
-`libfprint`) and then `aurora-sep`:
+On Arch Linux and Arch Linux ARM, build `aurora-sep`:
 
 ```sh
-cd tools/aurora-sep/packaging/arch/libfprint-aurora && makepkg -si
-cd ../aurora-sep && makepkg -si
+cd tools/aurora-sep/packaging/arch/aurora-sep && makepkg -si
 ```
 
 fprintd starts the loader the first time it runs. Loading the driver at boot
@@ -272,5 +244,5 @@ Disabling it and rebooting returns the login screen to GNOME's behaviour.
 The canonical ioctl ABI is `include/uapi/linux/apple-sep.h`. Export this
 checkout's headers with `make headers_install INSTALL_HDR_PATH=<directory>`
 and add that directory's `include` to the libfprint build include path. The
-libfprint patch uses `<linux/apple-sep.h>` directly; it has no copied ABI
-header. Interface version, ioctl numbers and fixed-width layouts are unchanged.
+aurora driver in aurora-sep-userspace uses `<linux/apple-sep.h>` directly; it
+has no copied ABI header. Interface version, ioctl numbers and fixed-width layouts are unchanged.
