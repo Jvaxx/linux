@@ -164,6 +164,23 @@ drop:
 	return NETDEV_TX_OK;
 }
 
+/* Width in MHz of a rate decoded by mt7932_rx_rate(). */
+static int mt_rate_width(enum rate_info_bw bw)
+{
+	switch (bw) {
+	case RATE_INFO_BW_20:
+		return 20;
+	case RATE_INFO_BW_40:
+		return 40;
+	case RATE_INFO_BW_80:
+		return 80;
+	case RATE_INFO_BW_160:
+		return 160;
+	default:
+		return INT_MAX;
+	}
+}
+
 void mt_data_receive(struct mt7932 *m, const struct mt7932_rx_frame *frame)
 {
 	struct sk_buff *skb;
@@ -202,17 +219,12 @@ void mt_data_receive(struct mt7932 *m, const struct mt7932_rx_frame *frame)
 		m->station_signal_valid = true;
 	}
 	if (frame->unicast && frame->rate_valid) {
-		m->station_rx_rate_valid = mt7932_rx_rate(frame->rxv, m->phy_cap[4],
-						       &m->station_rx_rate);
-		/* Report only RX widths admitted by the negotiated channel.
-		 * The qualified decoder already bounds mode/MCS/NSS/GI; the
-		 * association remains 20 MHz on 2 GHz and at most 80 MHz on 5 GHz.
-		 */
-		if (((frame->rxv >> 12) & 7) >
-		    (m->connect_chandef.width == NL80211_CHAN_WIDTH_80 ? 2 :
-		     m->connect_chandef.width == NL80211_CHAN_WIDTH_40 ? 1 : 0) ||
-		    (frame->channel <= 14 && ((frame->rxv >> 12) & 7)) ||
-		    (frame->channel > 14 && !((frame->rxv >> 24) & 15)))
+		struct rate_info *rate = &m->station_rx_rate;
+
+		m->station_rx_rate_valid = mt7932_rx_rate(frame->rxv, m->phy_cap[4], rate);
+		/* No CCK on 5 GHz, and no rate wider than the associated channel. */
+		if ((frame->channel > 14 && !((frame->rxv >> 24) & 15)) ||
+		    mt_rate_width(rate->bw) > cfg80211_chandef_get_width(&m->connect_chandef))
 			m->station_rx_rate_valid = false;
 		m->station_rx_rate_time = jiffies;
 	}
