@@ -1,0 +1,73 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# libfprint with the aurora driver for the Apple SEP fingerprint sensor.
+# The local sources are links into tools/aurora-sep and to
+# include/uapi/linux/apple-sep.h; after changing either file, run updpkgsums
+# here.
+
+pkgname=libfprint-aurora
+_pkgname=libfprint
+pkgver=1.94.100
+pkgrel=1
+pkgdesc="Library for fingerprint readers, with the Apple SEP (Touch ID) driver"
+url="https://github.com/aurora-silicon/linux/tree/aurora-wip/tools/aurora-sep"
+arch=(aarch64 x86_64)
+license=(LGPL-2.1-or-later)
+depends=(
+  libgcc
+  glib2
+  glibc
+  libgudev
+  libgusb
+  openssl
+  pixman
+)
+makedepends=(
+  glib2-devel
+  gobject-introspection
+  gtk-doc
+  meson
+  python-cairo
+  python-gobject
+  systemd
+)
+checkdepends=(
+  cairo
+  umockdev
+)
+provides=("$_pkgname=$pkgver" libfprint-2.so)
+conflicts=("$_pkgname")
+source=("https://gitlab.freedesktop.org/libfprint/libfprint/-/archive/v$pkgver/$_pkgname-v$pkgver.tar.gz"
+        "libfprint-$pkgver-apple-sep.patch"
+        apple-sep.uapi)
+sha256sums=('edc90e02f330a7595ceaf37f2c6ec32ed43541347fe936d3273b0bb2524fd19c'
+            '00f999dab395c0f6cd5ffda94099f898eb48d001e19036c500fe2713f76aa076'
+            '00cb09430461e0b0772619bc2054c8f9794484fbc3d807268955c0fb2de45c10')
+
+prepare() {
+  cd "$_pkgname-v$pkgver"
+  patch -Np1 -i "../libfprint-$pkgver-apple-sep.patch"
+
+  # The driver includes <linux/apple-sep.h>, which the distribution's kernel
+  # headers do not carry.
+  install -Dm644 ../apple-sep.uapi ../aurora-include/linux/apple-sep.h
+}
+
+build() {
+  local meson_options=(
+    -D drivers=all
+    -D installed-tests=false
+  )
+
+  CFLAGS+=" -I$srcdir/aurora-include"
+  arch-meson "$_pkgname-v$pkgver" build "${meson_options[@]}"
+  meson compile -C build
+}
+
+check() {
+  meson test -C build --print-errorlogs
+}
+
+package() {
+  meson install -C build --destdir "$pkgdir"
+}

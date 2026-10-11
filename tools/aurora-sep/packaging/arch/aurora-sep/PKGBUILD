@@ -1,0 +1,44 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# The loader, service and fprintd policy for the Apple SEP fingerprint driver.
+# The local sources are links into tools/aurora-sep; after changing any of
+# them, run updpkgsums here. libfprint-aurora provides the libfprint driver.
+
+pkgname=aurora-sep
+pkgver=1
+pkgrel=1
+pkgdesc="Loader and fprintd policy for the Apple SEP (Touch ID) driver"
+url="https://github.com/aurora-silicon/linux/tree/aurora-wip/tools/aurora-sep"
+arch=(any)
+license=(GPL-2.0-only)
+depends=(
+  coreutils
+  fprintd
+  keyutils
+  kmod
+  sh
+)
+source=(load-driver
+        aurora-sep.service
+        fprintd-aurora.conf
+        README.md
+        XART-SAFETY.md)
+sha256sums=('abea60bb264ced349f7cf671d8d26e1609a81a60ea4c34d66ec6f7f73b847dbb'
+            'd3441eeb06c930fcc13314d18012b1f5d71cc1a821ceaf44de13caafb2931d73'
+            'f8d0c4b9385e6716d5ac5dd9941a57459fbc551a8238383bcde36cd929d0523f'
+            'd6e5c68bab7e0d71da48820da75d4ff7e67a06e7970961377ed28d30c2b66c08'
+            '83ae33b34d4f4ff42be7ba22b6d5557c3c5776075753ea288bef986645687f23')
+
+package() {
+  install -Dm755 load-driver "$pkgdir/usr/lib/aurora-sep/aurora-sep-load"
+
+  install -Dm644 aurora-sep.service "$pkgdir/usr/lib/systemd/system/aurora-sep.service"
+  sed -i 's|^ExecStart=.*|ExecStart=/usr/lib/aurora-sep/aurora-sep-load|' \
+    "$pkgdir/usr/lib/systemd/system/aurora-sep.service"
+  grep -qx 'ExecStart=/usr/lib/aurora-sep/aurora-sep-load' \
+    "$pkgdir/usr/lib/systemd/system/aurora-sep.service"
+
+  install -Dm644 fprintd-aurora.conf \
+    "$pkgdir/usr/lib/systemd/system/fprintd.service.d/aurora-sep.conf"
+  install -Dm644 -t "$pkgdir/usr/share/doc/$pkgname" README.md XART-SAFETY.md
+}
