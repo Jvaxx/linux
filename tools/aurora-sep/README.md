@@ -73,6 +73,12 @@ number increases; guidance and stage-zero events are not captured samples.
 fprintd 1.94.5 itself emits an initial `enroll-stage-passed` after its
 duplicate check, **before** starting enrollment. That first line does not
 prove a finger was captured.
+A capture the enclave cannot use is reported as a retry, both while enrolling
+and while matching: fprintd shows `enroll-retry-scan` or `verify-retry-scan`,
+and starts a match again by itself. When the kernel ends an enrolment because
+too many captures in a row were unusable (`SEP_BIO_STATUS_REJECTED`), the
+enrolment fails with that reason in fprintd's log, and fprintd reports
+`enroll-unknown-error`. Kernels from before these statuses never send them.
 The device-specific `apple/mesa_calibration.bin` on m2 was recovered using
 the bundled [`extract-mesa-calibration.py`](extract-mesa-calibration.py), copied
 from [Gist revision `eb079a8007985d04e75182f20994f1a1c496f12e`](https://gist.github.com/DjDeveloperr/867a1961b861c570442724f48f770158/eb079a8007985d04e75182f20994f1a1c496f12e),
