@@ -17,9 +17,12 @@ Source3:        README.md
 Source4:        XART-SAFETY.md
 Source5:        aurora-sep-ready
 Source6:        aurora-sep-ready.service
+Source7:        fprintd-no-timeout.conf.in
 
 BuildArch:      noarch
 BuildRequires:  systemd-rpm-macros
+# Only to check where fprintd's unit runs it from.
+BuildRequires:  fprintd
 Requires:       coreutils
 Requires:       fprintd
 Requires:       keyutils
@@ -55,6 +58,9 @@ unit %{SOURCE0} %{SOURCE1} aurora-sep-load
 unit %{SOURCE5} %{SOURCE6} aurora-sep-ready
 install -Dpm 0644 %{SOURCE2} \
     %{buildroot}%{_unitdir}/fprintd.service.d/aurora-sep.conf
+grep -qx 'ExecStart=%{_libexecdir}/fprintd' %{_unitdir}/fprintd.service
+sed 's|@FPRINTD@|%{_libexecdir}/fprintd|' %{SOURCE7} \
+    >%{buildroot}%{_unitdir}/fprintd.service.d/50-aurora-sep-no-timeout.conf
 # Load the driver at boot, so the enclave is up before the login screen asks.
 install -d %{buildroot}%{_presetdir}
 echo 'enable aurora-sep.service' >%{buildroot}%{_presetdir}/80-aurora-sep.preset
@@ -77,11 +83,13 @@ echo 'enable aurora-sep.service' >%{buildroot}%{_presetdir}/80-aurora-sep.preset
 %{_unitdir}/aurora-sep-ready.service
 %dir %{_unitdir}/fprintd.service.d
 %{_unitdir}/fprintd.service.d/aurora-sep.conf
+%{_unitdir}/fprintd.service.d/50-aurora-sep-no-timeout.conf
 %{_presetdir}/80-aurora-sep.preset
 
 %changelog
 * Sun Oct 11 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-2
 - Activate Touch ID at boot, before fprintd starts
+- Keep fprintd running
 
 * Sun Oct 11 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-1
 - Package the loader, its service and the fprintd policy

@@ -90,7 +90,8 @@ mv "$spec.aurora" "$spec"
 dnf -y builddep "$spec"
 rpmbuild --define "_topdir $rpmtop" -ba "$spec"
 
-# The loader, its service and the fprintd policy, from this tree.
+# The loader, its units and the desktop integration, from this tree.
+dnf -y builddep "$here/aurora-sep.spec"
 rpmbuild --define "_topdir $rpmtop" --define "_sourcedir $sep" \
     -ba "$here/aurora-sep.spec"
 
