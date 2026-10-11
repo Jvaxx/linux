@@ -5,9 +5,9 @@ m1n1 keeps the ADT in a reserved-memory region with compatible "phram" and label
 phram module loaded, Linux shows that region as an MTD device named adt. This tool reads it
 through the read-only node /dev/mtdNro, or reads a regular file (tests, offline copies), and
 prints only:
-  - the nodes under ALLOWED_SUBTREES (GPU, display, PMP, power manager, CPU clusters), and
+  - the nodes under ALLOWED_SUBTREES (GPU, ANE, display, PMP, power manager, CPU clusters), and
   - the properties named in LIMITED_NODES of a few other nodes (/, /arm-io, /product, and the
-    reg of the memory cache controller and the Neural Engine).
+    reg of the memory cache controller).
 Every other node is left out. Inside the printed nodes it drops every property whose name
 contains one of DENIED_NAME_PARTS, and every property whose value contains the value of such a
 property anywhere in the ADT. The one exception is the uuid of a firmware processor's nub
@@ -76,6 +76,14 @@ ALLOWED_SUBTREES = (
     # stream ids.
     "/arm-io/dart-dcp*",
     "/arm-io/dart-disp*",
+    # Neural engine (ANE), matched by name so a chip this tool has not seen still prints it: the
+    # engine (ane, ane0, ane1: windows, interrupts, clock and power gates, iommu-parent, and any
+    # iop-*-nub or ascwrap child with its mailbox and segments), its DART (dart-ane*: stream ids,
+    # VM range) and the DART's address mapper (mapper-ane*). "ans" is the storage controller and
+    # is not matched.
+    "/arm-io/ane*",
+    "/arm-io/dart-ane*",
+    "/arm-io/mapper-ane*",
     # CPU clusters and cores: ids, cluster types, registers.
     "/cpus",
 )
@@ -91,8 +99,6 @@ LIMITED_NODES = {
     "/product": ("name", "product-name", "product-description"),
     # The memory cache controller's register windows (the GPU firmware's IO map slot for it).
     "/arm-io/mcc": ("reg",),
-    # The Neural Engine's register windows (the GPU firmware's ANE doorbell slot).
-    "/arm-io/ane": ("reg",),
 }
 
 # Nodes whose "uuid" property is printed: a firmware processor's nub names the firmware image the

@@ -4799,7 +4799,7 @@ M3_WORK=""
 # read-only node of the phram MTD device named adt and prints an allowlist of it;
 # "--check <node>" checks the node and what it is bound to, and reads nothing. Empty: a
 # release with none, and the report says so.
-M3_ADT_READER="aurora-adt-extract.py 809aa6b892042df92f11f346acdb73bb4c5f8c66a99c9765dada0dbdeea05cf5"
+M3_ADT_READER="aurora-adt-extract.py cfef5935f35c412e006ae70229406b0eac51e830a175ca9b98fcdabe873389f5"
 
 # A file's first line, or "-" when it can't be read. No fork: the report reads a few thousand.
 m3_attr() {

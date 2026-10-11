@@ -72,7 +72,7 @@ SECRETS = [SERIAL.encode(), MLB_SERIAL.encode(), CHIP_ID, WIFI_MAC, BT_MAC, NONC
            MAC_UUID.encode(), PANEL_SERIAL.encode()]
 # Strings that appear only in nodes outside the allowlist.
 OUTSIDE = ["OUTSIDE-wlan", "OUTSIDE-bluetooth", "OUTSIDE-sep", "OUTSIDE-smc", "OUTSIDE-chosen",
-           "OUTSIDE-nvme", "OUTSIDE-root-model", "OUTSIDE-product-color", "OUTSIDE-mcc", "OUTSIDE-ane"]
+           "OUTSIDE-nvme", "OUTSIDE-root-model", "OUTSIDE-product-color", "OUTSIDE-mcc"]
 SENSITIVE_NAMES = ["serial-number", "mlb-serial-number", "unique-chip-id", "mac-address-wifi0",
                    "local-mac-address", "boot-nonce", "random-seed", "sep-key", "gpu-calibration",
                    "panel-serial-number", "region-info", "ecid", "udid", "imei", "uuid",
@@ -132,11 +132,12 @@ def build_m3max_adt(chip="t6031"):
                                   prop("reg", [0x67670000 + i * 0x10000, 0x1, 0x4000, 0])],
                    [node(f"iop-dcpext{i}-nub", [prop("uuid", DCP_UUID if i < 3 else b"\x01" * 16)])])
               for i in range(4)]
-    # The memory cache controller and the Neural Engine: only their reg is printed.
+    # The memory cache controller: only its reg is printed. The Neural Engine is an allowed
+    # subtree: printed whole, with its nub.
     mcc = node("mcc", [prop("compatible", "mcc,t6031"), prop("reg", [0x20000000, 0x2, 0x95000, 0]),
                        prop("dcs-count", 8), prop("debug-tag", "OUTSIDE-mcc")])
     ane = node("ane", [prop("compatible", "ane,t6031"), prop("reg", [0x0945c000, 0x3, 0x4000, 0]),
-                       prop("debug-tag", "OUTSIDE-ane")], [node("iop-ane-nub", [prop("uuid", FW_UUID)])])
+                       prop("debug-tag", "ane-tag")], [node("iop-ane-nub", [prop("uuid", FW_UUID)])])
     disp = [node("disp0", [prop("compatible", "disp0,t6031"), prop("clock-gates", [1, 2])])]
     disp += [node(f"dispext{i}", [prop("compatible", "dispext,t6031"), prop("power-gates", [i])])
              for i in range(4)]
@@ -261,10 +262,10 @@ class AllowlistTest(unittest.TestCase):
                           "ranges", "chip-revision"])
         self.assertEqual(block("/arm-io/mcc"),
                          "  reg [16] = <0x20000000 0x00000002 0x00095000 0x00000000>\n")
-        self.assertEqual(block("/arm-io/ane"),
-                         "  reg [16] = <0x0945c000 0x00000003 0x00004000 0x00000000>\n")
-        # Its nub is not in an allowed subtree: not printed, uuid or not.
-        self.assertNotIn("/arm-io/ane/iop-ane-nub", text)
+        # The Neural Engine is not limited: printed whole, its nub with the firmware image uuid.
+        self.assertIn("  reg [16] = <0x0945c000 0x00000003 0x00004000 0x00000000>\n", block("/arm-io/ane"))
+        self.assertIn('  debug-tag [8] = "ane-tag"', block("/arm-io/ane"))
+        self.assertIn(f'  uuid [37] = "{FW_UUID}"', block("/arm-io/ane/iop-ane-nub"))
 
     def test_dropped_and_summary(self):
         text = render(build_m3max_adt())
@@ -279,7 +280,7 @@ class AllowlistTest(unittest.TestCase):
         self.assertNotIn("iop-dcp-nub uuid (", text)
         summary = text.rstrip("\n").splitlines()[-1]
         self.assertTrue(summary.startswith("# summary: printed "), summary)
-        self.assertRegex(summary, r"\(6 firmware image uuids\)")
+        self.assertRegex(summary, r"\(7 firmware image uuids\)")
         self.assertRegex(summary, r"dropped 9 properties \(7 by name: calibration 1, fuse 1, "
                                   r"serial 1, unique 1, uuid 3; 2 by value\)")
         self.assertRegex(summary, r"not printed: \d+ nodes outside the allowlist and \d+ properties")
@@ -334,8 +335,8 @@ class FirmwareUuidTest(unittest.TestCase):
             self.assertIn(f'  uuid [37] = "{DCP_UUID}"', block(f"/arm-io/dcpext{i}/iop-dcpext{i}-nub"))
         # Not a UUID string: dropped.
         self.assertNotIn("uuid", block("/arm-io/dcpext3/iop-dcpext3-nub"))
-        # A firmware uuid is no secret, even from a nub outside the allowlist (the ANE's holds
-        # the same one): another value that holds it stays.
+        # A firmware uuid is no secret (the ANE's nub holds the same one): another value that
+        # holds it stays.
         self.assertIn(f'  fw-note [43] = "image {FW_UUID}"', block("/arm-io/sgx"))
 
     def test_only_a_nubs_own_uuid(self):
@@ -492,6 +493,87 @@ class StageLogTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("# source: file log.bin", proc.stdout)
         self.check_text(proc.stdout)
+
+
+# --- The neural engine -----------------------------------------------------------------------
+
+def build_ane_adt(units=("",)):
+    """An ADT with one ANE per suffix in units, a DART and mapper for each, and look-alikes that
+    must not print."""
+    arm_io = []
+    for u in units:
+        arm_io.append(node(f"ane{u}", [
+            prop("compatible", "ane,t6031"), prop("reg", [0x88880000, 0x2, 0x100000, 0x0]),
+            prop("interrupts", [0x4c0, 0x4c1]), prop("interrupt-parent", 0xa1),
+            prop("clock-gates", [0x120]), prop("power-gates", [0x121, 0x122]),
+            prop("iommu-parent", 0x9f), prop("ane-type", 1),
+            prop("serial-number", SERIAL),
+        ], [node(f"iop-ane{u}-nub", [prop("compatible", "iop-nub,rtbuddy-v2"),
+                                      prop("segment-names", b"__TEXT\0__DATA\0"),
+                                      prop("uuid", FW_UUID), prop("volume-uuid", MAC_UUID)])]))
+        arm_io.append(node(f"dart-ane{u}", [prop("sids", [0, 1, 2]), prop("vm-size", [0, 0x20])],
+                           [node(f"mapper-ane{u}", [prop("compatible", "iommu-mapper,ane")])]))
+    arm_io += [
+        node("ans", [prop("compatible", "OUTSIDE-ans")], [node("iop-ans-nub", [prop("x", "OUTSIDE-ans")])]),
+        node("sart-ans", [prop("compatible", "OUTSIDE-ans")]),
+        node("plane-info", [prop("compatible", "OUTSIDE-plane")]),
+        node("pmgr", [prop("ane-dpe", 0), prop("ane-tvm", 1)]),
+    ]
+    return node("device-tree", [], [node("arm-io", [prop("compatible", "arm-io,t6031")], arm_io)])
+
+
+class AneTest(unittest.TestCase):
+    def test_ane_nodes_print_for_any_unit_count(self):
+        for units in [("",), ("0",), ("0", "1"), ("", "1", "2", "3")]:
+            with self.subTest(units=units):
+                text = render(build_ane_adt(units))
+                nodes = re.findall(r"^(/\S*)$", text, re.M)
+                for u in units:
+                    for want in [f"/arm-io/ane{u}", f"/arm-io/ane{u}/iop-ane{u}-nub",
+                                 f"/arm-io/dart-ane{u}", f"/arm-io/dart-ane{u}/mapper-ane{u}"]:
+                        self.assertIn(want, nodes)
+                for no in ["/arm-io/ans", "/arm-io/ans/iop-ans-nub", "/arm-io/sart-ans",
+                           "/arm-io/plane-info"]:
+                    self.assertNotIn(no, nodes)
+                self.assertNotIn("OUTSIDE", text)
+
+    def test_ane_properties_and_pmgr_entries(self):
+        text = render(build_ane_adt())
+        self.assertIn("  interrupts [8] = <0x000004c0 0x000004c1>", text)
+        self.assertIn("  power-gates [8] = <0x00000121 0x00000122>", text)
+        self.assertIn("  iommu-parent [4] = <0x0000009f>", text)
+        self.assertIn("  sids [12] = <0x00000000 0x00000001 0x00000002>", text)
+        self.assertIn('  segment-names [14] = "__TEXT", "__DATA"', text)
+        self.assertIn("  ane-dpe [4] = <0x00000000>", text)
+        self.assertIn("  ane-tvm [4] = <0x00000001>", text)
+
+    def test_ane_nodes_keep_the_private_value_rules(self):
+        text = render(build_ane_adt())
+        self.assertNotIn(SERIAL, text)
+        self.assertNotIn(MAC_UUID, text)
+        self.assertIn("# dropped: /arm-io/ane serial-number", text)
+        self.assertIn("# dropped: /arm-io/ane/iop-ane-nub volume-uuid", text)
+        # The nub's own uuid names the firmware image: printed, as for the other nubs.
+        self.assertIn(f'  uuid [37] = "{FW_UUID}"', text)
+
+    def test_patterns(self):
+        for path in ["/arm-io/ane", "/arm-io/ane0", "/arm-io/ane1/iop-ane1-nub",
+                     "/arm-io/dart-ane0", "/arm-io/dart-ane/mapper-ane", "/arm-io/mapper-ane0"]:
+            self.assertTrue(adt.in_allowed_subtree(path), path)
+        for path in ["/arm-io/ans", "/arm-io/sart-ans", "/arm-io/plane", "/ane", "/chosen/arm-io/ane",
+                     "/arm-io/dart-ans"]:
+            self.assertFalse(adt.in_allowed_subtree(path), path)
+
+    @unittest.skipUnless(os.environ.get("AURORA_ADT_FIXTURE"), "set AURORA_ADT_FIXTURE to a real ADT file")
+    def test_real_adt_prints_its_ane_nodes(self):
+        blob = Path(os.environ["AURORA_ADT_FIXTURE"]).read_bytes()
+        root, used, nodes, props = adt.parse_adt(blob)
+        text = adt.render(root, "fixture", used, nodes, props)
+        want = [path for path, _ in adt.walk(root) if re.match(r"/arm-io/(dart-|mapper-)?ane", path)]
+        self.assertTrue(want, "the fixture has no ANE node")
+        printed = re.findall(r"^(/\S*)$", text, re.M)
+        for path in want:
+            self.assertIn(path, printed)
 
 
 # --- Malformed input -------------------------------------------------------------------------
