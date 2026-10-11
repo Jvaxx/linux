@@ -61,6 +61,8 @@ void dcp_swap_watchdog_arm(struct apple_dcp *dcp);
 void dcp_swap_watchdog_complete(struct apple_dcp *dcp);
 void dcp_retry_placeholder_edid(struct apple_dcp *dcp,
 				const struct drm_edid *drm_edid);
+bool dcp_typec_relink(struct apple_dcp *dcp);
+bool dcp_typec_sink_relink(struct apple_dcp *dcp);
 
 struct dcpav_service_epic;
 
@@ -380,6 +382,12 @@ struct apple_dcp {
 	u64 crtc_unplugs;
 	u64 placeholder_generation;
 	struct delayed_work placeholder_edid_wq;
+	/* replugs replayed for a Type-C sink that lost its link */
+	u32 relink_tries;
+	bool relink_active;
+	unsigned long relink_done;
+	u64 relink_generation;
+	struct delayed_work typec_relink_wq;
 	bool use_timestamps;
 	bool vrr_enabled;
 	struct dcp_set_digital_out_mode_req mode;
