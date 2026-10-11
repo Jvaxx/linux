@@ -17,6 +17,17 @@ systemctl daemon-reload
 systemctl enable aurora-sep.service
 ```
 
+The loader waits up to 120 s for the enclave to seal and unseal a trusted key,
+then up to 60 s for `/dev/sep-bio`, and logs how long each took. On J700 the
+enclave's key store arrives around 43 s after boot. To change a wait, set
+`AURORA_SEP_READY_TIMEOUT` or `AURORA_SEP_DEVICE_TIMEOUT` in whole seconds,
+for example with `systemctl edit aurora-sep.service`:
+
+```ini
+[Service]
+Environment=AURORA_SEP_READY_TIMEOUT=180
+```
+
 `xart_writes=0` remains the default. `load-driver` explicitly opts into writes
 and must only be enabled on a machine whose APFS `.gl` extent passes the
 driver's narrow ownership checks: one physical extent, no snapshots or revert
