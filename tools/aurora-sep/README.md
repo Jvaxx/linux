@@ -158,35 +158,26 @@ by the Quickshell lock screen.
 
 ## Packages
 
-`packaging/` builds the same pieces as distribution packages: libfprint with
-the aurora driver, which replaces the distribution's libfprint so fprintd needs
-no library path, and `aurora-sep` with the loader, its service and the fprintd
-policy. Installing `aurora-sep` lets fprintd load the driver with xART writes
-on, as above.
+`packaging/` builds `aurora-sep`, with the loader, its service and the fprintd
+policy, as a distribution package. libfprint with the aurora driver comes from
+https://github.com/aurora-silicon/aurora-sep-userspace; install both. Installing
+`aurora-sep` lets fprintd load the driver with xART writes on, as above.
 
-On Fedora, `packaging/fedora/build.sh` rebuilds the release's own libfprint
-source package with the patch added (1.94.100 on Fedora 45) and builds
-`aurora-sep`. It installs build dependencies, so run it in a throwaway
-container from the top of this tree:
+On Fedora, `packaging/fedora/build.sh` builds `aurora-sep`. It installs build
+dependencies, so run it in a throwaway container from the top of this tree:
 
 ```sh
 mkdir rpms
 podman run --rm -v "$PWD":/src:ro,z -v "$PWD/rpms":/out:z \
     registry.fedoraproject.org/fedora:45 \
     /src/tools/aurora-sep/packaging/fedora/build.sh /out
-sudo dnf install rpms/libfprint-1.94.100-*.aurora1.*.rpm \
-    rpms/aurora-sep-1-*.noarch.rpm
+sudo dnf install rpms/aurora-sep-1-*.noarch.rpm
 ```
 
-A later Fedora libfprint update replaces the rebuilt one; rebuild after it, or
-hold it with `dnf versionlock add libfprint`.
-
-On Arch Linux and Arch Linux ARM, build `libfprint-aurora` (it replaces
-`libfprint`) and then `aurora-sep`:
+On Arch Linux and Arch Linux ARM, build `aurora-sep`:
 
 ```sh
-cd tools/aurora-sep/packaging/arch/libfprint-aurora && makepkg -si
-cd ../aurora-sep && makepkg -si
+cd tools/aurora-sep/packaging/arch/aurora-sep && makepkg -si
 ```
 
 fprintd starts the loader the first time it runs. Loading the driver at boot
@@ -284,5 +275,5 @@ Disabling it and rebooting returns the login screen to GNOME's behaviour.
 The canonical ioctl ABI is `include/uapi/linux/apple-sep.h`. Export this
 checkout's headers with `make headers_install INSTALL_HDR_PATH=<directory>`
 and add that directory's `include` to the libfprint build include path. The
-libfprint patch uses `<linux/apple-sep.h>` directly; it has no copied ABI
-header. Interface version, ioctl numbers and fixed-width layouts are unchanged.
+aurora driver in aurora-sep-userspace uses `<linux/apple-sep.h>` directly; it
+has no copied ABI header. Interface version, ioctl numbers and fixed-width layouts are unchanged.

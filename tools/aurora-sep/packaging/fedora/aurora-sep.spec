@@ -5,7 +5,7 @@
 
 Name:           aurora-sep
 Version:        1
-Release:        2%{?dist}
+Release:        3%{?dist}
 Summary:        Loader and desktop integration for the Apple SEP fingerprint driver
 
 License:        GPL-2.0-only
@@ -40,7 +40,8 @@ the secure enclave seals and unseals a trusted key and /dev/sep-bio appears,
 and lets fprintd reach /dev/sep-bio. The loader runs at boot, and fprintd
 also pulls it in when it starts. Touch ID is then activated, before fprintd
 starts, and pressing the Touch ID button suspends rather than powers off.
-libfprint needs the aurora driver, which this package does not provide. Read XART-SAFETY.md before installing it on
+libfprint needs the aurora driver, which this package does not provide; it is
+packaged in https://github.com/aurora-silicon/aurora-sep-userspace. Read XART-SAFETY.md before installing it on
 a machine that also runs macOS.
 
 %prep
@@ -98,6 +99,9 @@ echo 'enable aurora-sep.service' >%{buildroot}%{_presetdir}/80-aurora-sep.preset
 %{_presetdir}/80-aurora-sep.preset
 
 %changelog
+* Sun Oct 11 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-3
+- libfprint with the aurora driver is now built in aurora-sep-userspace
+
 * Sun Oct 11 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-2
 - Activate Touch ID at boot, before fprintd starts
 - Keep fprintd running

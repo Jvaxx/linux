@@ -41,16 +41,8 @@ class PkgbuildTest(unittest.TestCase):
                 digest, expected, "%s changed: run updpkgsums in %s" % (name, directory)
             )
 
-    def test_libfprint_sums_match_tree(self):
-        self.check(ARCH / "libfprint-aurora")
-
     def test_aurora_sep_sums_match_tree(self):
         self.check(ARCH / "aurora-sep")
-
-    def test_patch_version_matches_pkgver(self):
-        text = (ARCH / "libfprint-aurora" / "PKGBUILD").read_text()
-        pkgver = re.search(r"^pkgver=(\S+)$", text, re.M).group(1)
-        self.assertTrue((SEP / "patches" / ("libfprint-%s-apple-sep.patch" % pkgver)).is_file())
 
 
 class FedoraSpecTest(unittest.TestCase):
@@ -61,11 +53,10 @@ class FedoraSpecTest(unittest.TestCase):
         for source in sources:
             self.assertTrue((SEP / source).is_file(), source)
 
-    def test_build_script_patches_the_shipped_version(self):
+    def test_build_script_builds_only_aurora_sep(self):
         text = (FEDORA / "build.sh").read_text()
-        version = re.search(r"^patched_version=(\S+)$", text, re.M).group(1)
-        self.assertIn("libfprint-%s-apple-sep.patch" % version, text)
-        self.assertTrue((SEP / "patches" / ("libfprint-%s-apple-sep.patch" % version)).is_file())
+        self.assertIn("aurora-sep.spec", text)
+        self.assertNotIn("dnf -y download --source libfprint", text)
 
 
 if __name__ == "__main__":
