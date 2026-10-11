@@ -23,6 +23,7 @@ source=(load-driver
         fprintd-aurora.conf
         aurora-sep-ready
         aurora-sep-ready.service
+        fprintd-no-timeout.conf.in
         README.md
         XART-SAFETY.md)
 sha256sums=('abea60bb264ced349f7cf671d8d26e1609a81a60ea4c34d66ec6f7f73b847dbb'
@@ -30,7 +31,8 @@ sha256sums=('abea60bb264ced349f7cf671d8d26e1609a81a60ea4c34d66ec6f7f73b847dbb'
             'f8d0c4b9385e6716d5ac5dd9941a57459fbc551a8238383bcde36cd929d0523f'
             '2db07d3a0191e8d14581a3056505a8c4225b2fc8e6ea4a1956ae5493abcbb0ae'
             '5a5e5c7e93d1462d9d1023446fdb297926aeb93d8988867b515aca7adafe4487'
-            '29a8fb4970f7e550310a1c11d6aa0ad2b840b0307f4be0d1ad76875bed1a4ec2'
+            '8d8df0ba2a6861b2edb2110e606906d84ca4848617621ad3cb48493a1522971d'
+            '9d8caa6ad9be48cdb9331a5498eafad2b7db82764fe41b74bc97ba3fcccfbb2b'
             '83ae33b34d4f4ff42be7ba22b6d5557c3c5776075753ea288bef986645687f23')
 
 # A unit and the helper it runs ($1, installed as $3), pointed at the
@@ -52,5 +54,8 @@ package() {
 
   install -Dm644 fprintd-aurora.conf \
     "$pkgdir/usr/lib/systemd/system/fprintd.service.d/aurora-sep.conf"
+  grep -qx 'ExecStart=/usr/lib/fprintd' /usr/lib/systemd/system/fprintd.service
+  sed 's|@FPRINTD@|/usr/lib/fprintd|' fprintd-no-timeout.conf.in \
+    >"$pkgdir/usr/lib/systemd/system/fprintd.service.d/50-aurora-sep-no-timeout.conf"
   install -Dm644 -t "$pkgdir/usr/share/doc/$pkgname" README.md XART-SAFETY.md
 }

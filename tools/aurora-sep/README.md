@@ -212,6 +212,17 @@ install -Dm644 aurora-sep-ready.service /etc/systemd/system/aurora-sep-ready.ser
 systemctl daemon-reload
 ```
 
+fprintd exits after 30 s without a client, and each new start probes the
+reader again, while the login and lock screens ask for the reader as they
+come up. `fprintd-no-timeout.conf.in` keeps it running so that it answers
+them at once. The packages fill in where the distribution keeps fprintd; by
+hand, with `/usr/lib/fprintd` on Arch:
+
+```sh
+sed 's|@FPRINTD@|/usr/libexec/fprintd|' fprintd-no-timeout.conf.in \
+    >/etc/systemd/system/fprintd.service.d/aurora-sep-no-timeout.conf
+```
+
 ## Biometric userspace header
 
 The canonical ioctl ABI is `include/uapi/linux/apple-sep.h`. Export this
