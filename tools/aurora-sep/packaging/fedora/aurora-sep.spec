@@ -18,6 +18,7 @@ Source4:        XART-SAFETY.md
 Source5:        aurora-sep-ready
 Source6:        aurora-sep-ready.service
 Source7:        fprintd-no-timeout.conf.in
+Source8:        logind-aurora-sep.conf
 
 BuildArch:      noarch
 BuildRequires:  systemd-rpm-macros
@@ -34,8 +35,8 @@ Loads the Apple SEP driver (apple_sep) with xART writes enabled, waits until
 the secure enclave seals and unseals a trusted key and /dev/sep-bio appears,
 and lets fprintd reach /dev/sep-bio. The loader runs at boot, and fprintd
 also pulls it in when it starts. Touch ID is then activated, before fprintd
-starts. libfprint needs the aurora driver, which this package does not
-provide. Read XART-SAFETY.md before installing it on
+starts, and pressing the Touch ID button suspends rather than powers off.
+libfprint needs the aurora driver, which this package does not provide. Read XART-SAFETY.md before installing it on
 a machine that also runs macOS.
 
 %prep
@@ -61,6 +62,8 @@ install -Dpm 0644 %{SOURCE2} \
 grep -qx 'ExecStart=%{_libexecdir}/fprintd' %{_unitdir}/fprintd.service
 sed 's|@FPRINTD@|%{_libexecdir}/fprintd|' %{SOURCE7} \
     >%{buildroot}%{_unitdir}/fprintd.service.d/50-aurora-sep-no-timeout.conf
+install -Dpm 0644 %{SOURCE8} \
+    %{buildroot}%{_prefix}/lib/systemd/logind.conf.d/50-aurora-sep.conf
 # Load the driver at boot, so the enclave is up before the login screen asks.
 install -d %{buildroot}%{_presetdir}
 echo 'enable aurora-sep.service' >%{buildroot}%{_presetdir}/80-aurora-sep.preset
@@ -84,12 +87,14 @@ echo 'enable aurora-sep.service' >%{buildroot}%{_presetdir}/80-aurora-sep.preset
 %dir %{_unitdir}/fprintd.service.d
 %{_unitdir}/fprintd.service.d/aurora-sep.conf
 %{_unitdir}/fprintd.service.d/50-aurora-sep-no-timeout.conf
+%{_prefix}/lib/systemd/logind.conf.d/50-aurora-sep.conf
 %{_presetdir}/80-aurora-sep.preset
 
 %changelog
 * Sun Oct 11 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-2
 - Activate Touch ID at boot, before fprintd starts
 - Keep fprintd running
+- Suspend rather than power off on the Touch ID button
 
 * Sun Oct 11 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-1
 - Package the loader, its service and the fprintd policy

@@ -223,6 +223,20 @@ sed 's|@FPRINTD@|/usr/libexec/fprintd|' fprintd-no-timeout.conf.in \
     >/etc/systemd/system/fprintd.service.d/aurora-sep-no-timeout.conf
 ```
 
+The Touch ID sensor is the power button. A touch to authenticate goes to the
+enclave and never reaches logind as a key press, but a press does, and logind
+cannot tell a press meant for the sensor from one meant for the button. Its
+default is to power off. `logind-aurora-sep.conf` makes a short press
+suspend instead, so pressing while authenticating loses nothing and the next
+press wakes the machine, and holding the button for 5 s powers off cleanly.
+GNOME sessions and the GDM login screen handle a short press themselves
+(`power-button-action`, `suspend` by default); the setting covers consoles
+and other desktops. It takes effect at the next boot. By hand:
+
+```sh
+install -Dm644 logind-aurora-sep.conf /etc/systemd/logind.conf.d/aurora-sep.conf
+```
+
 ## Biometric userspace header
 
 The canonical ioctl ABI is `include/uapi/linux/apple-sep.h`. Export this
