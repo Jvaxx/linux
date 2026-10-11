@@ -2008,7 +2008,7 @@ F:	Documentation/hid/apple-j700-multitouch.rst
 F:	Documentation/soc/apple/t8140-pmp-dvfs.rst
 F:	Documentation/networking/device_drivers/wifi/mt7932-neo.rst
 F:	arch/arm64/boot/dts/apple/t8140*
-F:	arch/arm64/configs/j700-radio.config
+F:	arch/arm64/configs/j700*.config
 F:	arch/arm64/include/asm/apple-idle.h
 F:	arch/arm64/kernel/idle-apple.S
 F:	drivers/hid/dockchannel-hid/dockchannel-hid-protocol*
