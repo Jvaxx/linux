@@ -196,6 +196,22 @@ fprintd at another libfprint, then run `systemctl daemon-reload` and
 libfprint, remove `aurora-sep` and run `dnf distro-sync libfprint` or
 `pacman -S libfprint`.
 
+## Desktop integration
+
+The first open of `/dev/sep-bio` activates Touch ID: the driver restores the
+enrolled fingerprints from the enclave before the open returns, which takes
+a few seconds. `aurora-sep-ready.service`, which `aurora-sep.service` pulls
+in, makes that open at boot, before fprintd starts. The lock screen, sudo
+and polkit then find the reader and the fingerprints ready, and the first
+fingerprint request does not wait for the restore. A failed open is only
+logged. The packages install it; by hand:
+
+```sh
+install -Dm755 aurora-sep-ready /usr/local/sbin/aurora-sep-ready
+install -Dm644 aurora-sep-ready.service /etc/systemd/system/aurora-sep-ready.service
+systemctl daemon-reload
+```
+
 ## Biometric userspace header
 
 The canonical ioctl ABI is `include/uapi/linux/apple-sep.h`. Export this
