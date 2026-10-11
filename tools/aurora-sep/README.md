@@ -237,6 +237,36 @@ and other desktops. It takes effect at the next boot. By hand:
 install -Dm644 logind-aurora-sep.conf /etc/systemd/logind.conf.d/aurora-sep.conf
 ```
 
+GNOME Shell 51 offers fingerprint only on the lock screen, never on the
+login screen, and `org.gnome.login-screen enable-fingerprint-authentication`
+(true by default) cannot change that: the greeter connects its fingerprint
+reader only when it re-authenticates a running session. That is GNOME's
+choice, because a fingerprint cannot unlock the login keyring: after a
+fingerprint login, the first application that wants a stored secret asks
+for the password. `aurora-sep-greeter-fingerprint.service` lifts the
+restriction for those who want it. At boot it copies the one greeter source
+file that holds the check out of the installed GNOME Shell, drops the check,
+and serves the copy to the login screen's shell alone through a GResource
+overlay. When the check is not exactly as expected, for example after a
+GNOME update, it changes nothing. The enable key above still applies.
+
+The login screen asks fprintd for the reader once, as it comes up, so the
+same unit also holds it back until `aurora-sep-ready.service` has finished:
+a few seconds on a healthy boot, but as long as the enclave takes when it is
+slow, up to 90 s after boot. Without fingerprint at the login screen that
+wait buys nothing, which is why both are one switch, off by default. It
+needs `gresource` from glib2-devel. With the packages, or after installing
+it by hand, turn it on with `systemctl enable`:
+
+```sh
+install -Dm755 aurora-sep-greeter-fingerprint /usr/local/sbin/aurora-sep-greeter-fingerprint
+install -Dm644 aurora-sep-greeter-fingerprint.service /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable aurora-sep-greeter-fingerprint.service
+```
+
+Disabling it and rebooting returns the login screen to GNOME's behaviour.
+
 ## Biometric userspace header
 
 The canonical ioctl ABI is `include/uapi/linux/apple-sep.h`. Export this

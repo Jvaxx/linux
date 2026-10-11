@@ -19,6 +19,8 @@ Source5:        aurora-sep-ready
 Source6:        aurora-sep-ready.service
 Source7:        fprintd-no-timeout.conf.in
 Source8:        logind-aurora-sep.conf
+Source9:        aurora-sep-greeter-fingerprint
+Source10:       aurora-sep-greeter-fingerprint.service
 
 BuildArch:      noarch
 BuildRequires:  systemd-rpm-macros
@@ -28,6 +30,8 @@ Requires:       coreutils
 Requires:       fprintd
 Requires:       keyutils
 Requires:       kmod
+# Only for aurora-sep-greeter-fingerprint.service, which is off by default.
+Suggests:       /usr/bin/gresource
 %{?systemd_requires}
 
 %description
@@ -57,6 +61,7 @@ unit() {
 }
 unit %{SOURCE0} %{SOURCE1} aurora-sep-load
 unit %{SOURCE5} %{SOURCE6} aurora-sep-ready
+unit %{SOURCE9} %{SOURCE10} aurora-sep-greeter-fingerprint
 install -Dpm 0644 %{SOURCE2} \
     %{buildroot}%{_unitdir}/fprintd.service.d/aurora-sep.conf
 grep -qx 'ExecStart=%{_libexecdir}/fprintd' %{_unitdir}/fprintd.service
@@ -69,21 +74,23 @@ install -d %{buildroot}%{_presetdir}
 echo 'enable aurora-sep.service' >%{buildroot}%{_presetdir}/80-aurora-sep.preset
 
 %post
-%systemd_post aurora-sep.service aurora-sep-ready.service
+%systemd_post aurora-sep.service aurora-sep-ready.service aurora-sep-greeter-fingerprint.service
 
 %preun
-%systemd_preun aurora-sep.service aurora-sep-ready.service
+%systemd_preun aurora-sep.service aurora-sep-ready.service aurora-sep-greeter-fingerprint.service
 
 %postun
 # Never restart them: the driver attaches to the enclave once per boot.
-%systemd_postun aurora-sep.service aurora-sep-ready.service
+%systemd_postun aurora-sep.service aurora-sep-ready.service aurora-sep-greeter-fingerprint.service
 
 %files
 %doc README.md XART-SAFETY.md
 %{_libexecdir}/aurora-sep-load
 %{_libexecdir}/aurora-sep-ready
+%{_libexecdir}/aurora-sep-greeter-fingerprint
 %{_unitdir}/aurora-sep.service
 %{_unitdir}/aurora-sep-ready.service
+%{_unitdir}/aurora-sep-greeter-fingerprint.service
 %dir %{_unitdir}/fprintd.service.d
 %{_unitdir}/fprintd.service.d/aurora-sep.conf
 %{_unitdir}/fprintd.service.d/50-aurora-sep-no-timeout.conf
@@ -95,6 +102,7 @@ echo 'enable aurora-sep.service' >%{buildroot}%{_presetdir}/80-aurora-sep.preset
 - Activate Touch ID at boot, before fprintd starts
 - Keep fprintd running
 - Suspend rather than power off on the Touch ID button
+- Offer fingerprint at the GNOME 51 login screen, off by default
 
 * Sun Oct 11 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-1
 - Package the loader, its service and the fprintd policy
