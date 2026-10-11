@@ -3,12 +3,15 @@
 These files connect the Apple SEP kernel driver to the shared APFS xART
 gigalocker and the desktop fingerprint stack.
 
-For willing participants testing Apple Silicon hardware support, install the
-latest Aurora release with:
+The current release installer and matched packages are published in
+[omacom/linux-aurora](https://github.com/omacom/linux-aurora/releases/latest):
 
 ```sh
-curl -fsSL https://github.com/omacom/linux/releases/latest/download/install-aurora-sep.sh | bash
+curl -fsSL https://github.com/omacom/linux-aurora/releases/latest/download/install-aurora-sep.sh | bash
 ```
+
+The installer in this source tree is an assembly template. Use the release
+asset above, whose package checksums and GPU profiles are pinned together.
 
 Each release installer downloads its own exact package versions and verifies
 their checksums. Experimental hardware profiles require their explicit opt-ins.
