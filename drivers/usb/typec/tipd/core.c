@@ -1256,6 +1256,38 @@ static void cd321x_update_work(struct work_struct *work)
 	return;
 
 retry:
+	if (ret == -ESHUTDOWN) {
+		struct typec_mux_state safe = { .mode = TYPEC_STATE_SAFE };
+		int cleanup;
+
+		/* A terminal provider failure must not cycle the complex again. */
+		cd321x->state.alt = NULL;
+		cd321x->state.mode = TYPEC_STATE_SAFE;
+		cd321x->state.data = NULL;
+		/* Retain prepare/role/finish ownership even for a failed provider. */
+		cleanup = typec_mux_begin(cd321x->mux, &safe);
+		if (!cleanup) {
+			if (!typec_mux_safe_after_role(cd321x->mux))
+				cleanup = typec_mux_apply(cd321x->mux);
+			if (!cleanup) {
+				cleanup = usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
+				if (cleanup)
+					typec_mux_abort(cd321x->mux);
+				else
+					cleanup = typec_mux_end(cd321x->mux);
+			}
+		}
+		if (cleanup)
+			dev_warn(tps->dev, "terminal provider cleanup incomplete: %d\n", cleanup);
+		cd321x_pm_mux_done(&cd321x->pm);
+		cd321x->pm.phase = CD321X_PM_STALE;
+		cd321x->pm.attempts_left = 0;
+		cd321x->pm.force_reconnect = false;
+		cd321x->pm.provider_busy = false;
+		cd321x->state_valid = false;
+		dev_err(tps->dev, "Type-C provider shut down; automatic retries stopped\n");
+		return;
+	}
 	/* A held mux must not consume a coalesced partner edge. */
 	cd321x->update_status.dp_sid_event |= st.dp_sid_event;
 	cd321x->update_status.dp_sid_hpd_low |= st.dp_sid_hpd_low;
