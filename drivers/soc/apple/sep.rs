@@ -64,7 +64,8 @@ use kernel::{
         Arc,
         CondVar,
         CondVarTimeoutResult,
-        Mutex, //
+        Mutex,
+        MutexGuard, //
     },
     time,
     types::ForeignOwnable,
@@ -113,6 +114,11 @@ const SBIO_TIMEOUT_MS: time::Msecs = 5000;
 // request in flight, plus the capture loop's interrupt-wait backstop.
 const SLEEP_DRAIN_MS: u32 = 6000;
 static_assert!(SLEEP_DRAIN_MS as u64 > SBIO_TIMEOUT_MS as u64);
+
+// How long an open or a capture start waits for the last enrol or verify work
+// item to stop once its operation has ended. It is stopped in the same way,
+// so it gets the same bound as a capture draining before sleep.
+const WORKER_EXIT_WAIT_MS: time::Msecs = SLEEP_DRAIN_MS;
 
 const SKS_ALLOC: usize = 0x8000;
 
@@ -711,6 +717,9 @@ struct SepData {
     // deletion durable failed; the next deletion retries the save. Changed
     // only under `catacomb_writer`.
     deletion_unsaved: Atomic<bool>,
+    // Signalled when an enrol or verify work item has stopped.
+    #[pin]
+    worker_gone: CondVar,
 
     #[pin]
     rx_work: Work<SepData>,
@@ -888,6 +897,7 @@ impl SepData {
                 captures_running: Atomic::new(0),
                 catacomb_writer <- new_mutex!(()),
                 deletion_unsaved: Atomic::new(false),
+                worker_gone <- new_condvar!("SepData::worker_gone"),
                 rx_work <- new_work!("SepData::rx_work"),
                 enrol_work <- new_work!("SepData::enrol_work"),
                 verify_work <- new_work!("SepData::verify_work"),
@@ -2067,6 +2077,7 @@ impl SepData {
     fn remove(&self) {
         self.shutting_down.store(true, Relaxed);
         bio::release(&mut self.bio_session.lock());
+        self.worker_gone.notify_all();
         self.rng_shutdown.store(true, Relaxed);
         self.control_wq.notify_all();
         self.sbio_wq.notify_all();
@@ -2265,8 +2276,7 @@ impl WorkItem<ENROL_WORK_ID> for SepData {
         if !this.shutting_down.load(Relaxed) && this.capture_begin() {
             this.run_enrolment();
         }
-        this.run_enrolment();
-        this.capture_end();
+        this.capture_worker_stopped(epoch);
     }
 }
 
@@ -2278,8 +2288,7 @@ impl WorkItem<VERIFY_WORK_ID> for SepData {
         if !this.shutting_down.load(Relaxed) && this.capture_begin() {
             this.run_verify();
         }
-        this.run_verify();
-        this.capture_end();
+        this.capture_worker_stopped(epoch);
     }
 }
 
