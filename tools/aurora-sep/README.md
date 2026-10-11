@@ -144,6 +144,58 @@ lock screen then selects `omarchy-lock-fingerprint` automatically and accepts
 Touch ID through fprintd. Hyprlock's separate fingerprint switch is not used
 by the Quickshell lock screen.
 
+## Packages
+
+`packaging/` builds the same pieces as distribution packages: libfprint with
+the aurora driver, which replaces the distribution's libfprint so fprintd needs
+no library path, and `aurora-sep` with the loader, its service and the fprintd
+policy. Installing `aurora-sep` lets fprintd load the driver with xART writes
+on, as above.
+
+On Fedora, `packaging/fedora/build.sh` rebuilds the release's own libfprint
+source package with the patch added (1.94.100 on Fedora 45) and builds
+`aurora-sep`. It installs build dependencies, so run it in a throwaway
+container from the top of this tree:
+
+```sh
+mkdir rpms
+podman run --rm -v "$PWD":/src:ro,z -v "$PWD/rpms":/out:z \
+    registry.fedoraproject.org/fedora:45 \
+    /src/tools/aurora-sep/packaging/fedora/build.sh /out
+sudo dnf install rpms/libfprint-1.94.100-*.aurora1.*.rpm \
+    rpms/aurora-sep-1-*.noarch.rpm
+```
+
+A later Fedora libfprint update replaces the rebuilt one; rebuild after it, or
+hold it with `dnf versionlock add libfprint`.
+
+On Arch Linux and Arch Linux ARM, build `libfprint-aurora` (it replaces
+`libfprint`) and then `aurora-sep`:
+
+```sh
+cd tools/aurora-sep/packaging/arch/libfprint-aurora && makepkg -si
+cd ../aurora-sep && makepkg -si
+```
+
+fprintd starts the loader the first time it runs. Loading the driver at boot
+instead has the enclave ready before the login screen asks for a fingerprint.
+The Fedora package enables that with a systemd preset when it is first
+installed; on Arch, enable it yourself:
+
+```sh
+sudo systemctl enable aurora-sep.service
+```
+
+The driver attaches to the enclave once per boot, so reboot rather than
+restarting the service or reloading `apple_sep`. To move from the manual
+install above, remove `/usr/local/sbin/aurora-sep-load`,
+`/etc/systemd/system/aurora-sep.service`,
+`/etc/systemd/system/fprintd.service.d/aurora.conf` and any drop-in that points
+fprintd at another libfprint, then run `systemctl daemon-reload` and
+`systemctl reenable aurora-sep.service`. To go back to the distribution's
+libfprint, remove `aurora-sep` and run `dnf distro-sync libfprint` or
+`pacman -S libfprint`.
+
 ## Biometric userspace header
 
 The canonical ioctl ABI is `include/uapi/linux/apple-sep.h`. Export this
