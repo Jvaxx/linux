@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# The loader, service and fprintd policy for the Apple SEP fingerprint driver.
+# The loader and desktop integration for the Apple SEP fingerprint driver.
 # The local sources are links into tools/aurora-sep; after changing any of
 # them, run updpkgsums here. libfprint-aurora provides the libfprint driver.
 
 pkgname=aurora-sep
 pkgver=1
-pkgrel=1
-pkgdesc="Loader and fprintd policy for the Apple SEP (Touch ID) driver"
+pkgrel=2
+pkgdesc="Loader and desktop integration for the Apple SEP (Touch ID) driver"
 url="https://github.com/aurora-silicon/linux/tree/aurora-wip/tools/aurora-sep"
 arch=(any)
 license=(GPL-2.0-only)
@@ -21,22 +21,34 @@ depends=(
 source=(load-driver
         aurora-sep.service
         fprintd-aurora.conf
+        aurora-sep-ready
+        aurora-sep-ready.service
         README.md
         XART-SAFETY.md)
 sha256sums=('abea60bb264ced349f7cf671d8d26e1609a81a60ea4c34d66ec6f7f73b847dbb'
-            'd3441eeb06c930fcc13314d18012b1f5d71cc1a821ceaf44de13caafb2931d73'
+            '447f99cc3c7e683134f31b993aa825fadde24e4854954a3035c96e6631d4d4d0'
             'f8d0c4b9385e6716d5ac5dd9941a57459fbc551a8238383bcde36cd929d0523f'
-            'd6e5c68bab7e0d71da48820da75d4ff7e67a06e7970961377ed28d30c2b66c08'
+            '2db07d3a0191e8d14581a3056505a8c4225b2fc8e6ea4a1956ae5493abcbb0ae'
+            '5a5e5c7e93d1462d9d1023446fdb297926aeb93d8988867b515aca7adafe4487'
+            '29a8fb4970f7e550310a1c11d6aa0ad2b840b0307f4be0d1ad76875bed1a4ec2'
             '83ae33b34d4f4ff42be7ba22b6d5557c3c5776075753ea288bef986645687f23')
 
-package() {
-  install -Dm755 load-driver "$pkgdir/usr/lib/aurora-sep/aurora-sep-load"
+# A unit and the helper it runs ($1, installed as $3), pointed at the
+# packaged helper.
+_unit() {
+  local unit="$pkgdir/usr/lib/systemd/system/$2"
 
-  install -Dm644 aurora-sep.service "$pkgdir/usr/lib/systemd/system/aurora-sep.service"
-  sed -i 's|^ExecStart=.*|ExecStart=/usr/lib/aurora-sep/aurora-sep-load|' \
-    "$pkgdir/usr/lib/systemd/system/aurora-sep.service"
-  grep -qx 'ExecStart=/usr/lib/aurora-sep/aurora-sep-load' \
-    "$pkgdir/usr/lib/systemd/system/aurora-sep.service"
+  install -Dm755 "$1" "$pkgdir/usr/lib/aurora-sep/$3"
+  install -Dm644 "$2" "$unit"
+  sed -i "s|^\(Exec[A-Za-z]*=\)/usr/local/sbin/$3|\1/usr/lib/aurora-sep/$3|" "$unit"
+  if grep -q /usr/local "$unit"; then
+    return 1
+  fi
+}
+
+package() {
+  _unit load-driver aurora-sep.service aurora-sep-load
+  _unit aurora-sep-ready aurora-sep-ready.service aurora-sep-ready
 
   install -Dm644 fprintd-aurora.conf \
     "$pkgdir/usr/lib/systemd/system/fprintd.service.d/aurora-sep.conf"
