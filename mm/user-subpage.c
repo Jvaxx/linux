@@ -466,8 +466,10 @@ struct mm_subpage_pool *mm_subpage_cow_pool_get_charged(struct mm_struct *mm,
 			mm_subpage_pool_put(new);
 			break;
 		}
+#ifdef CONFIG_MEMCG
 		if (memcg)
 			css_get(&memcg->css);
+#endif
 		new->cow_memcg = memcg;
 		new->cow_nid = nid;
 		new->cow_shared = true;
