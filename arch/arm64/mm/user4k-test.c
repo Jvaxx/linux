@@ -3019,7 +3019,9 @@ static void test_anon_write_fault_granule(struct kunit *test, unsigned int shift
 					if (!backing)
 						backing = folio;
 					identity = folio == backing &&
-						mm_subpage_offset(slot) == i * size;
+						mm_subpage_phys(slot) ==
+						pte_phys_mm(vma->vm_mm, ptep_get(pte)) &&
+						(shape || mm_subpage_offset(slot) == i * size);
 					zero = !memchr_inv(folio_address(folio) + mm_subpage_offset(slot),
 							   0, size);
 					mm_subpage_put(slot);
@@ -8555,7 +8557,8 @@ static void test_swap_tags_set(struct folio *folio)
 #endif
 }
 
-static bool test_swap_tags_match(struct folio *folio, unsigned int slot)
+static bool test_swap_tags_match_at(struct folio *folio, unsigned int start,
+				   unsigned int slot)
 {
 #ifdef CONFIG_ARM64_MTE
 	unsigned int offset;
@@ -8564,7 +8567,7 @@ static bool test_swap_tags_match(struct folio *folio, unsigned int slot)
 		return true;
 	if (!page_mte_tagged(&folio->page))
 		return false;
-	for (offset = slot * SZ_4K; offset < (slot + 1) * SZ_4K; offset += MTE_GRANULE_SIZE) {
+	for (offset = start; offset < start + SZ_4K; offset += MTE_GRANULE_SIZE) {
 		unsigned long tag = 0;
 
 		asm volatile(".arch_extension memtag\n\tldg %0, [%1]"
@@ -8574,6 +8577,11 @@ static bool test_swap_tags_match(struct folio *folio, unsigned int slot)
 	}
 #endif
 	return true;
+}
+
+static bool test_swap_tags_match(struct folio *folio, unsigned int slot)
+{
+	return test_swap_tags_match_at(folio, slot * SZ_4K, slot);
 }
 
 struct fragment_test_pins {
@@ -8683,9 +8691,14 @@ static void user4k_fragment_pin_test(struct kunit *test)
 			KUNIT_EXPECT_PTR_EQ(test, memchr_inv(folio_address(f->folio) + f->offset,
 							    0x71 + i, f->length), NULL);
 			if (!native) {
+				pte_t parent_pte = test_fault_entry(test, mm, TEST_VA + i * size);
+
 				KUNIT_EXPECT_TRUE(test, mm_subpage_is_exclusive(f->subpage));
+				KUNIT_EXPECT_NE(test, pte_phys_mm(child, pte),
+						pte_phys_mm(mm, parent_pte));
 				if (i)
-					KUNIT_EXPECT_PTR_NE(test, f->folio, pins->fragments[0].folio);
+					KUNIT_EXPECT_NE(test, mm_subpage_phys(f->subpage),
+							mm_subpage_phys(pins->fragments[0].subpage));
 			}
 		}
 		fragment_test_unpin(pins);
@@ -9339,9 +9352,10 @@ static void user4k_slot_pin_test(struct kunit *test)
 		copy = mm_subpage_get_from_phys(pte_phys_mm(child, pte));
 		KUNIT_ASSERT_NOT_NULL(test, copy);
 		KUNIT_EXPECT_EQ(test, mm_subpage_is_exclusive(copy), i == 1);
-		KUNIT_EXPECT_PTR_EQ(test, memchr_inv(folio_address(mm_subpage_folio(copy)) + i * SZ_4K,
+		KUNIT_EXPECT_PTR_EQ(test, memchr_inv(folio_address(mm_subpage_folio(copy)) + mm_subpage_offset(copy),
 						    0x61 + i, SZ_4K), NULL);
-		KUNIT_EXPECT_TRUE(test, test_swap_tags_match(mm_subpage_folio(copy), i));
+		KUNIT_EXPECT_TRUE(test, test_swap_tags_match_at(mm_subpage_folio(copy),
+							     mm_subpage_offset(copy), i));
 		mm_subpage_put(copy);
 	}
 	/* A read pin on a shared slot must request unsharing, not pin shared COW data. */
@@ -10326,6 +10340,7 @@ static void user4k_migration_test(struct kunit *test)
 		unsigned long start = edge ? boundaries[mode - 6] :
 			TEST_VA + (sparse ? SZ_4K : 0);
 		unsigned int nr = sparse ? 1 : 4, i, side, succeeded = 0;
+		unsigned int offsets[TEST_SLOTS];
 		struct vm_area_struct *vma = test_fault_vma(test, start, nr * SZ_4K);
 		struct mm_struct *child = NULL;
 		struct folio *folio;
@@ -10352,6 +10367,9 @@ static void user4k_migration_test(struct kunit *test)
 		for (i = 0; i < TEST_SLOTS; i++)
 			memset(folio_address(folio) + i * SZ_4K, 0x41 + i + mode, SZ_4K);
 		test_swap_tags_set(folio);
+		for (i = 0; i < nr; i++)
+			offsets[i] = offset_in_page(pte_phys_mm(vma->vm_mm,
+					test_fault_entry(test, vma->vm_mm, start + i * SZ_4K)));
 		folio_put(folio);
 		if (forked) {
 			child = test_vma_mm(test);
@@ -10381,7 +10399,7 @@ static void user4k_migration_test(struct kunit *test)
 			struct mm_struct *mm = side ? child : vma->vm_mm;
 
 			for (i = 0; i < nr; i++) {
-				unsigned int index = sparse ? offset_in_page(start) / SZ_4K : i;
+				unsigned int index = offsets[i] / SZ_4K;
 				pte_t pte = test_fault_entry(test, mm, start + i * SZ_4K);
 				struct mm_subpage *slot;
 
@@ -10868,13 +10886,27 @@ static void test_user4k_swap_roundtrip(struct kunit *test, unsigned int mode, u8
 	KUNIT_EXPECT_TRUE(test, pte_write(pte));
 	folio = test_fault_folio(child, TEST_VA + SZ_4K);
 	KUNIT_ASSERT_NOT_NULL(test, folio);
-	KUNIT_EXPECT_PTR_EQ(test, memchr_inv(folio_address(folio) + SZ_4K, base + 1, SZ_4K), NULL);
-	KUNIT_EXPECT_TRUE(test, test_swap_tags_match(folio, 1));
-	memset(folio_address(folio) + SZ_4K, 0xa7, SZ_4K);
+	{
+		unsigned int offset = pte_phys_mm(child, pte) - PFN_PHYS(folio_pfn(folio));
+
+		KUNIT_EXPECT_PTR_EQ(test, memchr_inv(folio_address(folio) + offset,
+						    base + 1, SZ_4K), NULL);
+		KUNIT_EXPECT_TRUE(test, test_swap_tags_match_at(folio, offset, 1));
+		memset(folio_address(folio) + offset, 0xa7, SZ_4K);
+	}
 	folio_put(folio);
 	folio = test_fault_folio(parent->vm_mm, TEST_VA + SZ_4K);
 	KUNIT_ASSERT_NOT_NULL(test, folio);
-	KUNIT_EXPECT_PTR_EQ(test, memchr_inv(folio_address(folio) + SZ_4K, base + 1, SZ_4K), NULL);
+	{
+		pte_t parent_pte = test_fault_entry(test, parent->vm_mm, TEST_VA + SZ_4K);
+		unsigned int offset = pte_phys_mm(parent->vm_mm, parent_pte) -
+				      PFN_PHYS(folio_pfn(folio));
+
+		KUNIT_EXPECT_NE(test, pte_phys_mm(child, pte),
+				pte_phys_mm(parent->vm_mm, parent_pte));
+		KUNIT_EXPECT_PTR_EQ(test, memchr_inv(folio_address(folio) + offset,
+						    base + 1, SZ_4K), NULL);
+	}
 	folio_put(folio);
 	KUNIT_EXPECT_EQ(test, get_mm_counter_sum(child, MM_ANONPAGES), 1UL);
 	KUNIT_EXPECT_EQ(test, get_mm_counter_sum(child, MM_SWAPENTS), TEST_SLOTS - 1UL);
@@ -11249,12 +11281,13 @@ static void user4k_swapoff_boundaries_test(struct kunit *test)
 		struct vm_area_struct *parent = test_fault_vma(test, start, 2 * SZ_4K);
 		struct mm_struct *child;
 		unsigned int i, side;
+		unsigned int offsets[2];
 		int ret;
 
 		KUNIT_ASSERT_NOT_NULL(test, parent);
 		for (i = 0; i < 2; i++) {
 			unsigned long addr = start + i * SZ_4K;
-			unsigned int offset = vma_page_offset_at(parent, addr).offset;
+			unsigned int offset;
 			struct folio *folio;
 			vm_fault_t fault;
 			swp_entry_t entry;
@@ -11264,6 +11297,9 @@ static void user4k_swapoff_boundaries_test(struct kunit *test)
 			fault = handle_mm_fault(parent, addr, FAULT_FLAG_WRITE | FAULT_FLAG_REMOTE, NULL);
 			mmap_read_unlock(parent->vm_mm);
 			KUNIT_ASSERT_EQ(test, fault, (vm_fault_t)0);
+			offset = offset_in_page(pte_phys_mm(parent->vm_mm,
+					test_fault_entry(test, parent->vm_mm, addr)));
+			offsets[i] = offset;
 			lru_add_drain_all();
 			folio = test_fault_folio(parent->vm_mm, addr);
 			KUNIT_ASSERT_NOT_NULL(test, folio);
@@ -11295,7 +11331,7 @@ static void user4k_swapoff_boundaries_test(struct kunit *test)
 			KUNIT_EXPECT_EQ(test, get_mm_counter_sum(mm, MM_ANONPAGES), 2UL);
 			for (i = 0; i < 2; i++) {
 				unsigned long addr = start + i * SZ_4K;
-				unsigned int offset = vma_page_offset_at(parent, addr).offset;
+				unsigned int offset = offsets[i];
 				pte_t pte = test_fault_entry(test, mm, addr);
 				struct folio *folio;
 
@@ -11522,8 +11558,14 @@ static void test_live_fault_roundtrip(struct kunit *test, unsigned int mode)
 	}
 	folio = test_fault_folio(child, TEST_VA + SZ_4K);
 	KUNIT_ASSERT_NOT_NULL(test, folio);
-	for (i = 0; i < 2; i++)
-		KUNIT_EXPECT_EQ(test, *((u8 *)folio_address(folio) + SZ_4K + 64 + i), (u8)(0xe0 + i));
+	{
+		pte_t pte = test_fault_entry(test, child, TEST_VA + SZ_4K);
+		unsigned long offset = pte_phys_mm(child, pte) - PFN_PHYS(folio_pfn(folio));
+
+		for (i = 0; i < 2; i++)
+			KUNIT_EXPECT_EQ(test, *((u8 *)folio_address(folio) + offset + 64 + i),
+					(u8)(0xe0 + i));
+	}
 	folio_put(folio);
 	mmap_read_lock(parent->vm_mm);
 	fault = handle_mm_fault(parent, TEST_VA + SZ_4K, FAULT_FLAG_REMOTE, NULL);
