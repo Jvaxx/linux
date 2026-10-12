@@ -69,6 +69,13 @@ static void dcp_swap_submit(struct apple_dcp *dcp, bool oob,
 	const void *data = request;
 
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
+		for (i = 0; i < SWAP_SURFACES; i++) {
+			const struct dcp_surface *surface = &request->surf[i].base;
+
+			if (!request->surf_null[i])
+				trace_iomfb_surface(dcp, i, surface->format, surface->xfer_func,
+						    surface->colorspace, surface->is_premultiplied);
+		}
 		iomfb_serialize_present_h17p(&dcp->present_h17p, request);
 		if (!iomfb_apply_backlight_h17p(dcp, request, &dcp->present_h17p)) {
 			if (cb)
@@ -2112,7 +2119,8 @@ static void dcp_pre_swap_a428(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	u32 identity = 0x10000;
 
-	dcp_pipe_set_428(dcp, false, &identity, do_swap, cookie);
+	trace_iomfb_control_result(dcp, 423, !!out, out ? get_unaligned_le32(out) : 0);
+	dcp_pipe_set_428(dcp, false, &identity, dcp_post_swap_a428, cookie);
 }
 #endif
 
@@ -2379,6 +2387,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 			mat.matrix[0] = mat.matrix[4] = mat.matrix[8] = 1LLU << 32;
 		}
 
+		trace_iomfb_ctm(dcp, mat.location, mat.matrix, mat.matrix_null);
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
 		iomfb_set_matrix(dcp, false, &mat, dcp_pre_swap_a428, NULL);
 #else

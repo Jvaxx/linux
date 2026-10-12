@@ -205,6 +205,92 @@ TRACE_EVENT(
 		print_epic_category(__entry->category), __entry->subtype,
 		__entry->tag));
 
+/* Raw prefix before any protocol-specific decode; no peer address is followed. */
+TRACE_EVENT(afk_recv_header,
+	    TP_PROTO(struct apple_dcp_afkep *ep, u32 channel, u32 type,
+		     size_t data_size, const void *data),
+	    TP_ARGS(ep, channel, type, data_size, data),
+	    TP_STRUCT__entry(__string(devname, dev_name(ep->dcp->dev))
+			     __field(u8, endpoint)
+			     __field(u32, channel)
+			     __field(u32, type)
+			     __field(size_t, data_size)
+			     __field(u8, captured)
+			     __array(u8, header, 32)),
+	    TP_fast_assign(__assign_str(devname);
+			__entry->endpoint = ep->endpoint;
+			__entry->channel = channel;
+			__entry->type = type;
+			__entry->data_size = data_size;
+			__entry->captured = data ? min_t(size_t, data_size, 32) : 0;
+			memset(__entry->header, 0, sizeof(__entry->header));
+			if (__entry->captured)
+				memcpy(__entry->header, data, __entry->captured);
+	    ),
+	    TP_printk("%s: endpoint 0x%x channel 0x%x type 0x%x size %zu header[%u]=%s",
+		      __get_str(devname), __entry->endpoint, __entry->channel,
+		      __entry->type, __entry->data_size, __entry->captured,
+		      __print_hex(__entry->header, __entry->captured))
+);
+
+TRACE_EVENT(iomfb_ctm,
+	    TP_PROTO(struct apple_dcp *dcp, u32 location, const void *matrix, u8 matrix_null),
+	    TP_ARGS(dcp, location, matrix, matrix_null),
+	    TP_STRUCT__entry(__string(devname, dev_name(dcp->dev))
+			     __field(u32, location)
+			     __field(u8, matrix_null)
+			     __array(u64, matrix, 9)),
+	    TP_fast_assign(__assign_str(devname);
+			__entry->location = location;
+			__entry->matrix_null = matrix_null;
+			if (matrix)
+				memcpy(__entry->matrix, matrix, sizeof(__entry->matrix));
+			else
+				memset(__entry->matrix, 0, sizeof(__entry->matrix));
+	    ),
+	    TP_printk("%s: location %u null %u matrix=%s",
+		      __get_str(devname), __entry->location, __entry->matrix_null,
+		      __print_array(__entry->matrix, 9, sizeof(u64)))
+);
+
+TRACE_EVENT(iomfb_control_result,
+	    TP_PROTO(struct apple_dcp *dcp, u32 method, bool valid, u32 result),
+	    TP_ARGS(dcp, method, valid, result),
+	    TP_STRUCT__entry(__string(devname, dev_name(dcp->dev))
+			     __field(u32, method)
+			     __field(bool, valid)
+			     __field(u32, result)),
+	    TP_fast_assign(__assign_str(devname);
+			__entry->method = method;
+			__entry->valid = valid;
+			__entry->result = result;
+	    ),
+	    TP_printk("%s: A%u reply_valid %u result 0x%08x",
+		      __get_str(devname), __entry->method, __entry->valid, __entry->result)
+);
+
+TRACE_EVENT(iomfb_surface,
+	    TP_PROTO(struct apple_dcp *dcp, u32 index, u32 format, u8 xfer_func,
+		     u8 colorspace, u8 premultiplied),
+	    TP_ARGS(dcp, index, format, xfer_func, colorspace, premultiplied),
+	    TP_STRUCT__entry(__string(devname, dev_name(dcp->dev))
+			     __field(u32, index)
+			     __field(u32, format)
+			     __field(u8, xfer_func)
+			     __field(u8, colorspace)
+			     __field(u8, premultiplied)),
+	    TP_fast_assign(__assign_str(devname);
+			__entry->index = index;
+			__entry->format = format;
+			__entry->xfer_func = xfer_func;
+			__entry->colorspace = colorspace;
+			__entry->premultiplied = premultiplied;
+	    ),
+	    TP_printk("%s: surface %u format 0x%08x xfer %u colorspace %u source_premul %u",
+		      __get_str(devname), __entry->index, __entry->format,
+		      __entry->xfer_func, __entry->colorspace, __entry->premultiplied)
+);
+
 TRACE_EVENT(iomfb_callback,
 	    TP_PROTO(struct apple_dcp *dcp, int tag, const char *name),
 	    TP_ARGS(dcp, tag, name),
