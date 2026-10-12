@@ -9,7 +9,7 @@
 
 &{/soc} {
 	dcpext: dcp@416e00000 {
-		compatible = "apple,t8140-dcpext";
+		compatible = "apple,t8140-dcpext", "apple,dcp";
 		reg = <0x4 0x16e00000 0x0 0x4000>,
 		      <0x4 0x14000000 0x0 0xafc000>,
 		      <0x4 0x16240000 0x0 0x10000>,
