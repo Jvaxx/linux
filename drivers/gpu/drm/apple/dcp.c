@@ -3541,7 +3541,12 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	if (dcp->hw.adopt_live_session)
 		dev_info(dev, "negotiating RTKit with the running DCP\n");
 
-	ret = apple_rtkit_wake(dcp->rtk);
+	/* Announce host readiness before awaiting external IOP readiness. */
+	if (dcp->hw.iomfb_method_profile ==
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
+		ret = apple_rtkit_wake_early_ap(dcp->rtk);
+	else
+		ret = apple_rtkit_wake(dcp->rtk);
 	if (ret) {
 		ret = dev_err_probe(dev, ret, "Failed to boot RTKit: %d\n", ret);
 		goto err_piodma;
