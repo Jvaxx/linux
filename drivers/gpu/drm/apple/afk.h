@@ -367,6 +367,7 @@ struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 int afk_v2_copy_owned(struct apple_epic_service *service, u64 dva,
 		      void *buffer, size_t size, bool to_peer);
 int afk_start(struct apple_dcp_afkep *ep);
+void afk_trace_ring_snapshot(struct apple_dcp_afkep *ep);
 void afk_shutdown(struct apple_dcp_afkep *ep);
 void afk_quiesce(struct apple_dcp_afkep *ep);
 int afk_receive_message(struct apple_dcp_afkep *ep, u64 message);

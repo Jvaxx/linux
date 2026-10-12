@@ -233,6 +233,40 @@ TRACE_EVENT(afk_recv_header,
 		      __print_hex(__entry->header, __entry->captured))
 );
 
+TRACE_EVENT(afk_ring_snapshot,
+	    TP_PROTO(struct apple_dcp_afkep *ep, bool rx_ready, u32 rx_rptr,
+		     u32 rx_wptr, u32 rx_size, bool tx_ready, u32 tx_rptr,
+		     u32 tx_wptr, u32 tx_size),
+	    TP_ARGS(ep, rx_ready, rx_rptr, rx_wptr, rx_size,
+		    tx_ready, tx_rptr, tx_wptr, tx_size),
+	    TP_STRUCT__entry(__string(devname, dev_name(ep->dcp->dev))
+			     __field(u8, endpoint)
+			     __field(bool, rx_ready)
+			     __field(u32, rx_rptr)
+			     __field(u32, rx_wptr)
+			     __field(u32, rx_size)
+			     __field(bool, tx_ready)
+			     __field(u32, tx_rptr)
+			     __field(u32, tx_wptr)
+			     __field(u32, tx_size)),
+	    TP_fast_assign(__assign_str(devname);
+			__entry->endpoint = ep->endpoint;
+			__entry->rx_ready = rx_ready;
+			__entry->rx_rptr = rx_rptr;
+			__entry->rx_wptr = rx_wptr;
+			__entry->rx_size = rx_size;
+			__entry->tx_ready = tx_ready;
+			__entry->tx_rptr = tx_rptr;
+			__entry->tx_wptr = tx_wptr;
+			__entry->tx_size = tx_size;
+	    ),
+	    TP_printk("%s: endpoint 0x%x rx_ready %u rx_rptr %#x rx_wptr %#x rx_size %#x tx_ready %u tx_rptr %#x tx_wptr %#x tx_size %#x",
+		      __get_str(devname), __entry->endpoint, __entry->rx_ready,
+		      __entry->rx_rptr, __entry->rx_wptr, __entry->rx_size,
+		      __entry->tx_ready, __entry->tx_rptr, __entry->tx_wptr,
+		      __entry->tx_size)
+);
+
 TRACE_EVENT(iomfb_ctm,
 	    TP_PROTO(struct apple_dcp *dcp, u32 location, const void *matrix, u8 matrix_null),
 	    TP_ARGS(dcp, location, matrix, matrix_null),

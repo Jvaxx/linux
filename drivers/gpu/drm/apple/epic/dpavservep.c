@@ -373,6 +373,7 @@ int dpavservep_init(struct apple_dcp *dcp)
 	ret = wait_for_completion_timeout(&dcp->dcpavserv.enable_completion,
 					  msecs_to_jiffies(1000));
 	if (!ret) {
+		afk_trace_ring_snapshot(ep);
 		dev_warn(dcp->dev, "DCPAVSERV: timed out waiting for EDID service announcement\n");
 		return -ETIMEDOUT;
 	}

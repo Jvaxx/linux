@@ -208,6 +208,37 @@ int afk_start(struct apple_dcp_afkep *ep)
 		return 0;
 }
 
+/* Read only host-owned ring headers; never consume an entry or notify firmware. */
+void afk_trace_ring_snapshot(struct apple_dcp_afkep *ep)
+{
+	unsigned long flags;
+	u32 rx_rptr = 0, rx_wptr = 0, tx_rptr = 0, tx_wptr = 0;
+	bool rx_ready, tx_ready;
+
+	if (!ep || !ep->inline_v2 || !trace_afk_ring_snapshot_enabled())
+		return;
+	spin_lock_irqsave(&ep->lock, flags);
+	if (ep->stopping) {
+		spin_unlock_irqrestore(&ep->lock, flags);
+		return;
+	}
+	rx_ready = READ_ONCE(ep->rxbfr.ready) && ep->rxbfr.rptr && ep->rxbfr.wptr;
+	tx_ready = READ_ONCE(ep->txbfr.ready) && ep->txbfr.rptr && ep->txbfr.wptr;
+	dma_rmb();
+	if (rx_ready) {
+		rx_rptr = le32_to_cpu(READ_ONCE(*ep->rxbfr.rptr));
+		rx_wptr = le32_to_cpu(READ_ONCE(*ep->rxbfr.wptr));
+	}
+	if (tx_ready) {
+		tx_rptr = le32_to_cpu(READ_ONCE(*ep->txbfr.rptr));
+		tx_wptr = le32_to_cpu(READ_ONCE(*ep->txbfr.wptr));
+	}
+	trace_afk_ring_snapshot(ep, rx_ready, rx_rptr, rx_wptr,
+				READ_ONCE(ep->rxbfr.bufsz), tx_ready, tx_rptr,
+				tx_wptr, READ_ONCE(ep->txbfr.bufsz));
+	spin_unlock_irqrestore(&ep->lock, flags);
+}
+
 static void afk_getbuf(struct apple_dcp_afkep *ep, u64 message)
 {
 	u32 size = FIELD_GET(GETBUF_SIZE, message) << BLOCK_SHIFT;

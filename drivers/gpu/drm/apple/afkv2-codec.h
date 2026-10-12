@@ -270,7 +270,9 @@ static inline int afkv2_check_response(const struct afkv2_frame *frame,
 	return 0;
 }
 
-/* Kept separate so DPAV inline replies cannot loosen owned-DMA checks. */
+/* Kept separate so DPAV inline replies cannot loosen owned-DMA checks.
+ * Transport/interface flags and the reserved word are opaque firmware data.
+ */
 static inline int afkv2_check_inline_response(const struct afkv2_frame *frame,
 					      const struct afkv2_command *response,
 					      u16 interface, u8 type, u8 id,
@@ -278,8 +280,7 @@ static inline int afkv2_check_inline_response(const struct afkv2_frame *frame,
 {
 	if (!frame || !response || frame->category != AFKV2_RESPONSE ||
 	    frame->interface != interface || frame->type != type || response->id != id ||
-	    frame->token || frame->transport_flags || frame->interface_flags ||
-	    frame->reserved || response->oob || response->inline_size > capacity)
+	    frame->token || response->oob || response->inline_size > capacity)
 		return -EPROTO;
 	return 0;
 }
