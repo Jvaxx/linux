@@ -932,15 +932,23 @@ static void afk_v2_receive(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 	spin_lock_irqsave(&service->lock, flags);
 	ret = -EPROTO;
 	if (slot < MAX_PENDING_CMDS && test_bit(slot, service->cmd_map) &&
-	    !service->cmds[slot].done && response.id == service->cmds[slot].tag)
-		ret = afkv2_check_response(&frame, &response, service->channel,
-					   service->cmds[slot].type, service->cmds[slot].tag,
-					   service->cmds[slot].rxbuf_dma,
-					   service->cmds[slot].rxlen,
-					   service->cmds[slot].txbuf_dma,
-					   service->cmds[slot].txlen);
-	if (!ret)
-		service->cmds[slot].reply_length = response.value ? 0 : response.rx_size;
+	    !service->cmds[slot].done && response.id == service->cmds[slot].tag) {
+		struct epic_cmd_info *cmd = &service->cmds[slot];
+
+		if (ep->inline_v2)
+			ret = afkv2_check_inline_response(&frame, &response, service->channel,
+							  cmd->type, cmd->tag, cmd->rxlen);
+		else
+			ret = afkv2_check_response(&frame, &response, service->channel,
+						   cmd->type, cmd->tag, cmd->rxbuf_dma,
+						   cmd->rxlen, cmd->txbuf_dma, cmd->txlen);
+		if (!ret) {
+			cmd->reply_length = response.value ? 0 :
+				(ep->inline_v2 ? response.inline_size : response.rx_size);
+			if (ep->inline_v2 && !response.value && cmd->reply_length)
+				memcpy(cmd->rxbuf, response.inline_data, cmd->reply_length);
+		}
+	}
 	spin_unlock_irqrestore(&service->lock, flags);
 	if (!ret) {
 		legacy.retcode = cpu_to_le32(response.value);
@@ -1315,20 +1323,29 @@ static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 				return -EOPNOTSUPP;
 			v2_flags = 1;
 		} else if (ecat == EPIC_CAT_COMMAND) {
-			const struct epic_cmd *cmd = payload;
+			if (ep->inline_v2) {
+				struct afkv2_command command;
 
-			if (stype != EPIC_SUBTYPE_STD_SERVICE || !cmd ||
-			    payload_len != sizeof(*cmd))
-				return -EINVAL;
-			ret = afkv2_encode_oob_command(v2_command, sizeof(v2_command), tag,
-						       le64_to_cpu(cmd->rxbuf),
-						       le32_to_cpu(cmd->rxlen),
-						       le64_to_cpu(cmd->txbuf),
-						       le32_to_cpu(cmd->txlen));
-			if (ret)
-				return ret;
-			payload = v2_command;
-			payload_len = sizeof(v2_command);
+				if (stype != EPIC_SUBTYPE_STD_SERVICE ||
+				    afkv2_decode_command(payload, payload_len, &command) ||
+				    command.oob || command.id != tag)
+					return -EINVAL;
+			} else {
+				const struct epic_cmd *cmd = payload;
+
+				if (stype != EPIC_SUBTYPE_STD_SERVICE || !cmd ||
+				    payload_len != sizeof(*cmd))
+					return -EINVAL;
+				ret = afkv2_encode_oob_command(v2_command, sizeof(v2_command), tag,
+							       le64_to_cpu(cmd->rxbuf),
+							       le32_to_cpu(cmd->rxlen),
+							       le64_to_cpu(cmd->txbuf),
+							       le32_to_cpu(cmd->txlen));
+				if (ret)
+					return ret;
+				payload = v2_command;
+				payload_len = sizeof(v2_command);
+			}
 			v2_category = AFKV2_COMMAND;
 		} else if (ecat == EPIC_CAT_REPLY) {
 			v2_category = AFKV2_RESPONSE;
@@ -1564,6 +1581,8 @@ int afk_send_command_timeout(struct apple_epic_service *service, u8 type,
 			     unsigned int timeout_ms)
 {
 	struct epic_cmd cmd;
+	void *inline_command = NULL;
+	size_t copy_len = output_len;
 	void *rxbuf, *txbuf;
 	dma_addr_t rxbuf_dma, txbuf_dma;
 	unsigned long flags;
@@ -1611,6 +1630,17 @@ int afk_send_command_timeout(struct apple_epic_service *service, u8 type,
 	}
 
 	memcpy(txbuf, payload, payload_len);
+	if (ep->inline_v2) {
+		if (payload_len > AFKV2_MAX_PAYLOAD - AFKV2_COMMAND_SIZE) {
+			ret = -E2BIG;
+			goto err_free_txbuf;
+		}
+		inline_command = kmalloc(AFKV2_COMMAND_SIZE + payload_len, GFP_KERNEL);
+		if (!inline_command) {
+			ret = -ENOMEM;
+			goto err_free_txbuf;
+		}
+	}
 
 	memset(&cmd, 0, sizeof(cmd));
 	cmd.retcode = cpu_to_le32(0);
@@ -1650,9 +1680,21 @@ int afk_send_command_timeout(struct apple_epic_service *service, u8 type,
 	service->cmds[idx].completion = &completion;
 	init_completion(&completion);
 
-	ret = afk_send_epic(service->ep, service->channel, tag,
-			    EPIC_TYPE_COMMAND, EPIC_CAT_COMMAND, type, &cmd,
-			    sizeof(cmd));
+	if (ep->inline_v2) {
+		ret = afkv2_encode_inline_command(inline_command,
+						  AFKV2_COMMAND_SIZE + payload_len,
+						  tag, payload, payload_len, output_len);
+		if (!ret)
+			ret = afk_send_epic(ep, service->channel, tag, EPIC_TYPE_COMMAND,
+					    EPIC_CAT_COMMAND, type, inline_command,
+					    AFKV2_COMMAND_SIZE + payload_len);
+	} else {
+		ret = afk_send_epic(service->ep, service->channel, tag,
+				    EPIC_TYPE_COMMAND, EPIC_CAT_COMMAND, type, &cmd,
+				    sizeof(cmd));
+	}
+	kfree(inline_command);
+	inline_command = NULL;
 	spin_unlock_irqrestore(&service->lock, flags);
 	if (ret)
 		goto err_free_cmd;
@@ -1715,7 +1757,7 @@ int afk_send_command_timeout(struct apple_epic_service *service, u8 type,
 		}
 	} else if (output && output_len) {
 	if (ep->wire_v2 && !service->cmds[idx].retcode &&
-	    service->cmds[idx].reply_length < output_len)
+	    service->cmds[idx].reply_length < copy_len)
 		ret = -EMSGSIZE;
 	else if (output && output_len && (!ep->wire_v2 || !service->cmds[idx].retcode)) {
 		if (ep->wire_v2)
@@ -1729,6 +1771,8 @@ err_free_cmd:
 	bitmap_release_region(service->cmd_map, idx, 0);
 err_unlock:
 	spin_unlock_irqrestore(&service->lock, flags);
+err_free_txbuf:
+	kfree(inline_command);
 	dma_free_coherent(ep->dcp->dev, payload_len, txbuf, txbuf_dma);
 err_free_rxbuf:
 	dma_free_coherent(ep->dcp->dev, output_len, rxbuf, rxbuf_dma);
@@ -1778,6 +1822,22 @@ static int afk_service_call_full(struct apple_epic_service *service, u16 group,
 					output_pad, MSEC_PER_SEC);
 }
 
+static int afk_service_call_timeout_len(struct apple_epic_service *service, u16 group,
+					u32 command, const void *data, size_t data_len,
+					size_t data_pad, void *output, size_t output_len,
+					size_t output_pad, unsigned int timeout_ms,
+					size_t *received);
+
+int afk_service_call_len(struct apple_epic_service *service, u16 group,
+			 u32 command, const void *data, size_t data_len,
+			 size_t data_pad, void *output, size_t output_len,
+			 size_t output_pad, size_t *received)
+{
+	return afk_service_call_timeout_len(service, group, command, data, data_len,
+					    data_pad, output, output_len, output_pad,
+					    MSEC_PER_SEC, received);
+}
+
 int afk_service_call_timeout(struct apple_epic_service *service, u16 group,
 			     u32 command, const void *data, size_t data_len,
 			     size_t data_pad, void *output, size_t output_len,
@@ -1811,11 +1871,17 @@ int afk_service_call_timeout(struct apple_epic_service *service, u16 group,
 	memset(call, 0, sizeof(*call));
 	call->group = cpu_to_le16(group);
 	call->command = cpu_to_le32(command);
-	call->data_len = cpu_to_le32(data_len + data_pad);
+	call->data_len = cpu_to_le32(service->ep->inline_v2 ? data_len :
+				   data_len + data_pad);
 	call->magic = cpu_to_le32(EPIC_SERVICE_CALL_MAGIC);
 
 	memcpy(bfr + sizeof(*call), data, data_len);
 
+	/* Inline carries only the request; its response capacity is independent. */
+	ret = afk_send_command_timeout_len(service, EPIC_SUBTYPE_STD_SERVICE, bfr,
+					   service->ep->inline_v2 ? sizeof(*call) + data_len :
+					   bfr_len, bfr, bfr_len, &retcode, timeout_ms,
+					   received ? &wire_received : NULL);
 	ret = afk_send_command_full(service, EPIC_SUBTYPE_STD_SERVICE, bfr,
 				    bfr_len, bfr, bfr_len, &retcode,
 				    reply_len ? &received : NULL, timeout_ms);
@@ -1839,6 +1905,12 @@ int afk_service_call_timeout(struct apple_epic_service *service, u16 group,
 		ret = afk_reply_size_valid(true, received, bfr_len, sizeof(*call));
 		if (ret)
 			goto out;
+	if (received) {
+		ret = afkv2_service_reply_size(bfr, wire_received, group, command,
+					       output_len, &result_size);
+		if (ret)
+			goto out;
+		*received = result_size;
 	}
 	if (le32_to_cpu(call->magic) != EPIC_SERVICE_CALL_MAGIC ||
 	    le16_to_cpu(call->group) != group ||

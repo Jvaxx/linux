@@ -1306,6 +1306,10 @@ int dcp_get_modes(struct drm_connector *connector)
 	mutex_unlock(&dcp->modes_lock);
 	drm_connector_set_vrr_capable_property(connector, vrr_capable);
 
+	/* Internal H17P still has no supported EDID command transport. */
+	if (dcp->nr_modes && !apple_connector->drm_edid &&
+	    (dcp->fw_compat != DCP_FIRMWARE_H17P ||
+	     (dcp->dcpavservep && dcp->dcpavservep->inline_v2))) {
 	if (count) {
 		const struct drm_edid *edid;
 		edid = dcpavserv_copy_edid(dcp);

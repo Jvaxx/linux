@@ -92,6 +92,29 @@ struct apple_epic_service_ops {
 	void (*teardown)(struct apple_epic_service *service);
 };
 
+static inline int afk_ring_stride(u32 total, u32 bufsz, u32 *stride)
+{
+	u32 header, block;
+
+	if (bufsz >= total)
+		return -EINVAL;
+	header = total - bufsz;
+	block = header / 3;
+	if (header % 3 || block < 0x40 || block % 0x40 ||
+	    bufsz < block || bufsz % block)
+		return -EINVAL;
+
+	*stride = block;
+	return 0;
+}
+
+static inline u32 afk_ring_advance(u32 ptr, u32 bytes, u32 bufsz,
+				   u32 stride)
+{
+	u32 next = roundup(ptr + bytes, stride);
+
+	return next == bufsz ? 0 : next;
+}
 static inline struct apple_epic_service *afk_service_get(struct apple_epic_service *service)
 {
 	unsigned long flags;
@@ -208,29 +231,6 @@ struct afk_ringbuffer_header {
 	__le32 wptr;
 	u32 _pad3[15];
 };
-static inline int afk_ring_stride(u32 total, u32 bufsz, u32 *stride)
-{
-	u32 header, block;
-
-	if (bufsz >= total)
-		return -EINVAL;
-	header = total - bufsz;
-	block = header / 3;
-	if (header % 3 || block < 0x40 || block % 0x40 ||
-	    bufsz < block || bufsz % block)
-		return -EINVAL;
-
-	*stride = block;
-	return 0;
-}
-
-static inline u32 afk_ring_advance(u32 ptr, u32 bytes, u32 bufsz,
-				   u32 stride)
-{
-	u32 next = roundup(ptr + bytes, stride);
-
-	return next == bufsz ? 0 : next;
-}
 
 struct afk_qe {
 #define QE_MAGIC 0x20504f49 // ' POI'
@@ -328,12 +328,12 @@ struct afk_ringbuffer {
 
 struct apple_dcp_afkep {
 	struct apple_dcp *dcp;
-	/* Bounded external protocol observations, owned by the RX worker. */
-	u8 experimental_rx_logs;
 
 	u32 endpoint;
 	/* Set before afk_start; protocol selection is per endpoint. */
 	bool wire_v2;
+	/* External H17P DPAV only; other endpoints retain owned-DMA commands. */
+	bool inline_v2;
 	struct workqueue_struct *wq;
 
 	struct completion started;
@@ -395,4 +395,9 @@ int afk_service_call_with_reply_len(struct apple_epic_service *service,
 		u16 group, u32 command, const void *data, size_t data_len,
 		size_t data_pad, void *output, size_t output_len,
 		size_t output_pad, size_t *reply_len);
+int afk_service_call_len(struct apple_epic_service *service, u16 group,
+			 u32 command, const void *data, size_t data_len,
+			 size_t data_pad, void *output, size_t output_len,
+			 size_t output_pad, size_t *received);
+
 #endif

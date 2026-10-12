@@ -3,3 +3,8 @@
 #define ENOSPC 28
 #define E2BIG 7
 #define EPROTO 71
+#define EIO 5
+#define EMSGSIZE 90
+#define ENODEV 19
+#define ETIMEDOUT 110
+#define ENOMEM 12
