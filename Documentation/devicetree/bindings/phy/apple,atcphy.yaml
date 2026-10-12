@@ -50,6 +50,9 @@ allOf:
         reg-names:
           maxItems: 5
         apple,tunable-usb2phy-reg-dflt: false
+        apple,tunable-dp-common-pre: false
+        apple,tunable-dp-lpdptx: false
+        apple,tunable-dp-common-post: false
 
 $defs:
   apple,tunable:
@@ -178,6 +181,27 @@ properties:
 
       Note that lane here refers to a USB RX and TX pair re-used for DisplayPort
       and not to an individual DisplayPort differential lane.
+
+  apple,tunable-dp-common-pre:
+    $ref: "#/$defs/apple,tunable"
+    maxItems: 5461
+    description: >
+      T8140 DisplayPort core setup applied before the LPDPTX list. The
+      bootloader supplies device-specific values for the core register region.
+
+  apple,tunable-dp-lpdptx:
+    $ref: "#/$defs/apple,tunable"
+    maxItems: 5461
+    description: >
+      T8140 DisplayPort setup for the lpdptx register region, applied between
+      the common-pre and common-post lists.
+
+  apple,tunable-dp-common-post:
+    $ref: "#/$defs/apple,tunable"
+    maxItems: 5461
+    description: >
+      T8140 DisplayPort core setup applied after the LPDPTX list. All three
+      DisplayPort lists are needed before selecting a DisplayPort PHY mode.
 
   apple,tunable-usb2phy-reg-dflt:
     $ref: "#/$defs/apple,tunable"
