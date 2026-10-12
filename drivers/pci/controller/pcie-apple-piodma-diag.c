@@ -168,10 +168,14 @@ static int apple_piodma_pm_notify(struct notifier_block *nb,
 
 	switch (action) {
 	case PM_SUSPEND_PREPARE:
-		if (pm_suspend_no_platform() && READ_ONCE(diag->ready) &&
-		    smp_load_acquire(&diag->radio_admitted))
-			return NOTIFY_DONE;
-		fallthrough;
+		/*
+		 * The suspend core marks suspend-to-idle only after these
+		 * notifiers have run, so pm_suspend_no_platform() is still
+		 * false here for every suspend. apple_piodma_pm_prepare()
+		 * makes the same check once the target state is known, and
+		 * still vetoes everything but suspend-to-idle.
+		 */
+		return NOTIFY_DONE;
 	case PM_HIBERNATION_PREPARE:
 	case PM_RESTORE_PREPARE:
 		dev_warn_ratelimited(diag->dev,
