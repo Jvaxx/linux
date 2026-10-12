@@ -1875,6 +1875,8 @@ static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *dcp, u8 endpoint)
 		return dcp->dcpavservep;
 	case DPTX_ENDPOINT:
 		return dcp->dptxep;
+	case DPTX_CONTROLLER_ENDPOINT:
+		return dcp->dptx_controller_ep;
 	default:
 		return NULL;
 	}
@@ -1957,6 +1959,9 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 		break;
 	case DPTX_ENDPOINT:
 		ep = dcp->dptxep;
+		break;
+	case DPTX_CONTROLLER_ENDPOINT:
+		ep = dcp->dptx_controller_ep;
 		break;
 	default:
 		ep = NULL;
@@ -2570,6 +2575,14 @@ int dcp_start(struct platform_device *pdev)
 		if (ret)
 			dev_warn(dcp->dev, "Failed to start IBOOT endpoint: %d\n",
 				 ret);
+
+		if (dcp->hw.iomfb_method_profile ==
+		    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL) {
+			ret = dptx_controller_init(dcp);
+			if (ret)
+				return dev_err_probe(dcp->dev, ret,
+						     "Failed to start DPTX controller\n");
+		}
 
 		ret = dptxep_init(dcp);
 		if (ret) {
@@ -3601,6 +3614,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 		iomfb_queue_stop(dcp);
 		afk_quiesce(dcp->avep);
 		afk_quiesce(dcp->dptxep);
+		afk_quiesce(dcp->dptx_controller_ep);
 		afk_quiesce(dcp->ibootep);
 		afk_quiesce(dcp->systemep);
 		afk_quiesce(dcp->dcpavservep);
@@ -3635,6 +3649,11 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 	if (dcp->dptxep) {
 		afk_shutdown(dcp->dptxep);
 		dcp->dptxep = NULL;
+	}
+
+	if (!IS_ERR_OR_NULL(dcp->dptx_controller_ep)) {
+		afk_shutdown(dcp->dptx_controller_ep);
+		dcp->dptx_controller_ep = NULL;
 	}
 
 	if (dcp->ibootep) {
