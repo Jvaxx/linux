@@ -2030,6 +2030,7 @@ F:	tools/diagnostics/apple-dptx-training-test.c
 F:	tools/diagnostics/apple-j700-dp-test.c
 F:	tools/diagnostics/test-apple-j700-crossbar.py
 F:	tools/diagnostics/test-apple-j700-dp.py
+F:	tools/diagnostics/test-apple-j700-tuning.py
 F:	tools/testing/apple/
 
 APPLETALK NETWORK LAYER
