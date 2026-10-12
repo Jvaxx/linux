@@ -823,6 +823,23 @@ void dcp_hotplug(struct work_struct *work)
 	apple_connector_backlight_sync(connector);
 }
 
+/*
+ * J700/25G83 asks D134 after publishing its external video interface.
+ * The observed async record has no input and a four-byte result. Use the
+ * existing zero reply for this record only; its feature remains unsupported.
+ */
+static bool dcp_external_zero_reply(struct apple_dcp *dcp, int tag,
+				    enum dcp_context_id context,
+				    u32 in_len, u32 out_len)
+{
+	return tag == 134 && context == DCP_CONTEXT_ASYNC &&
+	       in_len == 0 && out_len == sizeof(u32) &&
+	       dcp->hw.iomfb_method_profile ==
+	       DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL &&
+	       of_machine_is_compatible("apple,j700") &&
+	       of_device_is_compatible(dcp->dev->of_node, "apple,t8140-dcpext");
+}
+
 static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 			    void *data, u32 length, u16 offset)
 {
@@ -832,7 +849,7 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 	int tag;
 	struct dcp_channel *ch = dcp_get_channel(dcp, context);
 	u8 depth;
-	bool handled;
+	bool handled, zero_reply;
 
 	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
 	    (length < sizeof(*hdr) || !ch || ch->depth >= DCP_MAX_CALL_DEPTH ||
@@ -869,13 +886,16 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 	out = in + hdr->in_len;
 
 	if (!handled) {
-		if (!iomfb_uses_queue(dcp) ||
-		    !test_and_set_bit(tag, dcp->unknown_callbacks))
+		zero_reply = dcp_external_zero_reply(dcp, tag, context,
+						     hdr->in_len, hdr->out_len);
+		if (!zero_reply &&
+		    (!iomfb_uses_queue(dcp) ||
+		     !test_and_set_bit(tag, dcp->unknown_callbacks)))
 			dev_warn(dev, "received unknown callback %c%c%c%c (%u, %u) context=%u\n",
 				 hdr->tag[3], hdr->tag[2], hdr->tag[1], hdr->tag[0],
 				 hdr->in_len, hdr->out_len, context);
 		if (dcp->hw.iomfb_method_profile ==
-		    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL) {
+		    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL && !zero_reply) {
 			/* Retain the failed session without inventing a successful reply. */
 			dcp->crashed = true;
 			complete(&dcp->start_done);
