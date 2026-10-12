@@ -48,8 +48,16 @@ int main(void)
 	frame.token = 1;
 	CHECK(afkv2_check_inline_response(&frame, &reply, 4, 0xc0, 0x91, 136));
 	frame.token = 0;
-	frame.reserved = 1;
-	CHECK(afkv2_check_inline_response(&frame, &reply, 4, 0xc0, 0x91, 136));
+	/* R30 responses carry these opaque nonzero header fields. */
+	frame.transport_flags = 0x18;
+	frame.interface_flags = 0x0400;
+	frame.reserved = 0x3607ebe0;
+	CHECK(!afkv2_check_inline_response(&frame, &reply, 4, 0xc0, 0x91, 136));
+	/* Context and bounds remain mandatory even with opaque header values. */
+	CHECK(afkv2_check_inline_response(&frame, &reply, 4, 0xc0, 0x92, 136));
+	CHECK(afkv2_check_inline_response(&frame, &reply, 4, 0xc0, 0x91, 135));
+	frame.transport_flags = 0;
+	frame.interface_flags = 0;
 	frame.reserved = 0;
 	reply.oob = true;
 	CHECK(afkv2_check_inline_response(&frame, &reply, 4, 0xc0, 0x91, 136));
