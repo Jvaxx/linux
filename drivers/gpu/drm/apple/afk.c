@@ -922,15 +922,6 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 	payload_size = data_size - hdr_len;
 
 	trace_afk_recv_handle(ep, channel, type, data_size, ehdr, eshdr);
-	if (ep->dcp->hw.iomfb_method_profile ==
-	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL &&
-	    ep->experimental_rx_logs < 32) {
-		ep->experimental_rx_logs++;
-		dev_info(ep->dcp->dev,
-			 "external AFK ep=%u channel=%u type=%u subtype=%u category=%u bytes=%zu\n",
-			 ep->endpoint, channel, type, subtype, eshdr->category,
-			 data_size);
-	}
 
 
 	service = afk_epic_find_service(ep, channel);
@@ -1092,13 +1083,7 @@ static void afk_receive_message_worker(struct work_struct *work_)
 	work = container_of(work_, struct afk_receive_message_work, work);
 
 	type = FIELD_GET(RBEP_TYPE, work->message);
-	if (work->ep->dcp->hw.iomfb_method_profile ==
-	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL &&
-	    (work->ep->endpoint == DPTX_ENDPOINT ||
-	     work->ep->endpoint == DPTX_ENDPOINT_V2) && type != RBEP_RECV)
-		dev_info_ratelimited(work->ep->dcp->dev,
-				     "external AFK control ep=%#x type=%#x\n",
-				     work->ep->endpoint, type);
+
 	switch (type) {
 	case RBEP_INIT_ACK:
 		break;

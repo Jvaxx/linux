@@ -844,7 +844,7 @@ static void dptxport_init(struct apple_epic_service *service, const char *name,
 			return;
 		}
 		port = 0;
-		dev_info(dcp->dev, "DPTX physical unit %lld maps to logical port 0\n", unit);
+		dev_dbg(dcp->dev, "DPTX physical unit %lld maps to logical port 0\n", unit);
 	}
 
 	switch (port) {

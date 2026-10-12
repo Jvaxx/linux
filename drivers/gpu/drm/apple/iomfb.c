@@ -823,13 +823,7 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 	}
 
 	tag = dcp_parse_tag(hdr->tag);
-	if (dcp->hw.iomfb_method_profile ==
-	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL &&
-	    dcp->experimental_callback_logs < 64) {
-		dcp->experimental_callback_logs++;
-		dev_info(dev, "external IOMFB callback=%d in=%u out=%u context=%u\n",
-			 tag, hdr->in_len, hdr->out_len, context);
-	}
+
 
 	handled = tag >= 0 && tag < IOMFB_MAX_CB && dcp->cb_handlers &&
 		  dcp->cb_handlers[tag];
