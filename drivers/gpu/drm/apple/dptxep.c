@@ -419,9 +419,7 @@ static int dptxport_call_set_active_lane_count(struct apple_epic_service *servic
 		ret = dptx_j700_validate_lanes(dptx, lane_count);
 		if (ret)
 			return ret;
-	}
-
-	if (dptx->lane_count < lane_count)
+	} else if (dptx->lane_count < lane_count)
 		dev_err(dcp->dev, "set_active_lane_count: unexpected lane "
 			"count:%llu phy: %d\n", lane_count, dptx->lane_count);
 
