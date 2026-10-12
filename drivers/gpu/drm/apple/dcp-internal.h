@@ -103,6 +103,7 @@ struct dcp_chunks {
 	void *data;
 	size_t received;
 	bool contiguous;
+	bool payload_complete;
 	struct dcp_metadata_ticket metadata_ticket;
 };
 
