@@ -1727,6 +1727,9 @@ static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *dcp, u8 endpoint)
 		return dcp->dcpavservep;
 	case DPTX_ENDPOINT:
 		return dcp->dptxep;
+	case DPTX_ENDPOINT_V2:
+		return dcp->hw.iomfb_method_profile ==
+		       DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL ? dcp->dptx_v2_probe_ep : NULL;
 	case DPTX_CONTROLLER_ENDPOINT:
 		return dcp->dptx_controller_ep;
 	default:
@@ -1842,6 +1845,9 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 		break;
 	case DPTX_ENDPOINT:
 		ep = dcp->dptxep;
+		break;
+	case DPTX_ENDPOINT_V2:
+		ep = dcp->dptx_v2_probe_ep;
 		break;
 	case DPTX_CONTROLLER_ENDPOINT:
 		ep = dcp->dptx_controller_ep;
@@ -4490,6 +4496,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 		afk_quiesce(dcp->avep);
 		afk_quiesce(dcp->dptxep);
 		afk_quiesce(dcp->dptx_controller_ep);
+		afk_quiesce(dcp->dptx_v2_probe_ep);
 		afk_quiesce(dcp->ibootep);
 		afk_quiesce(dcp->systemep);
 		afk_quiesce(dcp->dcpavservep);
@@ -4541,6 +4548,11 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 	}
 
 	dcp_fabric_shutdown_dptx(dcp);
+
+	if (!IS_ERR_OR_NULL(dcp->dptx_v2_probe_ep)) {
+		afk_shutdown(dcp->dptx_v2_probe_ep);
+		dcp->dptx_v2_probe_ep = NULL;
+	}
 
 	if (!IS_ERR_OR_NULL(dcp->dptx_controller_ep)) {
 		afk_shutdown(dcp->dptx_controller_ep);
