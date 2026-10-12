@@ -1864,9 +1864,9 @@ void dcp_firmware_metadata_begin(struct apple_dcp *dcp)
 
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
 	dcp->chunks.metadata_ticket = dcp_metadata_begin(&dcp->metadata.epoch);
-	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 	dcp->chunks.received = 0;
 	dcp->chunks.contiguous = true;
+	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 }
 
 static void dcp_firmware_metadata_notify(struct apple_dcp *dcp)
