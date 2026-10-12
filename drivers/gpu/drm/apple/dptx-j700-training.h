@@ -3,6 +3,22 @@
 #ifndef APPLE_DPTX_J700_TRAINING_H
 #define APPLE_DPTX_J700_TRAINING_H
 
+/* Active lanes may be zero during the firmware's training reset. */
+static int dptx_j700_validate_lanes(struct dptx_port *port, u64 requested)
+{
+	union phy_configure_opts capacity = {};
+	int ret;
+
+	if (!port || !port->atcphy)
+		return -ENODEV;
+	if (requested > 4 || requested == 3)
+		return -EINVAL;
+	ret = phy_validate(port->atcphy, PHY_MODE_DP, 0, &capacity);
+	if (ret)
+		return ret;
+	return requested <= capacity.dp.lanes ? 0 : -EINVAL;
+}
+
 static int dptx_j700_training(struct apple_epic_service *service, bool write,
 			      const void *data, size_t size, void *reply, size_t room)
 {
