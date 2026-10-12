@@ -1682,7 +1682,8 @@ static void dcp_trace_metadata(struct apple_dcp *dcp, const char *phase, bool va
 		(dcp->metadata.attributes_valid ? BIT(3) : 0) |
 		(dcp->metadata.timing_valid ? BIT(4) : 0) |
 		(dcp->chunks.metadata_ticket.associated ? BIT(5) : 0) |
-		(dcp->chunks.contiguous ? BIT(6) : 0) | (valid ? BIT(7) : 0);
+		(dcp->chunks.contiguous ? BIT(6) : 0) | (valid ? BIT(7) : 0) |
+		(dcp->chunks.payload_complete ? BIT(8) : 0);
 
 	if (dcp_firmware_metadata_enabled(dcp))
 		trace_iomfb_metadata(dcp, phase, dcp->metadata.epoch.generation,
@@ -1734,6 +1735,7 @@ void dcp_firmware_metadata_begin(struct apple_dcp *dcp)
 	dcp->chunks.metadata_ticket = dcp_metadata_begin(&dcp->metadata.epoch);
 	dcp->chunks.received = 0;
 	dcp->chunks.contiguous = true;
+	dcp->chunks.payload_complete = false;
 	dcp_trace_metadata(dcp, "begin", dcp->chunks.metadata_ticket.associated);
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 }
@@ -1754,7 +1756,7 @@ static void dcp_firmware_metadata_notify(struct apple_dcp *dcp)
 
 static bool dcp_firmware_metadata_complete(struct apple_dcp *dcp)
 {
-	return dcp->chunks.contiguous && dcp->chunks.received == dcp->chunks.length &&
+	return dcp->chunks.contiguous && dcp->chunks.payload_complete &&
 	       dcp_metadata_matches(&dcp->metadata.epoch, dcp->chunks.metadata_ticket);
 }
 

@@ -342,6 +342,23 @@ int parse(const void *blob, size_t size, struct dcp_parse_ctx *ctx)
 	return 0;
 }
 
+bool dcp_property_complete(const void *blob, size_t received, size_t advertised)
+{
+	struct dcp_parse_ctx ctx;
+
+	if (!blob || !received || received > U32_MAX - 3 ||
+	    received > advertised || advertised - received > 1)
+		return false;
+	/* H17P may count one unsent byte after the aligned serialized object. */
+	if (advertised != received && (received & 3))
+		return false;
+	/* Bound decoding to bytes actually delivered, never allocation padding. */
+	if (parse(blob, received, &ctx) || skip(&ctx))
+		return false;
+	return ctx.pos == received || round_up(ctx.pos, 4) == received;
+}
+
+static int parse_dimension(struct dcp_parse_ctx *handle, struct dimension *dim, bool polarity)
 static int parse_dimension(struct dcp_parse_ctx *handle, struct dimension *dim,
 			   bool require_rate)
 {

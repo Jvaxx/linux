@@ -109,6 +109,7 @@ struct dimension {
 };
 
 int parse(const void *blob, size_t size, struct dcp_parse_ctx *ctx);
+bool dcp_property_complete(const void *blob, size_t received, size_t advertised);
 struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 					 unsigned int *count, int width_mm,
 					 int height_mm, unsigned notch_height,
