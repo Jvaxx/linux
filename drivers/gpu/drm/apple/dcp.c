@@ -352,6 +352,8 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 		route->port->secondary_connector : route->port->connector;
 	int ret;
 
+	dcp_firmware_metadata_connection(dcp, READ_ONCE(dcp->typec_generation), false);
+
 	/*
 	 * The fixed output's HPD handler leaves disconnects to DCP, so the port
 	 * can still be marked connected to a display that is gone. Release it
@@ -453,6 +455,8 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 	if (dcp_is_external_h17p(dcp) &&
 	    (dcp->external_error || (dcp->external_power_attempted && !dcp->external_stopped)))
 		return dcp->external_error ?: -EBUSY;
+
+	dcp_firmware_metadata_connection(dcp, READ_ONCE(dcp->typec_generation), false);
 
 	/*
 	 * Under tb_lock so a DCP link (re)configuration can neither select the
@@ -1815,6 +1819,168 @@ void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now)
 	spin_unlock_irqrestore(&crtc->base.dev->event_lock, flags);
 }
 
+static bool dcp_firmware_metadata_enabled(struct apple_dcp *dcp)
+{
+	return dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL;
+}
+
+void dcp_firmware_metadata_connection(struct apple_dcp *dcp, u64 generation, bool connected)
+{
+	unsigned long flags;
+
+	if (!dcp_firmware_metadata_enabled(dcp))
+		return;
+	spin_lock_irqsave(&dcp->metadata.lock, flags);
+	if (generation != dcp->metadata.epoch.generation || !connected) {
+		dcp->metadata.attributes_valid = false;
+		dcp->metadata.timing_valid = false;
+		dcp->metadata.hpd_seen = false;
+	}
+	dcp_metadata_epoch_connection(&dcp->metadata.epoch, generation, connected);
+	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+}
+
+void dcp_firmware_metadata_hotplug(struct apple_dcp *dcp, bool connected)
+{
+	unsigned long flags;
+
+	if (!dcp_firmware_metadata_enabled(dcp))
+		return;
+	spin_lock_irqsave(&dcp->metadata.lock, flags);
+	if (connected) {
+		dcp->metadata.hpd_seen = true;
+	} else if (dcp->metadata.hpd_seen) {
+		dcp_metadata_epoch_connection(&dcp->metadata.epoch,
+					      dcp->metadata.epoch.generation, false);
+		dcp->metadata.attributes_valid = false;
+		dcp->metadata.timing_valid = false;
+	}
+	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+}
+
+void dcp_firmware_metadata_begin(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&dcp->metadata.lock, flags);
+	dcp->chunks.metadata_ticket = dcp_metadata_begin(&dcp->metadata.epoch);
+	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+	dcp->chunks.received = 0;
+	dcp->chunks.contiguous = true;
+}
+
+static void dcp_firmware_metadata_notify(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+	bool ready;
+
+	spin_lock_irqsave(&dcp->metadata.lock, flags);
+	ready = dcp->metadata.attributes_valid && dcp->metadata.timing_valid &&
+		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.attributes_ticket) &&
+		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.timing_ticket);
+	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+	if (ready && dcp->connector && READ_ONCE(dcp->connector->connected))
+		schedule_work(&dcp->connector->hotplug_wq);
+}
+
+static bool dcp_firmware_metadata_complete(struct apple_dcp *dcp)
+{
+	return dcp->chunks.contiguous && dcp->chunks.received == dcp->chunks.length &&
+	       dcp_metadata_matches(&dcp->metadata.epoch, dcp->chunks.metadata_ticket);
+}
+
+void dcp_firmware_metadata_attributes(struct apple_dcp *dcp,
+				      const struct dcp_display_metadata *attributes)
+{
+	unsigned long flags;
+
+	if (!dcp_firmware_metadata_enabled(dcp))
+		return;
+	spin_lock_irqsave(&dcp->metadata.lock, flags);
+	if (dcp_metadata_matches(&dcp->metadata.epoch, dcp->chunks.metadata_ticket)) {
+		dcp->metadata.attributes_valid = attributes && dcp_firmware_metadata_complete(dcp);
+		if (dcp->metadata.attributes_valid) {
+			dcp->metadata.attributes = *attributes;
+			dcp->metadata.attributes_ticket = dcp->chunks.metadata_ticket;
+		}
+	}
+	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+	dcp_firmware_metadata_notify(dcp);
+}
+
+void dcp_firmware_metadata_timing(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+	unsigned int i;
+
+	if (!dcp_firmware_metadata_enabled(dcp))
+		return;
+	spin_lock_irqsave(&dcp->metadata.lock, flags);
+	if (!dcp_metadata_matches(&dcp->metadata.epoch, dcp->chunks.metadata_ticket))
+		goto unlock;
+	dcp->metadata.timing_valid = false;
+	if (!dcp_firmware_metadata_complete(dcp))
+		goto unlock;
+	for (i = 0; i < dcp->nr_modes; i++) {
+		if (!(dcp->modes[i].mode.type & DRM_MODE_TYPE_PREFERRED) ||
+		    !dcp->modes[i].metadata_timing_valid)
+			continue;
+		dcp->metadata.preferred = dcp->modes[i].mode;
+		dcp->metadata.timing_ticket = dcp->chunks.metadata_ticket;
+		dcp->metadata.timing_valid = true;
+		break;
+	}
+unlock:
+	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+	dcp_firmware_metadata_notify(dcp);
+}
+
+bool dcp_firmware_metadata_current(struct apple_dcp *dcp, u64 generation)
+{
+	unsigned long flags;
+	bool valid;
+
+	spin_lock_irqsave(&dcp->metadata.lock, flags);
+	valid = !dcp->metadata.epoch.invalidated && dcp->metadata.epoch.connected &&
+		generation == dcp->metadata.epoch.generation;
+	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+	return valid;
+}
+
+const struct drm_edid *dcp_firmware_edid(struct apple_dcp *dcp, u64 *generation)
+{
+	struct dcp_display_metadata attributes;
+	struct drm_display_mode preferred;
+	const struct drm_edid *edid;
+	unsigned long flags;
+	bool valid;
+
+	if (!dcp_firmware_metadata_enabled(dcp))
+		return ERR_PTR(-ENODEV);
+	spin_lock_irqsave(&dcp->metadata.lock, flags);
+	valid = dcp->metadata.attributes_valid && dcp->metadata.timing_valid &&
+		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.attributes_ticket) &&
+		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.timing_ticket);
+	if (valid) {
+		attributes = dcp->metadata.attributes;
+		preferred = dcp->metadata.preferred;
+		*generation = dcp->metadata.epoch.generation;
+	}
+	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+	if (!valid)
+		return ERR_PTR(-ENODATA);
+	edid = dcp_metadata_edid(&attributes, &preferred);
+	spin_lock_irqsave(&dcp->metadata.lock, flags);
+	valid = !dcp->metadata.epoch.invalidated && dcp->metadata.epoch.connected &&
+		*generation == dcp->metadata.epoch.generation;
+	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+	if (!valid && !IS_ERR(edid)) {
+		drm_edid_free(edid);
+		return ERR_PTR(-ESTALE);
+	}
+	return edid;
+}
+
 void dcp_set_dimensions(struct apple_dcp *dcp)
 {
 	int i;
@@ -2592,12 +2758,13 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
 
 static void disconnected_hpd_event(struct apple_connector *con)
 {
-	if (con && con->connected) {
-		con->connected = 0;
-		drm_edid_free(con->drm_edid);
-		con->drm_edid = NULL;
-		drm_kms_helper_connector_hotplug_event(&con->base);
-	}
+	if (!con)
+		return;
+
+	/* May run with DRM modeset locks held; defer property/cache cleanup. */
+	WRITE_ONCE(con->connected, false);
+	WRITE_ONCE(con->edid_invalidation_pending, true);
+	schedule_work(&con->hotplug_wq);
 }
 
 static int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port)
@@ -2644,6 +2811,7 @@ int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 		guard(mutex)(&dcp->hpd_mutex);
 		dcp->typec_generation++;
 		WRITE_ONCE(dcp->typec_cable_connected, true);
+		dcp_firmware_metadata_connection(dcp, dcp->typec_generation, true);
 		dcp->typec_reconnect_tries = 0;
 		dcp->placeholder_retried = false;
 		cancel_delayed_work(&dcp->typec_reconnect_wq);
@@ -2668,6 +2836,7 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 		scoped_guard(mutex, &dcp->hpd_mutex) {
 			WRITE_ONCE(dcp->typec_cable_connected, false);
 			dcp->typec_generation++;
+			dcp_firmware_metadata_connection(dcp, dcp->typec_generation, false);
 		}
 		WRITE_ONCE(dcp->typec_crtc_off, false);
 		reinit_completion(&dcp->typec_iomfb_hpd_ready);
@@ -3636,6 +3805,7 @@ static void dcp_disable_typec_work(struct apple_dcp *dcp, bool release_cable)
 		if (release_cable)
 			WRITE_ONCE(dcp->typec_cable_connected, false);
 		dcp->typec_generation++;
+		dcp_firmware_metadata_connection(dcp, dcp->typec_generation, false);
 	}
 	/* Block new enqueues as well as draining users of the AFK endpoints. */
 	disable_delayed_work_sync(&dcp->typec_reconnect_wq);
@@ -4028,6 +4198,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	INIT_WORK(&dcp->external_stop_work, dcp_external_stop_work);
 	mutex_init(&dcp->tb_lock);
 	spin_lock_init(&dcp->mode_state.lock);
+	spin_lock_init(&dcp->metadata.lock);
 	spin_lock_init(&dcp->dcpavserv.lock);
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
 	if (dcp->hw.iomfb_method_profile ==

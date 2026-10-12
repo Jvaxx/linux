@@ -933,6 +933,7 @@ static u8 dcpep_cb_prop_start(struct apple_dcp *dcp, u32 *length)
 #endif
 
 	dcp->chunks.length = *length;
+	dcp_firmware_metadata_begin(dcp);
 	dcp->chunks.data = kzalloc(*length, GFP_KERNEL);
 
 	if (!dcp->chunks.data) {
@@ -951,11 +952,17 @@ static u8 dcpep_cb_prop_chunk(struct apple_dcp *dcp,
 		return false;
 	}
 
-	if (req->offset + req->length > dcp->chunks.length) {
+	if (req->offset > dcp->chunks.length || req->length > sizeof(req->data) ||
+	    req->length > dcp->chunks.length - req->offset) {
+		dcp->chunks.contiguous = false;
 		dev_warn(dcp->dev, "ignoring overflowing chunk\n");
 		return false;
 	}
 
+	if (req->offset != dcp->chunks.received)
+		dcp->chunks.contiguous = false;
+	if (dcp->chunks.contiguous)
+		dcp->chunks.received += req->length;
 	memcpy(dcp->chunks.data + req->offset, req->data, req->length);
 	return true;
 }
@@ -994,11 +1001,15 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 			dev_warn(dcp->dev, "failed to parse modes\n");
 			dcp->modes = NULL;
 			dcp->nr_modes = 0;
+			dcp_firmware_metadata_timing(dcp);
 			return false;
 		}
 		if (dcp->nr_modes == 0)
 			dev_warn(dcp->dev, "TimingElements without valid modes!\n");
+		dcp_firmware_metadata_timing(dcp);
 	} else if (!strcmp(req->key, "DisplayAttributes")) {
+		struct dcp_parse_ctx metadata_ctx = ctx;
+
 		ret = parse_display_attributes(&ctx, &dcp->width_mm,
 					&dcp->height_mm);
 
@@ -1008,6 +1019,12 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 		}
 
 		dcp_set_dimensions(dcp);
+		if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL) {
+			struct dcp_display_metadata metadata;
+
+			ret = parse_display_metadata(&metadata_ctx, &metadata);
+			dcp_firmware_metadata_attributes(dcp, ret ? NULL : &metadata);
+		}
 	}
 
 	return true;
@@ -1875,6 +1892,7 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 	if (dcp_external_hotplug(dcp, !!(*connected)))
 		return;
 
+	dcp_firmware_metadata_hotplug(dcp, !!(*connected));
 	action = dcp_mode_hotplug(&dcp->mode_state, !!(*connected),
 				  connector ? &connector->connected : NULL);
 	/*
