@@ -970,6 +970,8 @@ static int dptxport_group_call(struct apple_epic_service *service, u16 group, u3
 {
 	if (group == 1 && command == DPTX_APCALL_SET_DRIVE_SETTINGS)
 		return dptx_j700_training(service, true, data, size, reply, room);
+	if (group == 1 && command == DPTX_APCALL_GET_DRIVE_SETTINGS)
+		return dptx_j700_training(service, false, data, size, reply, room);
 	if (group)
 		return -EOPNOTSUPP;
 	if (command == DPTX_APCALL_SET_DRIVE_SETTINGS)
