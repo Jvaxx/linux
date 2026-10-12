@@ -3,11 +3,26 @@
 #ifndef APPLE_ATC_J700_DP_H
 #define APPLE_ATC_J700_DP_H
 
+/* Retry only the idle operations claimed by an incomplete route change. */
+static int j700_dp_idle_pending(struct apple_atcphy *p)
+{
+	int ret;
+
+	for (unsigned int lane = 0; lane < 2; lane++) {
+		if (!(p->dp_idle_pmas & BIT(lane)))
+			continue;
+		ret = j700_pma_idle(p, lane);
+		if (ret)
+			return ret;
+		p->dp_idle_pmas &= ~BIT(lane);
+	}
+	return 0;
+}
+
 /* Preserve the upper routing state established by the platform firmware. */
 static int j700_dp_route(struct apple_atcphy *p, bool four_lanes)
 {
 	u32 protocols = four_lanes ? 0x492 : (p->swap_lanes ? 0x252 : 0x489);
-	int ret;
 
 	core_mask32(p, 0x60, 0xfff, protocols);
 	if (four_lanes) {
@@ -19,11 +34,9 @@ static int j700_dp_route(struct apple_atcphy *p, bool four_lanes)
 	for (unsigned int lane = 0; lane < 2; lane++) {
 		if (!four_lanes && lane != !p->swap_lanes)
 			continue;
-		ret = j700_pma_idle(p, lane);
-		if (ret)
-			return ret;
+		p->dp_idle_pmas |= BIT(lane);
 	}
-	return 0;
+	return j700_dp_idle_pending(p);
 }
 
 /* Register facts from the authorized J700 hardware audit. */
@@ -306,6 +319,9 @@ static int j700_dp_configure(struct apple_atcphy *p, const struct phy_configure_
 	guard(mutex)(&p->lock);
 	if ((o->set_rate && !o->link_rate) || (o->set_lanes && !o->lanes))
 		return o->set_voltages ? -EINVAL : j700_dp_stop(p);
+	/* The last completed mode cannot describe a partially changed lane route. */
+	if (p->mode_dirty)
+		return -EBUSY;
 	if (p->mode != APPLE_ATCPHY_MODE_DP && p->mode != APPLE_ATCPHY_MODE_USB3_DP)
 		return -EINVAL;
 	mode = atcphy_get_mode_config(p, p->mode);
