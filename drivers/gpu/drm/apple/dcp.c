@@ -2642,6 +2642,15 @@ bool dcp_external_hotplug(struct apple_dcp *dcp, bool connected)
 	if (dcp->iomfb.presentation_paused) {
 		dcp->external_hotplug_pending = true;
 		dcp->external_hotplug_connected = connected;
+		/* Publish discovery so DRM can activate the first CRTC; keep presents paused. */
+		if (connected && READ_ONCE(dcp->external_cable) &&
+		    !READ_ONCE(dcp->external_power_attempted) && !READ_ONCE(dcp->external_error)) {
+			unsigned int action = dcp_mode_hotplug(&dcp->mode_state, true,
+							     dcp->connector ?
+							     &dcp->connector->connected : NULL);
+
+			dcp_handle_hotplug_actions(dcp, action);
+		}
 		return true;
 	}
 	if (!connected && !READ_ONCE(dcp->iomfb.presentation_paused)) {
