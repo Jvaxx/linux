@@ -1572,7 +1572,8 @@ int iomfb_start_rtkit(struct apple_dcp *dcp)
 	 * has nothing answering it on the AP side, and without this one the
 	 * display DART faults.
 	 */
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL) {
 		ret = apple_rtkit_start_ep(dcp->rtk, REMOTE_ALLOC_ENDPOINT);
 		if (ret)
 			return ret;
