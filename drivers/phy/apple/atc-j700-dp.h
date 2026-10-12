@@ -303,9 +303,7 @@ static int j700_dp_configure(struct apple_atcphy *p, const struct phy_configure_
 	unsigned int pmas, capacity, first, table;
 	int rate = -1, ret;
 
-	dev_dbg(p->dev, "J700 DP configure waiting for PHY lock\n");
 	guard(mutex)(&p->lock);
-	dev_dbg(p->dev, "J700 DP configure acquired PHY lock\n");
 	if ((o->set_rate && !o->link_rate) || (o->set_lanes && !o->lanes))
 		return o->set_voltages ? -EINVAL : j700_dp_stop(p);
 	if (p->mode != APPLE_ATCPHY_MODE_DP && p->mode != APPLE_ATCPHY_MODE_USB3_DP)
