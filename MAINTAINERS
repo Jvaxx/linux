@@ -1960,6 +1960,7 @@ F:	drivers/gpu/drm/apple/
 F:	drivers/gpu/drm/apple/dcp-fabric*
 F:	include/linux/soc/apple/dp-tunnel.h
 F:	tools/testing/apple/
+F:	tools/testing/selftests/drivers/gpu/apple-afkv2/
 
 APPLE PCIE CONTROLLER DRIVER
 M:	Marc Zyngier <maz@kernel.org>

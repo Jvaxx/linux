@@ -18,6 +18,7 @@
 
 #include "afk.h"
 #include "afk_reply.h"
+#include "afkv2-codec.h"
 #include "trace.h"
 
 struct afk_receive_message_work {
@@ -355,6 +356,10 @@ static struct apple_epic_service *afk_epic_find_service(struct apple_dcp_afkep *
 	return NULL;
 }
 
+static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
+			       enum epic_type etype, enum epic_category ecat, u8 stype,
+			       const void *payload, size_t payload_len, u64 token);
+
 static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 				 u8 *payload, size_t payload_size)
 {
@@ -440,6 +445,22 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 		goto free;
 	}
 	ep->num_channels = max(ep->num_channels, ch_idx + 1);
+	if (ep->wire_v2) {
+		int ret = afk_send_epic(ep, channel, 0, EPIC_TYPE_NOTIFY,
+					EPIC_CAT_REPORT, AFKV2_OPEN, NULL, 0);
+
+		if (ret) {
+			unsigned long flags;
+
+			spin_lock_irqsave(&service->lock, flags);
+			service->enabled = false;
+			service->torndown = true;
+			spin_unlock_irqrestore(&service->lock, flags);
+			dev_err(ep->dcp->dev, "AFKV2 interface %u OPEN failed: %d\n",
+				channel, ret);
+			goto free;
+		}
+	}
 	ops->init(service, epic_name, epic_class, epic_unit);
 	dev_info(ep->dcp->dev, "AFK[ep:%02x]: new service %s on channel %d\n",
 		 ep->endpoint, service_name, channel);
@@ -489,7 +510,7 @@ static void afk_recv_handle_reply(struct apple_dcp_afkep *ep, u32 channel,
 	struct epic_cmd *cmd = payload;
 	struct apple_epic_service *service;
 	unsigned long flags;
-	u8 idx = tag & 0xff;
+	u8 idx = tag & (ep->wire_v2 ? 0xf : 0xff);
 	void *rxbuf, *txbuf;
 	dma_addr_t rxbuf_dma, txbuf_dma;
 	size_t rxlen, txlen;
@@ -671,6 +692,233 @@ static bool afk_validate_h17p_header(const u8 *data, size_t size)
 	       get_unaligned_le32(data + 4) == size - 8;
 }
 
+static void afk_v2_status(struct apple_dcp_afkep *ep,
+			  const struct afkv2_frame *frame,
+			  const struct afkv2_command *command, u32 status)
+{
+	u8 record[AFKV2_HEADER_SIZE + AFKV2_COMMAND_SIZE + AFKV2_OOB_SIZE];
+	size_t size;
+	int ret;
+
+	ret = afkv2_encode_error_reply(record, sizeof(record), 0, frame, command,
+				       status, &size);
+	if (!ret)
+		ret = afk_send_epic_token(ep, frame->interface, command->id,
+					  EPIC_TYPE_REPLY, EPIC_CAT_REPLY, frame->type,
+					  record + AFKV2_HEADER_SIZE,
+					  size - AFKV2_HEADER_SIZE, frame->token);
+	if (ret)
+		dev_warn(ep->dcp->dev, "AFKV2 error reply failed: %d\n", ret);
+}
+
+static int afk_v2_access_owned(struct apple_epic_service *service, u64 dva,
+			       void *buffer, size_t size, bool to_peer, bool copy)
+{
+	unsigned long flags;
+	unsigned int i;
+	int ret = -EACCES;
+
+	if (!service || !service->ep->wire_v2 || size > SZ_1M || (copy && size && !buffer))
+		return -EINVAL;
+	if (!size)
+		return 0;
+	spin_lock_irqsave(&service->lock, flags);
+	for (i = 0; i < MAX_PENDING_CMDS; i++) {
+		struct epic_cmd_info *cmd = &service->cmds[i];
+		void *owned = NULL;
+		u64 offset;
+
+		if (!test_bit(i, service->cmd_map) || cmd->done)
+			continue;
+		if (cmd->rxbuf && afkv2_owned_span(cmd->rxbuf_dma, cmd->rxlen, dva, size)) {
+			offset = dva - cmd->rxbuf_dma;
+			owned = cmd->rxbuf + offset;
+		} else if (cmd->txbuf && afkv2_owned_span(cmd->txbuf_dma, cmd->txlen, dva, size)) {
+			offset = dva - cmd->txbuf_dma;
+			owned = cmd->txbuf + offset;
+		}
+		if (!owned)
+			continue;
+		if (!copy) {
+			ret = 0;
+			break;
+		}
+		if (to_peer) {
+			memcpy(owned, buffer, size);
+			dma_wmb();
+		} else {
+			dma_rmb();
+			memcpy(buffer, owned, size);
+		}
+		ret = 0;
+		break;
+	}
+	spin_unlock_irqrestore(&service->lock, flags);
+	if (ret)
+		dev_warn_ratelimited(service->ep->dcp->dev,
+				     "AFKV2 unowned buffer: ep=%u interface=%u size=%zu write=%u\n",
+				     service->ep->endpoint, service->channel, size, to_peer);
+	return ret;
+}
+
+int afk_v2_copy_owned(struct apple_epic_service *service, u64 dva,
+		      void *buffer, size_t size, bool to_peer)
+{
+	return afk_v2_access_owned(service, dva, buffer, size, to_peer, true);
+}
+
+static void afk_v2_callback(struct apple_dcp_afkep *ep,
+			    const struct afkv2_frame *frame,
+			    const struct afkv2_command *command)
+{
+	struct apple_epic_service *service;
+	const struct epic_service_call *call;
+	const u8 *request = command->inline_data;
+	u8 *owned_request = NULL, *reply = NULL;
+	size_t request_size = command->oob ? command->tx_size : command->inline_size;
+	size_t body_size, reply_size;
+	u32 status = 0xe00002c7;
+	int ret;
+
+	if (frame->type != EPIC_SUBTYPE_STD_SERVICE ||
+	    request_size < sizeof(*call) + sizeof(u32) ||
+	    request_size > SZ_1M - AFKV2_COMMAND_SIZE ||
+	    request_size > command->value ||
+	    (command->oob && request_size > command->rx_size))
+		goto reject;
+	service = afk_service_get(afk_epic_find_service(ep, frame->interface));
+	if (!service || READ_ONCE(service->torndown) || !service->ops->call) {
+		if (service)
+			afk_service_put(service);
+		goto reject;
+	}
+	if (command->oob) {
+		/* Reject an unowned response destination before any callback side effect. */
+		ret = afk_v2_access_owned(service, command->rx_address, NULL,
+					  request_size, true, false);
+		if (ret)
+			goto release;
+		owned_request = kmalloc(request_size, GFP_KERNEL);
+		if (!owned_request) {
+			status = 0xe00002bd;
+			goto release;
+		}
+		ret = afk_v2_copy_owned(service, command->tx_address,
+					owned_request, request_size, false);
+		if (ret)
+			goto release;
+		request = owned_request;
+	}
+	call = (const void *)request;
+	body_size = request_size - sizeof(*call);
+	if (le16_to_cpu(call->group) ||
+	    le32_to_cpu(call->magic) != EPIC_SERVICE_CALL_MAGIC ||
+	    le32_to_cpu(call->data_len) != body_size)
+		goto release;
+	reply = kzalloc(AFKV2_COMMAND_SIZE + request_size, GFP_KERNEL);
+	if (!reply) {
+		status = 0xe00002bd;
+		goto release;
+	}
+	reply[1] = command->id;
+	memcpy(reply + AFKV2_COMMAND_SIZE, call, sizeof(*call));
+	ret = service->ops->call(service, le32_to_cpu(call->command),
+				 request + sizeof(*call), body_size,
+				 reply + AFKV2_COMMAND_SIZE + sizeof(*call), body_size);
+	if (ret)
+		goto release;
+	reply_size = AFKV2_COMMAND_SIZE + request_size;
+	if (command->oob) {
+		ret = afk_v2_copy_owned(service, command->rx_address,
+					reply + AFKV2_COMMAND_SIZE, request_size, true);
+		if (ret)
+			goto release;
+		ret = afkv2_encode_oob_command(reply, reply_size, command->id,
+					       command->rx_address, request_size,
+					       command->tx_address, command->tx_size);
+		if (ret)
+			goto release;
+		afkv2_put32(reply + 4, 0);
+		reply_size = AFKV2_COMMAND_SIZE + AFKV2_OOB_SIZE;
+	}
+	ret = afk_send_epic_token(ep, frame->interface, command->id, EPIC_TYPE_REPLY,
+				  EPIC_CAT_REPLY, frame->type, reply, reply_size, frame->token);
+	kfree(reply);
+	kfree(owned_request);
+	afk_service_put(service);
+	if (ret)
+		dev_warn(ep->dcp->dev, "AFKV2 callback reply failed: %d\n", ret);
+	return;
+release:
+	kfree(reply);
+	kfree(owned_request);
+	afk_service_put(service);
+reject:
+	afk_v2_status(ep, frame, command, status);
+}
+
+static void afk_v2_receive(struct apple_dcp_afkep *ep, u32 channel, u32 type,
+			   const void *data, size_t size)
+{
+	struct afkv2_frame frame;
+	struct afkv2_command response;
+	struct apple_epic_service *service;
+	struct epic_cmd legacy = {};
+	unsigned long flags;
+	unsigned int slot;
+	int ret;
+
+	if (channel || type || afkv2_decode_frame(data, size, false, &frame) ||
+	    !frame.interface)
+		return;
+	if (frame.category == AFKV2_REPORT) {
+		if (frame.type == EPIC_SUBTYPE_ANNOUNCE_H17P)
+			afk_recv_handle_init(ep, frame.interface, (void *)frame.payload,
+					     frame.payload_size);
+		else if (frame.type == AFKV2_CLOSE && frame.interface_flags == 1)
+			afk_recv_handle_teardown(ep, frame.interface);
+		return;
+	}
+	if (afkv2_decode_command(frame.payload, frame.payload_size, &response))
+		return;
+	if (frame.category == AFKV2_COMMAND) {
+		afk_v2_callback(ep, &frame, &response);
+		return;
+	}
+	service = afk_epic_find_service(ep, frame.interface);
+	if (!service)
+		return;
+	spin_lock_irqsave(&service->lock, flags);
+	if (bitmap_empty(service->cmd_map, MAX_PENDING_CMDS)) {
+		spin_unlock_irqrestore(&service->lock, flags);
+		return;
+	}
+	service->users++;
+	spin_unlock_irqrestore(&service->lock, flags);
+	slot = response.id & 0xf;
+	spin_lock_irqsave(&service->lock, flags);
+	ret = -EPROTO;
+	if (slot < MAX_PENDING_CMDS && test_bit(slot, service->cmd_map) &&
+	    !service->cmds[slot].done && response.id == service->cmds[slot].tag)
+		ret = afkv2_check_response(&frame, &response, service->channel,
+					   service->cmds[slot].type, service->cmds[slot].tag,
+					   service->cmds[slot].rxbuf_dma,
+					   service->cmds[slot].rxlen,
+					   service->cmds[slot].txbuf_dma,
+					   service->cmds[slot].txlen);
+	if (!ret)
+		service->cmds[slot].reply_length = response.value ? 0 : response.rx_size;
+	spin_unlock_irqrestore(&service->lock, flags);
+	if (!ret) {
+		legacy.retcode = cpu_to_le32(response.value);
+		afk_recv_handle_reply(ep, frame.interface, response.id,
+				      &legacy, sizeof(legacy));
+	} else {
+		dev_warn(ep->dcp->dev, "AFKV2 reply rejected: %d\n", ret);
+	}
+	afk_service_put(service);
+}
+
 static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 			    u8 *data, size_t data_size)
 {
@@ -685,6 +933,11 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 	u16 subtype;
 	u8 *payload = data + sizeof(*ehdr) + sizeof(*eshdr);
 	size_t payload_size;
+
+	if (ep->wire_v2) {
+		afk_v2_receive(ep, channel, type, data, data_size);
+		return;
+	}
 
 	if (ep->dcp->fw_compat == DCP_FIRMWARE_H17P) {
 		const struct epic_sub_hdr_h17p *c =
@@ -991,9 +1244,9 @@ int afk_receive_message(struct apple_dcp_afkep *ep, u64 message)
 	return 0;
 }
 
-int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
-		  enum epic_type etype, enum epic_category ecat, u8 stype,
-		  const void *payload, size_t payload_len)
+static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
+			       enum epic_type etype, enum epic_category ecat, u8 stype,
+			       const void *payload, size_t payload_len, u64 token)
 {
 	u32 rptr, wptr;
 	struct afk_qe *hdr, *hdr2;
@@ -1001,7 +1254,10 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	struct epic_sub_hdr *eshdr;
 	unsigned long flags;
 	size_t total_epic_size, total_size;
-	bool compact = ep->dcp->hw.iomfb_method_profile ==
+	u8 v2_command[AFKV2_COMMAND_SIZE + AFKV2_OOB_SIZE];
+	u8 v2_category = 0;
+	u16 v2_flags = 0;
+	bool compact = !ep->wire_v2 && ep->dcp->hw.iomfb_method_profile ==
 		DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL;
 	int ret;
 
@@ -1015,7 +1271,7 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	 * callers are optional (verbose firmware logging, EDID copy, audio,
 	 * DPTX, debugfs) or replies to calls only DPTX services make.
 	 */
-	if (ep->dcp->fw_compat == DCP_FIRMWARE_H17P && !compact) {
+	if (ep->dcp->fw_compat == DCP_FIRMWARE_H17P && !compact && !ep->wire_v2) {
 		dev_dbg_once(ep->dcp->dev,
 			     "AFK[ep:%02x]: not sending EPIC message on H17P\n",
 			     ep->endpoint);
@@ -1033,14 +1289,44 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 		(etype == EPIC_TYPE_REPLY || etype == EPIC_TYPE_NOTIFY_ACK)))))
 		return -EOPNOTSUPP;
 
+	if (ep->wire_v2) {
+		if (!channel || channel > U16_MAX || tag > U8_MAX || payload_len > SZ_1M)
+			return -EINVAL;
+		if (ecat == EPIC_CAT_REPORT) {
+			if ((stype != AFKV2_OPEN && stype != AFKV2_CLOSE) || payload_len)
+				return -EOPNOTSUPP;
+			v2_flags = 1;
+		} else if (ecat == EPIC_CAT_COMMAND) {
+			const struct epic_cmd *cmd = payload;
+
+			if (stype != EPIC_SUBTYPE_STD_SERVICE || !cmd ||
+			    payload_len != sizeof(*cmd))
+				return -EINVAL;
+			ret = afkv2_encode_oob_command(v2_command, sizeof(v2_command), tag,
+						       le64_to_cpu(cmd->rxbuf),
+						       le32_to_cpu(cmd->rxlen),
+						       le64_to_cpu(cmd->txbuf),
+						       le32_to_cpu(cmd->txlen));
+			if (ret)
+				return ret;
+			payload = v2_command;
+			payload_len = sizeof(v2_command);
+			v2_category = AFKV2_COMMAND;
+		} else if (ecat == EPIC_CAT_REPLY) {
+			v2_category = AFKV2_RESPONSE;
+		} else {
+			return -EOPNOTSUPP;
+		}
+	}
+
 	spin_lock_irqsave(&ep->lock, flags);
 	if (ep->stopping) {
 		ret = -ESHUTDOWN;
 		goto out;
 	}
 
-	if (compact && (!ep->txbfr.ready || !ep->txbfr.rptr ||
-			!ep->txbfr.wptr || !ep->txbfr.buf)) {
+	if ((compact || ep->wire_v2) &&
+	    (!ep->txbfr.ready || !ep->txbfr.rptr || !ep->txbfr.wptr || !ep->txbfr.buf)) {
 		ret = -ESHUTDOWN;
 		goto out;
 	}
@@ -1050,11 +1336,11 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	wptr = le32_to_cpu(*ep->txbfr.wptr);
 	trace_afk_send_rwptr_pre(ep, rptr, wptr);
 	total_epic_size = sizeof(*ehdr) +
-		(compact ? sizeof(struct epic_sub_hdr_h17p) : sizeof(*eshdr)) +
+		((compact || ep->wire_v2) ? sizeof(struct epic_sub_hdr_h17p) : sizeof(*eshdr)) +
 		payload_len;
 	total_size = sizeof(*hdr) + total_epic_size;
 
-	if (compact) {
+	if (compact || ep->wire_v2) {
 		u32 available, needed;
 
 		if (!ep->txbfr.ready || !ep->txbfr.stride ||
@@ -1157,12 +1443,21 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 
 	hdr->magic = cpu_to_le32(QE_MAGIC);
 	hdr->size = cpu_to_le32(total_epic_size);
-	hdr->channel = cpu_to_le32(compact ? 0 : channel);
-	hdr->type = cpu_to_le32(etype);
+	hdr->channel = cpu_to_le32((compact || ep->wire_v2) ? 0 : channel);
+	hdr->type = cpu_to_le32(ep->wire_v2 ? 0 : etype);
 	if (hdr2)
 		memcpy(hdr2, hdr, sizeof(*hdr));
 
-	if (compact) {
+	if (ep->wire_v2) {
+		size_t written;
+
+		ret = afkv2_encode_frame(ep->txbfr.buf + wptr, total_epic_size,
+					 ep->qe_seq++, channel, token, stype, v2_category,
+					 v2_flags, payload, payload_len, &written);
+		if (ret)
+			goto out;
+		wptr += written;
+	} else if (compact) {
 		u8 *wire = ep->txbfr.buf + wptr;
 
 		/* Experimental symmetry with the published H17P receive layout. */
@@ -1197,8 +1492,10 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 		wptr += sizeof(*eshdr);
 	}
 
-	memcpy(ep->txbfr.buf + wptr, payload, payload_len);
-	wptr += payload_len;
+	if (!ep->wire_v2) {
+		memcpy(ep->txbfr.buf + wptr, payload, payload_len);
+		wptr += payload_len;
+	}
 	wptr = afk_ring_advance(wptr, 0, ep->txbfr.bufsz,
 				ep->txbfr.stride);
 	trace_afk_send_rwptr_post(ep, rptr, wptr);
@@ -1216,6 +1513,17 @@ out:
 	return ret;
 }
 
+int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
+		  enum epic_type etype, enum epic_category ecat, u8 stype,
+		  const void *payload, size_t payload_len)
+{
+	return afk_send_epic_token(ep, channel, tag, etype, ecat, stype,
+				   payload, payload_len, 0);
+}
+
+int afk_send_command(struct apple_epic_service *service, u8 type,
+		     const void *payload, size_t payload_len, void *output,
+		     size_t output_len, u32 *retcode)
 /*
  * Send one EPIC command and wait up to @timeout_ms for its reply. With
  * @reply_len set, only the bytes the firmware reported are copied to @output
@@ -1265,6 +1573,12 @@ int afk_send_command_timeout(struct apple_epic_service *service, u8 type,
 		goto err_put_service;
 	}
 
+	if (ep->wire_v2 && (payload_len > SZ_1M || output_len > SZ_1M ||
+			    (payload_len && !payload))) {
+		ret = -EINVAL;
+		goto err_put_service;
+	}
+
 	rxbuf = dma_alloc_coherent(ep->dcp->dev, output_len, &rxbuf_dma,
 				   GFP_KERNEL);
 	if (!rxbuf) {
@@ -1298,11 +1612,13 @@ int afk_send_command_timeout(struct apple_epic_service *service, u8 type,
 		goto err_unlock;
 	}
 
-	tag = (service->cmd_tag & 0xff) << 8;
-	tag |= idx & 0xff;
+	tag = ep->wire_v2 ? afkv2_command_id(service->cmd_tag, idx) :
+		((service->cmd_tag & 0xff) << 8) | idx;
 	service->cmd_tag++;
 
 	service->cmds[idx].tag = tag;
+	service->cmds[idx].type = type;
+	service->cmds[idx].reply_length = 0;
 	service->cmds[idx].rxbuf = rxbuf;
 	service->cmds[idx].txbuf = txbuf;
 	service->cmds[idx].rxbuf_dma = rxbuf_dma;
@@ -1380,6 +1696,12 @@ int afk_send_command_timeout(struct apple_epic_service *service, u8 type,
 			memcpy(output, rxbuf, *reply_len);
 		}
 	} else if (output && output_len) {
+	if (ep->wire_v2 && !service->cmds[idx].retcode &&
+	    service->cmds[idx].reply_length < output_len)
+		ret = -EMSGSIZE;
+	else if (output && output_len && (!ep->wire_v2 || !service->cmds[idx].retcode)) {
+		if (ep->wire_v2)
+			dma_rmb();
 		memcpy(output, rxbuf, output_len);
 	}
 

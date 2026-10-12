@@ -1,0 +1,24 @@
+AFKV2 host selftests
+===================
+
+Run ./run-afkv2-tests.sh from this directory, or use make run_tests in a
+complete kernel source checkout. HOSTCC, CFLAGS and PYTHON select host tools
+(standalone CC is also accepted).
+AFKV2_SANITIZERS=1 additionally enables AddressSanitizer and UBSan.
+AFKV2_SOURCE_ROOT can name the source checkout when running a copied test
+package; the Makefile exports it automatically for separate output builds.
+
+The codec tests include the production header directly and compare invented,
+independently specified golden bytes. They cover truncation, category ranges,
+length/padding/overflow, unaligned input, OOB descriptor ownership, response
+correlation, token preservation and command ID packing.
+
+The owned-copy test extracts the actual production function from afk.c, prints
+its SHA256, and compiles it with synthetic command slots and CPU buffers. It
+checks active/inactive/done slots, high device addresses, boundaries and copies.
+Locks and DMA barriers are mocked: this test does not qualify concurrency,
+DMA coherency, firmware, a graphics device or any hardware display behavior.
+
+All build products are temporary. No device node is opened and no GPU, firmware
+or target machine is contacted. The extractor fails if production function
+boundaries change, requiring review rather than silently testing a stale copy.

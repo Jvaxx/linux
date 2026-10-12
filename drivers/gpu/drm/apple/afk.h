@@ -25,6 +25,8 @@ struct apple_dcp_afkep;
 
 struct epic_cmd_info {
 	u16 tag;
+	u8 type;
+	size_t reply_length;
 
 	void *rxbuf;
 	void *txbuf;
@@ -298,6 +300,8 @@ struct apple_dcp_afkep {
 	u8 experimental_rx_logs;
 
 	u32 endpoint;
+	/* Set before afk_start; protocol selection is per endpoint. */
+	bool wire_v2;
 	struct workqueue_struct *wq;
 
 	struct completion started;
@@ -328,6 +332,8 @@ struct apple_dcp_afkep {
 
 struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 				 const struct apple_epic_service_ops *ops);
+int afk_v2_copy_owned(struct apple_epic_service *service, u64 dva,
+		      void *buffer, size_t size, bool to_peer);
 int afk_start(struct apple_dcp_afkep *ep);
 void afk_shutdown(struct apple_dcp_afkep *ep);
 void afk_quiesce(struct apple_dcp_afkep *ep);
