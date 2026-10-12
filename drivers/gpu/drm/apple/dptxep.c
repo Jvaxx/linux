@@ -8,6 +8,7 @@
 #include <linux/delay.h>
 #include <linux/jiffies.h>
 #include <linux/printk.h>
+#include <linux/unaligned.h>
 
 #include <linux/soc/apple/dp-tunnel.h>
 
@@ -16,6 +17,8 @@
 #include "dptxep.h"
 #include "parser.h"
 #include "trace.h"
+
+#include "dptx-j700-training.h"
 
 struct dcpdptx_connection_cmd {
 	__le32 unk;
@@ -264,6 +267,13 @@ dptxport_call_get_max_drive_settings(struct apple_epic_service *service,
 		return -EINVAL;
 
 	reply->retcode = cpu_to_le32(0);
+	if (service->ep->wire_v2) {
+		memset(reply, 0, reply_size);
+		put_unaligned_le32(3, reply_ + 20);
+		put_unaligned_le32(3, reply_ + 24);
+		return 0;
+	}
+
 	reply->max_drive_settings[0] = cpu_to_le32(0x3);
 	reply->max_drive_settings[1] = cpu_to_le32(0x3);
 
@@ -405,6 +415,9 @@ static int dptxport_call_set_active_lane_count(struct apple_epic_service *servic
 
 	u64 lane_count = le64_to_cpu(request->lane_count);
 
+	if (service->ep->wire_v2 && lane_count > dptx->lane_count)
+		return -EINVAL;
+
 	if (dptx->lane_count < lane_count)
 		dev_err(dcp->dev, "set_active_lane_count: unexpected lane "
 			"count:%llu phy: %d\n", lane_count, dptx->lane_count);
@@ -415,7 +428,7 @@ static int dptxport_call_set_active_lane_count(struct apple_epic_service *servic
 		dptx->phy_ops.dp.lanes = lane_count;
 		/* USB4 DP IN has no ATC PHY; still accept the lane count. */
 		dptx->phy_ops.dp.set_lanes =
-			dcp_is_usb4_output(dcp) || (dcp->dptx_phy > 3);
+			service->ep->wire_v2 || dcp_is_usb4_output(dcp) || (dcp->dptx_phy > 3);
 		break;
 	default:
 		dev_err(dcp->dev, "set_active_lane_count: invalid lane count:%llu\n", lane_count);
@@ -853,11 +866,26 @@ static void dptxport_init(struct apple_epic_service *service, const char *name,
 	}
 }
 
+static int dptxport_group_call(struct apple_epic_service *service, u16 group, u32 command,
+			       const void *data, size_t size, void *reply, size_t room)
+{
+	if (group == 1 && command == DPTX_APCALL_SET_DRIVE_SETTINGS)
+		return dptx_j700_training(service, true, data, size, reply, room);
+	if (group)
+		return -EOPNOTSUPP;
+	if (command == DPTX_APCALL_SET_DRIVE_SETTINGS)
+		return -EOPNOTSUPP;
+	if (command == DPTX_APCALL_GET_DRIVE_SETTINGS)
+		return dptx_j700_training(service, false, data, size, reply, room);
+	return dptxport_call(service, command, data, size, reply, room);
+}
+
 static const struct apple_epic_service_ops dptxep_ops[] = {
 	{
 		.name = "AppleDCPDPTXRemotePort",
 		.init = dptxport_init,
 		.call = dptxport_call,
+		.call_v2 = dptxport_group_call,
 	},
 	{}
 };
