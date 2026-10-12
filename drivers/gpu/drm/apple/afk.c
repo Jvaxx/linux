@@ -787,7 +787,8 @@ static void afk_v2_callback(struct apple_dcp_afkep *ep,
 	    (command->oob && request_size > command->rx_size))
 		goto reject;
 	service = afk_service_get(afk_epic_find_service(ep, frame->interface));
-	if (!service || READ_ONCE(service->torndown) || !service->ops->call) {
+	if (!service || READ_ONCE(service->torndown) ||
+	    (!service->ops->call && !service->ops->call_v2)) {
 		if (service)
 			afk_service_put(service);
 		goto reject;
@@ -811,7 +812,7 @@ static void afk_v2_callback(struct apple_dcp_afkep *ep,
 	}
 	call = (const void *)request;
 	body_size = request_size - sizeof(*call);
-	if (le16_to_cpu(call->group) ||
+	if ((le16_to_cpu(call->group) && !service->ops->call_v2) ||
 	    le32_to_cpu(call->magic) != EPIC_SERVICE_CALL_MAGIC ||
 	    le32_to_cpu(call->data_len) != body_size)
 		goto release;
@@ -822,9 +823,15 @@ static void afk_v2_callback(struct apple_dcp_afkep *ep,
 	}
 	reply[1] = command->id;
 	memcpy(reply + AFKV2_COMMAND_SIZE, call, sizeof(*call));
-	ret = service->ops->call(service, le32_to_cpu(call->command),
-				 request + sizeof(*call), body_size,
-				 reply + AFKV2_COMMAND_SIZE + sizeof(*call), body_size);
+	if (service->ops->call_v2)
+		ret = service->ops->call_v2(service, le16_to_cpu(call->group),
+					  le32_to_cpu(call->command),
+					  request + sizeof(*call), body_size,
+					  reply + AFKV2_COMMAND_SIZE + sizeof(*call), body_size);
+	else
+		ret = service->ops->call(service, le32_to_cpu(call->command),
+					 request + sizeof(*call), body_size,
+					 reply + AFKV2_COMMAND_SIZE + sizeof(*call), body_size);
 	if (ret)
 		goto release;
 	reply_size = AFKV2_COMMAND_SIZE + request_size;

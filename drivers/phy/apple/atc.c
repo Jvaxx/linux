@@ -676,6 +676,12 @@ struct atcphy_hw {
  *               mode is then allowed without the USB lane tunables
  * @dp_only: A DisplayPort-only instance without a USB side, such as the PHY
  *           behind the T6030 HDMI port; it maps only its core window
+ * @dp_tunables: The complete T8140 DisplayPort bundle was supplied
+ * @aux_power_requested: AUX power-up began and needs matching shutdown
+ * @dp_owned_pmas: J700 PMAs requiring main-link cleanup
+ * @dp_spread_spectrum: J700 main-link spread-spectrum state
+ * @dp_presets: Firmware-derived per-rate drive presets
+ * @dp_presets_valid: Firmware supplied each drive-preset table
  * @fixed_usb2: The USB2 pairs go to a fixed hub on the USB controller, which
  *              stays in host mode; the PHY provides USB2 from probe on
  * @typec_mode: Mode the Type-C mux last asked for; a fixed-hub port returns to
@@ -747,6 +753,10 @@ struct apple_atcphy {
 	bool dp_tunables;
 	bool dp_only;
 	bool aux_power_requested;
+	u8 dp_owned_pmas;
+	bool dp_spread_spectrum;
+	u32 dp_presets[5][16];
+	bool dp_presets_valid[5];
 	bool fixed_usb2;
 	enum atcphy_mode typec_mode;
 	bool host_active;
@@ -1584,6 +1594,8 @@ static int j700_pma_idle(struct apple_atcphy *atcphy, unsigned int lane)
 	return 0;
 }
 
+#include "atc-j700-dp.h"
+
 static int atcphy_configure_lanes(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 {
 	const struct atcphy_mode_configuration *mode_cfg = atcphy_get_mode_config(atcphy, mode);
@@ -1779,8 +1791,11 @@ static int atcphy_enable_dp_aux(struct apple_atcphy *atcphy)
 
 static int atcphy_disable_dp_aux(struct apple_atcphy *atcphy)
 {
-	if (atcphy->hw->has_t8140_dp)
-		return j700_aux_disable(atcphy);
+	if (atcphy->hw->has_t8140_dp) {
+		int ret = j700_dp_stop(atcphy);
+
+		return ret ? ret : j700_aux_disable(atcphy);
+	}
 
 	/* FIXME */
 	/* T8122 PHYs with DP support stop AUX in atcphy_dp_stop_t8122() */
@@ -3140,6 +3155,11 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 	u32 reg;
 
 	lockdep_assert_held(&atcphy->lock);
+	if (atcphy->hw->has_t8140_dp && atcphy->dp_owned_pmas && mode != atcphy->mode) {
+		ret = j700_dp_stop(atcphy);
+		if (ret)
+			return ret;
+	}
 	if (atcphy->hw->has_t8140_dp && atcphy_modes[mode].enable_dp_aux &&
 	    !atcphy->dp_tunables)
 		return -EOPNOTSUPP;
@@ -3527,6 +3547,8 @@ static int atcphy_dpphy_configure(struct phy *phy, union phy_configure_opts *opt
 
 	if (atcphy->hw->dp_t8122)
 		return atcphy_dpphy_configure_t8122(atcphy, opts);
+	if (atcphy->hw->has_t8140_dp)
+		return j700_dp_configure(atcphy, opts);
 
 	if (opts->set_voltages)
 		return -EINVAL;
@@ -4028,6 +4050,26 @@ static int atcphy_load_t8140_dp(struct apple_atcphy *atcphy)
 							 lists[i].name, lists[i].resource);
 		if (IS_ERR(*lists[i].out))
 			return PTR_ERR(*lists[i].out);
+	}
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(atcphy->dp_presets); i++) {
+		static const char * const properties[] = {
+			"apple,dp-training-table", "apple,dp-training-table-rbr",
+			"apple,dp-training-table-hbr", "apple,dp-training-table-hbr2",
+			"apple,dp-training-table-hbr3",
+		};
+		int count = of_property_count_u32_elems(atcphy->np, properties[i]);
+		int ret;
+
+		if (i && !of_find_property(atcphy->np, properties[i], NULL))
+			continue;
+		if (count != ARRAY_SIZE(atcphy->dp_presets[i]))
+			return -EINVAL;
+		ret = of_property_read_u32_array(atcphy->np, properties[i],
+						 atcphy->dp_presets[i], count);
+		if (ret)
+			return ret;
+		atcphy->dp_presets_valid[i] = true;
 	}
 
 	atcphy->dp_tunables = true;
