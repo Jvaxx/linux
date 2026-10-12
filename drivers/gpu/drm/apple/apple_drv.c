@@ -811,7 +811,8 @@ static void apple_drm_quiesce_connectors(struct drm_device *drm)
 static bool apple_dcp_usable(struct device_node *np)
 {
 	return of_device_is_available(np) &&
-	       !of_device_is_compatible(np, "apple,t8140-dcpext");
+	       (!of_device_is_compatible(np, "apple,t8140-dcpext") ||
+		dcp_h17p_external_ready(np));
 }
 
 static int apple_drm_init_dcp(struct device *dev)

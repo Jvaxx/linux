@@ -211,6 +211,7 @@ struct apple_dcp {
 	struct apple_dcp_hw_data hw;
 	/* Protected by the H17P IOMFB receive mutex. */
 	u8 experimental_callback_logs;
+	bool external_prepared;
 
 	/* firmware version and compatible firmware version */
 	enum dcp_firmware_version fw_compat;

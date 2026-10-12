@@ -20,6 +20,8 @@ struct apple_atomic_state {
 };
 
 #define to_apple_atomic_state(s) container_of(s, struct apple_atomic_state, base)
+bool dcp_h17p_external_enabled(void);
+bool dcp_h17p_external_ready(struct device_node *np);
 
 struct apple_crtc {
 	struct drm_crtc base;

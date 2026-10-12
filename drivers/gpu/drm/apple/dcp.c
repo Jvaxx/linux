@@ -7,6 +7,7 @@
 #include <linux/completion.h>
 #include <linux/component.h>
 #include <linux/delay.h>
+#include <linux/device/driver.h>
 #include <linux/dma-mapping.h>
 #include <linux/gpio/consumer.h>
 #include <linux/io.h>
@@ -66,6 +67,9 @@
 
 #define APPLE_DCP_COPROC_CPU_CONTROL	 0x44
 #define APPLE_DCP_COPROC_CPU_CONTROL_RUN BIT(4)
+#define APPLE_DCP_COPROC_CPU_STATUS 0x48
+#define APPLE_DCP_COPROC_CPU_STATUS_STOPPED BIT(1)
+#define APPLE_DCP_COPROC_CPU_STATUS_IDLE BIT(5)
 
 struct dcp_session_ref {
 	struct list_head link;
@@ -96,7 +100,10 @@ static int dcp_pin_live_session(struct apple_dcp *dcp)
 {
 	struct dcp_session_ref *session;
 
-	if (!dcp->hw.adopt_live_session || dcp->fw_compat != DCP_FIRMWARE_H17P ||
+	if ((!dcp->hw.adopt_live_session &&
+	     dcp->hw.iomfb_method_profile !=
+	     DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL) ||
+	    dcp->fw_compat != DCP_FIRMWARE_H17P ||
 	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G || dcp->retain_dma)
 		return 0;
 	session = kzalloc_obj(*session);
@@ -154,6 +161,27 @@ MODULE_PARM_DESC(experimental_h17p_external,
 bool dcp_h17p_external_enabled(void)
 {
 	return experimental_h17p_external;
+}
+
+bool dcp_h17p_external_ready(struct device_node *np)
+{
+	struct platform_device *pdev;
+	struct apple_dcp *dcp;
+	bool ready = false;
+
+	if (!dcp_h17p_external_enabled())
+		return false;
+	pdev = of_find_device_by_node(np);
+	if (!pdev)
+		return false;
+	/* Failed and deferred probes must never become required components. */
+	if (device_is_bound(&pdev->dev)) {
+		dcp = platform_get_drvdata(pdev);
+		ready = dcp && READ_ONCE(dcp->external_prepared) &&
+			!READ_ONCE(dcp->quiescing) && !READ_ONCE(dcp->crashed);
+	}
+	put_device(&pdev->dev);
+	return ready;
 }
 
 static bool show_notch;
@@ -4088,6 +4116,17 @@ static void dcp_enable_typec_work(struct apple_dcp *dcp)
 		mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq, 0);
 }
 
+static bool dcp_external_is_idle(struct apple_dcp *dcp)
+{
+	u32 control = readl_relaxed(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+	u32 status = readl_relaxed(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_STATUS);
+
+	/* Same externally inherited idle state accepted by the public loader. */
+	return (control & APPLE_DCP_COPROC_CPU_CONTROL_RUN) &&
+	       (status & APPLE_DCP_COPROC_CPU_STATUS_STOPPED) &&
+	       (status & APPLE_DCP_COPROC_CPU_STATUS_IDLE);
+}
+
 static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *data)
 {
@@ -4099,6 +4138,9 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 	if (READ_ONCE(dcp->quiescing))
 		return dev_err_probe(dev, -EBUSY,
 				     "Live DCP session cannot be rebound; reboot required\n");
+
+	if (dcp->external_prepared)
+		return 0;
 
 	/* A timed-out prior session may still scan these mappings. */
 	mutex_lock(&dcp->swapped_out_fbs_lock);
@@ -4133,6 +4175,12 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 			return dev_err_probe(dev, -EOPNOTSUPP,
 					     "DCP was not left running by the bootloader\n");
 	}
+
+	if (dcp->hw.iomfb_method_profile ==
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL &&
+	    !dcp_external_is_idle(dcp))
+		return dev_err_probe(dev, -EBUSY,
+				     "External DCP is not in the inherited idle state\n");
 
 	if (dcp->index || dcp->dptx_phy || dcp->dptx_die)
 		dev_info(dev, "DCP index:%u dptx target phy: %u dptx die: %u\n",
@@ -4239,6 +4287,19 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 
 	INIT_WORK(&dcp->vblank_wq, dcp_delayed_vblank);
 	INIT_DELAYED_WORK(&dcp->swap_watchdog_wq, dcp_swap_watchdog);
+
+	if (dcp->hw.iomfb_method_profile ==
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL) {
+		/* Pin before the first write or mailbox wake can expose DMA. */
+		ret = dcp_pin_live_session(dcp);
+		if (ret)
+			goto err_piodma;
+		if (!dcp_external_is_idle(dcp)) {
+			ret = dev_err_probe(dev, -EBUSY,
+					    "External DCP changed state before startup\n");
+			goto err_piodma;
+		}
+	}
 
 	dcp->swapped_out_fbs =
 		(struct list_head)LIST_HEAD_INIT(dcp->swapped_out_fbs);
@@ -4522,7 +4583,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 		return dev_err_probe(dev, -EBUSY, "Previous live DCP session requires a reboot\n");
 
 	/* Not part of the display subsystem yet; see apple_dcp_usable(). */
-	if (of_device_is_compatible(dev->of_node, "apple,t8140-dcpext")) {
+	if (of_device_is_compatible(dev->of_node, "apple,t8140-dcpext") &&
+	    !dcp_h17p_external_enabled()) {
 		dev_info(dev, "external display coprocessor not supported yet\n");
 		return -ENODEV;
 	}
@@ -4958,6 +5020,24 @@ unusable:
 	platform_set_drvdata(pdev, dcp);
 	dcp_ext_give_up(dcp, ret, "probe");
 	return component_add(dev, &dcp_comp_ops);
+	if (dcp->hw.iomfb_method_profile ==
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL) {
+		/* Complete optional startup before the DRM master can depend on it. */
+		ret = dcp_comp_bind(dev, NULL, NULL);
+		if (ret) {
+			dcp_disable_typec_work(dcp, true);
+			disable_delayed_work_sync(&dcp->typec_fabric_retrain_wq);
+			return ret;
+		}
+		WRITE_ONCE(dcp->external_prepared, true);
+	}
+
+	ret = component_add(&pdev->dev, &dcp_comp_ops);
+	if (ret && dcp->external_prepared) {
+		dcp_disable_typec_work(dcp, true);
+		disable_delayed_work_sync(&dcp->typec_fabric_retrain_wq);
+	}
+	return ret;
 }
 
 static void dcp_platform_remove(struct platform_device *pdev)
@@ -4982,6 +5062,12 @@ static void dcp_platform_shutdown(struct platform_device *pdev)
 
 	if (dcp && dcp->external && !dcp->external_native)
 		return;
+	if (dcp && dcp->retain_dma && dcp->hw.iomfb_method_profile ==
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL) {
+		dcp_comp_unbind(&pdev->dev, NULL, NULL);
+		return;
+	}
+
 	if (dcp && dcp->hw.adopt_live_session &&
 	    dcp->fw_compat == DCP_FIRMWARE_H17P &&
 	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
@@ -5254,6 +5340,14 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8140 = {
 	.firmware_request = 0x68000,
 };
 
+/* Separate from the established internal-panel H17P profile. */
+static const struct apple_dcp_hw_data apple_dcp_hw_t8140_external = {
+	.num_dptx_ports = 1,
+	.iomfb_method_profile = DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL,
+	.adopt_live_session = false,
+	.firmware_compat = DCP_FIRMWARE_H17P,
+};
+
 /*
  * M5 (T8142) runs H17-generation DCP firmware with the H17G method numbering
  * and is left running by the bootloader.
@@ -5304,6 +5398,7 @@ static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t6031-dcp", .data = &apple_dcp_hw_t6031, },
 	{ .compatible = "apple,t8122-dcpext", .data = &apple_dcp_hw_t8122_dcpext, },
 	{ .compatible = "apple,t8140-dcp", .data = &apple_dcp_hw_t8140,  },
+	{ .compatible = "apple,t8140-dcpext", .data = &apple_dcp_hw_t8140_external, },
 	{ .compatible = "apple,t8142-dcp", .data = &apple_dcp_hw_t8142,  },
 	{ .compatible = "apple,dcp",       .data = &apple_dcp_hw_dcp,    },
 	{ .compatible = "apple,dcpext",    .data = &apple_dcp_hw_dcpext, },
