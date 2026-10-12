@@ -719,6 +719,105 @@ bool iomfb_check_callback_h17p(struct apple_dcp *dcp, int tag, u32 in_len,
 	return true;
 }
 
+static_assert(sizeof(struct dcp_set_power_state_resp) == 8);
+
+struct dcp_external_power_cookie {
+	struct dcp_wait_cookie wait;
+	bool on;
+};
+
+/* A473's envelope is known; no OFF reply has been qualified as a stop. */
+static void iomfb_external_power_complete(struct apple_dcp *dcp, void *out, void *data)
+{
+	struct dcp_external_power_cookie *cookie = data;
+	const struct dcp_packet_header *header;
+	int ret = -EPROTO;
+
+	if (out) {
+		header = out - sizeof(struct dcp_set_power_state_req_h17p) - sizeof(*header);
+		if (header->in_len == sizeof(struct dcp_set_power_state_req_h17p) &&
+		    header->out_len == sizeof(struct dcp_set_power_state_resp)) {
+			u64 reply = get_unaligned_le64(out);
+
+			WRITE_ONCE(dcp->external_power_reply, reply);
+			WRITE_ONCE(dcp->external_power_reply_valid, true);
+			dev_info(dcp->dev, "A473 power=%u reply=%#llx%s\n",
+				 cookie->on, reply, cookie->on ? "" : " (stop unqualified)");
+			ret = cookie->on ? (reply == 1 ? 0 : -EREMOTEIO) : -EOPNOTSUPP;
+		}
+	}
+	WRITE_ONCE(cookie->wait.status, ret);
+	complete(&cookie->wait.done);
+	kref_put(&cookie->wait.refcount, release_wait_cookie);
+}
+
+static bool iomfb_external_reply_size(void *out, u32 in_len, u32 out_len)
+{
+	const struct dcp_packet_header *header;
+
+	if (!out)
+		return false;
+	header = out - in_len - sizeof(*header);
+	return header->in_len == in_len && header->out_len == out_len;
+}
+
+static void iomfb_external_parameter_complete(struct apple_dcp *dcp, void *out, void *data)
+{
+	struct dcp_set_power_state_req_h17p request = { .unklong = 1 };
+
+	if (!iomfb_external_reply_size(out, sizeof(struct dcp_set_parameter_dcp), sizeof(u32))) {
+		iomfb_external_power_complete(dcp, NULL, data);
+		return;
+	}
+	dcp_set_power_state(dcp, true, &request, iomfb_external_power_complete, data);
+}
+
+static void iomfb_external_device_complete(struct apple_dcp *dcp, void *out, void *data)
+{
+	struct dcp_set_parameter_dcp parameter = {
+		.param = IOMFBPARAM_ADAPTIVE_SYNC,
+		.count = 3,
+	};
+
+	if (!iomfb_external_reply_size(out, sizeof(u32), sizeof(u32))) {
+		iomfb_external_power_complete(dcp, NULL, data);
+		return;
+	}
+	/* Preserve the existing external power-on preparation and payload semantics. */
+	dcp_set_parameter_dcp(dcp, false, &parameter, iomfb_external_parameter_complete, data);
+}
+
+int iomfb_external_power_h17p(struct apple_dcp *dcp, bool on)
+{
+	struct dcp_set_power_state_req_h17p request = { .unklong = on };
+	struct dcp_external_power_cookie *cookie;
+	int ret;
+
+	if (READ_ONCE(dcp->crashed) || READ_ONCE(dcp->iomfb.stopped))
+		return -EIO;
+	cookie = kzalloc_obj(*cookie);
+	if (!cookie)
+		return -ENOMEM;
+	cookie->on = on;
+	WRITE_ONCE(dcp->external_power_reply_valid, false);
+	cookie->wait.status = -ETIMEDOUT;
+	init_completion(&cookie->wait.done);
+	kref_init(&cookie->wait.refcount);
+	kref_get(&cookie->wait.refcount);
+	if (on) {
+		u32 handle = 2;
+
+		iomfb_opaque_x_reset_h17p(dcp);
+		dcp_set_display_device(dcp, false, &handle, iomfb_external_device_complete, cookie);
+	} else {
+		dcp_set_power_state(dcp, true, &request, iomfb_external_power_complete, cookie);
+	}
+	ret = wait_for_completion_timeout(&cookie->wait.done, msecs_to_jiffies(500));
+	ret = ret ? (int)READ_ONCE(cookie->wait.status) : -ETIMEDOUT;
+	kref_put(&cookie->wait.refcount, release_wait_cookie);
+	return ret;
+}
+
 void iomfb_start_h17p(struct apple_dcp *dcp)
 {
 	WRITE_ONCE(dcp->pipe_enabled_h17p, false);

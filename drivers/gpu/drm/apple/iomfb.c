@@ -430,6 +430,45 @@ bool iomfb_queue_drain(struct apple_dcp *dcp, unsigned long timeout)
 	}
 }
 
+/* Admission is independent of transport: replies and control RPCs remain live. */
+void iomfb_pause_presentation(struct apple_dcp *dcp, bool pause)
+{
+	guard(mutex)(&dcp->iomfb.lock);
+	dcp->iomfb.presentation_paused = pause;
+	if (!pause && dcp->external_hotplug_pending) {
+		unsigned int action;
+
+		dcp->external_hotplug_pending = false;
+		action = dcp_mode_hotplug(&dcp->mode_state, dcp->external_hotplug_connected,
+					  dcp->connector ? &dcp->connector->connected : NULL);
+		dcp_handle_hotplug_actions(dcp, action);
+	}
+}
+
+/* A dead transport is not proof that DMA or a pending present has stopped. */
+int iomfb_queue_settle(struct apple_dcp *dcp, unsigned long timeout)
+{
+	unsigned long deadline = jiffies + timeout;
+	bool idle;
+
+	for (;;) {
+		mutex_lock(&dcp->iomfb.lock);
+		if (READ_ONCE(dcp->crashed) || dcp->iomfb.stopped) {
+			mutex_unlock(&dcp->iomfb.lock);
+			return -EIO;
+		}
+		idle = !dcp->iomfb.active && !dcp->iomfb.queued &&
+		       list_empty(&dcp->iomfb.pending) &&
+		       !dcp->present_state_h17p.pending && iomfb_channels_idle(dcp);
+		mutex_unlock(&dcp->iomfb.lock);
+		if (idle)
+			return 0;
+		if (time_after_eq(jiffies, deadline))
+			return -ETIMEDOUT;
+		usleep_range(2000, 4000);
+	}
+}
+
 int iomfb_queue(struct apple_dcp *dcp, struct iomfb_transaction *transaction)
 {
 	int ret = 0;
@@ -437,6 +476,8 @@ int iomfb_queue(struct apple_dcp *dcp, struct iomfb_transaction *transaction)
 	mutex_lock(&dcp->iomfb.lock);
 	if (READ_ONCE(dcp->crashed) || dcp->iomfb.stopped) {
 		ret = -EIO;
+	} else if (transaction->presentation && dcp->iomfb.presentation_paused) {
+		ret = -EAGAIN;
 	} else if (transaction->brightness_only && dcp->iomfb.backlight_queued) {
 		ret = -EALREADY;
 	} else if (dcp->iomfb.queued >= 32) {
@@ -506,7 +547,7 @@ void iomfb_queue_crc_h17p(struct apple_dcp *dcp, u32 swap_id)
 
 	lockdep_assert_held(&dcp->iomfb.lock);
 	if (!READ_ONCE(dcp->crc_enabled) || READ_ONCE(dcp->crashed) ||
-	    dcp->iomfb.stopped || dcp->iomfb.queued >= 32)
+	    dcp->iomfb.stopped || dcp->iomfb.presentation_paused || dcp->iomfb.queued >= 32)
 		return;
 	crc = kzalloc_obj(*crc);
 	if (!crc)
@@ -1119,6 +1160,13 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	int ret = -EIO;
 	bool modeset;
 
+	/* Disconnect cannot pass the admission check before these RPCs finish. */
+	guard(mutex)(&dcp->external_lock);
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL &&
+	    (!dcp->external_running || dcp->external_error || READ_ONCE(dcp->quiescing) ||
+	     READ_ONCE(dcp->crashed) || READ_ONCE(dcp->iomfb.presentation_paused)))
+		return -EPIPE;
+
 	crtc_state = drm_atomic_get_new_crtc_state(commit, crtc);
 	if (!crtc_state)
 		return 0;
@@ -1377,6 +1425,7 @@ static void iomfb_backlight_kick(struct apple_dcp *dcp)
 	transaction->start = iomfb_backlight_start;
 	transaction->release = iomfb_backlight_release;
 	transaction->brightness_only = true;
+	transaction->presentation = true;
 	if (iomfb_queue(dcp, transaction))
 		kfree(transaction);
 }
@@ -1437,18 +1486,29 @@ static void iomfb_queue_atomic(struct apple_dcp *dcp, struct drm_crtc *crtc,
 			       struct drm_atomic_commit *state)
 {
 	struct iomfb_atomic_transaction *atomic;
+	int ret;
 
+	if (READ_ONCE(dcp->iomfb.presentation_paused)) {
+		schedule_work(&dcp->vblank_wq);
+		return;
+	}
 	atomic = kzalloc_obj(*atomic);
 	if (!atomic)
 		goto failed;
 	atomic->transaction.start = iomfb_atomic_start;
+	atomic->transaction.presentation = true;
 	atomic->transaction.release = iomfb_atomic_release;
 	atomic->state = drm_atomic_commit_get(state);
 	atomic->crtc = crtc;
 	atomic->dcp = dcp;
-	if (!iomfb_queue(dcp, &atomic->transaction))
+	ret = iomfb_queue(dcp, &atomic->transaction);
+	if (!ret)
 		return;
 	iomfb_atomic_release(&atomic->transaction);
+	if (ret == -EAGAIN) {
+		schedule_work(&dcp->vblank_wq);
+		return;
+	}
 failed:
 	WRITE_ONCE(dcp->crashed, true);
 	schedule_work(&dcp->vblank_wq);
