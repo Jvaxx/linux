@@ -696,16 +696,15 @@ static void afk_v2_callback(struct apple_dcp_afkep *ep,
 	const struct epic_service_call *call;
 	const u8 *request = command->inline_data;
 	u8 *owned_request = NULL, *reply = NULL;
-	size_t request_size = command->oob ? command->tx_size : command->inline_size;
+	size_t request_size, response_size, response_body;
 	size_t body_size, reply_size;
 	u32 status = 0xe00002c7;
 	int ret;
 
 	if (frame->type != EPIC_SUBTYPE_STD_SERVICE ||
-	    request_size < sizeof(*call) + sizeof(u32) ||
-	    request_size > SZ_1M - AFKV2_COMMAND_SIZE ||
-	    request_size > command->value ||
-	    (command->oob && request_size > command->rx_size))
+	    afkv2_callback_lengths(command, sizeof(*call) + sizeof(u32),
+				   SZ_1M - AFKV2_COMMAND_SIZE,
+				   &request_size, &response_size))
 		goto reject;
 	service = afk_service_get(afk_epic_find_service(ep, frame->interface));
 	if (!service || READ_ONCE(service->torndown) ||
@@ -717,7 +716,7 @@ static void afk_v2_callback(struct apple_dcp_afkep *ep,
 	if (command->oob) {
 		/* Reject an unowned response destination before any callback side effect. */
 		ret = afk_v2_access_owned(service, command->rx_address, NULL,
-					  request_size, true, false);
+					  response_size, true, false);
 		if (ret)
 			goto release;
 		owned_request = kmalloc(request_size, GFP_KERNEL);
@@ -737,32 +736,36 @@ static void afk_v2_callback(struct apple_dcp_afkep *ep,
 	    le32_to_cpu(call->magic) != EPIC_SERVICE_CALL_MAGIC ||
 	    le32_to_cpu(call->data_len) != body_size)
 		goto release;
-	reply = kzalloc(AFKV2_COMMAND_SIZE + request_size, GFP_KERNEL);
+	response_body = response_size - sizeof(*call);
+	reply = kzalloc(AFKV2_COMMAND_SIZE + response_size, GFP_KERNEL);
 	if (!reply) {
 		status = 0xe00002bd;
 		goto release;
 	}
 	reply[1] = command->id;
 	memcpy(reply + AFKV2_COMMAND_SIZE, call, sizeof(*call));
+	((struct epic_service_call *)(reply + AFKV2_COMMAND_SIZE))->data_len =
+		cpu_to_le32(response_body);
 	if (service->ops->call_v2)
 		ret = service->ops->call_v2(service, le16_to_cpu(call->group),
 					  le32_to_cpu(call->command),
 					  request + sizeof(*call), body_size,
-					  reply + AFKV2_COMMAND_SIZE + sizeof(*call), body_size);
+					  reply + AFKV2_COMMAND_SIZE + sizeof(*call),
+					  response_body);
 	else
 		ret = service->ops->call(service, le32_to_cpu(call->command),
 					 request + sizeof(*call), body_size,
-					 reply + AFKV2_COMMAND_SIZE + sizeof(*call), body_size);
+					 reply + AFKV2_COMMAND_SIZE + sizeof(*call), response_body);
 	if (ret)
 		goto release;
-	reply_size = AFKV2_COMMAND_SIZE + request_size;
+	reply_size = AFKV2_COMMAND_SIZE + response_size;
 	if (command->oob) {
 		ret = afk_v2_copy_owned(service, command->rx_address,
-					reply + AFKV2_COMMAND_SIZE, request_size, true);
+					reply + AFKV2_COMMAND_SIZE, response_size, true);
 		if (ret)
 			goto release;
 		ret = afkv2_encode_oob_command(reply, reply_size, command->id,
-					       command->rx_address, request_size,
+					       command->rx_address, response_size,
 					       command->tx_address, command->tx_size);
 		if (ret)
 			goto release;

@@ -212,6 +212,25 @@ static inline int afkv2_decode_command(const void *payload, size_t size,
 	return 0;
 }
 
+/* Requests and responses may have different owned-buffer capacities. */
+static inline int afkv2_callback_lengths(const struct afkv2_command *command,
+					 size_t minimum, size_t limit,
+					 size_t *request, size_t *response)
+{
+	size_t in, out;
+
+	if (!command || !request || !response || minimum > limit)
+		return -EINVAL;
+	in = command->oob ? command->tx_size : command->inline_size;
+	out = command->oob ? command->rx_size : command->inline_size;
+	if (in < minimum || out < minimum || in > limit || out > limit ||
+	    in > command->value || out > command->value)
+		return -EINVAL;
+	*request = in;
+	*response = out;
+	return 0;
+}
+
 /* Correlate only; no buffer is read, written or freed by this helper. */
 static inline int afkv2_check_response(const struct afkv2_frame *frame,
 				       const struct afkv2_command *response,

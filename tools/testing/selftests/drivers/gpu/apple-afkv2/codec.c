@@ -178,6 +178,30 @@ int main(void)
 	CHECK(!afkv2_owned_span(0x1000, 0, 0x1000, 0));
 	CHECK(afkv2_owned_span(UINT64_MAX - 15, 16, UINT64_MAX, 1));
 	CHECK(!afkv2_owned_span(UINT64_MAX - 15, 17, UINT64_MAX, 1));
+	struct afkv2_command callback = { .oob = true, .tx_size = 96,
+		.rx_size = 144, .value = 144 };
+	size_t input = 0, output = 0;
+
+	CHECK(!afkv2_callback_lengths(&callback, 68, 1024, &input, &output));
+	CHECK(input == 96 && output == 144);
+	callback.value = 143;
+	CHECK(afkv2_callback_lengths(&callback, 68, 1024, &input, &output));
+	callback.value = 2048;
+	callback.rx_size = 2048;
+	CHECK(afkv2_callback_lengths(&callback, 68, 1024, &input, &output));
+	callback.rx_size = 67;
+	CHECK(afkv2_callback_lengths(&callback, 68, 1024, &input, &output));
+	callback.rx_size = 144;
+	callback.tx_size = 67;
+	CHECK(afkv2_callback_lengths(&callback, 68, 1024, &input, &output));
+	callback.oob = false;
+	callback.inline_size = 96;
+	CHECK(!afkv2_callback_lengths(&callback, 68, 1024, &input, &output));
+	CHECK(input == 96 && output == 96);
+	CHECK(afkv2_callback_lengths(NULL, 68, 1024, &input, &output));
+	CHECK(afkv2_callback_lengths(&callback, 68, 1024, NULL, &output));
+	CHECK(afkv2_callback_lengths(&callback, 68, 1024, &input, NULL));
+	CHECK(afkv2_callback_lengths(&callback, 1025, 1024, &input, &output));
 	printf("PASS %u assertions\n", assertions);
 	return 0;
 }
