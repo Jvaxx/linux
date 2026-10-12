@@ -146,6 +146,16 @@ static void dcp_release_rtkit(void *data)
 
 #define DCP_BOOT_TIMEOUT msecs_to_jiffies(1000)
 
+static bool experimental_h17p_external;
+module_param(experimental_h17p_external, bool, 0444);
+MODULE_PARM_DESC(experimental_h17p_external,
+		 "Enable experimental T8140 external display protocol");
+
+bool dcp_h17p_external_enabled(void)
+{
+	return experimental_h17p_external;
+}
+
 static bool show_notch;
 module_param(show_notch, bool, 0644);
 MODULE_PARM_DESC(show_notch, "Use the full display height and shows the notch");
