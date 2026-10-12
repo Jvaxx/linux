@@ -1866,6 +1866,7 @@ void dcp_firmware_metadata_begin(struct apple_dcp *dcp)
 	dcp->chunks.metadata_ticket = dcp_metadata_begin(&dcp->metadata.epoch);
 	dcp->chunks.received = 0;
 	dcp->chunks.contiguous = true;
+	dcp->chunks.payload_complete = false;
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 }
 
@@ -1885,7 +1886,7 @@ static void dcp_firmware_metadata_notify(struct apple_dcp *dcp)
 
 static bool dcp_firmware_metadata_complete(struct apple_dcp *dcp)
 {
-	return dcp->chunks.contiguous && dcp->chunks.received == dcp->chunks.length &&
+	return dcp->chunks.contiguous && dcp->chunks.payload_complete &&
 	       dcp_metadata_matches(&dcp->metadata.epoch, dcp->chunks.metadata_ticket);
 }
 

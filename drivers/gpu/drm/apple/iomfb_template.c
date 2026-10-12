@@ -978,6 +978,12 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 		return false;
 	}
 
+	/* Validate serialized extent outside the metadata spinlock. */
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
+		dcp->chunks.payload_complete = dcp->chunks.contiguous &&
+			dcp_property_complete(dcp->chunks.data, dcp->chunks.received,
+					      dcp->chunks.length);
+
 	/* used just as opaque pointer for tracing */
 	ctx.dcp = dcp;
 
