@@ -2204,10 +2204,14 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 
 	dcp->swap_submit_timestamp = 0;
 
-	if (DCP_INHERIT_BOOT_MODE) {
+	if (DCP_INHERIT_BOOT_MODE &&
+	    dcp->hw.iomfb_method_profile !=
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL) {
 		dev_dbg(dcp->dev, "inheriting the bootloader's display mode\n");
 		complete_set_digital_out_mode(dcp, NULL, cookie);
-	} else if (mode->vrr)
+	} else if (mode->vrr &&
+		   dcp->hw.iomfb_method_profile !=
+		   DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
 		dcp_set_adaptive_sync(dcp,
 				      crtc_state->vrr_enabled ? mode->min_vrr : 0,
 				      cookie);

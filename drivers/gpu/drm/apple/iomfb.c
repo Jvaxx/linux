@@ -790,6 +790,14 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 	}
 
 	tag = dcp_parse_tag(hdr->tag);
+	if (dcp->hw.iomfb_method_profile ==
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL &&
+	    dcp->experimental_callback_logs < 64) {
+		dcp->experimental_callback_logs++;
+		dev_info(dev, "external IOMFB callback=%d in=%u out=%u context=%u\n",
+			 tag, hdr->in_len, hdr->out_len, context);
+	}
+
 	handled = tag >= 0 && tag < IOMFB_MAX_CB && dcp->cb_handlers &&
 		  dcp->cb_handlers[tag];
 	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
@@ -812,6 +820,13 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 		    !test_and_set_bit(tag, dcp->unknown_callbacks))
 			dev_warn(dev, "received unknown callback %c%c%c%c\n",
 				 hdr->tag[3], hdr->tag[2], hdr->tag[1], hdr->tag[0]);
+		if (dcp->hw.iomfb_method_profile ==
+		    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL) {
+			/* Retain the failed session without inventing a successful reply. */
+			dcp->crashed = true;
+			complete(&dcp->start_done);
+			return;
+		}
 		/*
 		 * Leaving a callback unanswered wedges the coprocessor: it
 		 * waits for the ack forever and the outer call never returns.
@@ -1041,7 +1056,9 @@ static bool dcp_mode_settable(struct apple_dcp *dcp,
 	if (!dcp_mode)
 		return false;
 
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	    dcp->hw.iomfb_method_profile !=
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
 		return dcp_mode->mode.type & DRM_MODE_TYPE_PREFERRED;
 
 	return true;

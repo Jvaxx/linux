@@ -694,7 +694,8 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 	trace_dptxport_apcall(dptx, idx, data_size);
 	dev_dbg(service->ep->dcp->dev, "DPTXPort: APCALL %u (%zu bytes)\n",
 		 idx, data_size);
-	if (data_size)
+	if (data_size && service->ep->dcp->hw.iomfb_method_profile !=
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
 		print_hex_dump_debug("DPTXPort: apcall data: ",
 				     DUMP_PREFIX_OFFSET, 16, 1, data,
 				     min(data_size, (size_t)64), true);
@@ -792,6 +793,9 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 			memset(reply, 0, 4);
 		return 0;
 	default:
+		if (service->ep->dcp->hw.iomfb_method_profile ==
+		    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
+			return -EOPNOTSUPP;
 		/* just try to ACK and hope for the best... */
 		dev_info(service->ep->dcp->dev, "DPTXPort: acking unhandled call %u\n",
 			idx);

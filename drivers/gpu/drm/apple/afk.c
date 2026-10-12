@@ -8,6 +8,7 @@
 #include <linux/kconfig.h>
 #include <linux/of_platform.h>
 #include <linux/slab.h>
+#include <linux/sizes.h>
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
 #include <linux/soc/apple/rtkit.h>
@@ -572,8 +573,10 @@ static void afk_recv_handle_std_service(struct apple_dcp_afkep *ep, u32 channel,
 	dev_err(ep->dcp->dev,
 		"AFK[ep:%02x]: channel %d received unhandled standard service message: %x / %x\n",
 		ep->endpoint, channel, type, eshdr->category);
-	print_hex_dump(KERN_INFO, "AFK: ", DUMP_PREFIX_NONE, 16, 1, payload,
-				   payload_size, true);
+	if (ep->dcp->hw.iomfb_method_profile !=
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
+		print_hex_dump(KERN_INFO, "AFK: ", DUMP_PREFIX_NONE, 16, 1,
+			       payload, payload_size, true);
 }
 
 static bool afk_validate_h17p_header(const u8 *data, size_t size)
@@ -645,6 +648,16 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 	payload_size = data_size - hdr_len;
 
 	trace_afk_recv_handle(ep, channel, type, data_size, ehdr, eshdr);
+	if (ep->dcp->hw.iomfb_method_profile ==
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL &&
+	    ep->experimental_rx_logs < 32) {
+		ep->experimental_rx_logs++;
+		dev_info(ep->dcp->dev,
+			 "external AFK ep=%u channel=%u type=%u subtype=%u category=%u bytes=%zu\n",
+			 ep->endpoint, channel, type, subtype, eshdr->category,
+			 data_size);
+	}
+
 
 	service = afk_epic_find_service(ep, channel);
 
@@ -698,8 +711,10 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 
 	dev_err(ep->dcp->dev, "AFK[ep:%02x]: channel %d received unhandled message "
 		"(type %x subtype %x)\n", ep->endpoint, channel, type, subtype);
-	print_hex_dump(KERN_INFO, "AFK: ", DUMP_PREFIX_NONE, 16, 1, payload,
-				   payload_size, true);
+	if (ep->dcp->hw.iomfb_method_profile !=
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
+		print_hex_dump(KERN_INFO, "AFK: ", DUMP_PREFIX_NONE, 16, 1,
+			       payload, payload_size, true);
 	return;
 
 too_small:
@@ -878,6 +893,8 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	struct epic_sub_hdr *eshdr;
 	unsigned long flags;
 	size_t total_epic_size, total_size;
+	bool compact = ep->dcp->hw.iomfb_method_profile ==
+		DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL;
 	int ret;
 
 	/*
@@ -885,19 +902,37 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	 * 8-byte sub-header, with the service channel carried in the EPIC
 	 * header on queue channel 0.  Only the receive side of that format is
 	 * known, and the 24-byte framing below would be misparsed, so send
-	 * nothing.  The display path needs no AP-initiated EPIC traffic: the
+	 * nothing for the established internal profile. The external-only
+	 * experiment below tests receive-layout symmetry. Internal callers are: the
 	 * callers are optional (verbose firmware logging, EDID copy, audio,
 	 * DPTX, debugfs) or replies to calls only DPTX services make.
 	 */
-	if (ep->dcp->fw_compat == DCP_FIRMWARE_H17P) {
+	if (ep->dcp->fw_compat == DCP_FIRMWARE_H17P && !compact) {
 		dev_dbg_once(ep->dcp->dev,
 			     "AFK[ep:%02x]: not sending EPIC message on H17P\n",
 			     ep->endpoint);
 		return -EOPNOTSUPP;
 	}
 
+	/* Only existing DPTX/EDID service commands participate in this trial. */
+	if (compact &&
+	    (channel > U16_MAX || payload_len > SZ_1M ||
+	     (payload_len && !payload) || stype != EPIC_SUBTYPE_STD_SERVICE ||
+	     (ep->endpoint != DPTX_ENDPOINT && ep->endpoint != DPAVSERV_ENDPOINT) ||
+	     !((ecat == EPIC_CAT_COMMAND && etype == EPIC_TYPE_COMMAND &&
+		payload_len == sizeof(struct epic_cmd)) ||
+	       (ecat == EPIC_CAT_REPLY &&
+		(etype == EPIC_TYPE_REPLY || etype == EPIC_TYPE_NOTIFY_ACK)))))
+		return -EOPNOTSUPP;
+
 	spin_lock_irqsave(&ep->lock, flags);
 	if (ep->stopping) {
+		ret = -ESHUTDOWN;
+		goto out;
+	}
+
+	if (compact && (!ep->txbfr.ready || !ep->txbfr.rptr ||
+			!ep->txbfr.wptr || !ep->txbfr.buf)) {
 		ret = -ESHUTDOWN;
 		goto out;
 	}
@@ -906,8 +941,33 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	rptr = le32_to_cpu(*ep->txbfr.rptr);
 	wptr = le32_to_cpu(*ep->txbfr.wptr);
 	trace_afk_send_rwptr_pre(ep, rptr, wptr);
-	total_epic_size = sizeof(*ehdr) + sizeof(*eshdr) + payload_len;
+	total_epic_size = sizeof(*ehdr) +
+		(compact ? sizeof(struct epic_sub_hdr_h17p) : sizeof(*eshdr)) +
+		payload_len;
 	total_size = sizeof(*hdr) + total_epic_size;
+
+	if (compact) {
+		u32 available, needed;
+
+		if (!ep->txbfr.ready || !ep->txbfr.stride ||
+		    (ep->txbfr.stride & (ep->txbfr.stride - 1)) ||
+		    rptr >= ep->txbfr.bufsz || wptr >= ep->txbfr.bufsz ||
+		    !IS_ALIGNED(rptr, ep->txbfr.stride) ||
+		    !IS_ALIGNED(wptr, ep->txbfr.stride) ||
+		    total_size >= ep->txbfr.bufsz) {
+			ret = -EPROTO;
+			goto out;
+		}
+		available = rptr > wptr ? rptr - wptr : ep->txbfr.bufsz - wptr + rptr;
+		needed = ALIGN(total_size, ep->txbfr.stride);
+		if (total_size > ep->txbfr.bufsz - wptr)
+			needed += ep->txbfr.bufsz - wptr;
+		/* Retain an empty slot; equal read/write pointers mean empty. */
+		if (needed >= available) {
+			ret = -ENOSPC;
+			goto out;
+		}
+	}
 
 	hdr = hdr2 = NULL;
 
@@ -989,31 +1049,45 @@ int afk_send_epic(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 
 	hdr->magic = cpu_to_le32(QE_MAGIC);
 	hdr->size = cpu_to_le32(total_epic_size);
-	hdr->channel = cpu_to_le32(channel);
+	hdr->channel = cpu_to_le32(compact ? 0 : channel);
 	hdr->type = cpu_to_le32(etype);
 	if (hdr2)
 		memcpy(hdr2, hdr, sizeof(*hdr));
 
-	ehdr = ep->txbfr.buf + wptr;
-	memset(ehdr, 0, sizeof(*ehdr));
-	ehdr->version = 2;
-	ehdr->seq = cpu_to_le16(ep->qe_seq++);
-	ehdr->timestamp = cpu_to_le64(0);
-	wptr += sizeof(*ehdr);
+	if (compact) {
+		u8 *wire = ep->txbfr.buf + wptr;
 
-	eshdr = ep->txbfr.buf + wptr;
-	memset(eshdr, 0, sizeof(*eshdr));
-	eshdr->length = cpu_to_le32(payload_len);
-	eshdr->version = 4;
-	eshdr->category = ecat;
-	eshdr->type = cpu_to_le16(stype);
-	eshdr->timestamp = cpu_to_le64(0);
-	eshdr->tag = cpu_to_le16(tag);
-	if (ecat == EPIC_CAT_REPLY)
-		eshdr->inline_len = cpu_to_le32(payload_len - 4);
-	else
-		eshdr->inline_len = cpu_to_le32(0);
-	wptr += sizeof(*eshdr);
+		/* Experimental symmetry with the published H17P receive layout. */
+		memset(wire, 0, sizeof(*ehdr) + sizeof(struct epic_sub_hdr_h17p));
+		wire[0] = ep->qe_seq++;
+		put_unaligned_le16(channel, wire + 2);
+		put_unaligned_le32(total_epic_size - 8, wire + 4);
+		wire[16] = stype;
+		wire[17] = ecat;
+		put_unaligned_le32(tag, wire + 20);
+		wptr += sizeof(*ehdr) + sizeof(struct epic_sub_hdr_h17p);
+	} else {
+		ehdr = ep->txbfr.buf + wptr;
+		memset(ehdr, 0, sizeof(*ehdr));
+		ehdr->version = 2;
+		ehdr->seq = cpu_to_le16(ep->qe_seq++);
+		ehdr->timestamp = cpu_to_le64(0);
+		wptr += sizeof(*ehdr);
+
+		eshdr = ep->txbfr.buf + wptr;
+		memset(eshdr, 0, sizeof(*eshdr));
+		eshdr->length = cpu_to_le32(payload_len);
+		eshdr->version = 4;
+		eshdr->category = ecat;
+		eshdr->type = cpu_to_le16(stype);
+		eshdr->timestamp = cpu_to_le64(0);
+		eshdr->tag = cpu_to_le16(tag);
+		if (ecat == EPIC_CAT_REPLY)
+			eshdr->inline_len = cpu_to_le32(payload_len - 4);
+		else
+			eshdr->inline_len = cpu_to_le32(0);
+		wptr += sizeof(*eshdr);
+	}
 
 	memcpy(ep->txbfr.buf + wptr, payload, payload_len);
 	wptr += payload_len;

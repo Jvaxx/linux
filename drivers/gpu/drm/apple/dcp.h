@@ -12,6 +12,8 @@
 #include "dcp-internal.h"
 #include "parser.h"
 
+bool dcp_h17p_external_enabled(void);
+
 struct apple_crtc {
 	struct drm_crtc base;
 	struct drm_pending_vblank_event *event;
