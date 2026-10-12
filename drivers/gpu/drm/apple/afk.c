@@ -701,6 +701,8 @@ static void afk_v2_callback(struct apple_dcp_afkep *ep,
 	u32 status = 0xe00002c7;
 	int ret;
 
+	dev_dbg(ep->dcp->dev, "AFKV2 callback sizes: tx=%u rx=%u value=%u inline=%zu\n",
+		command->tx_size, command->rx_size, command->value, command->inline_size);
 	if (frame->type != EPIC_SUBTYPE_STD_SERVICE ||
 	    afkv2_callback_lengths(command, sizeof(*call) + sizeof(u32),
 				   SZ_1M - AFKV2_COMMAND_SIZE,
@@ -746,6 +748,8 @@ static void afk_v2_callback(struct apple_dcp_afkep *ep,
 	memcpy(reply + AFKV2_COMMAND_SIZE, call, sizeof(*call));
 	((struct epic_service_call *)(reply + AFKV2_COMMAND_SIZE))->data_len =
 		cpu_to_le32(response_body);
+	dev_dbg(ep->dcp->dev, "AFKV2 callback begin: group=%u command=%u in=%zu out=%zu\n",
+		le16_to_cpu(call->group), le32_to_cpu(call->command), body_size, response_body);
 	if (service->ops->call_v2)
 		ret = service->ops->call_v2(service, le16_to_cpu(call->group),
 					  le32_to_cpu(call->command),
@@ -756,6 +760,8 @@ static void afk_v2_callback(struct apple_dcp_afkep *ep,
 		ret = service->ops->call(service, le32_to_cpu(call->command),
 					 request + sizeof(*call), body_size,
 					 reply + AFKV2_COMMAND_SIZE + sizeof(*call), response_body);
+	dev_dbg(ep->dcp->dev, "AFKV2 callback end: group=%u command=%u result=%d\n",
+		le16_to_cpu(call->group), le32_to_cpu(call->command), ret);
 	if (ret)
 		goto release;
 	reply_size = AFKV2_COMMAND_SIZE + response_size;
