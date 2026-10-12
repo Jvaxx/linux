@@ -981,6 +981,7 @@ static u8 dcpep_cb_prop_start(struct apple_dcp *dcp, u32 *length)
 
 	dcp->chunks.modes_generation = dcp_modes_transfer_begin(dcp);
 	dcp->chunks.length = *length;
+	dcp_firmware_metadata_begin(dcp);
 	dcp->chunks.data = kzalloc(*length, GFP_KERNEL);
 
 	if (!dcp->chunks.data) {

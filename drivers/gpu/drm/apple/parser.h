@@ -7,6 +7,8 @@
 /* For mode parsing */
 #include <drm/drm_modes.h>
 
+#include "dcp-display-metadata.h"
+
 struct apple_dcp;
 struct apple_connector;
 struct apple_dcp_typec_route;
@@ -96,11 +98,14 @@ struct dcp_display_mode {
 	struct dcp_color_mode sdr;
 	struct dcp_color_mode best;
 	bool vrr;
+	bool metadata_timing_valid;
 };
 
 struct dimension {
 	s64 total, front_porch, sync_width, active;
 	s64 precise_sync_rate;
+	s64 sync_polarity;
+	s64 pixel_repetition;
 };
 
 int parse(const void *blob, size_t size, struct dcp_parse_ctx *ctx);
@@ -108,6 +113,7 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 					 unsigned int *count, int width_mm,
 					 int height_mm, unsigned notch_height,
 					 bool internal, bool external_sdr);
+int parse_display_metadata(struct dcp_parse_ctx *handle, struct dcp_display_metadata *out);
 					 bool internal);
 /* Caller holds modes_lock while checking connector ownership. */
 bool dcp_modes_for_connector(struct apple_dcp *dcp,

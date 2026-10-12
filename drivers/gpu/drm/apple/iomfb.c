@@ -822,6 +822,23 @@ void dcp_route_failure_notify(struct apple_connector *connector)
 	schedule_work(&connector->hotplug_wq);
 }
 
+static void dcp_clear_connector_edid(struct apple_connector *connector)
+{
+	lockdep_assert_held(&connector->base.dev->mode_config.mutex);
+	drm_edid_connector_update(&connector->base, NULL);
+	drm_edid_free(connector->drm_edid);
+	connector->drm_edid = NULL;
+	connector->drm_edid_firmware_derived = false;
+}
+
+static void dcp_consume_edid_invalidation(struct apple_connector *connector)
+{
+	lockdep_assert_held(&connector->base.dev->mode_config.mutex);
+	/* Preserve a disconnect even if the port reconnected before probing. */
+	if (xchg(&connector->edid_invalidation_pending, false))
+		dcp_clear_connector_edid(connector);
+}
+
 void dcp_hotplug(struct work_struct *work)
 {
 	struct apple_connector *connector;
@@ -832,12 +849,21 @@ void dcp_hotplug(struct work_struct *work)
 	int ret;
 
 	connector = container_of(work, struct apple_connector, hotplug_wq);
+	scoped_guard(mutex, &connector->base.dev->mode_config.mutex)
+		dcp_consume_edid_invalidation(connector);
 	reasons = atomic_xchg(&connector->hotplug_reasons, 0);
 	notify_only = (reasons & DCP_HOTPLUG_ROUTE_FAILURE) &&
 		      !(reasons & DCP_HOTPLUG_READY);
 
 	pdev = READ_ONCE(connector->dcp);
 	if (!pdev) {	/* a Type-C port unrouted after this was queued */
+		scoped_guard(mutex, &connector->base.dev->mode_config.mutex) {
+			if (!READ_ONCE(connector->dcp) && connector->drm_edid_firmware_derived) {
+				drm_edid_connector_update(&connector->base, NULL);
+				connector->drm_edid_firmware_derived = false;
+			}
+		}
+		drm_kms_helper_connector_hotplug_event(&connector->base);
 		apple_connector_invalidate_edid(connector);
 		dcp_notify_hotplug(connector);
 		apple_connector_backlight_sync(connector);
@@ -847,6 +873,10 @@ void dcp_hotplug(struct work_struct *work)
 	dev_info(dcp->dev, "%s() connected:%d valid_mode:%d nr_modes:%u\n", __func__,
 		 connector->connected, READ_ONCE(dcp->mode_state.valid), dcp->nr_modes);
 
+	scoped_guard(mutex, &connector->base.dev->mode_config.mutex) {
+		if (!READ_ONCE(connector->connected))
+			dcp_clear_connector_edid(connector);
+	}
 	if (!connector->connected)
 		apple_connector_invalidate_edid(connector);
 
@@ -1273,8 +1303,14 @@ int dcp_get_modes(struct drm_connector *connector)
 	unsigned int count;
 	int i;
 
+	dcp_consume_edid_invalidation(apple_connector);
+
 	/* A Type-C port has no pipeline while the fabric is moving it. */
 	if (!pdev) {
+		if (apple_connector->drm_edid_firmware_derived) {
+			drm_edid_connector_update(connector, NULL);
+			apple_connector->drm_edid_firmware_derived = false;
+		}
 		drm_edid_connector_update(connector, NULL);
 		return 0;
 	}
@@ -1335,6 +1371,36 @@ int dcp_get_modes(struct drm_connector *connector)
 			else
 				apple_connector_edid_install(apple_connector, pdev,
 							     generation, edid);
+		}
+	}
+	if (dcp->nr_modes && apple_connector->drm_edid) {
+		apple_connector->drm_edid_firmware_derived = false;
+		drm_edid_connector_update(connector, apple_connector->drm_edid);
+		dcp_retry_placeholder_edid(dcp, apple_connector->drm_edid);
+	} else {
+		u64 generation = 0;
+		const struct drm_edid *derived = dcp->nr_modes ?
+			dcp_firmware_edid(dcp, &generation) : ERR_PTR(-ENODATA);
+
+		if (!IS_ERR(derived)) {
+			bool log = !apple_connector->drm_edid_firmware_derived ||
+				apple_connector->drm_edid_generation != generation;
+			int update;
+
+			apple_connector->drm_edid_firmware_derived = true;
+			apple_connector->drm_edid_generation = generation;
+			update = drm_edid_connector_update(connector, derived);
+			drm_edid_free(derived);
+			if (update || !dcp_firmware_metadata_current(dcp, generation)) {
+				drm_edid_connector_update(connector, NULL);
+				apple_connector->drm_edid_firmware_derived = false;
+			} else if (log) {
+				dev_info(dcp->dev, "using firmware-derived EDID metadata for connection %llu\n",
+					 generation);
+			}
+		} else if (apple_connector->drm_edid_firmware_derived) {
+			drm_edid_connector_update(connector, NULL);
+			apple_connector->drm_edid_firmware_derived = false;
 		}
 
 		edid = apple_connector_edid_dup(apple_connector, pdev);

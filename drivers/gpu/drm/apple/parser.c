@@ -387,6 +387,18 @@ static int parse_dimension(struct dcp_parse_ctx *handle, struct dimension *dim,
 			ret = parse_int_bound(it.handle, &dim->sync_width, 0, U16_MAX);
 		else if (!strcmp(key, "PreciseSyncRate"))
 			ret = parse_int_bound(it.handle, &dim->precise_sync_rate, 1, U32_MAX);
+		else if (polarity && !strcmp(key, "SyncPolarity")) {
+			if (dim->sync_polarity >= 0)
+				ret = -EINVAL;
+			else
+				ret = parse_int_bound(it.handle, &dim->sync_polarity, 0, 1);
+		} else if (polarity && !strcmp(key, "PixelRepetition")) {
+			if (dim->pixel_repetition >= 0)
+				ret = -EINVAL;
+			else
+				ret = parse_int_bound(it.handle, &dim->pixel_repetition,
+						      0, U32_MAX);
+		}
 		else
 			ret = skip(it.handle);
 
@@ -680,6 +692,8 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 	s64 id = -1;
 	s64 best_color_mode = -1;
 	bool is_virtual = false;
+	bool preferred = false, interlaced = false;
+	bool have_preferred = false, have_interlaced = false;
 	struct drm_display_mode *mode = &out->mode;
 
 	*out = (struct dcp_display_mode) {};
@@ -722,6 +736,20 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 			ret = parse_int(it.handle, &id);
 		else if (!strcmp(key, "IsVirtual"))
 			ret = parse_bool(it.handle, &is_virtual);
+		else if (external_sdr && !strcmp(key, "IsPreferred")) {
+			if (have_preferred)
+				ret = -EINVAL;
+			else
+				ret = parse_bool(it.handle, &preferred);
+			have_preferred = true;
+		} else if (external_sdr && !strcmp(key, "IsInterlaced")) {
+			if (have_interlaced)
+				ret = -EINVAL;
+			else
+				ret = parse_bool(it.handle, &interlaced);
+			have_interlaced = true;
+		} else if (!strcmp(key, "Score"))
+			ret = parse_int_bound(it.handle, score, 0, S64_MAX);
 		else if (!strcmp(key, "Score"))
 			ret = parse_int(it.handle, score);
 		else
@@ -813,6 +841,12 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		.height_mm = height_mm,
 	};
 
+	if (external_sdr && horiz.sync_polarity >= 0 && vert.sync_polarity >= 0)
+		mode->flags = (horiz.sync_polarity ? DRM_MODE_FLAG_PHSYNC : DRM_MODE_FLAG_NHSYNC) |
+			      (vert.sync_polarity ? DRM_MODE_FLAG_PVSYNC : DRM_MODE_FLAG_NVSYNC);
+	out->metadata_timing_valid = external_sdr && have_preferred && preferred &&
+		have_interlaced && !interlaced && horiz.pixel_repetition == 0 &&
+		vert.pixel_repetition == 0 && horiz.sync_polarity >= 0 && vert.sync_polarity >= 0;
 	drm_mode_set_name(mode);
 
 	out->timing_mode_id = id;
@@ -965,6 +999,238 @@ int parse_display_attributes(struct dcp_parse_ctx *handle, int *width_mm,
 	*width_mm = 10 * width_cm;
 	*height_mm = 10 * height_cm;
 
+	return 0;
+}
+
+/* Metadata strings must fit an EDID text descriptor without hidden suffixes. */
+static int parse_metadata_string(struct dcp_parse_ctx *handle, char *out, size_t size)
+{
+	const struct dcp_parse_tag *tag = parse_tag_of_type(handle, DCP_TYPE_STRING);
+	const u8 *value;
+
+	if (IS_ERR(tag))
+		return PTR_ERR(tag);
+	if (!tag->size || tag->size >= size)
+		return -EINVAL;
+	value = parse_bytes(handle, tag->size);
+	if (IS_ERR(value))
+		return PTR_ERR(value);
+	for (unsigned int i = 0; i < tag->size; i++)
+		if (value[i] < 0x20 || value[i] > 0x7e)
+			return -EINVAL;
+	memcpy(out, value, tag->size);
+	out[tag->size] = 0;
+	return 0;
+}
+
+static int parse_metadata_number(struct dcp_parse_ctx *handle, u32 *out, u32 min, u32 max)
+{
+	s64 value;
+	int ret = parse_int_bound(handle, &value, min, max);
+
+	if (!ret)
+		*out = value;
+	return ret;
+}
+
+static int parse_metadata_point(struct dcp_parse_ctx *handle, u32 point[2], u32 *gamma)
+{
+	struct iterator it;
+	unsigned int seen = 0;
+	int ret = iterator_begin(handle, &it, true);
+
+	if (ret)
+		return ret;
+	for (; it.idx < it.len; it.idx++) {
+		char key[64];
+
+		ret = parse_metadata_string(handle, key, sizeof(key));
+		if (ret)
+			return ret;
+		if (!strcmp(key, "X")) {
+			if (seen & 1)
+				return -EINVAL;
+			seen |= 1;
+			ret = parse_metadata_number(handle, &point[0], 1, 65535);
+		} else if (!strcmp(key, "Y")) {
+			if (seen & 2)
+				return -EINVAL;
+			seen |= 2;
+			ret = parse_metadata_number(handle, &point[1], 1, 65535);
+		} else if (gamma && !strcmp(key, "Gamma")) {
+			if (seen & 4)
+				return -EINVAL;
+			seen |= 4;
+			ret = parse_metadata_number(handle, gamma, 65536, (354U << 16) / 100);
+		} else {
+			ret = skip(handle);
+		}
+		if (ret)
+			return ret;
+	}
+	if (seen != (gamma ? 7 : 3) || point[0] + point[1] > 65536)
+		return -EINVAL;
+	return 0;
+}
+
+static int parse_metadata_chromaticity(struct dcp_parse_ctx *handle,
+				       struct dcp_display_metadata *out)
+{
+	static const char * const names[] = { "Red", "Green", "Blue" };
+	struct iterator it;
+	unsigned int seen = 0;
+	int ret = iterator_begin(handle, &it, true);
+
+	if (ret)
+		return ret;
+	for (; it.idx < it.len; it.idx++) {
+		char key[64];
+		unsigned int color;
+
+		ret = parse_metadata_string(handle, key, sizeof(key));
+		if (ret)
+			return ret;
+		for (color = 0; color < ARRAY_SIZE(names); color++)
+			if (!strcmp(key, names[color]))
+				break;
+		if (color < ARRAY_SIZE(names)) {
+			if (seen & 1U << color)
+				return -EINVAL;
+			seen |= 1U << color;
+			ret = parse_metadata_point(handle, out->chromaticity[color], NULL);
+		} else {
+			ret = skip(handle);
+		}
+		if (ret)
+			return ret;
+	}
+	return seen == 7 ? 0 : -EINVAL;
+}
+
+static int parse_metadata_product(struct dcp_parse_ctx *handle, struct dcp_display_metadata *out)
+{
+	struct iterator it;
+	unsigned int seen = 0;
+	u32 legacy = 0;
+	int ret = iterator_begin(handle, &it, true);
+
+	if (ret)
+		return ret;
+	for (; it.idx < it.len; it.idx++) {
+		char key[64];
+
+		ret = parse_metadata_string(handle, key, sizeof(key));
+		if (ret)
+			return ret;
+		if (!strcmp(key, "ManufacturerID")) {
+			if (seen & 1)
+				return -EINVAL;
+			seen |= 1;
+			ret = parse_metadata_string(handle, out->manufacturer,
+						    sizeof(out->manufacturer));
+		} else if (!strcmp(key, "ProductName")) {
+			if (seen & 2)
+				return -EINVAL;
+			seen |= 2;
+			ret = parse_metadata_string(handle, out->name, sizeof(out->name));
+		} else if (!strcmp(key, "ProductID")) {
+			if (seen & 4)
+				return -EINVAL;
+			seen |= 4;
+			ret = parse_metadata_number(handle, &out->product, 0, U16_MAX);
+		} else if (!strcmp(key, "WeekOfManufacture")) {
+			if (seen & 8)
+				return -EINVAL;
+			seen |= 8;
+			ret = parse_metadata_number(handle, &out->week, 0, 53);
+		} else if (!strcmp(key, "YearOfManufacture")) {
+			if (seen & 16)
+				return -EINVAL;
+			seen |= 16;
+			ret = parse_metadata_number(handle, &out->year, 1990, 2245);
+		} else if (!strcmp(key, "SerialNumber")) {
+			if (seen & 64)
+				return -EINVAL;
+			seen |= 64;
+			ret = parse_metadata_number(handle, &out->serial, 0, U32_MAX);
+		} else if (!strcmp(key, "AlphanumericSerialNumber")) {
+			if (seen & 128)
+				return -EINVAL;
+			seen |= 128;
+			ret = parse_metadata_string(handle, out->serial_text,
+						    sizeof(out->serial_text));
+		} else if (!strcmp(key, "LegacyManufacturerID")) {
+			if (seen & 32)
+				return -EINVAL;
+			seen |= 32;
+			ret = parse_metadata_number(handle, &legacy, 0, 0x7fff);
+		} else {
+			ret = skip(handle);
+		}
+		if (ret)
+			return ret;
+	}
+	if ((seen & 31) != 31 || strlen(out->manufacturer) != 3)
+		return -EINVAL;
+	for (unsigned int i = 0; i < 3; i++)
+		if (out->manufacturer[i] < 'A' || out->manufacturer[i] > 'Z')
+			return -EINVAL;
+	if ((seen & 32) && legacy != ((out->manufacturer[0] - '@') << 10 |
+				   (out->manufacturer[1] - '@') << 5 |
+				   (out->manufacturer[2] - '@')))
+		return -EINVAL;
+	return 0;
+}
+
+int parse_display_metadata(struct dcp_parse_ctx *handle, struct dcp_display_metadata *out)
+{
+	struct dcp_display_metadata parsed = {};
+	struct iterator it;
+	unsigned int seen = 0;
+	int ret = iterator_begin(handle, &it, true);
+
+	if (ret)
+		return ret;
+	for (; it.idx < it.len; it.idx++) {
+		char key[64];
+
+		ret = parse_metadata_string(handle, key, sizeof(key));
+		if (ret)
+			return ret;
+		if (!strcmp(key, "MaxHorizontalImageSize")) {
+			if (seen & 1)
+				return -EINVAL;
+			seen |= 1;
+			ret = parse_metadata_number(handle, &parsed.width_cm, 1, 255);
+		} else if (!strcmp(key, "MaxVerticalImageSize")) {
+			if (seen & 2)
+				return -EINVAL;
+			seen |= 2;
+			ret = parse_metadata_number(handle, &parsed.height_cm, 1, 255);
+		} else if (!strcmp(key, "Chromaticity")) {
+			if (seen & 4)
+				return -EINVAL;
+			seen |= 4;
+			ret = parse_metadata_chromaticity(handle, &parsed);
+		} else if (!strcmp(key, "DefaultWhitePoint")) {
+			if (seen & 8)
+				return -EINVAL;
+			seen |= 8;
+			ret = parse_metadata_point(handle, parsed.white, &parsed.gamma);
+		} else if (!strcmp(key, "ProductAttributes")) {
+			if (seen & 16)
+				return -EINVAL;
+			seen |= 16;
+			ret = parse_metadata_product(handle, &parsed);
+		} else {
+			ret = skip(handle);
+		}
+		if (ret)
+			return ret;
+	}
+	if (seen != 31)
+		return -EINVAL;
+	*out = parsed;
 	return 0;
 }
 
