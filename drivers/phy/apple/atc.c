@@ -657,6 +657,7 @@ struct atcphy_hw {
  * @hw: SoC-specific PHY description
  * @ss_tunables: The complete SuperSpeed tunable set was supplied
  * @dp_tunables: The complete T8140 DisplayPort bundle was supplied
+ * @aux_power_requested: AUX power-up began and needs matching shutdown
  * @fixed_usb2: The USB2 pairs go to a fixed hub on the USB controller, which
  *              stays in host mode; the PHY provides USB2 from probe on
  * @typec_mode: Mode the Type-C mux last asked for; a fixed-hub port returns to
@@ -715,6 +716,7 @@ struct apple_atcphy {
 	const struct atcphy_hw *hw;
 	bool ss_tunables;
 	bool dp_tunables;
+	bool aux_power_requested;
 	bool fixed_usb2;
 	enum atcphy_mode typec_mode;
 	bool host_active;
@@ -1498,19 +1500,81 @@ static void atcphy_configure_lanes(struct apple_atcphy *atcphy, enum atcphy_mode
 	}
 }
 
-static void atcphy_enable_dp_aux(struct apple_atcphy *atcphy)
+#define J700_AUX_ANALOG_CONTROL 0x16000
+#define J700_AUX_SUPPLY_CONTROL 0x16400
+#define J700_AUX_ANALOG_OFF BIT(0)
+#define J700_AUX_CLAMP_SELECT BIT(8)
+#define J700_AUX_CLAMP_ENABLE BIT(9)
+
+static int j700_aux_update(struct apple_atcphy *atcphy, u32 offset, u32 mask, u32 value)
+{
+	u32 observed;
+
+	core_mask32(atcphy, offset, mask, value);
+	usleep_range(10, 20);
+	return readl_poll_timeout_atomic(atcphy->regs.core + offset, observed,
+					(observed & mask) == value, 1, 100);
+}
+
+static int j700_aux_enable(struct apple_atcphy *atcphy)
+{
+	u32 clamp = J700_AUX_CLAMP_SELECT | J700_AUX_CLAMP_ENABLE;
+	int ret;
+
+	/* Even an incomplete power-up must be unwound before the domain is stopped. */
+	atcphy->aux_power_requested = true;
+	for (unsigned int stage = 0; stage < 2; stage++) {
+		u32 fields = 3U << (2 * stage);
+
+		ret = j700_aux_update(atcphy, J700_AUX_SUPPLY_CONTROL, fields, fields);
+		if (ret)
+			return ret;
+	}
+	ret = j700_aux_update(atcphy, J700_AUX_SUPPLY_CONTROL, clamp, J700_AUX_CLAMP_SELECT);
+	if (ret)
+		return ret;
+
+	return j700_aux_update(atcphy, J700_AUX_ANALOG_CONTROL, J700_AUX_ANALOG_OFF, 0);
+}
+
+static int j700_aux_disable(struct apple_atcphy *atcphy)
+{
+	u32 clamp = J700_AUX_CLAMP_SELECT | J700_AUX_CLAMP_ENABLE;
+	int ret;
+
+	if (!atcphy->aux_power_requested)
+		return 0;
+	ret = j700_aux_update(atcphy, J700_AUX_ANALOG_CONTROL,
+			      J700_AUX_ANALOG_OFF, J700_AUX_ANALOG_OFF);
+	if (ret)
+		return ret;
+	ret = j700_aux_update(atcphy, J700_AUX_SUPPLY_CONTROL, clamp, clamp);
+	if (ret)
+		return ret;
+	for (unsigned int remaining = 2; remaining; remaining--) {
+		u32 override = BIT(2 * remaining - 1);
+
+		ret = j700_aux_update(atcphy, J700_AUX_SUPPLY_CONTROL, override, 0);
+		if (ret)
+			return ret;
+	}
+	atcphy->aux_power_requested = false;
+	return 0;
+}
+
+static int atcphy_enable_dp_aux(struct apple_atcphy *atcphy)
 {
 	if (atcphy->hw->has_t8140_dp) {
 		apple_tunable_apply(atcphy->regs.core, atcphy->tunables.dp_common_pre);
 		apple_tunable_apply(atcphy->regs.lpdptx, atcphy->tunables.dp_lpdptx);
 		apple_tunable_apply(atcphy->regs.core, atcphy->tunables.dp_common_post);
 		dev_info_once(atcphy->dev, "Applied T8140 DisplayPort setup lists\n");
-		return;
+		return j700_aux_enable(atcphy);
 	}
 
 	/* FIXME */
 	if (atcphy->hw->gen == ATCPHY_GENERATION_T8122)
-		return;
+		return 0;
 
 	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTXPHY_PMA_LANE_RESET_N);
 	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTXPHY_PMA_LANE_RESET_N_OV);
@@ -1560,10 +1624,14 @@ static void atcphy_enable_dp_aux(struct apple_atcphy *atcphy)
 	       FIELD_PREP(LPDPTX_AUX_MARGIN_RCAL_TXSWING, 12));
 
 	atcphy->dp_link_rate = -1;
+	return 0;
 }
 
-static void atcphy_disable_dp_aux(struct apple_atcphy *atcphy)
+static int atcphy_disable_dp_aux(struct apple_atcphy *atcphy)
 {
+	if (atcphy->hw->has_t8140_dp)
+		return j700_aux_disable(atcphy);
+
 	/* FIXME */
 	if (atcphy->hw->gen != ATCPHY_GENERATION_T8122) {
 		set32(atcphy->regs.lpdptx + LPDPTX_AUX_CONTROL, LPDPTX_AUX_PWN_DOWN);
@@ -1578,6 +1646,7 @@ static void atcphy_disable_dp_aux(struct apple_atcphy *atcphy)
 	core_clear32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPRX_PCLK_ENABLE);
 	core_clear32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK1_ENABLE);
 	core_clear32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, DPTX_PCLK2_ENABLE);
+	return 0;
 }
 
 static int atcphy_dp_configure_lane(struct apple_atcphy *atcphy, enum atcphy_lane lane,
@@ -1944,7 +2013,9 @@ static int atcphy_power_off(struct apple_atcphy *atcphy)
 	u32 reg;
 	int ret;
 
-	atcphy_disable_dp_aux(atcphy);
+	ret = atcphy_disable_dp_aux(atcphy);
+	if (ret)
+		return ret;
 
 	/* Enable all reset lines */
 	core_clear32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_PHY_RESET_N);
@@ -2620,6 +2691,12 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 	if (atcphy->hw->has_t8140_dp && atcphy_modes[mode].enable_dp_aux &&
 	    !atcphy->dp_tunables)
 		return -EOPNOTSUPP;
+	if (atcphy->hw->has_t8140_dp && !atcphy_modes[mode].enable_dp_aux &&
+	    atcphy->aux_power_requested) {
+		ret = j700_aux_disable(atcphy);
+		if (ret)
+			return ret;
+	}
 	/* the mode change below may power the PHY down: stop the tunnel clock first */
 	atc_tunnel_stop_t8103(atcphy);
 	atc_tunnel_restore(atcphy);
@@ -2638,8 +2715,11 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 	atcphy->hw->configure_post_tunable(atcphy, mode);
 
 	/* Setup AUX channel if DP altmode is requested */
-	if (atcphy_modes[mode].enable_dp_aux)
-		atcphy_enable_dp_aux(atcphy);
+	if (atcphy_modes[mode].enable_dp_aux) {
+		ret = atcphy_enable_dp_aux(atcphy);
+		if (ret)
+			return ret;
+	}
 
 	/* Enable clocks and configure lanes */
 	if (atcphy->hw->gen == ATCPHY_GENERATION_T8103) {
