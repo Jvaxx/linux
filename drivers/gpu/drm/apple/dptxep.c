@@ -884,11 +884,52 @@ int dptx_controller_init(struct apple_dcp *dcp)
 	return 0;
 }
 
+static void dptx_v2_probe_service(struct apple_epic_service *service,
+				  const char *name, const char *class, s64 unit)
+{
+	dev_info(service->ep->dcp->dev,
+		 "DPTX v2 discovery name=%s class=%s unit=%lld channel=%u\n",
+		 name ?: "(none)", class ?: "(none)", unit, service->channel);
+	complete(&service->ep->dcp->dptx_v2_probe_ready);
+}
+
+static const struct apple_epic_service_ops dptx_v2_probe_ops[] = {
+	{
+		.name = "AppleDCPDPTXRemotePort",
+		.init = dptx_v2_probe_service,
+	},
+	{}
+};
+
+static int dptx_v2_discover(struct apple_dcp *dcp)
+{
+	struct apple_dcp_afkep *ep;
+	int ret;
+
+	init_completion(&dcp->dptx_v2_probe_ready);
+	ep = afk_init(dcp, DPTX_ENDPOINT_V2, dptx_v2_probe_ops);
+	if (IS_ERR(ep))
+		return PTR_ERR(ep);
+	dcp->dptx_v2_probe_ep = ep;
+	ret = afk_start(ep);
+	if (ret)
+		return ret;
+	if (!wait_for_completion_timeout(&dcp->dptx_v2_probe_ready,
+					 msecs_to_jiffies(1000)))
+		return -ETIMEDOUT;
+
+	/* Discovery does not enable port callbacks or transmit service commands. */
+	return -EOPNOTSUPP;
+}
+
 int dptxep_init(struct apple_dcp *dcp)
 {
 	int ret;
 	u32 port;
 	unsigned long timeout = msecs_to_jiffies(1000);
+
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
+		return dptx_v2_discover(dcp);
 
 	init_completion(&dcp->dptxport[0].enable_completion);
 	init_completion(&dcp->dptxport[1].enable_completion);
