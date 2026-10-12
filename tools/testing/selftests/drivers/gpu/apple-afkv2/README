@@ -22,3 +22,19 @@ DMA coherency, firmware, a graphics device or any hardware display behavior.
 All build products are temporary. No device node is opened and no GPU, firmware
 or target machine is contacted. The extractor fails if production function
 boundaries change, requiring review rather than silently testing a stale copy.
+
+The inline EDID tests cover response context, status, declared/actual lengths,
+EDID header/checksum/block limits, and continued rejection of inline responses
+by the OOB matcher. The actual service-call body is extracted for short reply,
+error status and timeout checks; its wire sender is mocked.
+
+The real sender is also extracted to test a 128-byte mocked command payload
+with a 32 KiB response capacity, OOB behavior, send failures and timeout
+retention. The two production EDID readers are tested independently to
+prove legacy checksum tolerance remains unchanged.
+
+The complete encoded EDID request is 160 bytes including the queue entry,
+consumes 192 bytes at a 64-byte stride, and needs a 256-byte empty ring. The
+ring-admission block is extracted from the real transmitter to check this.
+The late-publication notifier is extracted to test asynchronous hotplug
+queueing and connector-registration, quiesce, routing and legacy guards.
