@@ -76,6 +76,34 @@
 		{ DPTX_APCALL_DEVICE_BUSY_TIMEOUT, "device_busy_timeout" },   \
 		{ DPTX_APCALL_DEVICE_NOT_STARTED, "device_not_started" })
 
+TRACE_EVENT(iomfb_metadata,
+	TP_PROTO(struct apple_dcp *dcp, const char *phase, u64 generation,
+		 u64 ticket_generation, u32 flags, u32 received, u32 length),
+	TP_ARGS(dcp, phase, generation, ticket_generation, flags, received, length),
+	TP_STRUCT__entry(
+		__string(devname, dev_name(dcp->dev))
+		__string(phase, phase)
+		__field(u64, generation)
+		__field(u64, ticket_generation)
+		__field(u32, flags)
+		__field(u32, received)
+		__field(u32, length)
+	),
+	TP_fast_assign(
+		__assign_str(devname);
+		__assign_str(phase);
+		__entry->generation = generation;
+		__entry->ticket_generation = ticket_generation;
+		__entry->flags = flags;
+		__entry->received = received;
+		__entry->length = length;
+	),
+	TP_printk("%s: %s generation=%llu ticket=%llu flags=%#x received=%u length=%u",
+		  __get_str(devname), __get_str(phase), __entry->generation,
+		  __entry->ticket_generation, __entry->flags,
+		  __entry->received, __entry->length)
+);
+
 TRACE_EVENT(dcp_recv_msg,
 	    TP_PROTO(struct apple_dcp *dcp, u8 endpoint, u64 message),
 	    TP_ARGS(dcp, endpoint, message),

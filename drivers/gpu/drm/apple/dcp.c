@@ -1673,6 +1673,23 @@ static bool dcp_firmware_metadata_enabled(struct apple_dcp *dcp)
 	return dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL;
 }
 
+/* Called under metadata.lock; no monitor contents or pointers are exposed. */
+static void dcp_trace_metadata(struct apple_dcp *dcp, const char *phase, bool valid)
+{
+	u32 flags = (dcp->metadata.epoch.connected ? BIT(0) : 0) |
+		(dcp->metadata.epoch.associated_once ? BIT(1) : 0) |
+		(dcp->metadata.epoch.invalidated ? BIT(2) : 0) |
+		(dcp->metadata.attributes_valid ? BIT(3) : 0) |
+		(dcp->metadata.timing_valid ? BIT(4) : 0) |
+		(dcp->chunks.metadata_ticket.associated ? BIT(5) : 0) |
+		(dcp->chunks.contiguous ? BIT(6) : 0) | (valid ? BIT(7) : 0);
+
+	if (dcp_firmware_metadata_enabled(dcp))
+		trace_iomfb_metadata(dcp, phase, dcp->metadata.epoch.generation,
+				     dcp->chunks.metadata_ticket.generation, flags,
+				     dcp->chunks.received, dcp->chunks.length);
+}
+
 void dcp_firmware_metadata_connection(struct apple_dcp *dcp, u64 generation, bool connected)
 {
 	unsigned long flags;
@@ -1686,6 +1703,7 @@ void dcp_firmware_metadata_connection(struct apple_dcp *dcp, u64 generation, boo
 		dcp->metadata.hpd_seen = false;
 	}
 	dcp_metadata_epoch_connection(&dcp->metadata.epoch, generation, connected);
+	dcp_trace_metadata(dcp, "connection", connected);
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 }
 
@@ -1704,6 +1722,7 @@ void dcp_firmware_metadata_hotplug(struct apple_dcp *dcp, bool connected)
 		dcp->metadata.attributes_valid = false;
 		dcp->metadata.timing_valid = false;
 	}
+	dcp_trace_metadata(dcp, "hotplug", connected);
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 }
 
@@ -1713,9 +1732,10 @@ void dcp_firmware_metadata_begin(struct apple_dcp *dcp)
 
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
 	dcp->chunks.metadata_ticket = dcp_metadata_begin(&dcp->metadata.epoch);
-	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 	dcp->chunks.received = 0;
 	dcp->chunks.contiguous = true;
+	dcp_trace_metadata(dcp, "begin", dcp->chunks.metadata_ticket.associated);
+	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 }
 
 static void dcp_firmware_metadata_notify(struct apple_dcp *dcp)
@@ -1753,6 +1773,7 @@ void dcp_firmware_metadata_attributes(struct apple_dcp *dcp,
 			dcp->metadata.attributes_ticket = dcp->chunks.metadata_ticket;
 		}
 	}
+	dcp_trace_metadata(dcp, "attributes", !!attributes);
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 	dcp_firmware_metadata_notify(dcp);
 }
@@ -1780,6 +1801,7 @@ void dcp_firmware_metadata_timing(struct apple_dcp *dcp)
 		break;
 	}
 unlock:
+	dcp_trace_metadata(dcp, "timing", dcp->metadata.timing_valid);
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 	dcp_firmware_metadata_notify(dcp);
 }
@@ -1810,6 +1832,7 @@ const struct drm_edid *dcp_firmware_edid(struct apple_dcp *dcp, u64 *generation)
 	valid = dcp->metadata.attributes_valid && dcp->metadata.timing_valid &&
 		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.attributes_ticket) &&
 		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.timing_ticket);
+	dcp_trace_metadata(dcp, "probe", valid);
 	if (valid) {
 		attributes = dcp->metadata.attributes;
 		preferred = dcp->metadata.preferred;
