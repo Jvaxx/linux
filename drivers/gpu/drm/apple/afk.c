@@ -146,6 +146,11 @@ int afk_start(struct apple_dcp_afkep *ep)
 	afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_INIT));
 
 	ret = wait_for_completion_timeout(&ep->started, msecs_to_jiffies(1000));
+	if (ret <= 0 && ep->dcp->hw.iomfb_method_profile ==
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
+		dev_warn(ep->dcp->dev,
+			 "external AFK startup ep=%#x tx_ready=%u rx_ready=%u bytes=%zu\n",
+			 ep->endpoint, ep->txbfr.ready, ep->rxbfr.ready, ep->bfr_size);
 	if (ret <= 0)
 		return -ETIMEDOUT;
 	else
@@ -818,6 +823,11 @@ static void afk_receive_message_worker(struct work_struct *work_)
 	work = container_of(work_, struct afk_receive_message_work, work);
 
 	type = FIELD_GET(RBEP_TYPE, work->message);
+	if (work->ep->dcp->hw.iomfb_method_profile ==
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL && type != RBEP_RECV)
+		dev_info_ratelimited(work->ep->dcp->dev,
+				     "external AFK control ep=%#x type=%#x\n",
+				     work->ep->endpoint, type);
 	switch (type) {
 	case RBEP_INIT_ACK:
 		break;
