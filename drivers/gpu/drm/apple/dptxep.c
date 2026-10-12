@@ -885,6 +885,9 @@ int dptx_controller_init(struct apple_dcp *dcp)
 	ep = afk_init(dcp, DPTX_CONTROLLER_ENDPOINT, dptx_controller_ops);
 	if (IS_ERR(ep))
 		return PTR_ERR(ep);
+	/* Controller interfaces require the same OPEN handshake as the port. */
+	ep->wire_v2 = dcp->hw.iomfb_method_profile ==
+		DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL;
 	dcp->dptx_controller_ep = ep;
 
 	ret = afk_start(ep);
