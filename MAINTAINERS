@@ -2028,6 +2028,7 @@ F:	rust/kernel/soc/apple/aop.rs
 F:	sound/soc/apple/t8140_aop_audio.rs
 F:	tools/diagnostics/apple-dptx-training-test.c
 F:	tools/diagnostics/apple-j700-dp-test.c
+F:	tools/diagnostics/test-apple-afk-admission.py
 F:	tools/diagnostics/test-apple-atc-unwind.py
 F:	tools/diagnostics/test-apple-dcp-readiness.py
 F:	tools/diagnostics/test-apple-j700-crossbar.py
