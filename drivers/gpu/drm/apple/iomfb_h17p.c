@@ -445,7 +445,9 @@ static bool trampoline_provider_property_h17p(struct apple_dcp *dcp, int tag,
 			goto fail;
 	} else if (!of_property_present(node, property->dt_name) &&
 		   of_machine_is_compatible("apple,j700") &&
-		   of_device_is_compatible(node, "apple,t8140-dcp")) {
+		   (of_device_is_compatible(node, "apple,t8140-dcp") ||
+		    (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL &&
+		     of_device_is_compatible(node, "apple,t8140-dcpext")))) {
 		/* Qualified older loaders lack the newly described table properties. */
 		memset(reply, 0, sizeof(*reply));
 		memcpy(reply->data, property->legacy_data, property->length);
