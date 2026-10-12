@@ -45,6 +45,7 @@
 #include "av.h"
 #include "dcp.h"
 #include "dcp-internal.h"
+#include "dcp-external-bw.h"
 #include "iomfb.h"
 #include "parser.h"
 #include "trace.h"
@@ -141,6 +142,16 @@ static bool experimental_h17p_external;
 module_param(experimental_h17p_external, bool, 0444);
 MODULE_PARM_DESC(experimental_h17p_external,
 		 "Enable experimental T8140 external display protocol");
+
+static int experimental_h17p_external_bw_scratch = -1;
+module_param(experimental_h17p_external_bw_scratch, int, 0444);
+MODULE_PARM_DESC(experimental_h17p_external_bw_scratch,
+		 "Experimental external bandwidth scratch offset; unset by default");
+
+static int experimental_h17p_external_bw_request = -1;
+module_param(experimental_h17p_external_bw_request, int, 0444);
+MODULE_PARM_DESC(experimental_h17p_external_bw_request,
+		 "Experimental external bandwidth request offset; unset by default");
 
 bool dcp_h17p_external_enabled(void)
 {
@@ -3167,8 +3178,25 @@ static int dcp_get_disp_regs(struct apple_dcp *dcp)
 	}
 
 	if (dcp->hw.firmware_clock) {
-		/* The internal firmware's last aperture follows five display windows. */
-		if (count != 5 || resource_size(dcp->hw.firmware_clock) < 4 ||
+		unsigned int windows = dcp->hw.firmware_display_windows;
+		bool external = dcp->hw.iomfb_method_profile ==
+			DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL;
+
+		if (!windows || windows >= MAX_DISP_REGISTERS)
+			return -EINVAL;
+		if (external) {
+			/* The external clock aperture is already described by disp-4. */
+			if (count != windows + 1)
+				return -EINVAL;
+			res = dcp->disp_registers[windows];
+			if (!apple_dcp_external_clock_window(res->start,
+							     resource_size(res),
+							     dcp->hw.firmware_clock->start,
+							     resource_size(dcp->hw.firmware_clock)))
+				return -EINVAL;
+			count = windows;
+		}
+		if (count != windows || resource_size(dcp->hw.firmware_clock) < 4 ||
 		    dcp->hw.firmware_scratch > resource_size(dcp->hw.firmware_clock) - 4 ||
 		    dcp->hw.firmware_request > resource_size(dcp->hw.firmware_clock) - 4)
 			return -EINVAL;
@@ -3460,6 +3488,15 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 		goto err_piodma;
 	}
 
+	if (dcp->hw.iomfb_method_profile ==
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL &&
+	    (!dcp->clk_194 || !clk_get_rate(dcp->clk) ||
+	     !clk_get_rate(dcp->clk_194))) {
+		ret = dev_err_probe(dev, -EINVAL,
+				    "External display clocks are unavailable\n");
+		goto err_piodma;
+	}
+
 	bitmap_zero(dcp->memdesc_map, DCP_MAX_MAPPINGS);
 	// TDOD: mem_desc IDs start at 1, for simplicity just skip '0' entry
 	set_bit(0, dcp->memdesc_map);
@@ -3674,6 +3711,18 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	spin_lock_init(&dcp->mode_state.lock);
 	spin_lock_init(&dcp->dcpavserv.lock);
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
+	if (dcp->hw.iomfb_method_profile ==
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL) {
+		if (!dcp->hw.firmware_clock ||
+		    !apple_dcp_external_bw_valid(resource_size(dcp->hw.firmware_clock),
+					 experimental_h17p_external_bw_scratch,
+					 experimental_h17p_external_bw_request))
+			return dev_err_probe(dev, -EINVAL,
+					     "External bandwidth offsets are unset or invalid\n");
+		dcp->hw.firmware_scratch = experimental_h17p_external_bw_scratch;
+		dcp->hw.firmware_request = experimental_h17p_external_bw_request;
+	}
+
 
 	/* The domain use must survive driver-core DMA cleanup for a live session. */
 	ret = iommu_device_use_default_domain(dev);
@@ -4000,6 +4049,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8140 = {
 	.adopt_live_session = true,
 	.firmware_compat = DCP_FIRMWARE_H17P,
 	.firmware_clock = &t8140_firmware_clock,
+	.firmware_display_windows = 5,
 	.firmware_scratch = 0x20000,
 	.firmware_request = 0x68000,
 };
@@ -4010,6 +4060,8 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8140_external = {
 	.iomfb_method_profile = DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL,
 	.adopt_live_session = false,
 	.firmware_compat = DCP_FIRMWARE_H17P,
+	.firmware_clock = &t8140_firmware_clock,
+	.firmware_display_windows = 4,
 };
 
 /*
