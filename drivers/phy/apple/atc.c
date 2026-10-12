@@ -43,6 +43,7 @@
 #include <linux/usb/typec_mux.h>
 #include <linux/usb/typec_tbt.h>
 
+#include "atc-dp-tunables.h"
 #include "atc-t8122-dp.h"
 #include "atc-tunnel.h"
 
@@ -648,6 +649,7 @@ struct atcphy_hw {
 	u32 pipe_mux_data;
 	bool has_usb2phy_reg;
 	bool optional_tunables;
+	bool has_t8140_dp;
 	bool dp_t8122;
 	bool park_pipe_unlocked;
 	bool park_dummy_phy;
@@ -664,6 +666,9 @@ struct atcphy_hw {
  * @tunables.lane_usb3: USB3 lane-specific tunables
  * @tunables.lane_dp: DisplayPort lane-specific tunables
  * @tunables.lane_usb4: USB4 lane-specific tunables
+ * @tunables.dp_common_pre: T8140 DisplayPort common setup
+ * @tunables.dp_lpdptx: T8140 DisplayPort LPDPTX setup
+ * @tunables.dp_common_post: T8140 DisplayPort common completion
  * @tunables.usb2phy_reg_dflt: Defaults for the secondary eUSB2 register bank
  * @hw: SoC-specific PHY description
  * @ss_tunables: The complete SuperSpeed tunable set was supplied
@@ -708,6 +713,7 @@ struct atcphy_hw {
  * @regs.lpdptx: DisplayPort registers
  * @res: Resources for memory-mapped registers, used to verify that tunables aren't out of bounds
  * @res.core: Core register resource
+ * @res.lpdptx: DisplayPort register resource
  * @res.axi2af: AXI to Apple Fabric interface resource
  * @res.usb2phy_reg: Secondary eUSB2 register bank resource
  * @phys: PHY instances
@@ -731,6 +737,9 @@ struct apple_atcphy {
 		struct apple_tunable *lane_dp[2];
 		struct apple_tunable *lane_usb4[2];
 		struct apple_tunable *usb2phy_reg_dflt;
+		struct apple_tunable *dp_common_pre;
+		struct apple_tunable *dp_lpdptx;
+		struct apple_tunable *dp_common_post;
 	} tunables;
 
 	const struct atcphy_hw *hw;
@@ -776,6 +785,7 @@ struct apple_atcphy {
 
 	struct {
 		struct resource *core;
+		struct resource *lpdptx;
 		struct resource *axi2af;
 		struct resource *usb2phy_reg;
 	} res;
@@ -1591,6 +1601,14 @@ static void atcphy_configure_lanes(struct apple_atcphy *atcphy, enum atcphy_mode
 
 static void atcphy_enable_dp_aux(struct apple_atcphy *atcphy)
 {
+	if (atcphy->hw->has_t8140_dp) {
+		apple_tunable_apply(atcphy->regs.core, atcphy->tunables.dp_common_pre);
+		apple_tunable_apply(atcphy->regs.lpdptx, atcphy->tunables.dp_lpdptx);
+		apple_tunable_apply(atcphy->regs.core, atcphy->tunables.dp_common_post);
+		return;
+	}
+
+	/* FIXME */
 	/* T8122 PHYs with DP support enable AUX in atcphy_dp_aux_on_t8122() */
 	if (atcphy->hw->gen == ATCPHY_GENERATION_T8122)
 		return;
@@ -3001,6 +3019,9 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 	u32 reg;
 
 	lockdep_assert_held(&atcphy->lock);
+	if (atcphy->hw->has_t8140_dp && atcphy_modes[mode].enable_dp_aux &&
+	    !atcphy->dp_tunables)
+		return -EOPNOTSUPP;
 	/* the mode change below may power the PHY down: stop the tunnel clock first */
 	if (apple_atc_tunnel_is_t6030(atcphy)) {
 		ret = atc_t8122_tunnel_stop(atcphy);
@@ -3776,6 +3797,11 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 	case APPLE_ATCPHY_MODE_USB3:
 	case APPLE_ATCPHY_MODE_USB3_DP:
 	case APPLE_ATCPHY_MODE_DP:
+		if (atcphy->hw->has_t8140_dp && atcphy_modes[target_mode].enable_dp_aux &&
+		    !atcphy->dp_tunables)
+			return -EOPNOTSUPP;
+		/* Without the lane tunables the SuperSpeed lanes are not calibrated */
+		if (!atcphy->ss_tunables)
 		/*
 		 * Without the lane tunables the SuperSpeed lanes are not calibrated.
 		 * T8122 four-lane DP programs its lanes itself and needs only the
@@ -3843,6 +3869,37 @@ static int atcphy_probe_mux(struct apple_atcphy *atcphy)
 		return PTR_ERR(mux);
 
 	return devm_add_action_or_reset(atcphy->dev, atcphy_typec_mux_unregister, mux);
+}
+
+static int atcphy_load_t8140_dp(struct apple_atcphy *atcphy)
+{
+	struct {
+		const char *name;
+		struct resource *resource;
+		struct apple_tunable **out;
+	} lists[] = {
+		{ "apple,tunable-dp-common-pre", atcphy->res.core,
+		  &atcphy->tunables.dp_common_pre },
+		{ "apple,tunable-dp-lpdptx", atcphy->res.lpdptx,
+		  &atcphy->tunables.dp_lpdptx },
+		{ "apple,tunable-dp-common-post", atcphy->res.core,
+		  &atcphy->tunables.dp_common_post },
+	};
+	if (!of_machine_is_compatible("apple,j700"))
+		return -EOPNOTSUPP;
+	for (unsigned int i = 0; i < ARRAY_SIZE(lists); i++) {
+		struct property *property = of_find_property(atcphy->np, lists[i].name, NULL);
+
+		if (!property || !atc_dp_list_length_valid(property->length))
+			return -EINVAL;
+		*lists[i].out = devm_apple_tunable_parse(atcphy->dev, atcphy->np,
+							 lists[i].name, lists[i].resource);
+		if (IS_ERR(*lists[i].out))
+			return PTR_ERR(*lists[i].out);
+	}
+
+	atcphy->dp_tunables = true;
+	return 0;
 }
 
 static int atcphy_load_tunables(struct apple_atcphy *atcphy)
@@ -3937,6 +3994,13 @@ static int atcphy_load_tunables(struct apple_atcphy *atcphy)
 		atcphy->tunables.usb2phy_reg_dflt = tunable;
 	}
 
+	if (atcphy->hw->has_t8140_dp) {
+		int ret = atcphy_load_t8140_dp(atcphy);
+
+		if (ret)
+			dev_warn(atcphy->dev, "DisplayPort tunable bundle unavailable: %d\n", ret);
+	}
+
 	atcphy->ss_tunables = !ss_missing;
 	atcphy->dp_tunables = atcphy->hw->dp_t8122 && !common_missing;
 	if (atcphy->dp_only && !atcphy->dp_tunables)
@@ -3958,7 +4022,7 @@ static int atcphy_map_resources(struct platform_device *pdev, struct apple_atcph
 		struct resource **res;
 	} resources[] = {
 		{ "core", &atcphy->regs.core, &atcphy->res.core },
-		{ "lpdptx", &atcphy->regs.lpdptx, NULL },
+		{ "lpdptx", &atcphy->regs.lpdptx, &atcphy->res.lpdptx },
 		{ "axi2af", &atcphy->regs.axi2af, &atcphy->res.axi2af },
 		{ "usb2phy", &atcphy->regs.usb2phy, NULL },
 		{ "pipehandler", &atcphy->regs.pipehandler, NULL },
@@ -4253,6 +4317,7 @@ static const struct atcphy_hw atcphy_hw_t8140 = {
 	.pipe_mux_clk = PIPEHANDLER_MUX_CTRL_CLK_T8103,
 	.pipe_mux_data = PIPEHANDLER_MUX_CTRL_DATA_T8103,
 	.has_usb2phy_reg = true,
+	.has_t8140_dp = true,
 	.optional_tunables = true,
 };
 
