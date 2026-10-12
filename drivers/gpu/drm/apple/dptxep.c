@@ -706,7 +706,7 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 			 size_t reply_size)
 {
 	struct dptx_port *dptx = service->cookie;
-	trace_dptxport_apcall(dptx, idx, data_size);
+	trace_dptxport_apcall(dptx, 0, idx, data_size);
 	dev_dbg(service->ep->dcp->dev, "DPTXPort: APCALL %u (%zu bytes)\n",
 		 idx, data_size);
 	if (data_size && service->ep->dcp->hw.iomfb_method_profile !=
@@ -854,7 +854,7 @@ static void dptxport_init(struct apple_epic_service *service, const char *name,
 				 &service->ep->dcp->typec_reconnect_wq, 0);
 }
 
-static int dptxport_group_call(struct apple_epic_service *service, u16 group, u32 command,
+static int dptxport_v2_group_call(struct apple_epic_service *service, u16 group, u32 command,
 			       const void *data, size_t size, void *reply, size_t room)
 {
 	if (group == 1 && command == DPTX_APCALL_SET_DRIVE_SETTINGS)
@@ -874,6 +874,68 @@ static int dptxport_group_call(struct apple_epic_service *service, u16 group, u3
 	if (command == DPTX_APCALL_GET_DRIVE_SETTINGS)
 		return dptx_j700_training(service, false, data, size, reply, room);
 	return dptxport_call(service, command, data, size, reply, room);
+}
+
+/*
+ * Group 1 calls 3 and 4 come around link (re)configuration, audio prepare
+ * included. They carry a lane count at +0x10 in (1, 3) and at +0x00 in
+ * (1, 4); the J700 code reads (1, 3) as drive settings with levels per
+ * lane from +0x20, and its group 0 GET (0, 4) has the count at +0x00.
+ * macOS 13 acks both with the request, (1, 3) with +0x00..0x03
+ * cleared and (1, 4) with +0x10..0x13 and +0x20 to the end cleared, so
+ * what DCP left there does not go back (42 of 42 traced pairs on t6020,
+ * 13.5 firmware: TV through a USB-C to HDMI adapter, Dell over TB).
+ */
+static int dptxport_call_group1(u32 command, const void *data,
+				size_t data_size, void *reply, size_t reply_size)
+{
+	size_t size = min(reply_size, data_size);
+
+	memcpy(reply, data, size);
+	if (command == 3) {
+		memset(reply, 0, min_t(size_t, size, 0x4));
+	} else if (size > 0x10) {
+		memset(reply + 0x10, 0, min_t(size_t, size - 0x10, 0x4));
+		if (size > 0x20)
+			memset(reply + 0x20, 0, size - 0x20);
+	}
+	return 0;
+}
+
+static int dptxport_group_call(struct apple_epic_service *service, u16 group,
+			       u32 command, const void *data, size_t size,
+			       void *reply, size_t room)
+{
+	struct dptx_port *dptx = service->cookie;
+
+	/* Keep native AFK-v2 training and its refusal policy distinct. */
+	if (service->ep->wire_v2)
+		return dptxport_v2_group_call(service, group, command, data,
+					     size, reply, room);
+
+	if (!group)
+		return dptxport_call(service, command, data, size, reply, room);
+
+	trace_dptxport_apcall(dptx, group, command, size);
+	dev_dbg(service->ep->dcp->dev, "DPTXPort: APCALL %u:%u (%zu bytes)\n",
+		group, command, size);
+	if (size)
+		print_hex_dump_debug("DPTXPort: apcall data: ",
+				     DUMP_PREFIX_OFFSET, 16, 1, data,
+				     min(size, (size_t)64), true);
+
+	if (group == 1 && (command == 3 || command == 4))
+		return dptxport_call_group1(command, data, size, reply, room);
+
+	/*
+	 * Echo it, as group 0 acks an unhandled call: no reply might stall
+	 * DCP's caller.
+	 */
+	dev_warn_ratelimited(service->ep->dcp->dev,
+			     "DPTXPort: unknown AP call %u:%u, echoing it\n",
+			     group, command);
+	memcpy(reply, data, min(room, size));
+	return 0;
 }
 
 static const struct apple_epic_service_ops dptxep_ops[] = {
