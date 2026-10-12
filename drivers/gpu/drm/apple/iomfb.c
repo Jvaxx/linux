@@ -871,8 +871,9 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 	if (!handled) {
 		if (!iomfb_uses_queue(dcp) ||
 		    !test_and_set_bit(tag, dcp->unknown_callbacks))
-			dev_warn(dev, "received unknown callback %c%c%c%c\n",
-				 hdr->tag[3], hdr->tag[2], hdr->tag[1], hdr->tag[0]);
+			dev_warn(dev, "received unknown callback %c%c%c%c (%u, %u) context=%u\n",
+				 hdr->tag[3], hdr->tag[2], hdr->tag[1], hdr->tag[0],
+				 hdr->in_len, hdr->out_len, context);
 		if (dcp->hw.iomfb_method_profile ==
 		    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL) {
 			/* Retain the failed session without inventing a successful reply. */
