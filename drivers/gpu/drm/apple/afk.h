@@ -71,6 +71,12 @@ struct apple_epic_service_ops {
 	/* All retained pointers must be pinned before enabling slot reuse. */
 	bool reusable;
 
+	/*
+	 * Optional admission, before OPEN/publication. Must not retain service
+	 * on failure; teardown must accept a failed/partial preparation.
+	 */
+	int (*prepare)(struct apple_epic_service *service, const char *name,
+		       const char *class, s64 unit);
 	void (*init)(struct apple_epic_service *service, const char *name,
 			      const char *class, s64 unit);
 	int (*call)(struct apple_epic_service *service, u32 idx,
@@ -177,7 +183,7 @@ afk_service_reinit(struct apple_epic_service *service,
 	spin_lock_irqsave(&service->lock, flags);
 	reusable = afk_service_reclaimable(service);
 	if (reusable) {
-		service->enabled = true;
+		service->enabled = !ops->prepare;
 		service->torndown = false;
 		service->ops = ops;
 		service->ep = ep;
@@ -187,6 +193,30 @@ afk_service_reinit(struct apple_epic_service *service,
 	}
 	spin_unlock_irqrestore(&service->lock, flags);
 	return reusable;
+}
+
+/* Only used before a prepared service has been published to callers. */
+static inline void afk_service_discard(struct apple_epic_service *service)
+{
+	unsigned long flags;
+
+	if (service->ops->teardown)
+		service->ops->teardown(service);
+	spin_lock_irqsave(&service->lock, flags);
+	service->enabled = false;
+	service->torndown = true;
+	service->cookie = NULL;
+	service->ops = NULL;
+	spin_unlock_irqrestore(&service->lock, flags);
+}
+
+static inline void afk_service_publish(struct apple_epic_service *service)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&service->lock, flags);
+	service->enabled = true;
+	spin_unlock_irqrestore(&service->lock, flags);
 }
 
 struct afk_ringbuffer_header {

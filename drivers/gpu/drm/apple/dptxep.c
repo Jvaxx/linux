@@ -15,6 +15,7 @@
 #include "afk.h"
 #include "dcp.h"
 #include "dptxep.h"
+#include "dptx-service.h"
 #include "parser.h"
 #include "trace.h"
 
@@ -823,48 +824,26 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 	}
 }
 
+static int dptxport_prepare(struct apple_epic_service *service, const char *name,
+			    const char *class, s64 unit)
+{
+	struct apple_dcp *dcp = service->ep->dcp;
+	int port = dptx_service_port(name, class, unit, service->ep->wire_v2,
+				     dcp->index, dcp->hw.num_dptx_ports);
+
+	if (port < 0)
+		return port;
+	trace_dptxport_init(dcp, unit);
+	return dptx_service_bind(service, &dcp->dptxport[port], unit);
+}
+
 static void dptxport_init(struct apple_epic_service *service, const char *name,
 			  const char *class, s64 unit)
 {
-	struct apple_dcp *dcp = service->ep->dcp;
-	s64 port = unit;
+	struct dptx_port *port = service->cookie;
 
-	if (!name || !class)
-		return;
-	if (strcmp(name, "dcpdptx-port-epic"))
-		return;
-	if (strcmp(class, "AppleDCPDPTXRemotePort"))
-		return;
-
-	trace_dptxport_init(dcp, unit);
-	if (service->ep->wire_v2) {
-		/* The single external service reports its physical DCP unit. */
-		if (dcp->hw.num_dptx_ports != 1 || unit != dcp->index) {
-			dev_err(dcp->dev, "Unexpected external DPTX unit %lld\n", unit);
-			return;
-		}
-		port = 0;
-		dev_dbg(dcp->dev, "DPTX physical unit %lld maps to logical port 0\n", unit);
-	}
-
-	switch (port) {
-	case 0:
-	case 1:
-		if (service->ep->dcp->dptxport[port].enabled) {
-			dev_err(service->ep->dcp->dev,
-				"DPTXPort: unit %lld already exists\n", unit);
-			return;
-		}
-		service->ep->dcp->dptxport[port].unit = unit;
-		service->ep->dcp->dptxport[port].service = service;
-		service->ep->dcp->dptxport[port].enabled = true;
-		service->cookie = (void *)&service->ep->dcp->dptxport[port];
-		complete(&service->ep->dcp->dptxport[port].enable_completion);
-		break;
-	default:
-		dev_err(service->ep->dcp->dev, "DPTXPort: invalid unit %lld\n",
-			unit);
-	}
+	dptx_service_publish(service);
+	complete(&port->enable_completion);
 }
 
 static int dptxport_group_call(struct apple_epic_service *service, u16 group, u32 command,
@@ -892,6 +871,8 @@ static int dptxport_group_call(struct apple_epic_service *service, u16 group, u3
 static const struct apple_epic_service_ops dptxep_ops[] = {
 	{
 		.name = "AppleDCPDPTXRemotePort",
+		.prepare = dptxport_prepare,
+		.teardown = dptx_service_unbind,
 		.init = dptxport_init,
 		.call = dptxport_call,
 		.call_v2 = dptxport_group_call,

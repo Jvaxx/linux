@@ -22,3 +22,5 @@ appledrm-$(CONFIG_TRACING) += trace.o
 obj-$(CONFIG_DRM_APPLE) += appledrm.o
 obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += afk_test.o
 obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_backlight_test.o
+
+obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += afk-service-test.o
