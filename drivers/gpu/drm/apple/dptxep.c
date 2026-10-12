@@ -957,6 +957,12 @@ static int dptxport_group_call(struct apple_epic_service *service, u16 group, u3
 		return -EOPNOTSUPP;
 	if (command == DPTX_APCALL_SET_DRIVE_SETTINGS)
 		return -EOPNOTSUPP;
+	if (command == DPTX_APCALL_GET_VIRTUAL_DEVICE_MODE) {
+		if (room < sizeof(struct dptxport_apcall_get_support))
+			return -EINVAL;
+		memset(reply, 0, room);
+		return 0;
+	}
 	if (command == DPTX_APCALL_GET_DRIVE_SETTINGS)
 		return dptx_j700_training(service, false, data, size, reply, room);
 	return dptxport_call(service, command, data, size, reply, room);
