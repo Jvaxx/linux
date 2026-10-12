@@ -146,6 +146,30 @@ static void apple_connector_oob_hotplug(struct drm_connector *connector,
 			":0x%x in oob_hotplug event\n", (u32)status);
 }
 
+/* The fabric hold is optional at link time, see dcp.h. */
+static int apple_drm_fabric_hold(void)
+{
+	typeof(&apple_pmgr_fabric_hold) hold = symbol_get(apple_pmgr_fabric_hold);
+	int ret;
+
+	if (!hold)
+		return 0;
+	ret = hold();
+	symbol_put(apple_pmgr_fabric_hold);
+	return ret;
+}
+
+static void apple_drm_fabric_release(void)
+{
+	typeof(&apple_pmgr_fabric_release) release =
+		symbol_get(apple_pmgr_fabric_release);
+
+	if (!release)
+		return;
+	release();
+	symbol_put(apple_pmgr_fabric_release);
+}
+
 static void apple_crtc_atomic_enable(struct drm_crtc *crtc,
 				     struct drm_atomic_commit *commit)
 {
@@ -171,6 +195,12 @@ static void apple_crtc_atomic_enable(struct drm_crtc *crtc,
 	}
 	if (crtc_state->active && !dcp_crtc_route_ready(crtc, commit, true))
 		goto failed;
+	if (crtc_state->active && !dcp->main_display && !apple_crtc->fabric_held) {
+		/* Raise the fabric before external scanout starts. */
+		if (apple_drm_fabric_hold())
+			dev_warn(dcp->dev, "fabric raise not confirmed before scanout\n");
+		apple_crtc->fabric_held = true;
+	}
 	if (crtc_state->active &&
 	    (crtc_state->active_changed || dcp_crtc_needs_route_start(dcp))) {
 		dcp_poweron(apple_crtc->dcp);
@@ -206,6 +236,10 @@ static void apple_crtc_atomic_disable(struct drm_crtc *crtc,
 
 	if (crtc_state->active_changed && !crtc_state->active) {
 		dcp_poweroff(apple_crtc->dcp);
+		if (apple_crtc->fabric_held) {
+			apple_crtc->fabric_held = false;
+			apple_drm_fabric_release();
+		}
 	}
 
 	if (crtc->state->event && !crtc->state->active) {
