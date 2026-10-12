@@ -65,3 +65,8 @@
 		};
 	};
 };
+
+/* Retain the inherited firmware supply once the loader publishes it. */
+&ps_dispext0_cpu {
+	apple,always-on;
+};
