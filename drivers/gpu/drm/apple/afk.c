@@ -825,7 +825,8 @@ static void afk_receive_message_worker(struct work_struct *work_)
 	type = FIELD_GET(RBEP_TYPE, work->message);
 	if (work->ep->dcp->hw.iomfb_method_profile ==
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL &&
-	    work->ep->endpoint == DPTX_ENDPOINT && type != RBEP_RECV)
+	    (work->ep->endpoint == DPTX_ENDPOINT ||
+	     work->ep->endpoint == DPTX_ENDPOINT_V2) && type != RBEP_RECV)
 		dev_info_ratelimited(work->ep->dcp->dev,
 				     "external AFK control ep=%#x type=%#x\n",
 				     work->ep->endpoint, type);
