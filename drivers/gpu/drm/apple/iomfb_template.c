@@ -1865,6 +1865,9 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 	if (dcp_is_typec_output(dcp) && *connected && dcp->nr_modes)
 		complete_all(&dcp->typec_iomfb_hpd_ready);
 
+	if (dcp_external_hotplug(dcp, !!(*connected)))
+		return;
+
 	action = dcp_mode_hotplug(&dcp->mode_state, !!(*connected),
 				  connector ? &connector->connected : NULL);
 	/*
