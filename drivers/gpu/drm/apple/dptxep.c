@@ -929,6 +929,40 @@ static const struct apple_epic_service_ops dptxep_ops[] = {
 	{}
 };
 
+static void dptx_controller_service_init(struct apple_epic_service *service,
+					 const char *name, const char *class, s64 unit)
+{
+	complete(&service->ep->dcp->dptx_controller_ready);
+}
+
+static const struct apple_epic_service_ops dptx_controller_ops[] = {
+	{
+		.name = "AppleDCPDPTXController",
+		.init = dptx_controller_service_init,
+	},
+	{}
+};
+
+int dptx_controller_init(struct apple_dcp *dcp)
+{
+	struct apple_dcp_afkep *ep;
+	int ret;
+
+	init_completion(&dcp->dptx_controller_ready);
+	ep = afk_init(dcp, DPTX_CONTROLLER_ENDPOINT, dptx_controller_ops);
+	if (IS_ERR(ep))
+		return PTR_ERR(ep);
+	dcp->dptx_controller_ep = ep;
+
+	ret = afk_start(ep);
+	if (ret)
+		return ret;
+	if (!wait_for_completion_timeout(&dcp->dptx_controller_ready,
+					 msecs_to_jiffies(1000)))
+		return -ETIMEDOUT;
+
+	return 0;
+}
 /* 14.7 also announces the port under its EPIC names. */
 static const struct apple_epic_service_ops dptxep_v14_7_ops[] = {
 	{

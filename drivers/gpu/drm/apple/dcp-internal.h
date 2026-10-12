@@ -83,6 +83,7 @@ enum {
 	DISP0_ENDPOINT = 0x23,
 	/* DPAV controller: publishes the port service used by DPTX 0x2a. */
 	DPAV_CTRL_ENDPOINT = 0x24,
+	DPTX_CONTROLLER_ENDPOINT = 0x24,
 	DPAVSERV_ENDPOINT = 0x28,
 	AV_ENDPOINT = 0x29,
 	DPTX_ENDPOINT = 0x2a,
@@ -418,6 +419,8 @@ struct apple_dcp {
 	struct audiosrv_data *audiosrv;
 
 	struct apple_dcp_afkep *dptxep;
+	struct apple_dcp_afkep *dptx_controller_ep;
+	struct completion dptx_controller_ready;
 
 	struct apple_dcp_afkep *dpavctrlep;
 	struct apple_epic_service *dpav_ctrl;
