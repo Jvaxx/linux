@@ -951,6 +951,14 @@ static void dptxport_init(struct apple_epic_service *service, const char *name,
 		dev_err(service->ep->dcp->dev, "DPTXPort: invalid unit %lld\n",
 			unit);
 	}
+	/* Publication may follow the startup wait or the bounded retry window. */
+	if (service->ep->dcp->hw.iomfb_method_profile ==
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL &&
+	    READ_ONCE(service->ep->dcp->typec_cable_connected) &&
+	    !READ_ONCE(service->ep->dcp->quiescing) &&
+	    !READ_ONCE(service->ep->dcp->external_error))
+		mod_delayed_work(system_freezable_wq,
+				 &service->ep->dcp->typec_reconnect_wq, 0);
 }
 
 static int dptxport_group_call(struct apple_epic_service *service, u16 group, u32 command,

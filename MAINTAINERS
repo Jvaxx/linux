@@ -2031,6 +2031,7 @@ F:	tools/diagnostics/apple-j700-dp-test.c
 F:	tools/diagnostics/test-apple-afk-admission.py
 F:	tools/diagnostics/test-apple-atc-unwind.py
 F:	tools/diagnostics/test-apple-dcp-readiness.py
+F:	tools/diagnostics/test-apple-dptx-readiness.py
 F:	tools/diagnostics/test-apple-external-lifecycle.py
 F:	tools/diagnostics/test-apple-j700-crossbar.py
 F:	tools/diagnostics/test-apple-j700-d134.py

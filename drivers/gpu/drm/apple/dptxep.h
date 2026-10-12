@@ -50,6 +50,8 @@ struct apple_epic_service;
 
 struct dptx_port {
 	bool enabled, connected;
+	/* A published session closed; unlike initial discovery, this is terminal. */
+	bool closed;
 	struct completion enable_completion;
 	struct completion linkcfg_completion;
 	u32 unit;
