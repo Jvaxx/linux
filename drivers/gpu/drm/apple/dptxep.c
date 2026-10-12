@@ -961,7 +961,7 @@ static void dptxport_init(struct apple_epic_service *service, const char *name,
 				 &service->ep->dcp->typec_reconnect_wq, 0);
 }
 
-static int dptxport_group_call(struct apple_epic_service *service, u16 group, u32 command,
+static int dptxport_v2_group_call(struct apple_epic_service *service, u16 group, u32 command,
 			       const void *data, size_t size, void *reply, size_t room)
 {
 	if (group == 1 && command == DPTX_APCALL_SET_DRIVE_SETTINGS)
@@ -1014,6 +1014,11 @@ static int dptxport_group_call(struct apple_epic_service *service, u16 group,
 			       void *reply, size_t room)
 {
 	struct dptx_port *dptx = service->cookie;
+
+	/* Keep native AFK-v2 training and its refusal policy distinct. */
+	if (service->ep->wire_v2)
+		return dptxport_v2_group_call(service, group, command, data,
+					     size, reply, room);
 
 	if (!group)
 		return dptxport_call(service, command, data, size, reply, room);
