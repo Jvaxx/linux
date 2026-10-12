@@ -2478,6 +2478,10 @@ static void dcp_external_report_disconnected(struct apple_dcp *dcp)
 	guard(mutex)(&dcp->iomfb.lock);
 	action = dcp_mode_hotplug(&dcp->mode_state, false,
 				  dcp->connector ? &dcp->connector->connected : NULL);
+	if (dcp->connector) {
+		WRITE_ONCE(dcp->connector->edid_invalidation_pending, true);
+		action |= DCP_HOTPLUG_NOTIFY;
+	}
 	/* The existing worker delivers DRM notifications outside our locks. */
 	dcp_handle_hotplug_actions(dcp, action);
 }
@@ -2607,6 +2611,7 @@ static int dcp_external_disconnect(struct apple_dcp *dcp, bool physical)
 		scoped_guard(mutex, &dcp->hpd_mutex) {
 			WRITE_ONCE(dcp->typec_cable_connected, false);
 			dcp->typec_generation++;
+			dcp_firmware_metadata_connection(dcp, dcp->typec_generation, false);
 		}
 		/* A missing cable is reported even when its hardware remains owned. */
 		dcp_external_report_disconnected(dcp);
@@ -2800,17 +2805,23 @@ int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 	int ret;
 
 	if (dcp_is_external_h17p(dcp)) {
+		bool new_cable;
+
 		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
 		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
 		cancel_work_sync(&dcp->external_stop_work);
 		guard(mutex)(&dcp->external_lock);
-		if (!dcp->external_cable)
+		new_cable = !dcp->external_cable;
+		if (new_cable)
 			dcp->external_generation++;
 		dcp->external_cable = true;
 		dcp_external_publish_generation(dcp);
 		scoped_guard(mutex, &dcp->hpd_mutex) {
 			WRITE_ONCE(dcp->typec_cable_connected, true);
-			dcp->typec_generation++;
+			if (new_cable) {
+				dcp->typec_generation++;
+				dcp_firmware_metadata_connection(dcp, dcp->typec_generation, true);
+			}
 			dcp->placeholder_retried = false;
 		}
 		return dcp_external_link_locked(dcp);
