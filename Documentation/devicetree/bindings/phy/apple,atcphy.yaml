@@ -53,6 +53,8 @@ allOf:
         apple,tunable-dp-common-pre: false
         apple,tunable-dp-lpdptx: false
         apple,tunable-dp-common-post: false
+      patternProperties:
+        "^apple,dp-training-table(-rbr|-hbr|-hbr2|-hbr3)?$": false
 
 $defs:
   apple,tunable:
@@ -209,6 +211,16 @@ properties:
       Per-device defaults for the secondary eUSB2 PHY register bank of the
       T8140, copied from Apple's Device Tree by the bootloader. Unlike the
       other tunables these are applied to the usb2phy-reg region.
+
+patternProperties:
+  "^apple,dp-training-table(-rbr|-hbr|-hbr2|-hbr3)?$":
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 16
+    maxItems: 16
+    description: >
+      Firmware-provided T8140 drive presets indexed by voltage swing times
+      four plus pre-emphasis. The unsuffixed table is the required fallback;
+      a link-rate suffix selects an optional rate-specific override.
 
 required:
   - compatible
