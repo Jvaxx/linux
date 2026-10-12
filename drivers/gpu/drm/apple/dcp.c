@@ -3095,6 +3095,13 @@ int dcp_start(struct platform_device *pdev)
 		return -ENODEV;
 	}
 
+	/* Make the H17P allocator available before external service discovery. */
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL) {
+		ret = apple_rtkit_start_ep(dcp->rtk, REMOTE_ALLOC_ENDPOINT);
+		if (ret)
+			return dev_err_probe(dcp->dev, ret, "Failed to start remote allocator\n");
+	}
+
 	/* start RTKit endpoints */
 	ret = systemep_init(dcp);
 	if (ret)
