@@ -812,27 +812,40 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 static void dptxport_init(struct apple_epic_service *service, const char *name,
 			  const char *class, s64 unit)
 {
+	struct apple_dcp *dcp = service->ep->dcp;
+	s64 port = unit;
 
+	if (!name || !class)
+		return;
 	if (strcmp(name, "dcpdptx-port-epic"))
 		return;
 	if (strcmp(class, "AppleDCPDPTXRemotePort"))
 		return;
 
-	trace_dptxport_init(service->ep->dcp, unit);
+	trace_dptxport_init(dcp, unit);
+	if (service->ep->wire_v2) {
+		/* The single external service reports its physical DCP unit. */
+		if (dcp->hw.num_dptx_ports != 1 || unit != dcp->index) {
+			dev_err(dcp->dev, "Unexpected external DPTX unit %lld\n", unit);
+			return;
+		}
+		port = 0;
+		dev_info(dcp->dev, "DPTX physical unit %lld maps to logical port 0\n", unit);
+	}
 
-	switch (unit) {
+	switch (port) {
 	case 0:
 	case 1:
-		if (service->ep->dcp->dptxport[unit].enabled) {
+		if (service->ep->dcp->dptxport[port].enabled) {
 			dev_err(service->ep->dcp->dev,
 				"DPTXPort: unit %lld already exists\n", unit);
 			return;
 		}
-		service->ep->dcp->dptxport[unit].unit = unit;
-		service->ep->dcp->dptxport[unit].service = service;
-		service->ep->dcp->dptxport[unit].enabled = true;
-		service->cookie = (void *)&service->ep->dcp->dptxport[unit];
-		complete(&service->ep->dcp->dptxport[unit].enable_completion);
+		service->ep->dcp->dptxport[port].unit = unit;
+		service->ep->dcp->dptxport[port].service = service;
+		service->ep->dcp->dptxport[port].enabled = true;
+		service->cookie = (void *)&service->ep->dcp->dptxport[port];
+		complete(&service->ep->dcp->dptxport[port].enable_completion);
 		break;
 	default:
 		dev_err(service->ep->dcp->dev, "DPTXPort: invalid unit %lld\n",
@@ -884,61 +897,25 @@ int dptx_controller_init(struct apple_dcp *dcp)
 	return 0;
 }
 
-static void dptx_v2_probe_service(struct apple_epic_service *service,
-				  const char *name, const char *class, s64 unit)
-{
-	dev_info(service->ep->dcp->dev,
-		 "DPTX v2 discovery name=%s class=%s unit=%lld channel=%u\n",
-		 name ?: "(none)", class ?: "(none)", unit, service->channel);
-	complete(&service->ep->dcp->dptx_v2_probe_ready);
-}
-
-static const struct apple_epic_service_ops dptx_v2_probe_ops[] = {
-	{
-		.name = "AppleDCPDPTXRemotePort",
-		.init = dptx_v2_probe_service,
-	},
-	{}
-};
-
-static int dptx_v2_discover(struct apple_dcp *dcp)
-{
-	struct apple_dcp_afkep *ep;
-	int ret;
-
-	init_completion(&dcp->dptx_v2_probe_ready);
-	ep = afk_init(dcp, DPTX_ENDPOINT_V2, dptx_v2_probe_ops);
-	if (IS_ERR(ep))
-		return PTR_ERR(ep);
-	dcp->dptx_v2_probe_ep = ep;
-	ret = afk_start(ep);
-	if (ret)
-		return ret;
-	if (!wait_for_completion_timeout(&dcp->dptx_v2_probe_ready,
-					 msecs_to_jiffies(1000)))
-		return -ETIMEDOUT;
-
-	/* Discovery does not enable port callbacks or transmit service commands. */
-	return -EOPNOTSUPP;
-}
-
 int dptxep_init(struct apple_dcp *dcp)
 {
+	struct apple_dcp_afkep *ep;
+	bool wire_v2 = dcp->hw.iomfb_method_profile ==
+		DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL;
 	int ret;
 	u32 port;
 	unsigned long timeout = msecs_to_jiffies(1000);
-
-	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
-		return dptx_v2_discover(dcp);
 
 	init_completion(&dcp->dptxport[0].enable_completion);
 	init_completion(&dcp->dptxport[1].enable_completion);
 	init_completion(&dcp->dptxport[0].linkcfg_completion);
 	init_completion(&dcp->dptxport[1].linkcfg_completion);
 
-	dcp->dptxep = afk_init(dcp, DPTX_ENDPOINT, dptxep_ops);
-	if (IS_ERR(dcp->dptxep))
-		return PTR_ERR(dcp->dptxep);
+	ep = afk_init(dcp, wire_v2 ? DPTX_ENDPOINT_V2 : DPTX_ENDPOINT, dptxep_ops);
+	if (IS_ERR(ep))
+		return PTR_ERR(ep);
+	ep->wire_v2 = wire_v2;
+	dcp->dptxep = ep;
 
 	ret = afk_start(dcp->dptxep);
 	if (ret)
