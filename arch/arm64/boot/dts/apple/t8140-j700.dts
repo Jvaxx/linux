@@ -381,52 +381,6 @@
 				};
 			};
 		};
-
-		/*
-		 * Once the PMP knows the GPU is on, it votes the DRAM controller
-		 * (DCS) up with GPU load, and the GPU and memory system draw up
-		 * to 2.4 W more. The CPU zones above cannot hold that back: on a
-		 * GPU-bound load the CPUs request little power, so with the
-		 * performance governor the die passed 95 C within 35 s and
-		 * reached 104 C before they throttled. This zone limits the DCS
-		 * vote instead, through the PMC. With it the same load peaks at
-		 * 97 C, as it does without any DCS vote, and a ten-minute
-		 * balanced GPU load loses 1-2% of its throughput.
-		 *
-		 * Tp0t reads at or above every CPU die sensor under GPU load,
-		 * and leads them by about 1 C when the CPUs also run hot. The
-		 * sustainable power is the whole DCS range, so the vote is only
-		 * trimmed above the control trip; the PID gains follow from it
-		 * and the 6 C between the trips.
-		 */
-		soc-dcs-thermal {
-			polling-delay-passive = <500>;
-			polling-delay = <500>;
-			thermal-sensors = <&smc_hwmon 6>;	/* Tp0t */
-			sustainable-power = <2407>;
-
-			trips {
-				soc_dcs_alert: trip-alert {
-					temperature = <89000>;
-					hysteresis = <2000>;
-					type = "passive";
-				};
-
-				soc_dcs_control: trip-control {
-					temperature = <95000>;
-					hysteresis = <2000>;
-					type = "passive";
-				};
-			};
-
-			cooling-maps {
-				map0 {
-					trip = <&soc_dcs_control>;
-					cooling-device =
-						<&pmc THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
-				};
-			};
-		};
 	};
 };
 
@@ -472,6 +426,14 @@
 	/*
 	 * System power above DCS state 0 at each DCS state, measured with
 	 * glmark2's terrain scene, GPU-bound, on the J700.
+	 *
+	 * No thermal zone limits the DCS rail. The PMP already drops its
+	 * DCS vote when the GPU idles, and under load the rail must stay
+	 * where the PMP puts it: a power allocator zone on Tp0t at 95 C
+	 * stepped the limit between states 1 and 4 every 1-2 s in
+	 * Minecraft, swinging the game's GPU submission rate about 2.5x.
+	 * With the limit lifted the rate held within 8% and Tp0t settled
+	 * near 100 C, under the 110 C critical trips of the CPU zones.
 	 */
 	apple,dcs-power-microwatt = <0 919000 1453000 2058000 2407000>;
 	status = "okay";
@@ -676,7 +638,7 @@
 	 * the SMC key groups and are not otherwise verified.
 	 */
 
-	/* Channel 6, the sensor of soc-dcs-thermal: keep it first here. */
+	/* Channel 6: reads at or above every CPU die sensor under GPU load. */
 	temperature-Tp0t {
 		apple,key-id = "Tp0t";
 		label = "SMC Tp0t";
