@@ -1444,7 +1444,50 @@ static void atcphy_setup_pipehandler(struct apple_atcphy *atcphy)
 		atcphy_enable_dummy_phy(atcphy);
 }
 
-static void atcphy_configure_lanes(struct apple_atcphy *atcphy, enum atcphy_mode mode)
+#define J700_PMA_RECEIVER_CONTROL 0x000c
+#define J700_PMA_POWER_CONTROL 0x0200
+
+static int j700_field_update(struct apple_atcphy *atcphy, u32 offset, u32 mask, u32 value)
+{
+	u32 observed;
+
+	core_mask32(atcphy, offset, mask, value);
+	usleep_range(10, 20);
+	return readl_poll_timeout_atomic(atcphy->regs.core + offset, observed,
+					(observed & mask) == value, 1, 100);
+}
+
+static int j700_pma_idle(struct apple_atcphy *atcphy, unsigned int lane)
+{
+	u32 field;
+	int ret;
+
+	if (lane >= 2)
+		return -EINVAL;
+	for (unsigned int supply = 0; supply < 2; supply++) {
+		field = BIT(2 + lane + 4 * supply);
+		ret = j700_field_update(atcphy, J700_PMA_RECEIVER_CONTROL, field, field);
+		if (ret)
+			return ret;
+	}
+	field = BIT(4 * lane + 3);
+	ret = j700_field_update(atcphy, J700_PMA_POWER_CONTROL, field, 0);
+	if (ret)
+		return ret;
+	field = BIT(4 * lane);
+	ret = j700_field_update(atcphy, J700_PMA_POWER_CONTROL, field, field);
+	if (ret)
+		return ret;
+	for (unsigned int control = 1; control <= 2; control++) {
+		field = BIT(4 * lane + control);
+		ret = j700_field_update(atcphy, J700_PMA_POWER_CONTROL, field, 0);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+static int atcphy_configure_lanes(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 {
 	const struct atcphy_mode_configuration *mode_cfg = atcphy_get_mode_config(atcphy, mode);
 
@@ -1471,9 +1514,22 @@ static void atcphy_configure_lanes(struct apple_atcphy *atcphy, enum atcphy_mode
 	else
 		core_clear32(atcphy, atcphy->hw->aciophy_crossbar, ACIOPHY_CROSSBAR_DP_BOTH_PMA);
 
+	if (atcphy->hw->has_t8140_dp) {
+		for (unsigned int lane = 0; lane < 2; lane++) {
+			int ret;
+
+			if (!mode_cfg->dp_lane[lane])
+				continue;
+			ret = j700_pma_idle(atcphy, lane);
+			if (ret)
+				return ret;
+		}
+		return 0;
+	}
+
 	/* unclear if we need the remainder for t8122 */
 	if (atcphy->hw->gen == ATCPHY_GENERATION_T8122)
-		return;
+		return 0;
 
 	if (mode_cfg->dp_lane[0]) {
 		core_set32(atcphy, LN0_AUSPMA_RX_TOP + LN_AUSPMA_RX_TOP_PMAFSM,
@@ -1498,6 +1554,7 @@ static void atcphy_configure_lanes(struct apple_atcphy *atcphy, enum atcphy_mode
 			     LN_AUSPMA_RX_TOP_PMAFSM_PCS_OV);
 		udelay(10);
 	}
+	return 0;
 }
 
 #define J700_AUX_ANALOG_CONTROL 0x16000
@@ -1506,15 +1563,6 @@ static void atcphy_configure_lanes(struct apple_atcphy *atcphy, enum atcphy_mode
 #define J700_AUX_CLAMP_SELECT BIT(8)
 #define J700_AUX_CLAMP_ENABLE BIT(9)
 
-static int j700_aux_update(struct apple_atcphy *atcphy, u32 offset, u32 mask, u32 value)
-{
-	u32 observed;
-
-	core_mask32(atcphy, offset, mask, value);
-	usleep_range(10, 20);
-	return readl_poll_timeout_atomic(atcphy->regs.core + offset, observed,
-					(observed & mask) == value, 1, 100);
-}
 
 static int j700_aux_enable(struct apple_atcphy *atcphy)
 {
@@ -1526,15 +1574,15 @@ static int j700_aux_enable(struct apple_atcphy *atcphy)
 	for (unsigned int stage = 0; stage < 2; stage++) {
 		u32 fields = 3U << (2 * stage);
 
-		ret = j700_aux_update(atcphy, J700_AUX_SUPPLY_CONTROL, fields, fields);
+		ret = j700_field_update(atcphy, J700_AUX_SUPPLY_CONTROL, fields, fields);
 		if (ret)
 			return ret;
 	}
-	ret = j700_aux_update(atcphy, J700_AUX_SUPPLY_CONTROL, clamp, J700_AUX_CLAMP_SELECT);
+	ret = j700_field_update(atcphy, J700_AUX_SUPPLY_CONTROL, clamp, J700_AUX_CLAMP_SELECT);
 	if (ret)
 		return ret;
 
-	return j700_aux_update(atcphy, J700_AUX_ANALOG_CONTROL, J700_AUX_ANALOG_OFF, 0);
+	return j700_field_update(atcphy, J700_AUX_ANALOG_CONTROL, J700_AUX_ANALOG_OFF, 0);
 }
 
 static int j700_aux_disable(struct apple_atcphy *atcphy)
@@ -1544,17 +1592,17 @@ static int j700_aux_disable(struct apple_atcphy *atcphy)
 
 	if (!atcphy->aux_power_requested)
 		return 0;
-	ret = j700_aux_update(atcphy, J700_AUX_ANALOG_CONTROL,
-			      J700_AUX_ANALOG_OFF, J700_AUX_ANALOG_OFF);
+	ret = j700_field_update(atcphy, J700_AUX_ANALOG_CONTROL,
+				J700_AUX_ANALOG_OFF, J700_AUX_ANALOG_OFF);
 	if (ret)
 		return ret;
-	ret = j700_aux_update(atcphy, J700_AUX_SUPPLY_CONTROL, clamp, clamp);
+	ret = j700_field_update(atcphy, J700_AUX_SUPPLY_CONTROL, clamp, clamp);
 	if (ret)
 		return ret;
 	for (unsigned int remaining = 2; remaining; remaining--) {
 		u32 override = BIT(2 * remaining - 1);
 
-		ret = j700_aux_update(atcphy, J700_AUX_SUPPLY_CONTROL, override, 0);
+		ret = j700_field_update(atcphy, J700_AUX_SUPPLY_CONTROL, override, 0);
 		if (ret)
 			return ret;
 	}
@@ -2726,7 +2774,9 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 		core_set32(atcphy, CIO3PLL_CLK_CTRL, CIO3PLL_CLK_PCLK_EN);
 		core_set32(atcphy, CIO3PLL_CLK_CTRL, CIO3PLL_CLK_REFCLK_EN);
 	}
-	atcphy_configure_lanes(atcphy, mode);
+	ret = atcphy_configure_lanes(atcphy, mode);
+	if (ret)
+		return ret;
 
 	/* Take the USB3 PHY out of reset */
 	core_set32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_PHY_RESET_N);
