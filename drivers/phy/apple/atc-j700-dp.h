@@ -71,15 +71,17 @@ static void j700_dp_output_power(struct apple_atcphy *p, unsigned int lane, bool
 {
 	u32 reg = tx ? 0x10c : 0xc;
 
-	core_set32(p, reg, (BIT(4) | BIT(6)) << lane);
-	udelay(1);
-	core_set32(p, reg, (BIT(0) | BIT(2)) << lane);
-	udelay(1);
+	for (unsigned int pair = 0; pair < 2; pair++) {
+		core_set32(p, reg, BIT(4 - 4 * pair + lane));
+		core_set32(p, reg, BIT(6 - 4 * pair + lane));
+		udelay(1);
+	}
 	if (!tx) {
-		core_set32(p, 0x8, (BIT(10) | BIT(12)) << lane);
-		udelay(1);
-		core_set32(p, 0x8, (BIT(6) | BIT(8)) << lane);
-		udelay(1);
+		for (unsigned int pair = 0; pair < 2; pair++) {
+			core_set32(p, 0x8, BIT(10 - 4 * pair + lane));
+			core_set32(p, 0x8, BIT(12 - 4 * pair + lane));
+			udelay(1);
+		}
 	}
 	reg = tx ? 0x10c : 0x8;
 	core_clear32(p, reg, BIT(tx ? 8 : 14) << lane);
@@ -115,7 +117,8 @@ static void j700_dp_transmitter(struct apple_atcphy *p, unsigned int lane, int r
 		{ 0x44, 0x400000, 0x400000, 0 },
 	};
 	static const struct j700_dp_step finish[] = {
-		{ 0x04, 0x33000000, 0x32000000, 0 },
+		{ 0x04, 0x03000000, 0x02000000, 0 },
+		{ 0x04, 0x30000000, 0x30000000, 0 },
 		{ 0x10, 0x600, 0x600, 0 },
 		{ 0x1c, 0xc00000, 0x800000, 0 },
 	};
@@ -126,9 +129,10 @@ static void j700_dp_transmitter(struct apple_atcphy *p, unsigned int lane, int r
 	j700_dp_equalize(p, lane, true, 0);
 	if (rate != ATCPHY_DP_LINK_RATE_HBR3)
 		j700_dp_steps(p, base, divide, ARRAY_SIZE(divide));
-	j700_dp_steps(p, base, finish, ARRAY_SIZE(finish));
+	j700_dp_steps(p, base, finish, 2);
 	core_mask32(p, base + 0xc, 0x7000000,
 		    rate == ATCPHY_DP_LINK_RATE_RBR ? 0x5000000 : 0x4000000);
+	j700_dp_steps(p, base, finish + 2, ARRAY_SIZE(finish) - 2);
 }
 
 static void j700_dp_receiver(struct apple_atcphy *p, unsigned int lane, int rate)
