@@ -658,6 +658,8 @@ struct atcphy_hw {
  * @ss_tunables: The complete SuperSpeed tunable set was supplied
  * @dp_tunables: The complete T8140 DisplayPort bundle was supplied
  * @aux_power_requested: AUX power-up began and needs matching shutdown
+ * @mode_dirty: J700 mode transition needs cleanup before it can be retried
+ * @dp_idle_pmas: J700 PMAs with an incomplete routing idle sequence
  * @dp_owned_pmas: J700 PMAs requiring main-link cleanup
  * @dp_spread_spectrum: J700 main-link spread-spectrum state
  * @dp_presets: Firmware-derived per-rate drive presets
@@ -721,6 +723,8 @@ struct apple_atcphy {
 	bool ss_tunables;
 	bool dp_tunables;
 	bool aux_power_requested;
+	bool mode_dirty;
+	u8 dp_idle_pmas;
 	u8 dp_owned_pmas;
 	bool dp_spread_spectrum;
 	u32 dp_presets[5][16];
@@ -2755,28 +2759,43 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 	u32 reg;
 
 	lockdep_assert_held(&atcphy->lock);
-	if (atcphy->hw->has_t8140_dp && atcphy->dp_owned_pmas && mode != atcphy->mode) {
+	if (atcphy->hw->has_t8140_dp && atcphy->dp_owned_pmas &&
+	    (mode != atcphy->mode || atcphy->mode_dirty)) {
+		atcphy->mode_dirty = true;
 		ret = j700_dp_stop(atcphy);
+		if (ret)
+			return ret;
+	}
+	if (atcphy->hw->has_t8140_dp && atcphy->mode_dirty) {
+		ret = j700_dp_idle_pending(atcphy);
 		if (ret)
 			return ret;
 	}
 	if (atcphy->hw->has_t8140_dp && atcphy_modes[mode].enable_dp_aux &&
 	    !atcphy->dp_tunables)
 		return -EOPNOTSUPP;
-	if (atcphy->hw->has_t8140_dp && !atcphy_modes[mode].enable_dp_aux &&
+	if (atcphy->hw->has_t8140_dp &&
+	    (!atcphy_modes[mode].enable_dp_aux || atcphy->mode_dirty) &&
 	    atcphy->aux_power_requested) {
+		atcphy->mode_dirty = true;
 		ret = j700_aux_disable(atcphy);
 		if (ret)
 			return ret;
 	}
+	/* Keep failed transitions retryable even when the requested mode is unchanged. */
+	if (atcphy->hw->has_t8140_dp)
+		atcphy->mode_dirty = true;
 	/* the mode change below may power the PHY down: stop the tunnel clock first */
 	atc_tunnel_stop_t8103(atcphy);
 	atc_tunnel_restore(atcphy);
 
 	if (mode == APPLE_ATCPHY_MODE_OFF) {
 		ret = atcphy_power_off(atcphy);
+		if (ret)
+			return ret;
 		atcphy->mode = mode;
-		return ret;
+		atcphy->mode_dirty = false;
+		return 0;
 	}
 
 	ret = atcphy_power_on(atcphy);
@@ -2820,6 +2839,7 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 	}
 
 	atcphy->mode = mode;
+	atcphy->mode_dirty = false;
 
 	return 0;
 }
@@ -3289,7 +3309,7 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 	if (atcphy->fixed_usb2 && target_mode == APPLE_ATCPHY_MODE_OFF)
 		target_mode = APPLE_ATCPHY_MODE_USB2;
 
-	if (atcphy->mode == target_mode)
+	if (atcphy->mode == target_mode && !atcphy->mode_dirty)
 		return 0;
 
 	switch (target_mode) {
