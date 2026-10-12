@@ -986,8 +986,9 @@ int dptxep_init(struct apple_dcp *dcp)
 				return 0;
 			}
 			return -ETIMEDOUT;
-		} else if (ret < 0)
+		} else if (ret < 0) {
 			return ret;
+		}
 		timeout = ret;
 	}
 
