@@ -681,6 +681,7 @@ static int apple_drm_init_dcp(struct device *dev)
 		if (!apple_dcp_usable(np))
 			continue;
 		dcp_ext = of_device_is_compatible(np, "apple,dcpext") ||
+		          of_device_is_compatible(np, "apple,t8140-dcpext") ||
 		          of_property_present(np, "phys");
 
 		dcp[num_dcp] = of_find_device_by_node(np);
