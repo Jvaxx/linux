@@ -7,6 +7,8 @@
 /* For mode parsing */
 #include <drm/drm_modes.h>
 
+#include "dcp-display-metadata.h"
+
 struct apple_dcp;
 
 struct dcp_parse_ctx {
@@ -94,11 +96,14 @@ struct dcp_display_mode {
 	struct dcp_color_mode sdr;
 	struct dcp_color_mode best;
 	bool vrr;
+	bool metadata_timing_valid;
 };
 
 struct dimension {
 	s64 total, front_porch, sync_width, active;
 	s64 precise_sync_rate;
+	s64 sync_polarity;
+	s64 pixel_repetition;
 };
 
 int parse(const void *blob, size_t size, struct dcp_parse_ctx *ctx);
@@ -106,6 +111,7 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 					 unsigned int *count, int width_mm,
 					 int height_mm, unsigned notch_height,
 					 bool internal, bool external_sdr);
+int parse_display_metadata(struct dcp_parse_ctx *handle, struct dcp_display_metadata *out);
 int parse_display_attributes(struct dcp_parse_ctx *handle, int *width_mm,
 			     int *height_mm);
 int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,

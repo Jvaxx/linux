@@ -18,6 +18,8 @@
 
 #include "dptxep.h"
 #include "dcp_backlight.h"
+#include "dcp-display-metadata.h"
+#include "dcp-metadata-epoch.h"
 #include "iomfb.h"
 #include "iomfb_h17p.h"
 #include "iomfb-state.h"
@@ -99,6 +101,9 @@ enum {
 struct dcp_chunks {
 	size_t length;
 	void *data;
+	size_t received;
+	bool contiguous;
+	struct dcp_metadata_ticket metadata_ticket;
 };
 
 #define DCP_MAX_MAPPINGS (128) /* should be enough */
@@ -279,6 +284,15 @@ struct apple_dcp {
 
 	/* Active chunked transfer. There can only be one at a time. */
 	struct dcp_chunks chunks;
+	struct {
+		/* Protects connection tickets and cached metadata snapshots. */
+		spinlock_t lock;
+		struct dcp_metadata_epoch epoch;
+		struct dcp_display_metadata attributes;
+		struct drm_display_mode preferred;
+		struct dcp_metadata_ticket attributes_ticket, timing_ticket;
+		bool attributes_valid, timing_valid, hpd_seen;
+	} metadata;
 
 	/* Queued swap. Owned by the DCP to avoid per-swap memory allocation */
 	union {
@@ -468,6 +482,15 @@ struct apple_dcp {
 		struct iomfb_scanout_h17p *next_scanout;
 	} iomfb;
 };
+
+void dcp_firmware_metadata_connection(struct apple_dcp *dcp, u64 generation, bool connected);
+void dcp_firmware_metadata_hotplug(struct apple_dcp *dcp, bool connected);
+void dcp_firmware_metadata_begin(struct apple_dcp *dcp);
+void dcp_firmware_metadata_attributes(struct apple_dcp *dcp,
+				      const struct dcp_display_metadata *attributes);
+void dcp_firmware_metadata_timing(struct apple_dcp *dcp);
+bool dcp_firmware_metadata_current(struct apple_dcp *dcp, u64 generation);
+const struct drm_edid *dcp_firmware_edid(struct apple_dcp *dcp, u64 *generation);
 
 void iomfb_scanout_complete_h17p(struct apple_dcp *dcp);
 void iomfb_present_backlight_h17p(struct apple_dcp *dcp);
