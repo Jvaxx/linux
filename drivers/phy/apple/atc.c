@@ -1011,6 +1011,14 @@ static const struct atcphy_mode_configuration *atcphy_get_mode_config(struct app
 		return &atcphy_modes[mode].normal;
 }
 
+static void j700_dp_tunables(struct apple_atcphy *atcphy)
+{
+	apple_tunable_apply(atcphy->regs.axi2af, atcphy->tunables.axi2af);
+	apple_tunable_apply(atcphy->regs.core, atcphy->tunables.dp_common_pre);
+	apple_tunable_apply(atcphy->regs.lpdptx, atcphy->tunables.dp_lpdptx);
+	apple_tunable_apply(atcphy->regs.core, atcphy->tunables.dp_common_post);
+}
+
 static void atcphy_apply_tunables(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 {
 	const int lane0 = atcphy->swap_lanes ? 1 : 0;
@@ -1024,6 +1032,11 @@ static void atcphy_apply_tunables(struct apple_atcphy *atcphy, enum atcphy_mode 
 	 */
 	if (mode == APPLE_ATCPHY_MODE_USB2 && atcphy->fixed_usb2)
 		return;
+
+	if (atcphy->hw->has_t8140_dp && mode == APPLE_ATCPHY_MODE_DP) {
+		j700_dp_tunables(atcphy);
+		return;
+	}
 
 	apple_tunable_apply(atcphy->regs.core, atcphy->tunables.common[0]);
 	apple_tunable_apply(atcphy->regs.axi2af, atcphy->tunables.axi2af);
@@ -1061,6 +1074,9 @@ static void atcphy_apply_tunables(struct apple_atcphy *atcphy, enum atcphy_mode 
 	case APPLE_ATCPHY_MODE_USB2:
 		break;
 	}
+	if (atcphy->hw->has_t8140_dp && mode == APPLE_ATCPHY_MODE_USB3_DP)
+		j700_dp_tunables(atcphy);
+
 }
 
 static int atcphy_pipehandler_lock(struct apple_atcphy *atcphy)
@@ -1616,9 +1632,6 @@ static int j700_aux_disable(struct apple_atcphy *atcphy)
 static int atcphy_enable_dp_aux(struct apple_atcphy *atcphy)
 {
 	if (atcphy->hw->has_t8140_dp) {
-		apple_tunable_apply(atcphy->regs.core, atcphy->tunables.dp_common_pre);
-		apple_tunable_apply(atcphy->regs.lpdptx, atcphy->tunables.dp_lpdptx);
-		apple_tunable_apply(atcphy->regs.core, atcphy->tunables.dp_common_post);
 		dev_info_once(atcphy->dev, "Applied T8140 DisplayPort setup lists\n");
 		return j700_aux_enable(atcphy);
 	}
