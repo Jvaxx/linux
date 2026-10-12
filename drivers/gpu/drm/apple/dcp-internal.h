@@ -532,6 +532,8 @@ struct apple_dcp {
 	bool typec_follow_start;
 	bool typec_follow_retiring;
 	u64 typec_follow_gen;
+	/* dcp_poweron() reconnects DPTX; its own modeset follows the HPD */
+	bool typec_poweron_hpd;
 	/* IOMFB reports its video interface ready after DPTX link training. */
 	struct completion typec_iomfb_hpd_ready;
 	struct delayed_work typec_reconnect_wq;
