@@ -2188,11 +2188,13 @@ bool dcp_has_typec_routes(struct platform_device *pdev)
 #define DPTX_RECONNECT_DELAY msecs_to_jiffies(1000)
 #define DPTX_RECONNECT_RETRIES 5
 
-static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port)
+static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *waiting_service)
 {
 	unsigned long timeout;
 	int ret = 0;
 
+	if (waiting_service)
+		*waiting_service = false;
 	if (!dcp->phy) {
 		dev_warn(dcp->dev, "dcp_dptx_connect: missing phy\n");
 		return -ENODEV;
@@ -2208,6 +2210,11 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port)
 	if (!dptx_service_available(&dcp->dptxport[port])) {
 		dev_warn(dcp->dev, "dcp_dptx_connect: dptx service for port %d not enabled\n", port);
 		ret = -ENODEV;
+		/* No firmware request has been made; the first publication can retry. */
+		if (waiting_service && !READ_ONCE(dcp->dptxport[port].closed)) {
+			*waiting_service = true;
+			ret = -EAGAIN;
+		}
 		goto out_unlock;
 	}
 
@@ -2318,6 +2325,7 @@ static void dcp_external_publish_generation(struct apple_dcp *dcp)
 /* external_lock is never taken by the serialized IOMFB receive callbacks. */
 static int dcp_external_link_locked(struct apple_dcp *dcp)
 {
+	bool waiting_service;
 	int ret;
 
 	lockdep_assert_held(&dcp->external_lock);
@@ -2327,8 +2335,8 @@ static int dcp_external_link_locked(struct apple_dcp *dcp)
 		return dcp->external_error;
 	if (!dcp->external_cable)
 		return -ENODEV;
-	ret = dcp_dptx_connect_raw(dcp, 0);
-	if (ret)
+	ret = dcp_dptx_connect_raw(dcp, 0, &waiting_service);
+	if (ret && !waiting_service)
 		dcp->external_error = ret;
 	return ret;
 }
@@ -2360,7 +2368,7 @@ static int dcp_external_start_locked(struct apple_dcp *dcp)
 static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 {
 	if (!dcp_is_external_h17p(dcp))
-		return dcp_dptx_connect_raw(dcp, port);
+		return dcp_dptx_connect_raw(dcp, port, NULL);
 	guard(mutex)(&dcp->external_lock);
 	return dcp_external_link_locked(dcp);
 }

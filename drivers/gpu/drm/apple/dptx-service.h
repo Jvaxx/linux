@@ -49,7 +49,9 @@ static inline void dptx_service_unbind(struct apple_epic_service *service)
 	struct dptx_port *port = service->cookie;
 
 	if (port && port->service == service) {
-		WRITE_ONCE(port->enabled, false);
+		WRITE_ONCE(port->closed, true);
+		/* Make terminal state visible to readers of availability. */
+		smp_store_release(&port->enabled, false);
 		WRITE_ONCE(port->connected, false);
 		reinit_completion(&port->enable_completion);
 	}
