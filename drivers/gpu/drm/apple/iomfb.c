@@ -193,6 +193,10 @@ static int iomfb_enqueue_opaque_x(struct apple_dcp *dcp)
 	struct iomfb_opaque_x_transaction *opaque;
 
 	lockdep_assert_held(&dcp->iomfb.lock);
+	/* DCPEXT rejects enableGPAlphaDiv; retain the panel-only workaround. */
+	if (dcp->hw.iomfb_method_profile ==
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
+		return 0;
 	if (atomic_read(&dcp->iomfb.opaque_x_state) != IOMFB_OPAQUE_X_NEEDED)
 		return 0;
 	if (dcp->iomfb.queued >= 32)
