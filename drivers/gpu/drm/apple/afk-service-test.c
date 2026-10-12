@@ -3,6 +3,7 @@
 #include <linux/module.h>
 
 #include "afk.h"
+#include "dptx-service.h"
 
 static const struct apple_epic_service_ops reusable_ops = {
 	.name = "reusable",
@@ -122,7 +123,105 @@ static void afk_service_unconverted_owner_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, afk_service_reinit(service, NULL, &reusable_ops, 2));
 }
 
+static int afk_test_prepare(struct apple_epic_service *service,
+			    const char *name, const char *class, s64 unit)
+{
+	return 0;
+}
+
+static const struct apple_epic_service_ops prepared_ops = {
+	.name = "prepared",
+	.prepare = afk_test_prepare,
+	.teardown = dptx_service_unbind,
+};
+
+static void afk_service_admission_test(struct kunit *test)
+{
+	struct apple_epic_service *service = test->priv;
+
+	KUNIT_ASSERT_TRUE(test, afk_service_reinit(service, NULL, &prepared_ops, 1));
+	/* Neither callback dispatch nor command callers can observe preparation. */
+	KUNIT_EXPECT_FALSE(test, afk_service_matches(service, 1));
+	KUNIT_EXPECT_PTR_EQ(test, afk_service_get(service), NULL);
+	/* A rejected announcement or failed OPEN consumes no service slot. */
+	afk_service_discard(service);
+	KUNIT_ASSERT_TRUE(test, afk_service_reinit(service, NULL, &prepared_ops, 2));
+	/* Cookie-less services are valid: admission does not test cookie != NULL. */
+	afk_service_publish(service);
+	KUNIT_EXPECT_TRUE(test, afk_service_matches(service, 2));
+	KUNIT_ASSERT_PTR_EQ(test, afk_service_get(service), service);
+	afk_service_put(service);
+}
+
+static void dptx_service_identity_test(struct kunit *test)
+{
+	const char *name = "dcpdptx-port-epic";
+	const char *class = "AppleDCPDPTXRemotePort";
+
+	KUNIT_EXPECT_EQ(test, dptx_service_port(name, class, 3, true, 3, 1), 0);
+	KUNIT_EXPECT_EQ(test, dptx_service_port(name, class, 0, true, 3, 1), -EINVAL);
+	KUNIT_EXPECT_EQ(test, dptx_service_port(name, class, -1, true, 3, 1), -EINVAL);
+	KUNIT_EXPECT_EQ(test, dptx_service_port(name, class, 3, true, 3, 2), -EINVAL);
+	KUNIT_EXPECT_EQ(test, dptx_service_port(NULL, class, 3, true, 3, 1), -EINVAL);
+	KUNIT_EXPECT_EQ(test, dptx_service_port(name, NULL, 3, true, 3, 1), -EINVAL);
+	KUNIT_EXPECT_EQ(test, dptx_service_port("wrong", class, 3, true, 3, 1), -EINVAL);
+	KUNIT_EXPECT_EQ(test, dptx_service_port(name, "wrong", 3, true, 3, 1), -EINVAL);
+	KUNIT_EXPECT_EQ(test, dptx_service_port(name, class, 1, false, 3, 2), 1);
+	KUNIT_EXPECT_EQ(test, dptx_service_port(name, class, 2, false, 3, 2), -EINVAL);
+}
+
+static void dptx_service_duplicate_close_test(struct kunit *test)
+{
+	struct apple_epic_service *first = test->priv;
+	struct apple_epic_service *next;
+	struct dptx_port port = {};
+
+	next = kunit_kzalloc(test, sizeof(*next), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, next);
+	spin_lock_init(&next->lock);
+	init_completion(&port.enable_completion);
+	KUNIT_ASSERT_TRUE(test, afk_service_reinit(first, NULL, &prepared_ops, 1));
+	KUNIT_ASSERT_EQ(test, dptx_service_bind(first, &port, 3), 0);
+	/* An observer during preparation/OPEN sees no available port or owner. */
+	KUNIT_EXPECT_FALSE(test, dptx_service_available(&port));
+	KUNIT_EXPECT_PTR_EQ(test, port.service, NULL);
+	KUNIT_EXPECT_PTR_EQ(test, first->cookie, &port);
+	/* Failed OPEN does not publish anything and permits a fresh attempt. */
+	afk_service_discard(first);
+	KUNIT_EXPECT_FALSE(test, port.enabled);
+	KUNIT_EXPECT_PTR_EQ(test, port.service, NULL);
+	KUNIT_ASSERT_TRUE(test, afk_service_reinit(first, NULL, &prepared_ops, 1));
+	KUNIT_ASSERT_EQ(test, dptx_service_bind(first, &port, 3), 0);
+	afk_service_publish(first);
+	KUNIT_EXPECT_FALSE(test, port.enabled);
+	dptx_service_publish(first);
+	KUNIT_EXPECT_TRUE(test, dptx_service_available(&port));
+	KUNIT_EXPECT_PTR_EQ(test, port.service->cookie, &port);
+	KUNIT_ASSERT_TRUE(test, afk_service_reinit(next, NULL, &prepared_ops, 2));
+	KUNIT_EXPECT_EQ(test, dptx_service_bind(next, &port, 3), -EBUSY);
+	afk_service_discard(next);
+	KUNIT_EXPECT_TRUE(test, port.enabled);
+	KUNIT_EXPECT_PTR_EQ(test, port.service, first);
+	/* CLOSE invalidates a connected session without publishing a replacement. */
+	port.connected = true;
+	afk_test_retire(first);
+	dptx_service_unbind(first);
+	KUNIT_EXPECT_FALSE(test, port.enabled);
+	KUNIT_EXPECT_FALSE(test, port.connected);
+	KUNIT_EXPECT_PTR_EQ(test, first->cookie, &port);
+	KUNIT_ASSERT_TRUE(test, afk_service_reinit(next, NULL, &prepared_ops, 3));
+	KUNIT_EXPECT_EQ(test, dptx_service_bind(next, &port, 3), -EBUSY);
+	afk_service_discard(next);
+	/* Old work between validate/connect/request still names the old session. */
+	KUNIT_EXPECT_PTR_EQ(test, port.service, first);
+	KUNIT_EXPECT_PTR_EQ(test, afk_service_get(port.service), NULL);
+	KUNIT_EXPECT_FALSE(test, port.enabled);
+}
+
 static struct kunit_case afk_service_cases[] = {
+	KUNIT_CASE(afk_service_admission_test),
+	KUNIT_CASE(dptx_service_identity_test),
+	KUNIT_CASE(dptx_service_duplicate_close_test),
 	KUNIT_CASE(afk_service_many_generations_test),
 	KUNIT_CASE(afk_service_reader_pin_test),
 	KUNIT_CASE(afk_service_pending_reply_test),

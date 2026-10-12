@@ -445,6 +445,16 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 		goto free;
 	}
 	ep->num_channels = max(ep->num_channels, ch_idx + 1);
+	if (ops->prepare) {
+		int ret = ops->prepare(service, epic_name, epic_class, epic_unit);
+
+		if (ret) {
+			dev_err(ep->dcp->dev, "AFK service %s admission failed: %d\n",
+				service_name, ret);
+			afk_service_discard(service);
+			goto free;
+		}
+	}
 	if (ep->wire_v2) {
 		int ret = afk_send_epic(ep, channel, 0, EPIC_TYPE_NOTIFY,
 					EPIC_CAT_REPORT, AFKV2_OPEN, NULL, 0);
@@ -452,16 +462,23 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 		if (ret) {
 			unsigned long flags;
 
-			spin_lock_irqsave(&service->lock, flags);
-			service->enabled = false;
-			service->torndown = true;
-			spin_unlock_irqrestore(&service->lock, flags);
+			if (ops->prepare) {
+				afk_service_discard(service);
+			} else {
+				spin_lock_irqsave(&service->lock, flags);
+				service->enabled = false;
+				service->torndown = true;
+				spin_unlock_irqrestore(&service->lock, flags);
+			}
 			dev_err(ep->dcp->dev, "AFKV2 interface %u OPEN failed: %d\n",
 				channel, ret);
 			goto free;
 		}
 	}
-	ops->init(service, epic_name, epic_class, epic_unit);
+	if (ops->prepare)
+		afk_service_publish(service);
+	if (ops->init)
+		ops->init(service, epic_name, epic_class, epic_unit);
 	dev_info(ep->dcp->dev, "AFK[ep:%02x]: new service %s on channel %d\n",
 		 ep->endpoint, service_name, channel);
 

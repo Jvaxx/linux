@@ -61,6 +61,7 @@
 #include "dcpext_scanout.h"
 #include "dcp-internal.h"
 #include "dcp-external-bw.h"
+#include "dptx-service.h"
 #include "iomfb.h"
 #include "ibootep.h"
 #include "parser.h"
@@ -185,12 +186,14 @@ bool dcp_h17p_external_ready(struct device_node *np)
 	pdev = of_find_device_by_node(np);
 	if (!pdev)
 		return false;
-	/* Failed and deferred probes must never become required components. */
-	if (device_is_bound(&pdev->dev)) {
-		dcp = platform_get_drvdata(pdev);
-		ready = dcp && READ_ONCE(dcp->external_prepared) &&
-			!READ_ONCE(dcp->quiescing) && !READ_ONCE(dcp->crashed);
-	}
+	/*
+	 * Called after component binding. component_add() may synchronously
+	 * bind the master before the platform probe itself returns, so the
+	 * driver core's bound flag is not a readiness condition here.
+	 */
+	dcp = platform_get_drvdata(pdev);
+	ready = dcp && READ_ONCE(dcp->external_prepared) &&
+		!READ_ONCE(dcp->quiescing) && !READ_ONCE(dcp->crashed);
 	put_device(&pdev->dev);
 	return ready;
 }
@@ -2180,6 +2183,7 @@ static int dcp_dptx_connect_session(struct apple_dcp *dcp, u32 port,
 		return -ESHUTDOWN;
 	}
 	if (!dcp->dptxport[port].enabled) {
+	if (!dptx_service_available(&dcp->dptxport[port])) {
 		dev_warn(dcp->dev, "dcp_dptx_connect: dptx service for port %d not enabled\n", port);
 		ret = -ENODEV;
 		goto out_unlock;
@@ -2736,7 +2740,7 @@ static void dcp_placeholder_edid_work(struct work_struct *work)
 	mutex_lock(&dcp->hpd_mutex);
 	generation = dcp->placeholder_generation;
 	if (!dcp->typec_cable_connected || !dcp->dptxport[0].connected ||
-	    !dcp->dptxport[0].enabled || generation != dcp->typec_generation)
+	    !dptx_service_available(&dcp->dptxport[0]) || generation != dcp->typec_generation)
 		goto out_unlock;
 	service = dcp->dptxport[0].service;
 
@@ -2840,6 +2844,9 @@ static int dcp_dptx_release_locked(struct apple_dcp *dcp, u32 port)
 		ret = dptxport_release_display(dcp->dptxport[port].service);
 		if (ret)
 			return ret;
+	mutex_lock(&dcp->hpd_mutex);
+	if (dptx_service_available(&dcp->dptxport[port]) && dcp->dptxport[port].connected) {
+		dptxport_release_display(dcp->dptxport[port].service);
 		dcp->dptxport[port].connected = false;
 	}
 	/*
@@ -2969,6 +2976,8 @@ int dcp_dptx_recover_irq(struct apple_dcp *dcp)
 
 	/* Another delivered IRQ must confirm release before a failed attempt retries. */
 	return dcp_dptx_connect_session(dcp, 0, session, true, true);
+	if (dptx_service_available(&dcp->dptxport[port]))
+		dptxport_set_hpd(dcp->dptxport[port].service, false);
 
 out_unlock:
 	mutex_unlock(&dcp->hpd_mutex);
@@ -3150,7 +3159,7 @@ int dcp_start(struct platform_device *pdev)
 		 * Since dcp0 is not used at the moment let's avoid this
 		 * since it is possibly the cause for startup issues.
 		 */
-		} else if (dcp->dptxport[0].enabled) {
+		} else if (dptx_service_available(&dcp->dptxport[0])) {
 			bool connected;
 			/* force disconnect on start - necessary if the display
 			 * is already up from m1n1
@@ -3493,7 +3502,7 @@ void dcp_poweroff(struct platform_device *pdev)
 	if (dcp_is_typec_output(dcp)) {
 		ret = 0;
 		/* DCP owns a synthetic HPD for Type-C. Release it with the CRTC. */
-		if (dcp->dptxport[0].enabled && dcp->dptxport[0].connected) {
+		if (dptx_service_available(&dcp->dptxport[0]) && dcp->dptxport[0].connected) {
 			ret = dptxport_set_hpd(dcp->dptxport[0].service, false);
 			if (ret)
 				dev_warn(dcp->dev,

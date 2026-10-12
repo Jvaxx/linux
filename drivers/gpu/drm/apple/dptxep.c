@@ -18,6 +18,7 @@
 #include "dcp.h"
 #include "dcp-hdmi.h"
 #include "dptxep.h"
+#include "dptx-service.h"
 #include "parser.h"
 #include "trace.h"
 
@@ -893,10 +894,12 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 	}
 }
 
-static void dptxport_init(struct apple_epic_service *service, const char *name,
-			  const char *class, s64 unit)
+static int dptxport_prepare(struct apple_epic_service *service, const char *name,
+			    const char *class, s64 unit)
 {
 	struct apple_dcp *dcp = service->ep->dcp;
+	int port = dptx_service_port(name, class, unit, service->ep->wire_v2,
+				     dcp->index, dcp->hw.num_dptx_ports);
 	s64 port = unit;
 	bool v14_7 = dcp_fw_is_14_7(service->ep->dcp);
 
@@ -913,17 +916,19 @@ static void dptxport_init(struct apple_epic_service *service, const char *name,
 		    !class || strcmp(class, "AppleDCPDPTXRemotePort"))
 		return;
 
+	if (port < 0)
+		return port;
 	trace_dptxport_init(dcp, unit);
-	if (service->ep->wire_v2) {
-		/* The single external service reports its physical DCP unit. */
-		if (dcp->hw.num_dptx_ports != 1 || unit != dcp->index) {
-			dev_err(dcp->dev, "Unexpected external DPTX unit %lld\n", unit);
-			return;
-		}
-		port = 0;
-		dev_dbg(dcp->dev, "DPTX physical unit %lld maps to logical port 0\n", unit);
-	}
+	return dptx_service_bind(service, &dcp->dptxport[port], unit);
+}
 
+static void dptxport_init(struct apple_epic_service *service, const char *name,
+			  const char *class, s64 unit)
+{
+	struct dptx_port *port = service->cookie;
+
+	dptx_service_publish(service);
+	complete(&port->enable_completion);
 	switch (unit) {
 	case 0:
 	case 1:
@@ -973,6 +978,8 @@ static int dptxport_group_call(struct apple_epic_service *service, u16 group, u3
 static const struct apple_epic_service_ops dptxep_ops[] = {
 	{
 		.name = "AppleDCPDPTXRemotePort",
+		.prepare = dptxport_prepare,
+		.teardown = dptx_service_unbind,
 		.init = dptxport_init,
 		.call = dptxport_call,
 		.call_v2 = dptxport_group_call,

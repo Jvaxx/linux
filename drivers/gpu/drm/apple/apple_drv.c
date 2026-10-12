@@ -812,7 +812,7 @@ static bool apple_dcp_usable(struct device_node *np)
 {
 	return of_device_is_available(np) &&
 	       (!of_device_is_compatible(np, "apple,t8140-dcpext") ||
-		dcp_h17p_external_ready(np));
+		dcp_h17p_external_enabled());
 }
 
 static int apple_drm_init_dcp(struct device *dev)
@@ -836,6 +836,13 @@ static int apple_drm_init_dcp(struct device *dev)
 		          of_device_is_compatible(np, "apple,t8140-dcpext") ||
 		          of_property_present(np, "phys");
 
+		/* component_bind_all() established the matched provider lifetime. */
+		if (of_device_is_compatible(np, "apple,t8140-dcpext") &&
+		    !dcp_h17p_external_ready(np)) {
+			of_node_put(np);
+			return -ENODEV;
+		}
+
 		dcp[num_dcp] = of_find_device_by_node(np);
 		if (!dcp[num_dcp])
 			continue;
@@ -852,8 +859,14 @@ static int apple_drm_init_dcp(struct device *dev)
 		ret = apple_probe_per_dcp(dev, &apple->drm, dcp[num_dcp],
 					  num_dcp, dcp_ext, &encoder[num_dcp],
 					  &crtc_mask[num_dcp]);
-		if (ret)
+		if (ret) {
+			if (of_device_is_compatible(np, "apple,t8140-dcpext")) {
+				put_device(&dcp[num_dcp]->dev);
+				of_node_put(np);
+				return ret;
+			}
 			continue;
+		}
 
 		num_dcp++;
 	}
