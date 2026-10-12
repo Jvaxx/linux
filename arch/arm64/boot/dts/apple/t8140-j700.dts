@@ -1880,3 +1880,6 @@
 		local-mac-address = [00 00 00 00 00 00];
 	};
 };
+
+/* External resources stay disabled pending the separate firmware profile. */
+#include "t8140-j700-dcpext.dtsi"
