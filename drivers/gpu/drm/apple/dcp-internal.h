@@ -49,6 +49,7 @@ struct iomfb_transaction {
 	bool backlight_reserved;
 	bool backlight_failed;
 	bool brightness_only;
+	bool presentation;
 	bool completed;
 };
 struct apple_dcp_typec_port;
@@ -215,6 +216,25 @@ struct apple_dcp {
 	/* Protected by the H17P IOMFB receive mutex. */
 	u8 experimental_callback_logs;
 	bool external_prepared;
+	/* Serializes external connection, power, and CRTC generation changes. */
+	struct mutex external_lock;
+	u64 external_generation;
+	u64 external_crtc_generation;
+	/* iomfb.lock: epoch used by receive-side deferred stop requests. */
+	u64 external_rx_generation;
+	u64 external_stop_generation;
+	bool external_cable;
+	bool external_running;
+	bool external_power_attempted;
+	/* iomfb.lock: replay the latest callback after activation succeeds. */
+	bool external_hotplug_pending;
+	bool external_hotplug_connected;
+	bool external_stopped;
+	int external_error;
+	u64 external_power_reply;
+	bool external_power_reply_valid;
+	struct work_struct external_stop_work;
+
 
 	/* firmware version and compatible firmware version */
 	enum dcp_firmware_version fw_compat;
@@ -567,6 +587,7 @@ struct apple_dcp {
 		unsigned long deadline;
 		unsigned int queued;
 		bool stopped;
+		bool presentation_paused;
 		bool backlight_queued;
 		atomic_t opaque_x_state;
 		struct iomfb_scanout_h17p *scanout;
@@ -591,11 +612,15 @@ int iomfb_configure_backlight_h17p(struct apple_dcp *dcp, u32 maximum,
 void iomfb_queue_init(struct apple_dcp *dcp);
 void iomfb_queue_stop(struct apple_dcp *dcp);
 bool iomfb_queue_drain(struct apple_dcp *dcp, unsigned long timeout);
+int iomfb_queue_settle(struct apple_dcp *dcp, unsigned long timeout);
+void iomfb_pause_presentation(struct apple_dcp *dcp, bool pause);
+int iomfb_external_power_h17p(struct apple_dcp *dcp, bool on);
 int iomfb_queue(struct apple_dcp *dcp, struct iomfb_transaction *transaction);
 void iomfb_queue_crc_h17p(struct apple_dcp *dcp, u32 swap_id);
 
 void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);
 void dcp_handle_hotplug_actions(struct apple_dcp *dcp, unsigned int action);
+bool dcp_external_hotplug(struct apple_dcp *dcp, bool connected);
 
 int dcp_backlight_init(struct apple_dcp *dcp, struct device *dev);
 void dcp_backlight_stop(struct apple_dcp *dcp);
