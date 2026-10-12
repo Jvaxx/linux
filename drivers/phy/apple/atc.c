@@ -1504,6 +1504,7 @@ static void atcphy_enable_dp_aux(struct apple_atcphy *atcphy)
 		apple_tunable_apply(atcphy->regs.core, atcphy->tunables.dp_common_pre);
 		apple_tunable_apply(atcphy->regs.lpdptx, atcphy->tunables.dp_lpdptx);
 		apple_tunable_apply(atcphy->regs.core, atcphy->tunables.dp_common_post);
+		dev_info_once(atcphy->dev, "Applied T8140 DisplayPort setup lists\n");
 		return;
 	}
 
