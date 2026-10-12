@@ -1324,6 +1324,7 @@ static int apple_rtkit_boot_common(struct apple_rtkit *rtk, bool early_ap_power)
 	ret = apple_rtkit_wait(rtk, &rtk->epmap_completion);
 	if (ret)
 		return ret;
+	}
 	if (rtk->boot_result)
 		return rtk->boot_result;
 
@@ -1332,12 +1333,14 @@ static int apple_rtkit_boot_common(struct apple_rtkit *rtk, bool early_ap_power)
 		ret = apple_rtkit_set_ap_power_state(rtk, APPLE_RTKIT_PWR_STATE_ON);
 		if (ret)
 			return ret;
+		}
 	}
 
 	dev_dbg(rtk->dev, "RTKit: waiting for IOP power state ACK\n");
 	ret = apple_rtkit_wait(rtk, &rtk->iop_pwr_ack_completion);
 	if (ret)
 		return ret;
+	}
 
 	return early_ap_power ? 0 :
 		apple_rtkit_set_ap_power_state(rtk, APPLE_RTKIT_PWR_STATE_ON);
