@@ -291,6 +291,8 @@ struct afk_ringbuffer {
 
 struct apple_dcp_afkep {
 	struct apple_dcp *dcp;
+	/* Bounded external protocol observations, owned by the RX worker. */
+	u8 experimental_rx_logs;
 
 	u32 endpoint;
 	struct workqueue_struct *wq;

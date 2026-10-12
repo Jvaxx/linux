@@ -169,6 +169,7 @@ struct dcp_panel {
 enum dcp_iomfb_method_profile {
 	DCP_IOMFB_METHODS_DEFAULT,
 	DCP_IOMFB_METHODS_H17G,
+	DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL,
 };
 
 struct apple_dcp_hw_data {
@@ -203,6 +204,8 @@ struct apple_dcp {
 	struct apple_connector *connector;
 
 	struct apple_dcp_hw_data hw;
+	/* Protected by the H17P IOMFB receive mutex. */
+	u8 experimental_callback_logs;
 
 	/* firmware version and compatible firmware version */
 	enum dcp_firmware_version fw_compat;
