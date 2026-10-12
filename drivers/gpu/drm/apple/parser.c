@@ -467,8 +467,92 @@ static unsigned int external_sdr_rank(const struct color_mode *color)
 	}
 }
 
+/* Firmware lists color element IDs which this timing cannot safely use. */
+#define DCP_TIMING_COLOR_ID_LIMIT 64
+
+struct timing_color_ids {
+	u32 ids[DCP_TIMING_COLOR_ID_LIMIT];
+	unsigned int count;
+};
+
+struct timing_color_restrictions {
+	struct timing_color_ids unsafe;
+	struct timing_color_ids dsc_required;
+};
+
+static bool timing_color_contains(const struct timing_color_ids *ids, u32 id)
+{
+	unsigned int i;
+
+	for (i = 0; i < ids->count; i++)
+		if (ids->ids[i] == id)
+			return true;
+	return false;
+}
+
+static int parse_timing_color_ids(struct dcp_parse_ctx *handle,
+				  struct timing_color_ids *ids)
+{
+	struct iterator it;
+	int ret;
+
+	ret = iterator_begin(handle, &it, false);
+	if (ret)
+		return ret;
+	if (it.len > DCP_TIMING_COLOR_ID_LIMIT)
+		return -E2BIG;
+	for (; it.idx < it.len; it.idx++) {
+		s64 id;
+
+		ret = parse_int_bound(handle, &id, 0, U32_MAX);
+		if (ret)
+			return ret;
+		if (timing_color_contains(ids, id))
+			return -EINVAL;
+		ids->ids[ids->count++] = id;
+	}
+	return 0;
+}
+
+static int parse_timing_color_restrictions(struct dcp_parse_ctx *handle,
+					   struct timing_color_restrictions *limits)
+{
+	struct iterator it;
+	bool unsafe_seen = false, dsc_seen = false, colors_seen = false;
+	int ret;
+
+	ret = iterator_begin(handle, &it, true);
+	if (ret)
+		return ret;
+	for (; it.idx < it.len; it.idx++) {
+		char *key = parse_string(handle);
+
+		if (IS_ERR(key))
+			return PTR_ERR(key);
+		if (!strcmp(key, "UnsafeColorElementIDs")) {
+			ret = unsafe_seen ? -EINVAL :
+				parse_timing_color_ids(handle, &limits->unsafe);
+			unsafe_seen = true;
+		} else if (!strcmp(key, "DSCRequiredColorElementIDs")) {
+			ret = dsc_seen ? -EINVAL :
+				parse_timing_color_ids(handle, &limits->dsc_required);
+			dsc_seen = true;
+		} else if (!strcmp(key, "ColorModes")) {
+			ret = colors_seen ? -EINVAL : skip(handle);
+			colors_seen = true;
+		} else {
+			ret = skip(handle);
+		}
+		kfree(key);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
 static int parse_color_modes(struct dcp_parse_ctx *handle,
-			     struct dcp_display_mode *out, bool external_sdr)
+			     struct dcp_display_mode *out, bool external_sdr,
+			     const struct timing_color_restrictions *limits)
 {
 	struct iterator outer_it;
 	unsigned int best_sdr_rank = 0;
@@ -536,8 +620,13 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 				       cmode.pixel_encoding);
 
 		if (external_sdr) {
-			unsigned int rank = external_sdr_rank(&cmode);
+			unsigned int rank;
 
+			if (cmode.id <= U32_MAX &&
+			    (timing_color_contains(&limits->unsafe, cmode.id) ||
+			     timing_color_contains(&limits->dsc_required, cmode.id)))
+				continue;
+			rank = external_sdr_rank(&cmode);
 			if (!rank || rank < best_sdr_rank)
 				continue;
 			if (rank > best_sdr_rank)
@@ -582,6 +671,8 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 {
 	int ret = 0;
 	struct iterator it;
+	struct dimension horiz = { .active = -1 }, vert = { .active = -1 };
+	struct timing_color_restrictions limits = {};
 	struct dimension horiz = {}, vert = {};
 	u64 clock;
 	s64 min_vrr = 0, max_vrr = 0;
@@ -598,6 +689,14 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 	out->best.score = -1;
 	*score = -1;
 
+	if (external_sdr) {
+		struct dcp_parse_ctx scan = *handle;
+
+		/* ColorModes can precede either list: collect restrictions first. */
+		ret = parse_timing_color_restrictions(&scan, &limits);
+		if (ret)
+			return ret;
+	}
 	ret = iterator_begin(handle, &it, true);
 	if (ret)
 		return ret;
@@ -618,7 +717,7 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		else if (!strcmp(key, "MaximumVariableRefreshRate"))
 			ret = parse_int_bound(it.handle, &max_vrr, 0, U32_MAX);
 		else if (!strcmp(key, "ColorModes"))
-			ret = parse_color_modes(it.handle, out, external_sdr);
+			ret = parse_color_modes(it.handle, out, external_sdr, &limits);
 		else if (!strcmp(key, "ID"))
 			ret = parse_int(it.handle, &id);
 		else if (!strcmp(key, "IsVirtual"))
