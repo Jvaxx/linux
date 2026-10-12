@@ -1501,6 +1501,11 @@ static int atcphy_configure_lanes(struct apple_atcphy *atcphy, enum atcphy_mode 
 {
 	const struct atcphy_mode_configuration *mode_cfg = atcphy_get_mode_config(atcphy, mode);
 
+	if (atcphy->hw->has_t8140_dp &&
+	    (mode == APPLE_ATCPHY_MODE_USB3 || mode == APPLE_ATCPHY_MODE_USB3_DP ||
+	     mode == APPLE_ATCPHY_MODE_DP))
+		return j700_dp_route(atcphy, mode == APPLE_ATCPHY_MODE_DP);
+
 	core_mask32(atcphy, atcphy->hw->aciophy_lane_mode, ACIOPHY_LANE_MODE_RX0,
 		    FIELD_PREP(ACIOPHY_LANE_MODE_RX0, mode_cfg->lane_mode[0]));
 	core_mask32(atcphy, atcphy->hw->aciophy_lane_mode, ACIOPHY_LANE_MODE_TX0,
@@ -1524,18 +1529,6 @@ static int atcphy_configure_lanes(struct apple_atcphy *atcphy, enum atcphy_mode 
 	else
 		core_clear32(atcphy, atcphy->hw->aciophy_crossbar, ACIOPHY_CROSSBAR_DP_BOTH_PMA);
 
-	if (atcphy->hw->has_t8140_dp) {
-		for (unsigned int lane = 0; lane < 2; lane++) {
-			int ret;
-
-			if (!mode_cfg->dp_lane[lane])
-				continue;
-			ret = j700_pma_idle(atcphy, lane);
-			if (ret)
-				return ret;
-		}
-		return 0;
-	}
 
 	/* unclear if we need the remainder for t8122 */
 	if (atcphy->hw->gen == ATCPHY_GENERATION_T8122)

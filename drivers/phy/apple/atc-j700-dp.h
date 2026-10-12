@@ -3,6 +3,29 @@
 #ifndef APPLE_ATC_J700_DP_H
 #define APPLE_ATC_J700_DP_H
 
+/* Preserve the upper routing state established by the platform firmware. */
+static int j700_dp_route(struct apple_atcphy *p, bool four_lanes)
+{
+	u32 protocols = four_lanes ? 0x492 : (p->swap_lanes ? 0x252 : 0x489);
+	int ret;
+
+	core_mask32(p, 0x60, 0xfff, protocols);
+	if (four_lanes) {
+		core_mask32(p, 0x64, 0x1f, 0x14);
+		core_mask32(p, 0x64, 0x3ffe0, p->swap_lanes ? 0x100 : 0x22000);
+	} else {
+		core_mask32(p, 0x64, 0x1ffff, 0x110 | p->swap_lanes);
+	}
+	for (unsigned int lane = 0; lane < 2; lane++) {
+		if (!four_lanes && lane != !p->swap_lanes)
+			continue;
+		ret = j700_pma_idle(p, lane);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
 /* Register facts from the authorized J700 hardware audit. */
 struct j700_dp_step {
 	u32 offset, mask, value;
@@ -213,6 +236,7 @@ static int j700_dp_stop(struct apple_atcphy *p)
 	}
 	p->dp_owned_pmas = 0;
 	p->dp_link_rate = -1;
+	dev_dbg(p->dev, "J700 DP main stopped\n");
 	return 0;
 }
 
@@ -265,6 +289,7 @@ static int j700_dp_start(struct apple_atcphy *p, unsigned int pmas, int rate, bo
 	core_clear32(p, 0x7000, 1);
 	p->dp_link_rate = rate;
 	p->dp_spread_spectrum = ssc;
+	dev_dbg(p->dev, "J700 DP main ready: PMAs=%u rate=%d ssc=%u\n", pmas, rate, ssc);
 	return 0;
 }
 
@@ -274,7 +299,9 @@ static int j700_dp_configure(struct apple_atcphy *p, const struct phy_configure_
 	unsigned int pmas, capacity, first, table;
 	int rate = -1, ret;
 
+	dev_dbg(p->dev, "J700 DP configure waiting for PHY lock\n");
 	guard(mutex)(&p->lock);
+	dev_dbg(p->dev, "J700 DP configure acquired PHY lock\n");
 	if ((o->set_rate && !o->link_rate) || (o->set_lanes && !o->lanes))
 		return o->set_voltages ? -EINVAL : j700_dp_stop(p);
 	if (p->mode != APPLE_ATCPHY_MODE_DP && p->mode != APPLE_ATCPHY_MODE_USB3_DP)
