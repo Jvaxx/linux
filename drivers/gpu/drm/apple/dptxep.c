@@ -5,7 +5,6 @@
 #include <linux/bitfield.h>
 #include <linux/completion.h>
 #include <linux/module.h>
-#include <linux/of.h>
 #include <linux/phy/phy.h>
 #include <linux/delay.h>
 #include <linux/jiffies.h>
@@ -23,12 +22,6 @@
 #include "trace.h"
 
 #include "dptx-j700-training.h"
-
-/* Diagnostic ceiling for the experimental physical J700 output only. */
-static unsigned int j700_dp_max_link_rate = LINK_RATE_HBR3;
-module_param(j700_dp_max_link_rate, uint, 0600);
-MODULE_PARM_DESC(j700_dp_max_link_rate,
-		 "J700 external DP ceiling: 6=RBR, 10=HBR, 20=HBR2, 30=HBR3");
 
 struct dcpdptx_connection_cmd {
 	__le32 unk;
@@ -372,22 +365,12 @@ static int dptxport_call_get_max_link_rate(struct apple_epic_service *service,
 					   void *reply_, size_t reply_size)
 {
 	struct dptxport_apcall_link_rate *reply = reply_;
-	struct apple_dcp *dcp = service->ep->dcp;
-	u32 ceiling = READ_ONCE(j700_dp_max_link_rate);
 
 	if (reply_size < sizeof(*reply))
 		return -EINVAL;
 
 	reply->retcode = cpu_to_le32(0);
-	if (service->cookie && ((struct dptx_port *)service->cookie)->atcphy &&
-	    dcp->hw.iomfb_method_profile ==
-	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL &&
-	    of_machine_is_compatible("apple,j700") &&
-	    (ceiling == LINK_RATE_RBR || ceiling == LINK_RATE_HBR ||
-	     ceiling == LINK_RATE_HBR2 || ceiling == LINK_RATE_HBR3))
-		reply->link_rate = cpu_to_le32(ceiling);
-	else
-		reply->link_rate = cpu_to_le32(LINK_RATE_HBR3);
+	reply->link_rate = cpu_to_le32(LINK_RATE_HBR3);
 
 	return 0;
 }
@@ -938,7 +921,7 @@ static void dptxport_init(struct apple_epic_service *service, const char *name,
 			return;
 		}
 		port = 0;
-		dev_info(dcp->dev, "DPTX physical unit %lld maps to logical port 0\n", unit);
+		dev_dbg(dcp->dev, "DPTX physical unit %lld maps to logical port 0\n", unit);
 	}
 
 	switch (unit) {

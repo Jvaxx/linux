@@ -2029,9 +2029,12 @@ F:	sound/soc/apple/t8140_aop_audio.rs
 F:	tools/diagnostics/apple-dptx-training-test.c
 F:	tools/diagnostics/apple-j700-dp-test.c
 F:	tools/diagnostics/test-apple-j700-crossbar.py
+F:	tools/diagnostics/test-apple-j700-d134.py
 F:	tools/diagnostics/test-apple-j700-dp.py
+F:	tools/diagnostics/test-apple-j700-opaque-scope.py
 F:	tools/diagnostics/test-apple-j700-provider.py
 F:	tools/diagnostics/test-apple-j700-tuning.py
+F:	tools/diagnostics/wayland-output-frame-test.py
 F:	tools/testing/apple/
 
 APPLETALK NETWORK LAYER
