@@ -1036,22 +1036,28 @@ static int apple_rtkit_boot_common(struct apple_rtkit *rtk, bool early_ap_power)
 
 	dev_dbg(rtk->dev, "RTKit: waiting for boot to finish\n");
 	ret = apple_rtkit_wait_for_completion(&rtk->epmap_completion);
-	if (ret)
+	if (ret) {
+		dev_err(rtk->dev, "RTKit: endpoint discovery failed: %d\n", ret);
 		return ret;
+	}
 	if (rtk->boot_result)
 		return rtk->boot_result;
 
 	/* Some helpers need AP readiness before acknowledging IOP power. */
 	if (early_ap_power) {
 		ret = apple_rtkit_set_ap_power_state(rtk, APPLE_RTKIT_PWR_STATE_ON);
-		if (ret)
+		if (ret) {
+			dev_err(rtk->dev, "RTKit: early AP readiness failed: %d\n", ret);
 			return ret;
+		}
 	}
 
 	dev_dbg(rtk->dev, "RTKit: waiting for IOP power state ACK\n");
 	ret = apple_rtkit_wait_for_completion(&rtk->iop_pwr_ack_completion);
-	if (ret)
+	if (ret) {
+		dev_err(rtk->dev, "RTKit: IOP power acknowledgment failed: %d\n", ret);
 		return ret;
+	}
 
 	return early_ap_power ? 0 :
 		apple_rtkit_set_ap_power_state(rtk, APPLE_RTKIT_PWR_STATE_ON);
