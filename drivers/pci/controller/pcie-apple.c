@@ -843,6 +843,21 @@ static void apple_pcie_port_disable_irq(struct apple_pcie_port *port)
 	raw_spin_lock_irqsave(&port->irq_lock, flags);
 	port->irq_disabled = true;
 	raw_spin_unlock_irqrestore(&port->irq_lock, flags);
+ * A chained handler is not tracked by IRQD_IRQ_INPROGRESS, and AIC does not
+ * report IRQCHIP_STATE_ACTIVE. Gate and drain MMIO explicitly before masking
+ * the parent; disable_irq() alone cannot synchronize this chained handler.
+ */
+static void apple_pcie_port_disable_irq(struct apple_pcie_port *port)
+{
+	unsigned long flags;
+
+	if (!port->irq || !port->domain || port->irq_disabled)
+		return;
+
+	raw_spin_lock_irqsave(&port->irq_lock, flags);
+	port->irq_disabled = true;
+	raw_spin_unlock_irqrestore(&port->irq_lock, flags);
+	disable_irq(port->irq);
 }
 
 static void apple_pcie_port_enable_irq(struct apple_pcie_port *port)
@@ -2436,6 +2451,20 @@ static int apple_pcie_tunnel_pci_notify(struct notifier_block *nb,
 		pm_runtime_get_noresume(&pdev->dev);
 		if (pci_pcie_type(pdev) == PCI_EXP_TYPE_ROOT_PORT)
 			pcie_aspm_remove_cap(pdev, PCI_EXP_LNKCAP_ASPM_L1);
+ */
+static int apple_pcie_tunnel_pci_notify(struct notifier_block *nb,
+					unsigned long action, void *data)
+{
+	struct apple_pcie *pcie = container_of(nb, struct apple_pcie,
+					       tunnel_pci_nb);
+	struct pci_dev *pdev = to_pci_dev(data);
+
+	if (pci_host_bridge_priv(pci_find_host_bridge(pdev->bus)) != pcie)
+		return NOTIFY_DONE;
+
+	switch (action) {
+	case BUS_NOTIFY_ADD_DEVICE:
+		pm_runtime_get_noresume(&pdev->dev);
 		break;
 	case BUS_NOTIFY_DEL_DEVICE:
 		pm_runtime_put_noidle(&pdev->dev);
@@ -2685,6 +2714,7 @@ static int apple_pcie_neo_enumerate(struct pci_host_bridge *bridge)
 	ret = apple_pcie_neo_check_cold(pcie, root);
 	if (ret)
 		goto close_config;
+	apple_piodma_bootstrap_admitted(pcie->piodma_supplier);
 	pci_bus_add_devices(root->subordinate);
 	for (function = 0; function < 2; function++) {
 		endpoint = pci_get_slot(root->subordinate, PCI_DEVFN(0, function));
@@ -3080,6 +3110,8 @@ int apple_pcie_tunnel_restore(struct device *dev)
 	pci_rescan_bus(bridge->bus);
 	pci_walk_bus(bridge->bus, apple_pcie_tunnel_keep_d0, NULL);
 	pcie->bus_stopped = false;
+	list_for_each_entry(port, &pcie->ports, entry)
+		apple_pcie_port_enable_irq(port);
 	pci_unlock_rescan_remove();
 
 	dev_info(dev, "PCIe-C hierarchy restored after tunnel activation\n");

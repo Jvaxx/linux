@@ -3,8 +3,8 @@
  * Covers firmware download and the NIC capability exchange.
  * All addresses here are BAR0 offsets, never chip/CPU physical addresses.
  */
-#include <linux/soc/apple/pci-apple-piodma.h>
 #include <linux/mt7932.h>
+#include <linux/soc/apple/pci-apple-piodma.h>
 
 #include "mt7932.h"
 
@@ -1406,6 +1406,7 @@ static struct pci_driver mt_driver = {
 	.driver.suppress_bind_attrs = true,
 	.driver.pm = pm_sleep_ptr(&mt_pm_ops),
 };
+
 /**
  * mt7932_fullmac_ready() - check that the Wi-Fi function is up
  * @pdev: function 0 of the radio

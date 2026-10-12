@@ -2672,7 +2672,6 @@ F:	include/dt-bindings/interrupt-controller/apple-aic.h
 F:	include/dt-bindings/pinctrl/apple.h
 F:	include/linux/mfd/macsmc.h
 F:	include/linux/soc/apple/*
-F:	tools/testing/selftests/drivers/apple/
 F:	include/uapi/drm/asahi_drm.h
 F:	include/uapi/linux/apple-sep.h
 F:	net/bluetooth/brcm.c

@@ -3202,6 +3202,9 @@ static void apple_cio_remove(struct platform_device *pdev)
 	/* A set may hold the switch read lock while waiting for acio->lock. */
 	typec_thunderbolt_switch_unregister(acio->tbt_switch);
 	guard(mutex)(&acio->lock);
+	/* The worker can notify this switch; stop current and future enqueues. */
+	disable_delayed_work_sync(&acio->pcie_tunnel_work);
+	typec_thunderbolt_switch_unregister(acio->tbt_switch);
 	if (acio->current_cable_info)
 		apple_cio_stop(acio);
 }

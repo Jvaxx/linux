@@ -313,6 +313,24 @@ static void mt_policy_disable(struct mt7932 *m, const struct mt7932_policy *poli
 	rtnl_unlock();
 }
 
+/* Retry only a completed file lookup that failed before any policy SET.
+ * Consume the flag under the same lock as the worker publication, so repeated
+ * userspace requests cannot continually invalidate an in-flight attempt.
+ */
+void mt_retry_missing_policy(struct mt7932 *m)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&m->response_lock, flags);
+	if (m->reg_retryable && m->reg_pending && m->interface_registered &&
+	    !m->stopping && !m->policy_failed && !m->link_failed && !m->cal_state.error) {
+		m->reg_retryable = false;
+		m->reg_generation++;
+		schedule_work(&m->startup_work);
+	}
+	spin_unlock_irqrestore(&m->response_lock, flags);
+}
+
 static void mt_startup_work(struct work_struct *work)
 {
 	struct mt7932 *m = container_of(work, struct mt7932, startup_work);
@@ -379,6 +397,13 @@ static void mt_startup_work(struct work_struct *work)
 		if (!ret) {
 			mt7932_policy_filter(&reg, &policy);
 			mt_policy_disable(m, &policy);
+			ret = mt7932_policy_parse(&policy, file->data, file->size, reg.domain);
+			if (!ret) {
+				mt7932_policy_filter(&reg, &policy);
+				mt_policy_disable(m, &policy, generation);
+			} else {
+				dev_err_ratelimited(&m->pdev->dev, "local input %s has invalid policy: %d\n", path, ret);
+			}
 		}
 		mutex_lock(&m->command_mutex);
 		if (READ_ONCE(m->stopping) || generation != READ_ONCE(m->reg_generation))

@@ -24,7 +24,8 @@ The tested configuration includes ``CONFIG_MT7932_FULLMAC=m``,
 ``CONFIG_BT_LE=y``, ``CONFIG_CRYPTO_AES=y`` and ``CONFIG_CRYPTO_CMAC=y``.
 The Bluetooth transport can be built with modular Bluetooth and system
 sleep. The separately selected bootstrap provider has its own lifecycle
-restrictions. Kexec is excluded while either retained experiment is enabled.
+restrictions. A runtime guard refuses kexec while radio admission or retained
+bootstrap DMA ownership is active. Kernels may still support kexec elsewhere.
 The station uses 2.4 GHz channels 1-13 and the 5 GHz channels 36-64,
 100-144 and 149-165 that the cfg80211 regulatory domain permits. Radar (DFS)
 channels stay passive: the firmware listens on them while the station is not
@@ -54,7 +55,9 @@ as in the tested sequence, however the drivers are loaded. Bluetooth therefore
 stays unbound while the Wi-Fi driver is missing or has failed, including when
 a failed Wi-Fi function stays bound to keep DMA it could not stop. A device link
 makes the driver core unbind Bluetooth before Wi-Fi; unloading
-``mt7932_bt_pcie`` does not affect Wi-Fi. The probe rejects a function that is
+``mt7932_bt_pcie`` does not affect Wi-Fi. Wi-Fi pins its module before publishing
+DMA pointers, and refuses function reset while its Bluetooth sibling is live.
+The probe rejects a function that is
 not cold, which is what now prevents a reprobe after a failed or uncertain
 admission; ``enable=0`` leaves the function unbound. The transport also
 disables ASPM on the shared link. Like the Wi-Fi driver, it reads its firmware
@@ -155,7 +158,8 @@ Limitations
 -----------
 
 * PCI bootstrap memory remains retained until external reset. Controller
-  removal, memory reuse, suspend and kexec are unqualified.
+  removal and memory reuse are unqualified. Runtime guards refuse reset and
+  kexec; suspend-to-idle retains the successfully admitted arena.
 * Bluetooth system sleep uses a bounded firmware quiesce/restore handshake
   around HCI suspend/resume, preserving its DMA arena. Hibernation is rejected.
   Removal first quiesces firmware, then stops work and interrupts, disables

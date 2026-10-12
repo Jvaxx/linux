@@ -708,7 +708,7 @@ static void dcp_typec_route_waiting(void)
 		if (!route || dcp_typec_route_activate(route, route->xbar))
 			continue;
 		port->owner = route;
-		port->dp_release_deadline = 0;
+
 		dcp_typec_port_attach(port);
 	}
 }
@@ -804,7 +804,7 @@ dcp_typec_rebalance_locked(struct apple_dcp_typec_port *arriving,
 		}
 		port->owner = route;
 		port->preferred_route = route;
-		port->dp_release_deadline = 0;
+
 		dcp_typec_port_attach(port);
 	}
 
@@ -4067,14 +4067,12 @@ static void dcp_disable_typec_work(struct apple_dcp *dcp, bool release_cable)
 	/* Block new enqueues as well as draining users of the AFK endpoints. */
 	disable_delayed_work_sync(&dcp->typec_reconnect_wq);
 	disable_delayed_work_sync(&dcp->placeholder_edid_wq);
-	disable_delayed_work_sync(&dcp->typec_fabric_retrain_wq);
 }
 
 static void dcp_enable_typec_work(struct apple_dcp *dcp)
 {
 	enable_delayed_work(&dcp->typec_reconnect_wq);
 	enable_delayed_work(&dcp->placeholder_edid_wq);
-	enable_delayed_work(&dcp->typec_fabric_retrain_wq);
 	/* A cable can be routed before the DRM component binds. */
 	if (READ_ONCE(dcp->typec_cable_connected))
 		mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq, 0);
@@ -4353,7 +4351,6 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 			cancel_work_sync(&dcp->bl_update_wq);
 		}
 		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
-		cancel_delayed_work_sync(&dcp->typec_fabric_retrain_wq);
 		cancel_work_sync(&dcp->vblank_wq);
 		if (dcp->connector)
 			cancel_work_sync(&dcp->connector->hotplug_wq);
@@ -4621,7 +4618,6 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	/* Balanced by enable at successful component bind. */
 	disable_delayed_work(&dcp->typec_reconnect_wq);
 	disable_delayed_work(&dcp->placeholder_edid_wq);
-	disable_delayed_work(&dcp->typec_fabric_retrain_wq);
 
 	platform_set_drvdata(pdev, dcp);
 

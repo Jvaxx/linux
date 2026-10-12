@@ -21,7 +21,12 @@ a module dependency on a provider whose lifetime cannot end at unload.
 Suspend-to-idle suspend retains the arena after checking the completed request,
 idle FIFO and command state. Resume restores the existing configuration
 banks without issuing a second bootstrap. Hibernation, deeper suspend and
-kexec are unsupported after activation. Failed or uncertain bootstrap state
+kexec are refused while admission or retained DMA ownership is active. The
+runtime kexec guard permits the kernel to support kexec on other machines.
+Host removal, sysfs reset, hotplug, VFIO assignment and native AER/DPC
+recovery are withheld on this retained hierarchy. Sleep is refused until
+radio admission completes; the existing suspend-to-idle path remains available
+after successful admission. Failed or uncertain bootstrap state
 requires a full external hardware reset; there is no command retry.
 
 The PIODMA arena remains allocated until external reset. Controller removal,

@@ -171,6 +171,10 @@ static int apple_piodma_pm_notify(struct notifier_block *nb,
 
 	switch (action) {
 	case PM_SUSPEND_PREPARE:
+		if (pm_suspend_no_platform() && READ_ONCE(diag->ready) &&
+		    smp_load_acquire(&diag->radio_admitted))
+			return NOTIFY_DONE;
+		fallthrough;
 	case PM_HIBERNATION_PREPARE:
 	case PM_RESTORE_PREPARE:
 		dev_warn_ratelimited(diag->dev,
@@ -188,6 +192,9 @@ static int apple_piodma_pm_prepare(struct device *dev)
 	/* Acquire admission before either PCI children or DMA pointers escape. */
 	if (!diag || !smp_load_acquire(&diag->guarded))
 		return 0;
+	if (pm_suspend_no_platform() && READ_ONCE(diag->ready) &&
+	    smp_load_acquire(&diag->radio_admitted))
+		return 0;
 	/*
 	 * A /dev/snapshot file may have sent its PREPARE notifier before this
 	 * supplier probed. Its later image/restore/suspend ioctls go straight
@@ -197,10 +204,6 @@ static int apple_piodma_pm_prepare(struct device *dev)
 			     "sleep refused: Neo guard active during radio admission or retained DMA lifetime\n");
 	return -EOPNOTSUPP;
 }
-
-static const struct dev_pm_ops apple_piodma_pm_ops = {
-	.prepare = apple_piodma_pm_prepare,
-};
 
 static int apple_piodma_diag_root(struct apple_piodma_diag *diag, struct pci_dev *root)
 {
@@ -914,6 +917,7 @@ static int apple_piodma_diag_freeze(struct device *dev)
 }
 
 static const struct dev_pm_ops apple_piodma_diag_pm_ops = {
+	.prepare = apple_piodma_pm_prepare,
 	.suspend_noirq = apple_piodma_diag_suspend_noirq,
 	.resume_noirq = apple_piodma_diag_resume_noirq,
 	.freeze = apple_piodma_diag_freeze,
