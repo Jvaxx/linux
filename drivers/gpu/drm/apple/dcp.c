@@ -2092,6 +2092,14 @@ static struct apple_rtkit_ops rtkit_ops = {
 	.shmem_destroy = dcp_rtk_shmem_destroy,
 };
 
+static const struct apple_rtkit_ops external_h17p_rtkit_ops = {
+	.flags = APPLE_RTKIT_COPROC_PLACES_BUFFERS,
+	.crashed = dcp_rtk_crashed,
+	.recv_message = dcp_recv_msg,
+	.shmem_setup = dcp_rtk_shmem_setup,
+	.shmem_destroy = dcp_rtk_shmem_destroy,
+};
+
 void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message)
 {
 	if (READ_ONCE(dcp->quiescing))
@@ -3528,7 +3536,13 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	ret = dcp_pin_live_session(dcp);
 	if (ret)
 		goto err_piodma;
-	dcp->rtk = apple_rtkit_init(dev, dcp, "mbox", 0, &rtkit_ops);
+	/* External H17P supplies shared-buffer addresses during RTKit startup. */
+	if (dcp->hw.iomfb_method_profile ==
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
+		dcp->rtk = apple_rtkit_init(dev, dcp, "mbox", 0,
+					    &external_h17p_rtkit_ops);
+	else
+		dcp->rtk = apple_rtkit_init(dev, dcp, "mbox", 0, &rtkit_ops);
 	if (IS_ERR(dcp->rtk)) {
 		ret = dev_err_probe(dev, PTR_ERR(dcp->rtk),
 				    "Failed to initialize RTKit\n");
@@ -3541,12 +3555,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	if (dcp->hw.adopt_live_session)
 		dev_info(dev, "negotiating RTKit with the running DCP\n");
 
-	/* Announce host readiness before awaiting external IOP readiness. */
-	if (dcp->hw.iomfb_method_profile ==
-	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
-		ret = apple_rtkit_wake_early_ap(dcp->rtk);
-	else
-		ret = apple_rtkit_wake(dcp->rtk);
+	ret = apple_rtkit_wake(dcp->rtk);
 	if (ret) {
 		ret = dev_err_probe(dev, ret, "Failed to boot RTKit: %d\n", ret);
 		goto err_piodma;
