@@ -84,6 +84,7 @@ enum {
 	TEST_ENDPOINT = 0x21,
 	DCP_EXPERT_ENDPOINT = 0x22,
 	DISP0_ENDPOINT = 0x23,
+	DPTX_CONTROLLER_ENDPOINT = 0x24,
 	DPAVSERV_ENDPOINT = 0x28,
 	AV_ENDPOINT = 0x29,
 	DPTX_ENDPOINT = 0x2a,
@@ -353,6 +354,8 @@ struct apple_dcp {
 	struct audiosrv_data *audiosrv;
 
 	struct apple_dcp_afkep *dptxep;
+	struct apple_dcp_afkep *dptx_controller_ep;
+	struct completion dptx_controller_ready;
 
 	struct dptx_port dptxport[2];
 
