@@ -493,14 +493,12 @@ static void afk_recv_handle_reply(struct apple_dcp_afkep *ep, u32 channel,
 		dma_free_coherent(ep->dcp->dev, txlen, txbuf, txbuf_dma);
 }
 
+/* A call from DCP: one word ahead of the call header AP sends. */
 struct epic_std_service_ap_call {
 	__le32 unk0;
-	__le32 unk1;
-	__le32 type;
-	__le32 len;
-	__le32 magic;
-	u8 _unk[48];
+	struct epic_service_call call;
 } __attribute__((packed));
+static_assert(sizeof(struct epic_std_service_ap_call) == 68);
 
 static void afk_recv_handle_std_service(struct apple_dcp_afkep *ep, u32 channel,
 					u32 type, struct epic_hdr *ehdr,
@@ -525,30 +523,56 @@ static void afk_recv_handle_std_service(struct apple_dcp_afkep *ep, u32 channel,
 	if (type == EPIC_TYPE_NOTIFY && eshdr->category == EPIC_CAT_NOTIFY) {
 		struct epic_std_service_ap_call *call = payload;
 		size_t call_size;
+		u32 command;
 		void *reply;
+		u16 group;
 		int ret;
 
 		if (payload_size < sizeof(*call))
 			return;
 
-		call_size = le32_to_cpu(call->len);
+		call_size = le32_to_cpu(call->call.data_len);
 		if (payload_size < sizeof(*call) + call_size)
 			return;
 
-		if (!service->ops->call)
+		group = le16_to_cpu(call->call.group);
+		command = le32_to_cpu(call->call.command);
+
+		/*
+		 * Command numbers are per group: a group-less .call handler
+		 * would take another group's call for a group 0 one. Without
+		 * call_v2 there is no handler for it, and AFK cannot guess a
+		 * reply, so it gets none, as a call without any handler.
+		 */
+		if (!service->ops->call_v2 && (group || !service->ops->call)) {
+			if (group)
+				dev_warn_ratelimited(ep->dcp->dev,
+						     "AFK[ep:%02x]: %s (chan:%u) apcall %u:%u has no handler, sending NO reply\n",
+						     ep->endpoint, service->ops->name,
+						     channel, group, command);
 			return;
+		}
 		reply = kzalloc(payload_size, GFP_KERNEL);
 		if (!reply)
 			return;
 
-		ret = service->ops->call(service, le32_to_cpu(call->type),
-					 payload + sizeof(*call), call_size,
-					 reply + sizeof(*call), call_size);
+		if (service->ops->call_v2)
+			ret = service->ops->call_v2(service, group, command,
+						    payload + sizeof(*call),
+						    call_size,
+						    reply + sizeof(*call),
+						    call_size);
+		else
+			ret = service->ops->call(service, command,
+						 payload + sizeof(*call),
+						 call_size,
+						 reply + sizeof(*call),
+						 call_size);
 		if (ret) {
 			dev_warn(ep->dcp->dev,
-				 "AFK[ep:%02x]: %s (chan:%u) apcall %u handler returned %d, sending NO reply\n",
+				 "AFK[ep:%02x]: %s (chan:%u) apcall %u:%u handler returned %d, sending NO reply\n",
 				 ep->endpoint, service->ops->name, channel,
-				 le32_to_cpu(call->type), ret);
+				 group, command, ret);
 			kfree(reply);
 			return;
 		}
