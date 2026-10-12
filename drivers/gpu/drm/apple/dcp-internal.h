@@ -357,8 +357,6 @@ struct apple_dcp {
 	struct apple_dcp_afkep *dptxep;
 	struct apple_dcp_afkep *dptx_controller_ep;
 	struct completion dptx_controller_ready;
-	struct apple_dcp_afkep *dptx_v2_probe_ep;
-	struct completion dptx_v2_probe_ready;
 
 	struct dptx_port dptxport[2];
 
