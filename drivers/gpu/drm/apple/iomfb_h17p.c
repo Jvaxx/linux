@@ -725,7 +725,7 @@ struct dcp_external_power_cookie {
 	bool on;
 };
 
-/* A473's envelope is known; no OFF reply has been qualified as a stop. */
+/* A473 echoes the accepted state with zero status; DMA ownership is unchanged. */
 static void iomfb_external_power_complete(struct apple_dcp *dcp, void *out, void *data)
 {
 	struct dcp_external_power_cookie *cookie = data;
@@ -740,9 +740,9 @@ static void iomfb_external_power_complete(struct apple_dcp *dcp, void *out, void
 
 			WRITE_ONCE(dcp->external_power_reply, reply);
 			WRITE_ONCE(dcp->external_power_reply_valid, true);
-			dev_info(dcp->dev, "A473 power=%u reply=%#llx%s\n",
-				 cookie->on, reply, cookie->on ? "" : " (stop unqualified)");
-			ret = cookie->on ? (reply == 1 ? 0 : -EREMOTEIO) : -EOPNOTSUPP;
+			dev_info(dcp->dev, "A473 power=%u reply=%#llx\n",
+				 cookie->on, reply);
+			ret = reply == (u64)cookie->on ? 0 : -EREMOTEIO;
 		}
 	}
 	WRITE_ONCE(cookie->wait.status, ret);

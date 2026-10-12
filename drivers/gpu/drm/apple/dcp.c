@@ -3004,12 +3004,12 @@ static int dcp_external_stop_locked(struct apple_dcp *dcp, u64 generation)
 		return 0;
 	if (dcp->external_error)
 		return dcp->external_error;
-	if (dcp->external_stopped)
+	if (dcp->external_stopped && !READ_ONCE(dcp->dptxport[0].connected))
 		return 0;
 	iomfb_pause_presentation(dcp, true);
 	dcp->external_running = false;
 	/* Route setup can call this before IOMFB or its shared memory exists. */
-	if (!dcp->external_power_attempted)
+	if (dcp->external_stopped || !dcp->external_power_attempted)
 		goto release_link;
 	ret = iomfb_queue_settle(dcp, msecs_to_jiffies(500));
 	if (!ret)
@@ -3097,9 +3097,14 @@ bool dcp_external_hotplug(struct apple_dcp *dcp, bool connected)
 	if (dcp->iomfb.presentation_paused) {
 		dcp->external_hotplug_pending = true;
 		dcp->external_hotplug_connected = connected;
-		/* Publish discovery so DRM can activate the first CRTC; keep presents paused. */
+		/* Publish initial/new-cable discovery, never same-cable DPMS wake. */
 		if (connected && READ_ONCE(dcp->external_cable) &&
-		    !READ_ONCE(dcp->external_power_attempted) && !READ_ONCE(dcp->external_error)) {
+		    !READ_ONCE(dcp->external_error) &&
+		    (!READ_ONCE(dcp->external_power_attempted) ||
+		     (READ_ONCE(dcp->external_stopped) &&
+		      READ_ONCE(dcp->external_rx_generation) !=
+		      READ_ONCE(dcp->external_crtc_generation) &&
+		      READ_ONCE(dcp->dptxport[0].connected)))) {
 			unsigned int action = dcp_mode_hotplug(&dcp->mode_state, true,
 							     dcp->connector ?
 							     &dcp->connector->connected : NULL);
