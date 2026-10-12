@@ -1463,6 +1463,250 @@ static void __init gate_describe(void)
 	of_node_put(dcp);
 }
 
+/*
+ * The T8122 (M3) external display processor, dcpext. Unlike T6030's, the
+ * boot loader does not hand it over: the display driver starts its firmware
+ * itself, as on M1/M2 (DCP_FIRMWARE_V_14_7_TEMPLATE). The boot loader only
+ * reserves that firmware (memory-region and iommu-addresses), sets its
+ * firmware version and marks the node apple,t8122-dcpext-firmware-ready =
+ * <1>. The node stays disabled in the device tree, so a kernel that cannot
+ * drive it never sees it, and neither does a USB-C port controller waiting
+ * for its Type-C display route. So do its DARTs, its mailbox and the display
+ * crossbars of its routes, and the ATC power states are left as they are:
+ * without the marker, nothing of the dcpext's probes or stays powered.
+ *
+ * Once the internal display was handed over, this enables, in one
+ * changeset:
+ *  - the dcpext node and its Type-C routes (a processor's routes are usable
+ *    exactly when the processor is);
+ *  - its DART, its display DART and its mailbox;
+ *  - the display crossbars its routes switch (mux-controls), and
+ *    apple,always-on on the common power state of each crossbar's ATC, as
+ *    the M1/M2 laptops have for DP alt mode across suspend;
+ *  - <&dispextN_dart 0> in the display subsystem's iommus, so that every
+ *    framebuffer is mapped for the external pipe too, as on M1/M2 (the
+ *    display DART is the one the dcpext's piodma child names);
+ *  - an active floor on the dcpext's CPU power state, as on T6030, so that
+ *    the running PMP cannot power the processor down under its firmware;
+ *  - if the PMP was added, its DISPEXT request (pmp-dispext0), as on
+ *    T6030: once the PMP runs it owns the SoC power and performance states
+ *    and keeps a block up only if that block's request bit was set when it
+ *    started. The dcpext points at the entry (apple,pmp-report) and the
+ *    display driver waits for its acknowledgement before it runs the dcpext
+ *    CPU.
+ * The DARTs, the mailbox and the crossbars must be described and still
+ * disabled. Without the marker, with other firmware, or if anything does not
+ * check out, all of them stay disabled and the ATC power states are left
+ * alone. apple_t8122_display.dcpext=0 keeps them disabled too.
+ */
+static bool gate_t8122_dcpext_requested __initdata = true;
+
+static int __init gate_t8122_dcpext_setup(char *arg)
+{
+	return kstrtobool(arg, &gate_t8122_dcpext_requested);
+}
+early_param("apple_t8122_display.dcpext", gate_t8122_dcpext_setup);
+
+/* The most display crossbars a T8122 dcpext's routes switch: ATC0's and ATC1's. */
+#define GATE_T8122_XBARS	2
+
+/*
+ * The ATC common power state above display crossbar @xbar: the crossbar sits
+ * in atcN_usb, one of whose parents is atcN_common.
+ */
+static struct device_node *__init gate_t8122_atc_common(struct device_node *xbar)
+{
+	struct device_node *usb, *found = NULL;
+	struct of_phandle_args args;
+	const char *label;
+	char want[32];
+	size_t len;
+	int i, n;
+
+	usb = gate_ps_parent(xbar);
+	if (!usb || of_property_read_string(usb, "label", &label))
+		goto out;
+	len = strlen(label);
+	if (!strstarts(label, "atc") || len < 8 || strcmp(label + len - 4, "_usb"))
+		goto out;
+	snprintf(want, sizeof(want), "%.*s_common", (int)(len - 4), label);
+	n = of_count_phandle_with_args(usb, "power-domains", "#power-domain-cells");
+	for (i = 0; i < n && !found; i++) {
+		if (of_parse_phandle_with_args(usb, "power-domains", "#power-domain-cells",
+					       i, &args))
+			break;
+		if (!args.args_count && gate_ps_is(args.np, want))
+			found = args.np;
+		else
+			of_node_put(args.np);
+	}
+out:
+	of_node_put(usb);
+	return found;
+}
+
+/* Is @np among the first @n entries of @nodes? */
+static bool __init gate_node_in(struct device_node *const *nodes, int n,
+				const struct device_node *np)
+{
+	while (n--)
+		if (nodes[n] == np)
+			return true;
+	return false;
+}
+
+static void __init gate_t8122_dcpext_one(struct device_node *np)
+{
+	struct device_node *dart = NULL, *mbox = NULL, *piodma = NULL;
+	struct device_node *disp_dart = NULL, *ps = NULL, *entry = NULL;
+	struct device_node *xbar[GATE_T8122_XBARS] = {};
+	struct device_node *common[GATE_T8122_XBARS] = {};
+	struct of_phandle_args args;
+	struct of_changeset *cs;
+	const char *label, *pmp_note;
+	bool pmp_request = false;
+	int ret, i, nxbar = 0;
+	u32 ready;
+
+	if (!gate_disabled(np)) {
+		gate_warn("%pOF is not disabled; external display gate skipped\n", np);
+		return;
+	}
+	if (of_property_read_u32(np, "apple,t8122-dcpext-firmware-ready", &ready) ||
+	    ready != 1) {
+		gate_ext_refuse(np, "the boot loader did not reserve its firmware");
+		return;
+	}
+	if (!gate_ext_firmware_ok(np)) {
+		gate_ext_refuse(np, "its firmware-compat is not 14.7.0");
+		return;
+	}
+	if (!of_property_present(np, "memory-region")) {
+		gate_ext_refuse(np, "it has no firmware memory");
+		goto put;
+	}
+	dart = gate_target(np, "iommus", "#iommu-cells", 1, 5, "apple,t8110-dart");
+	mbox = gate_target(np, "mboxes", "#mbox-cells", 0, 0, "apple,asc-mailbox-v4");
+	piodma = of_get_child_by_name(np, "piodma");
+	if (piodma)
+		disp_dart = gate_target(piodma, "iommus", "#iommu-cells", 1, 4,
+					"apple,t8110-dart");
+	if (!dart || !mbox || !disp_dart || dart == disp_dart || !gate_disabled(dart) ||
+	    !gate_disabled(mbox) || !gate_disabled(disp_dart)) {
+		gate_ext_refuse(np, "its DARTs or mailbox are not described or not disabled");
+		goto put;
+	}
+	ret = of_count_phandle_with_args(np, "mux-controls", "#mux-control-cells");
+	if (ret != -ENOENT && (ret < 0 || ret > GATE_T8122_XBARS)) {
+		gate_ext_refuse(np, "its display crossbars are not described");
+		goto put;
+	}
+	for (i = 0; i < ret; i++, nxbar++) {
+		if (of_parse_phandle_with_args(np, "mux-controls", "#mux-control-cells",
+					       i, &args))
+			break;
+		xbar[i] = args.np;
+		if (!of_device_is_compatible(xbar[i], "apple,t6020-display-crossbar") ||
+		    !gate_disabled(xbar[i]))
+			break;
+		common[i] = gate_t8122_atc_common(xbar[i]);
+		if (!common[i])
+			break;
+	}
+	if (i < ret) {
+		gate_ext_refuse(np,
+				"a display crossbar or its ATC power state is not described, or the crossbar is not disabled");
+		goto put;
+	}
+	ps = of_parse_phandle(np, "power-domains", 0);
+	if (!ps || !of_device_is_compatible(ps, gate_soc->pwrstate_compat) ||
+	    of_property_read_string(ps, "label", &label) || strcmp(label, "dispext_cpu")) {
+		gate_ext_refuse(np, "its power state is not dispext_cpu");
+		goto put;
+	}
+
+	/* The PMP DISPEXT request, if the PMP was added (see above). */
+	entry = gate_pmp_dispext_entry(0);
+	if (!entry) {
+		pmp_note = "no PMP DISPEXT request (the PMP is not described)";
+	} else if (!entry->phandle ||
+		   !of_device_is_compatible(entry, "apple,t6000-pmp-v2-report-entry") ||
+		   !gate_disabled(entry)) {
+		pmp_note = "no PMP DISPEXT request (its report entry is not usable)";
+	} else {
+		pmp_request = true;
+		pmp_note = "PMP DISPEXT request";
+	}
+
+	cs = gate_cs_alloc();
+	if (!cs) {
+		gate_ext_refuse(np, "out of memory");
+		goto put;
+	}
+	ret = gate_set_u32(cs, ps, "apple,min-state", PMGR_PS_ACTIVE);
+	/* The driver waits for this request's acknowledgement before RUN. */
+	if (!ret && pmp_request) {
+		ret = gate_set_u32(cs, np, "apple,pmp-report", entry->phandle);
+		if (!ret)
+			ret = of_changeset_update_prop_string(cs, entry, "status", "okay");
+	}
+	if (!ret)
+		ret = of_changeset_update_prop_string(cs, dart, "status", "okay");
+	if (!ret)
+		ret = of_changeset_update_prop_string(cs, disp_dart, "status", "okay");
+	if (!ret)
+		ret = of_changeset_update_prop_string(cs, mbox, "status", "okay");
+	/* DP alt mode keeps the ATC's common power state on, as on M1/M2. */
+	for (i = 0; i < nxbar && !ret; i++) {
+		if (!gate_node_in(xbar, i, xbar[i]))
+			ret = of_changeset_update_prop_string(cs, xbar[i], "status", "okay");
+		if (!ret && !gate_node_in(common, i, common[i]) &&
+		    !of_property_read_bool(common[i], "apple,always-on"))
+			ret = of_changeset_add_prop_bool(cs, common[i], "apple,always-on");
+	}
+	if (!ret)
+		ret = of_changeset_update_prop_string(cs, np, "status", "okay");
+	if (!ret)
+		ret = gate_ext_routes(cs, np, "okay");
+	if (!ret)
+		ret = gate_display_add_dart(cs, disp_dart);
+	if (!ret)
+		ret = of_changeset_apply(cs);
+	if (ret) {
+		gate_cs_free(cs);
+		gate_warn("%pOF: changeset failed: %d\n", np, ret);
+		gate_ext_refuse(np, "the gate could not enable it");
+		goto put;
+	}
+	gate_info("enabled %pOF with its Type-C routes, DARTs, mailbox, %d display crossbar(s) with ATC common power kept on, display DART %pOF in the display subsystem, CPU power floor and %s; started by the display driver\n",
+		  np, nxbar, disp_dart, pmp_note);
+put:
+	for (i = 0; i < GATE_T8122_XBARS; i++) {
+		of_node_put(common[i]);
+		of_node_put(xbar[i]);
+	}
+	of_node_put(entry);
+	of_node_put(ps);
+	of_node_put(disp_dart);
+	of_node_put(piodma);
+	of_node_put(mbox);
+	of_node_put(dart);
+}
+
+static void __init gate_t8122_dcpext(bool panel)
+{
+	struct device_node *np;
+
+	for_each_compatible_node(np, NULL, "apple,t8122-dcpext") {
+		if (!panel)
+			gate_ext_refuse(np, "the internal display was not handed over");
+		else if (!gate_t8122_dcpext_requested)
+			gate_ext_refuse(np, "disabled on the command line");
+		else
+			gate_t8122_dcpext_one(np);
+	}
+}
+
 static void __init gate_run(void)
 {
 	struct device_node *np[GATE_NR_NODES] = {};
@@ -1494,6 +1738,8 @@ static void __init gate_run(void)
 	/* External processors need the panel's PMP; without it they stay off. */
 	if (gate_soc->dcpext)
 		gate_dcpext(panel ? NULL : "the internal display was not handed over");
+	if (gate_soc == &gate_t8122)
+		gate_t8122_dcpext(panel);
 	of_node_put(aic);
 	for (i = 0; i < PMP_PS_NR; i++)
 		of_node_put(ps[i]);
