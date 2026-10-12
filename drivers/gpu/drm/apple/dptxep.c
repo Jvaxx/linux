@@ -871,10 +871,13 @@ int dptxep_init(struct apple_dcp *dcp)
 	for (port = 0; port < dcp->hw.num_dptx_ports; port++) {
 		ret = wait_for_completion_timeout(&dcp->dptxport[port].enable_completion,
 						timeout);
-		if (!ret)
+		if (!ret) {
+			dev_warn(dcp->dev, "DPTX transport ready but port %u service not announced\n",
+				 port);
 			return -ETIMEDOUT;
-		else if (ret < 0)
+		} else if (ret < 0) {
 			return ret;
+		}
 		timeout = ret;
 	}
 
