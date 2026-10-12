@@ -38,3 +38,45 @@ $afkv2_cc -std=gnu11 -Wall -Wextra -Werror ${CFLAGS:-} $afkv2_sanitizers \
 	-I"$afkv2_dir/host-include" -I"$afkv2_root/drivers/gpu/drm/apple" \
 	"$afkv2_tmp/owned.c" -o "$afkv2_tmp/owned"
 "$afkv2_tmp/owned"
+
+# Inline DPAV transport and actual-length EDID response validation.
+# shellcheck disable=SC2086
+$afkv2_cc -std=c11 -Wall -Wextra -Werror -pedantic ${CFLAGS:-} $afkv2_sanitizers \
+    -I"$afkv2_dir/host-include" -I"$afkv2_root/drivers/gpu/drm/apple" \
+    "$afkv2_dir/inline-edid.c" -o "$afkv2_tmp/inline-edid"
+"$afkv2_tmp/inline-edid"
+"$afkv2_python" "$afkv2_dir/extract-service.py" \
+    "$afkv2_root/drivers/gpu/drm/apple/afk.c" "$afkv2_tmp/service.c"
+# shellcheck disable=SC2086
+$afkv2_cc -std=gnu11 -Wall -Wextra -Werror ${CFLAGS:-} $afkv2_sanitizers \
+    -I"$afkv2_dir/host-include" -I"$afkv2_root/drivers/gpu/drm/apple" \
+    "$afkv2_tmp/service.c" -o "$afkv2_tmp/service"
+"$afkv2_tmp/service"
+
+"$afkv2_python" "$afkv2_dir/extract-send.py" \
+    "$afkv2_root/drivers/gpu/drm/apple/afk.c" "$afkv2_tmp/send.c"
+# shellcheck disable=SC2086
+$afkv2_cc -std=gnu11 -Wall -Wextra -Werror ${CFLAGS:-} $afkv2_sanitizers \
+    -I"$afkv2_dir/host-include" -I"$afkv2_root/drivers/gpu/drm/apple" \
+    "$afkv2_tmp/send.c" -o "$afkv2_tmp/send"
+"$afkv2_tmp/send"
+
+"$afkv2_python" "$afkv2_dir/extract-edid.py" \
+    "$afkv2_root/drivers/gpu/drm/apple/epic/dpavservep.c" "$afkv2_tmp/edid.c"
+# shellcheck disable=SC2086
+$afkv2_cc -std=gnu11 -Wall -Wextra -Werror ${CFLAGS:-} $afkv2_sanitizers \
+    -I"$afkv2_dir/host-include" -I"$afkv2_root/drivers/gpu/drm/apple" \
+    "$afkv2_tmp/edid.c" -o "$afkv2_tmp/edid"
+"$afkv2_tmp/edid"
+
+"$afkv2_python" "$afkv2_dir/extract-ring.py" \
+    "$afkv2_root/drivers/gpu/drm/apple/afk.c" "$afkv2_tmp/ring.c"
+"$afkv2_python" "$afkv2_dir/extract-notify.py" \
+    "$afkv2_root/drivers/gpu/drm/apple/epic/dpavservep.c" "$afkv2_tmp/notify.c"
+for afkv2_test in ring notify; do
+    # shellcheck disable=SC2086
+    $afkv2_cc -std=gnu11 -Wall -Wextra -Werror ${CFLAGS:-} $afkv2_sanitizers \
+        -I"$afkv2_dir/host-include" -I"$afkv2_root/drivers/gpu/drm/apple" \
+        "$afkv2_tmp/$afkv2_test.c" -o "$afkv2_tmp/$afkv2_test"
+    "$afkv2_tmp/$afkv2_test"
+done

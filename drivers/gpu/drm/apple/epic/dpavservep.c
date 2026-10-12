@@ -2,6 +2,9 @@
 /* Copyright The Asahi Linux Contributors */
 
 #include "dpavservep.h"
+#include "dpavserv-edid.h"
+
+#define EDID_EXT_BLOCK_COUNT_OFFSET 0x7E
 
 #include <drm/drm_edid.h>
 
@@ -12,7 +15,22 @@
 #include "../afk.h"
 #include "../dcp.h"
 #include "../dcp-internal.h"
+#include "../connector.h"
 #include "../trace.h"
+
+static void dcpavserv_notify_edid(struct apple_epic_service *service)
+{
+	struct apple_dcp *dcp = service->ep->dcp;
+	struct apple_connector *connector = READ_ONCE(dcp->connector);
+
+	if (!service->ep->inline_v2 || READ_ONCE(dcp->quiescing) || !connector ||
+	    !READ_ONCE(dcp->nr_modes) || !READ_ONCE(connector->connected) ||
+	    READ_ONCE(connector->base.registration_state) != DRM_CONNECTOR_REGISTERED ||
+	    READ_ONCE(connector->dcp) != to_platform_device(dcp->dev))
+		return;
+	/* get_modes may already have run before this service was announced. */
+	schedule_work(&connector->hotplug_wq);
+}
 
 static void dcpavserv_init(struct apple_epic_service *service, const char *name,
 			  const char *class, s64 unit)
@@ -35,6 +53,11 @@ static void dcpavserv_init(struct apple_epic_service *service, const char *name,
 		service->cookie = &dcp->dcpavserv;
 		complete(&dcp->dcpavserv.enable_completion);
 		spin_unlock_irqrestore(&dcp->dcpavserv.lock, flags);
+		if (service->ep->inline_v2) {
+			dev_info(dcp->dev, "DCPAVSERV: inline EDID service ready on channel %u\n",
+				 service->channel);
+			dcpavserv_notify_edid(service);
+		}
 	}
 }
 
@@ -99,12 +122,6 @@ struct dpavserv_copy_edid_cmd {
 	__le64 used_size;
 	u8 _pad2[8];
 } __packed;
-
-#define EDID_LEADING_DATA_SIZE		8
-#define EDID_BLOCK_SIZE			128
-#define EDID_EXT_BLOCK_COUNT_OFFSET	0x7E
-#define EDID_MAX_SIZE			SZ_32K
-#define EDID_BUF_SIZE			(EDID_LEADING_DATA_SIZE + EDID_MAX_SIZE)
 
 struct dpavserv_copy_edid_resp {
 	__le64 max_size;
@@ -182,7 +199,7 @@ static int dcpdpserv_report(struct apple_epic_service *service,
 	return parse_report(service, type, data, data_size);
 }
 
-static const struct drm_edid *dcpavserv_read_edid(struct apple_epic_service *service)
+static const struct drm_edid *dcpavserv_read_edid_legacy(struct apple_epic_service *service)
 {
 	struct dpavserv_copy_edid_cmd cmd;
 	struct dpavserv_copy_edid_resp *resp __free(kfree) = NULL;
@@ -229,6 +246,32 @@ static const struct drm_edid *dcpavserv_read_edid(struct apple_epic_service *ser
 			      data_size - EDID_LEADING_DATA_SIZE);
 }
 
+static const struct drm_edid *dcpavserv_read_edid_inline(struct apple_epic_service *service)
+{
+	struct dpavserv_copy_edid_cmd cmd;
+	struct dpavserv_copy_edid_resp *resp __free(kfree) = NULL;
+	size_t resp_size = sizeof(*resp) + EDID_BUF_SIZE;
+	size_t received, edid_size;
+	int ret;
+
+	memset(&cmd, 0, sizeof(cmd));
+	cmd.max_size = cpu_to_le64(EDID_BUF_SIZE);
+	resp = kzalloc(resp_size, GFP_KERNEL);
+	if (!resp)
+		return ERR_PTR(-ENOMEM);
+
+	ret = afk_service_call_len(service, 1, 7, &cmd, sizeof(cmd), EDID_BUF_SIZE,
+				   resp, resp_size, 0, &received);
+	if (ret < 0)
+		return ERR_PTR(ret);
+
+	ret = dpavserv_edid_size(resp, received, &edid_size);
+	if (ret)
+		return ERR_PTR(ret);
+
+	return drm_edid_alloc(resp->data + EDID_LEADING_DATA_SIZE, edid_size);
+}
+
 const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *dcp)
 {
 	struct apple_epic_service *service;
@@ -236,12 +279,13 @@ const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *dcp)
 	unsigned long flags;
 
 	spin_lock_irqsave(&dcp->dcpavserv.lock, flags);
-	service = afk_service_get(dcp->dcpavserv.service);
+	service = dcp->dcpavserv.enabled ? afk_service_get(dcp->dcpavserv.service) : NULL;
 	spin_unlock_irqrestore(&dcp->dcpavserv.lock, flags);
 	if (!service)
 		return ERR_PTR(-ENODEV);
 
-	edid = dcpavserv_read_edid(service);
+	edid = service->ep->inline_v2 ? dcpavserv_read_edid_inline(service) :
+		dcpavserv_read_edid_legacy(service);
 	spin_lock_irqsave(&dcp->dcpavserv.lock, flags);
 	if (dcp->dcpavserv.service != service) {
 		if (!IS_ERR(edid))
@@ -281,6 +325,10 @@ int dpavservep_init(struct apple_dcp *dcp)
 	ep = afk_init(dcp, DPAVSERV_ENDPOINT, dpavservep_ops);
 	if (IS_ERR(ep))
 		return PTR_ERR(ep);
+	/* Only the external H17P DPAV endpoint uses inline AFKV2 service calls. */
+	ep->wire_v2 = dcp->hw.iomfb_method_profile ==
+		DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL;
+	ep->inline_v2 = ep->wire_v2;
 	dcp->dcpavservep = ep;
 
 	dcp->dcpavservep->match_epic_name = true;
@@ -295,8 +343,10 @@ int dpavservep_init(struct apple_dcp *dcp)
 
 	ret = wait_for_completion_timeout(&dcp->dcpavserv.enable_completion,
 					  msecs_to_jiffies(1000));
-	if (ret >= 0)
-		return 0;
+	if (!ret) {
+		dev_warn(dcp->dev, "DCPAVSERV: timed out waiting for EDID service announcement\n");
+		return -ETIMEDOUT;
+	}
 
-	return ret;
+	return 0;
 }

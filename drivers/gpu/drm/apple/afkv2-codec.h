@@ -179,6 +179,26 @@ static inline int afkv2_encode_oob_command(void *payload, size_t capacity,
 	return 0;
 }
 
+/* Inline requests carry a response capacity separately from their body. */
+static inline int afkv2_encode_inline_command(void *payload, size_t capacity,
+					      u8 id, const void *body,
+					      size_t size, u32 response_capacity)
+{
+	u8 *p = payload;
+
+	if (!payload || (size && !body) || size > AFKV2_MAX_PAYLOAD - AFKV2_COMMAND_SIZE ||
+	    response_capacity > AFKV2_MAX_PAYLOAD)
+		return -EINVAL;
+	if (capacity < AFKV2_COMMAND_SIZE || size > capacity - AFKV2_COMMAND_SIZE)
+		return -ENOSPC;
+	if (size)
+		memmove(p + AFKV2_COMMAND_SIZE, body, size);
+	memset(p, 0, AFKV2_COMMAND_SIZE);
+	p[1] = id;
+	afkv2_put32(p + 4, response_capacity);
+	return 0;
+}
+
 static inline int afkv2_decode_command(const void *payload, size_t size,
 				       struct afkv2_command *out)
 {
@@ -247,6 +267,38 @@ static inline int afkv2_check_response(const struct afkv2_frame *frame,
 	    response->rx_address != rx_address || response->tx_address != tx_address ||
 	    response->rx_size > rx_capacity || response->tx_size > tx_capacity)
 		return -EPROTO;
+	return 0;
+}
+
+/* Kept separate so DPAV inline replies cannot loosen owned-DMA checks. */
+static inline int afkv2_check_inline_response(const struct afkv2_frame *frame,
+					      const struct afkv2_command *response,
+					      u16 interface, u8 type, u8 id,
+					      size_t capacity)
+{
+	if (!frame || !response || frame->category != AFKV2_RESPONSE ||
+	    frame->interface != interface || frame->type != type || response->id != id ||
+	    frame->token || frame->transport_flags || frame->interface_flags ||
+	    frame->reserved || response->oob || response->inline_size > capacity)
+		return -EPROTO;
+	return 0;
+}
+
+/* The standard service envelope precedes the actual, possibly short reply. */
+static inline int afkv2_service_reply_size(const void *body, size_t received,
+					   u16 group, u32 command, size_t capacity,
+					   size_t *size)
+{
+	const u8 *p = body;
+	u32 length;
+
+	if (!body || !size || received < 64 || afkv2_get32(p + 12) != 0x69706378 ||
+	    afkv2_get16(p + 2) != group || afkv2_get32(p + 4) != command)
+		return -EPROTO;
+	length = afkv2_get32(p + 8);
+	if (length > received - 64 || length > capacity)
+		return -EMSGSIZE;
+	*size = length;
 	return 0;
 }
 

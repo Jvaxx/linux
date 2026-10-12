@@ -329,6 +329,8 @@ struct apple_dcp_afkep {
 	u32 endpoint;
 	/* Set before afk_start; protocol selection is per endpoint. */
 	bool wire_v2;
+	/* External H17P DPAV only; other endpoints retain owned-DMA commands. */
+	bool inline_v2;
 	struct workqueue_struct *wq;
 
 	struct completion started;
@@ -382,4 +384,9 @@ int afk_service_call_timeout(struct apple_epic_service *service, u16 group,
 			     u32 command, const void *data, size_t data_len,
 			     size_t data_pad, void *output, size_t output_len,
 			     size_t output_pad, unsigned int timeout_ms);
+int afk_service_call_len(struct apple_epic_service *service, u16 group,
+			 u32 command, const void *data, size_t data_len,
+			 size_t data_pad, void *output, size_t output_len,
+			 size_t output_pad, size_t *received);
+
 #endif
