@@ -22,6 +22,8 @@
 //!   OS, so the driver uses the warm registration path.
 //! * `T8112` / J413, J415 (MacBook Air, M2): iBoot hands over a running SEP and
 //!   a powered sensor, so the driver uses the warm registration path.
+//! * `T8122` / J613, J615 (MacBook Air, M3): the T8112 warm registration with
+//!   the T8140 SEP DART aperture above 4 GiB.
 
 // The boot handshake, identity source, sensor and DART fields are consumed by
 // the boot-endpoint, identity and sensor-transport paths.
@@ -348,6 +350,29 @@ const T8112: PlatformProfile = PlatformProfile {
     nonce_session: false,
 };
 
+/// MacBook Air M3 (J613, J615). The J613 and J615 ADTs (26.6.2, 25G83) are
+/// wired identically: the Mesa sensor (`R3`) sits on spi2 at `0x2a1108000`,
+/// 8 MHz, chip select 0, with the same `reg` bytes as J415's, so this keeps
+/// J415's SPI mode. Its power is on the NUB GPIO controller (pin 29), not an
+/// AP GPIO, and its data-ready line is AP GPIO 199. The SEP is
+/// `iop-sep,ascwrap-v6` and its DART's input aperture is
+/// `0x100_0000_4000 + 0xffff0000`, the BIT(40) alias J700 uses, so this needs
+/// the wide DMA mask. `/defaults` carries `cpx-encryption-mode = 2`.
+///
+/// Otherwise a warm-registration platform like T8112: the shared-memory
+/// geometry and key-store dialect follow it. J613 on system firmware 27.0
+/// (OS firmware 26.6.2) attaches, provisions the keybag, enrols, matches and
+/// restores the enrolment after a reboot; J615 has not been run.
+const T8122: PlatformProfile = PlatformProfile {
+    name: "T8122/J613",
+    sensor: SensorProfile {
+        controller_base: 0x2_a110_8000,
+        ..T8112.sensor
+    },
+    wide_dma_mask: true,
+    ..T8112
+};
+
 static_assert!(T8103.shmem_capacity == 0x30000);
 static_assert!(T6020.shmem_capacity == 0x40000);
 static_assert!(T8140.shmem_capacity == 0x40000);
@@ -360,6 +385,9 @@ static_assert!(T6000.sensor.controller_base == T6020.sensor.controller_base);
 static_assert!(T6000.sensor.expected_id == T6020.sensor.expected_id);
 static_assert!(T8112.shmem_capacity == T6020.shmem_capacity);
 static_assert!(T8112.sensor.controller_base == T8103.sensor.controller_base);
+static_assert!(T8122.shmem_capacity == T8112.shmem_capacity);
+static_assert!(T8122.sensor.controller_base == 0x2a1108000);
+static_assert!(T8122.wide_dma_mask);
 
 /// Whether the machine root declares `compatible`.
 ///
@@ -497,6 +525,11 @@ pub(crate) fn detect() -> Result<&'static PlatformProfile> {
     }
     if machine_has(b"apple,t8112") {
         return Ok(&T8112);
+    }
+    // Only the boards whose ADTs were read: the other T8122 Macs (J433, J434,
+    // J504) share the SoC but their sensor wiring is unchecked.
+    if machine_has(b"apple,t8122") && (machine_has(b"apple,j613") || machine_has(b"apple,j615")) {
+        return Ok(&T8122);
     }
     Err(ENODEV)
 }
