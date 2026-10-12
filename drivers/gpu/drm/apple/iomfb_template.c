@@ -986,7 +986,9 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 					     dcp->width_mm, dcp->height_mm,
 					     dcp->notch_height,
 					     dcp->fixed_connector_type ==
-						     DRM_MODE_CONNECTOR_eDP);
+						     DRM_MODE_CONNECTOR_eDP,
+					     dcp->hw.iomfb_method_profile ==
+						     DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL);
 
 		if (IS_ERR(dcp->modes)) {
 			dev_warn(dcp->dev, "failed to parse modes\n");
