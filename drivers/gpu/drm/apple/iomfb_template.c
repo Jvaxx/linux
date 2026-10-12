@@ -853,6 +853,34 @@ static u64 dcpep_cb_get_frequency(struct apple_dcp *dcp)
 	return clk_get_rate(dcp->clk);
 }
 
+#if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0) && DCP_FW_VER < DCP_FW_VERSION(26, 0, 0)
+/* The DVA that map_reg hands out for display register range @index. */
+static dma_addr_t dcpep_map_reg_dva(struct apple_dcp *dcp, u32 index,
+				    struct resource *rsrc)
+{
+#if DCP_FW_LAYOUT_14_7(DCP_FW_VER)
+	/*
+	 * T8122 dcpext: with the PMGR bandwidth page mapped, the DART faults
+	 * at display power-off and the DCP crashes. Give it a RAM page
+	 * instead. Generic M1/M2 DCPs on 14.7.0 also use this template
+	 * instance and keep the MMIO page.
+	 */
+	if (of_device_is_compatible(dcp->dev->of_node, "apple,t8122-dcpext") &&
+	    dcp->disp_bw_scratch_index && !dcp->disp_bw_doorbell_index &&
+	    index == dcp->disp_bw_scratch_index) {
+		dma_addr_t dva;
+
+		if (!dmam_alloc_coherent(dcp->dev, resource_size(rsrc), &dva,
+					 GFP_KERNEL))
+			return DMA_MAPPING_ERROR;
+		return dva;
+	}
+#endif
+	return dma_map_resource(dcp->dev, rsrc->start, resource_size(rsrc),
+				DMA_BIDIRECTIONAL, 0);
+}
+#endif
+
 static struct DCP_FW_NAME(dcp_map_reg_resp) dcpep_cb_map_reg(struct apple_dcp *dcp,
 						struct DCP_FW_NAME(dcp_map_reg_req) *req)
 {
@@ -872,8 +900,7 @@ static struct DCP_FW_NAME(dcp_map_reg_resp) dcpep_cb_map_reg(struct apple_dcp *d
 		 */
 		dma_addr_t dva = rsrc->start;
 #elif DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-		dma_addr_t dva = dma_map_resource(dcp->dev, rsrc->start, resource_size(rsrc),
-						  DMA_BIDIRECTIONAL, 0);
+		dma_addr_t dva = dcpep_map_reg_dva(dcp, req->index, rsrc);
 		WARN_ON(dva == DMA_MAPPING_ERROR);
 #endif
 
