@@ -446,10 +446,32 @@ static int fill_color_mode(struct dcp_color_mode *color,
 	return 0;
 }
 
+/* External SDR scanout must not select a wide-gamut mode by score alone. */
+static unsigned int external_sdr_rank(const struct color_mode *color)
+{
+	if (color->id < 0 || color->id > U32_MAX ||
+	    color->eotf != DCP_EOTF_SDR_GAMMA ||
+	    color->pixel_encoding != DCP_COLOR_FORMAT_RGB ||
+	    color->dynamic_range != DCP_COLOR_YCBCR_RANGE_FULL ||
+	    (color->depth != 8 && color->depth != 10))
+		return 0;
+
+	switch (color->colorimetry) {
+	case DCP_COLORIMETRY_SRGB:
+	case DCP_COLORIMETRY_BT709:
+		return 2;
+	case DCP_COLORIMETRY_RGB:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
 static int parse_color_modes(struct dcp_parse_ctx *handle,
-			     struct dcp_display_mode *out)
+			     struct dcp_display_mode *out, bool external_sdr)
 {
 	struct iterator outer_it;
+	unsigned int best_sdr_rank = 0;
 	int ret = 0;
 	out->sdr_444.score = -1;
 	out->sdr_rgb.score = -1;
@@ -513,6 +535,18 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 				       cmode.eotf, cmode.dynamic_range,
 				       cmode.pixel_encoding);
 
+		if (external_sdr) {
+			unsigned int rank = external_sdr_rank(&cmode);
+
+			if (!rank || rank < best_sdr_rank)
+				continue;
+			if (rank > best_sdr_rank)
+				out->sdr_rgb.score = -1;
+			fill_color_mode(&out->sdr_rgb, &cmode);
+			best_sdr_rank = rank;
+			continue;
+		}
+
 		if (cmode.eotf == DCP_EOTF_SDR_GAMMA) {
 			if (cmode.pixel_encoding == DCP_COLOR_FORMAT_RGB &&
 				cmode.depth <= 10)
@@ -544,7 +578,7 @@ static u64 calculate_clock(struct dimension *horiz, struct dimension *vert)
 
 static int parse_mode(struct dcp_parse_ctx *handle,
 		      struct dcp_display_mode *out, s64 *score, int width_mm,
-		      int height_mm, unsigned notch_height, bool internal)
+		      int height_mm, unsigned notch_height, bool internal, bool external_sdr)
 {
 	int ret = 0;
 	struct iterator it;
@@ -584,7 +618,7 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		else if (!strcmp(key, "MaximumVariableRefreshRate"))
 			ret = parse_int_bound(it.handle, &max_vrr, 0, U32_MAX);
 		else if (!strcmp(key, "ColorModes"))
-			ret = parse_color_modes(it.handle, out);
+			ret = parse_color_modes(it.handle, out, external_sdr);
 		else if (!strcmp(key, "ID"))
 			ret = parse_int(it.handle, &id);
 		else if (!strcmp(key, "IsVirtual"))
@@ -695,7 +729,7 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 					 unsigned int *count, int width_mm,
 					 int height_mm, unsigned notch_height,
-					 bool internal)
+					 bool internal, bool external_sdr)
 {
 	struct iterator it;
 	int ret;
@@ -730,6 +764,7 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 
 		mode = &modes[*count];
 		ret = parse_mode(it.handle, mode, &score, width_mm, height_mm,
+				 notch_height, internal, external_sdr);
 				 notch_height, internal);
 		*handle = next;
 
