@@ -1751,6 +1751,10 @@ static void send_vblank_event(struct drm_device *dev,
 
 /**
  * dcp_crtc_send_page_flip_event - helper to send vblank event after pageflip
+ * @crtc: CRTC whose flip completed
+ * @e: pending vblank event
+ * @now: swap completion timestamp
+ * @start: swap submission timestamp
  *
  * Compensate for unknown slack between page flip and arrival of the
  * swap_complete callback. Minimal observed duration on DCP with HDMI output
@@ -2051,6 +2055,11 @@ static void dcp_delayed_vblank(struct work_struct *work)
 
 static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *dcp, u8 endpoint)
 {
+	/* DPAV 0x2a on H17P overlaps the legacy DPTX endpoint number. */
+	if (dcp->dcpavservep && endpoint == dcp->dcpavservep->endpoint)
+		return dcp->dcpavservep;
+	if (dcp->dptxep && endpoint == dcp->dptxep->endpoint)
+		return dcp->dptxep;
 	switch (endpoint) {
 	case AV_ENDPOINT:
 		return dcp->avep;
@@ -2058,13 +2067,6 @@ static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *dcp, u8 endpoint)
 		return dcp->systemep;
 	case DISP0_ENDPOINT:
 		return dcp->ibootep;
-	case DPAVSERV_ENDPOINT:
-		return dcp->dcpavservep;
-	case DPTX_ENDPOINT:
-		return dcp->dptxep;
-	case DPTX_ENDPOINT_V2:
-		return dcp->hw.iomfb_method_profile ==
-		       DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL ? dcp->dptxep : NULL;
 	case DPTX_CONTROLLER_ENDPOINT:
 		return dcp->dptx_controller_ep;
 	default:
@@ -2132,34 +2134,10 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 		return;
 	}
 
-	switch (endpoint) {
-	case IOMFB_ENDPOINT:
+	if (endpoint == IOMFB_ENDPOINT)
 		return iomfb_recv_msg(dcp, message);
-	case AV_ENDPOINT:
-		ep = dcp->avep;
-		break;
-	case SYSTEM_ENDPOINT:
-		ep = dcp->systemep;
-		break;
-	case DISP0_ENDPOINT:
-		ep = dcp->ibootep;
-		break;
-	case DPAVSERV_ENDPOINT:
-		ep = dcp->dcpavservep;
-		break;
-	case DPTX_ENDPOINT:
-		ep = dcp->dptxep;
-		break;
-	case DPTX_ENDPOINT_V2:
-		ep = dcp->dptxep;
-		break;
-	case DPTX_CONTROLLER_ENDPOINT:
-		ep = dcp->dptx_controller_ep;
-		break;
-	default:
-		ep = NULL;
-		break;
-	}
+
+	ep = dcp_afkep(dcp, endpoint);
 
 	if (!ep) {
 		dev_warn_ratelimited(dcp->dev,
@@ -2603,16 +2581,19 @@ static int dcp_external_disconnect(struct apple_dcp *dcp, bool physical)
 	cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
 	cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
 	guard(mutex)(&dcp->external_lock);
-	ret = dcp_external_stop_locked(dcp, dcp->external_generation);
+	/* Invalidate physical EDID before waiting for firmware power/link teardown. */
 	if (physical) {
-		dcp->external_cable = false;
-		dcp->external_generation++;
-		dcp_external_publish_generation(dcp);
 		scoped_guard(mutex, &dcp->hpd_mutex) {
 			WRITE_ONCE(dcp->typec_cable_connected, false);
 			dcp->typec_generation++;
 			dcp_firmware_metadata_connection(dcp, dcp->typec_generation, false);
 		}
+	}
+	ret = dcp_external_stop_locked(dcp, dcp->external_generation);
+	if (physical) {
+		dcp->external_cable = false;
+		dcp->external_generation++;
+		dcp_external_publish_generation(dcp);
 		/* A missing cable is reported even when its hardware remains owned. */
 		dcp_external_report_disconnected(dcp);
 	}

@@ -1054,6 +1054,8 @@ int dcp_get_modes(struct drm_connector *connector)
 	struct drm_display_mode *mode;
 	u16 min_vfreq = 0, max_vfreq = 0;
 	bool vrr_capable = false;
+	bool physical_edid;
+	u64 edid_generation = 0;
 	int i;
 
 	dcp_consume_edid_invalidation(apple_connector);
@@ -1090,12 +1092,40 @@ int dcp_get_modes(struct drm_connector *connector)
 	}
 	drm_connector_set_vrr_capable_property(connector, vrr_capable);
 
+	physical_edid = dcp->hw.iomfb_method_profile ==
+		DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL;
+	/* get_modes holds mode_config.mutex; HPD paths never acquire it. */
+	if (physical_edid) {
+		mutex_lock(&dcp->hpd_mutex);
+		edid_generation = dcp->typec_generation;
+		if (apple_connector->drm_edid &&
+		    apple_connector->drm_edid_generation != edid_generation)
+			dcp_clear_connector_edid(apple_connector);
+		if (!dcpavserv_edid_current(dcp, edid_generation)) {
+			dcp_clear_connector_edid(apple_connector);
+			goto edid_done;
+		}
+	}
+
 	/* Internal H17P still has no supported EDID command transport. */
 	if (dcp->nr_modes && !apple_connector->drm_edid &&
 	    (dcp->fw_compat != DCP_FIRMWARE_H17P ||
 	     (dcp->dcpavservep && dcp->dcpavservep->inline_v2))) {
 		const struct drm_edid *edid;
-		edid = dcpavserv_copy_edid(dcp);
+		/* Let physical disconnect advance the generation during the request. */
+		if (physical_edid)
+			mutex_unlock(&dcp->hpd_mutex);
+		edid = dcpavserv_copy_edid(dcp, edid_generation);
+		if (physical_edid) {
+			mutex_lock(&dcp->hpd_mutex);
+			if (!dcpavserv_edid_current(dcp, edid_generation) ||
+			    READ_ONCE(apple_connector->dcp) != pdev) {
+				if (!IS_ERR_OR_NULL(edid))
+					drm_edid_free(edid);
+				dcp_clear_connector_edid(apple_connector);
+				goto edid_done;
+			}
+		}
 		if (IS_ERR_OR_NULL(edid)) {
 			/*
 			 * An internal panel has no AV service and so no EDID;
@@ -1108,12 +1138,12 @@ int dcp_get_modes(struct drm_connector *connector)
 		} else {
 			drm_edid_free(apple_connector->drm_edid);
 			apple_connector->drm_edid = edid;
+			apple_connector->drm_edid_generation = edid_generation;
 		}
 	}
 	if (dcp->nr_modes && apple_connector->drm_edid) {
 		apple_connector->drm_edid_firmware_derived = false;
 		drm_edid_connector_update(connector, apple_connector->drm_edid);
-		dcp_retry_placeholder_edid(dcp, apple_connector->drm_edid);
 	} else {
 		u64 generation = 0;
 		const struct drm_edid *derived = dcp->nr_modes ?
@@ -1140,6 +1170,12 @@ int dcp_get_modes(struct drm_connector *connector)
 			apple_connector->drm_edid_firmware_derived = false;
 		}
 	}
+
+edid_done:
+	if (physical_edid)
+		mutex_unlock(&dcp->hpd_mutex);
+	if (apple_connector->drm_edid)
+		dcp_retry_placeholder_edid(dcp, apple_connector->drm_edid);
 
 	/*
 	 * An internal panel has no EDID, so nothing fills in the refresh range
