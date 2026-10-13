@@ -880,6 +880,7 @@ static const struct apple_mbox_hw apple_mbox_m3_hw = {
 };
 
 static const struct of_device_id apple_mbox_of_match[] = {
+	{ .compatible = "apple,t6031-agx-asc-mailbox", .data = &apple_mbox_asc_hw },
 	{ .compatible = "apple,t8122-agx-asc-mailbox", .data = &apple_mbox_asc_hw },
 	{ .compatible = "apple,t8140-ascwrap-v6", .data = &apple_mbox_ascwrap_v6_hw },
 	{ .compatible = "apple,t8140-asc-mailbox", .data = &apple_mbox_t8140_asc_hw },
