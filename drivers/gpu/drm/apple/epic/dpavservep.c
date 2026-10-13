@@ -32,25 +32,51 @@ static void dcpavserv_notify_edid(struct apple_epic_service *service)
 	schedule_work(&connector->hotplug_wq);
 }
 
+static bool dcpavserv_identity(struct apple_epic_service *service, const char *name,
+			       const char *class, s64 unit)
+{
+	if (!name || strcmp(name, "dcpav-service-epic"))
+		return false;
+	if (!service->ep->wire_v2)
+		return unit == 0;
+	/* H17P's lower-case interface-id is dynamic, not a physical-port unit. */
+	return service->ep->endpoint == DPAVSERV_ENDPOINT_V2 && class &&
+		!strcmp(class, "AppleDCPDP2HDMI") && service->channel &&
+		service->channel <= U16_MAX && unit == service->channel;
+}
+
+static bool dcpavserv_admission_current(struct apple_dcp *dcp, u64 generation)
+{
+	lockdep_assert_held(&dcp->hpd_mutex);
+	/* Initial service discovery may precede the first Type-C attachment. */
+	return !READ_ONCE(dcp->quiescing) && generation == dcp->typec_generation &&
+		(!generation || dcp->typec_cable_connected);
+}
+
 /* Admission runs before AFKV2 OPEN and before readers can pin the service. */
 static int dcpavserv_prepare(struct apple_epic_service *service, const char *name,
 			    const char *class, s64 unit)
 {
 	struct apple_dcp *dcp = service->ep->dcp;
-	int ret;
+	bool v2 = service->ep->wire_v2;
+	int ret = 0;
 
-	if (!name || strcmp(name, "dcpav-service-epic"))
+	if (!dcpavserv_identity(service, name, class, unit))
 		return -ENODEV;
-	if (service->ep->wire_v2) {
-		if (service->ep->endpoint != DPAVSERV_ENDPOINT_V2 || !class ||
-		    strcmp(class, "AppleDCPDP2HDMI") || unit != 1)
-			return -ENODEV;
-	} else if (unit != 0) {
-		return -ENODEV;
-	}
+	if (v2)
+		mutex_lock(&dcp->hpd_mutex);
 	mutex_lock(&dcp->dcpavserv.lock);
-	ret = dcp->dcpavserv.enabled ? -EBUSY : 0;
+	if (dcp->dcpavserv.enabled)
+		ret = -EBUSY;
+	else if (v2 && !dcpavserv_admission_current(dcp, dcp->typec_generation))
+		ret = -ENODEV;
+	else {
+		service->admission.generation = v2 ? dcp->typec_generation : 0;
+		service->admission.epoch = dcp->dcpavserv.epoch;
+	}
 	mutex_unlock(&dcp->dcpavserv.lock);
+	if (v2)
+		mutex_unlock(&dcp->hpd_mutex);
 	return ret;
 }
 
@@ -58,28 +84,38 @@ static void dcpavserv_init(struct apple_epic_service *service, const char *name,
 			  const char *class, s64 unit)
 {
 	struct apple_dcp *dcp = service->ep->dcp;
+	bool v2 = service->ep->wire_v2;
+	bool published = false;
 
 	trace_dcpavserv_init(dcp, unit);
-
-	if (!dcpavserv_prepare(service, name, class, unit)) {
-		mutex_lock(&dcp->dcpavserv.lock);
-		if (dcp->dcpavserv.enabled) {
-			mutex_unlock(&dcp->dcpavserv.lock);
-			dev_err(dcp->dev,
-				"DCPAVSERV: unit %lld already exists\n", unit);
-			return;
-		}
+	if (v2)
+		mutex_lock(&dcp->hpd_mutex);
+	mutex_lock(&dcp->dcpavserv.lock);
+	if (dcpavserv_identity(service, name, class, unit) &&
+	    !dcp->dcpavserv.enabled &&
+	    service->admission.epoch == dcp->dcpavserv.epoch &&
+	    (!v2 || dcpavserv_admission_current(dcp, service->admission.generation))) {
 		dcp->dcpavserv.service = afk_service_get(service);
-		dcp->dcpavserv.enabled = true;
-		dcp->dcpavserv.epoch++;
-		service->cookie = &dcp->dcpavserv;
-		complete(&dcp->dcpavserv.enable_completion);
-		mutex_unlock(&dcp->dcpavserv.lock);
-		if (service->ep->wire_v2) {
-			dev_info(dcp->dev, "DCPAVSERV: AFKV2 EDID service ready on channel %u\n",
-				 service->channel);
-			dcpavserv_notify_edid(service);
+		if (dcp->dcpavserv.service) {
+			dcp->dcpavserv.enabled = true;
+			dcp->dcpavserv.epoch++;
+			service->cookie = &dcp->dcpavserv;
+			complete(&dcp->dcpavserv.enable_completion);
+			published = true;
 		}
+	}
+	mutex_unlock(&dcp->dcpavserv.lock);
+	if (v2)
+		mutex_unlock(&dcp->hpd_mutex);
+	if (!published) {
+		/* A generation/registry change during OPEN cannot enable stale work. */
+		afk_service_retire(service);
+		return;
+	}
+	if (v2) {
+		dev_info(dcp->dev, "DCPAVSERV: AFKV2 EDID service ready on channel %u\n",
+			 service->channel);
+		dcpavserv_notify_edid(service);
 	}
 }
 
@@ -124,15 +160,16 @@ void dpavservep_detach(struct apple_dcp *dcp)
 	service = dcp->dcpavserv.service;
 	dcp->dcpavserv.service = NULL;
 	dcp->dcpavserv.enabled = false;
+	/* Also reject an in-flight prepare/OPEN with no published owner yet. */
+	dcp->dcpavserv.epoch++;
+	reinit_completion(&dcp->dcpavserv.enable_completion);
 	if (service) {
-		dcp->dcpavserv.epoch++;
+		afk_service_retire(service);
 		dcpavserv_invalidate_edid(dcp);
 	}
 	mutex_unlock(&dcp->dcpavserv.lock);
-	if (service) {
-		afk_service_disable(service);
+	if (service)
 		afk_service_put(service);
-	}
 }
 
 static int dcpdpserv_prepare(struct apple_epic_service *service, const char *name,

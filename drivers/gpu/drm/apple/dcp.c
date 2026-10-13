@@ -495,6 +495,8 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 		if (sel && sel != -EOPNOTSUPP)
 			dev_warn(dcp->dev, "DP tunnel source reset failed: %d\n", sel);
 	}
+	if (dcp_is_external_h17p(dcp))
+		dpavservep_detach(dcp);
 	route->selected = false;
 	if (dcp->active_typec_route == route)
 		dcp->active_typec_route = NULL;
@@ -2601,6 +2603,8 @@ static int dcp_external_disconnect(struct apple_dcp *dcp, bool physical)
 			dcp->typec_generation++;
 			dcp_firmware_metadata_connection(dcp, dcp->typec_generation, false);
 		}
+		/* HPD is fenced; retire the AV owner after releasing hpd_mutex. */
+		dpavservep_detach(dcp);
 	}
 	ret = dcp_external_stop_locked(dcp, dcp->external_generation);
 	if (physical) {
@@ -2625,6 +2629,8 @@ static void dcp_external_stop_work(struct work_struct *work)
 	cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
 	guard(mutex)(&dcp->external_lock);
 	if (generation == dcp->external_generation) {
+		/* The deferred disconnect also covers missing out-of-band HPD. */
+		dpavservep_detach(dcp);
 		dcp_external_stop_locked(dcp, generation);
 		dcp_external_report_disconnected(dcp);
 	}
@@ -3827,6 +3833,8 @@ static void dcp_disable_typec_work(struct apple_dcp *dcp, bool release_cable)
 		dcp->typec_generation++;
 		dcp_firmware_metadata_connection(dcp, dcp->typec_generation, false);
 	}
+	if (release_cable && dcp_is_external_h17p(dcp))
+		dpavservep_detach(dcp);
 	/* Block new enqueues as well as draining users of the AFK endpoints. */
 	disable_delayed_work_sync(&dcp->typec_reconnect_wq);
 	disable_delayed_work_sync(&dcp->placeholder_edid_wq);
