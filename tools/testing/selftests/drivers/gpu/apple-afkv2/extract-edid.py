@@ -17,7 +17,7 @@ def function(name):
         end += 1
     return source[match.start():end]
 
-assert "service->ep->inline_v2 ? dcpavserv_read_edid_inline(service)" in source
+assert "service->ep->wire_v2 ? dcpavserv_read_edid_inline(service)" in source
 prefix = r'''
 #undef NDEBUG
 #include <assert.h>
