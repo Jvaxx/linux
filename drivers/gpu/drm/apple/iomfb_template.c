@@ -2354,6 +2354,18 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		if (dcp->connector_type == DRM_MODE_CONNECTOR_eDP &&
 		    req->surf[l].base.colorspace == DCP_COLORSPACE_BG_SRGB)
 			req->surf[l].base.colorspace = DCP_COLORSPACE_NATIVE;
+
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+		/* H17P external SDR RGB needs an sRGB source tag. Native
+		 * tagging washes out the same pixel values on this profile.
+		 * Keep YUV, other source spaces and other profiles unchanged.
+		 */
+		if (dcp->hw.iomfb_method_profile ==
+			    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL &&
+		    !new_state->fb->format->is_yuv &&
+		    req->surf[l].base.colorspace == DCP_COLORSPACE_NATIVE)
+			req->surf[l].base.colorspace = DCP_COLORSPACE_BG_SRGB;
+#endif
 	}
 
 	if (!has_surface && !crtc_state->color_mgmt_changed) {
