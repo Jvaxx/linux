@@ -32,6 +32,29 @@ static void dcpavserv_notify_edid(struct apple_epic_service *service)
 	schedule_work(&connector->hotplug_wq);
 }
 
+/* Admission runs before AFKV2 OPEN and before readers can pin the service. */
+static int dcpavserv_prepare(struct apple_epic_service *service, const char *name,
+			    const char *class, s64 unit)
+{
+	struct apple_dcp *dcp = service->ep->dcp;
+	unsigned long flags;
+	int ret;
+
+	if (!name || strcmp(name, "dcpav-service-epic"))
+		return -ENODEV;
+	if (service->ep->inline_v2) {
+		if (service->ep->endpoint != DPAVSERV_ENDPOINT_V2 || !class ||
+		    strcmp(class, "AppleDCPDP2HDMI") || unit != 1)
+			return -ENODEV;
+	} else if (unit != 0) {
+		return -ENODEV;
+	}
+	spin_lock_irqsave(&dcp->dcpavserv.lock, flags);
+	ret = dcp->dcpavserv.enabled ? -EBUSY : 0;
+	spin_unlock_irqrestore(&dcp->dcpavserv.lock, flags);
+	return ret;
+}
+
 static void dcpavserv_init(struct apple_epic_service *service, const char *name,
 			  const char *class, s64 unit)
 {
@@ -40,7 +63,7 @@ static void dcpavserv_init(struct apple_epic_service *service, const char *name,
 
 	trace_dcpavserv_init(dcp, unit);
 
-	if (unit == 0 && name && !strcmp(name, "dcpav-service-epic")) {
+	if (!dcpavserv_prepare(service, name, class, unit)) {
 		spin_lock_irqsave(&dcp->dcpavserv.lock, flags);
 		if (dcp->dcpavserv.enabled) {
 			spin_unlock_irqrestore(&dcp->dcpavserv.lock, flags);
@@ -93,6 +116,13 @@ void dpavservep_detach(struct apple_dcp *dcp)
 		afk_service_disable(service);
 		afk_service_put(service);
 	}
+}
+
+static int dcpdpserv_prepare(struct apple_epic_service *service, const char *name,
+			    const char *class, s64 unit)
+{
+	/* No production command transport is needed for this H17P service. */
+	return service->ep->inline_v2 ? -ENODEV : 0;
 }
 
 static void dcpdpserv_init(struct apple_epic_service *service, const char *name,
@@ -272,12 +302,25 @@ static const struct drm_edid *dcpavserv_read_edid_inline(struct apple_epic_servi
 	return drm_edid_alloc(resp->data + EDID_LEADING_DATA_SIZE, edid_size);
 }
 
-const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *dcp)
+bool dcpavserv_edid_current(struct apple_dcp *dcp, u64 generation)
+{
+	lockdep_assert_held(&dcp->hpd_mutex);
+	return dcp->hw.iomfb_method_profile !=
+		DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL ||
+		(dcp->typec_cable_connected && generation == dcp->typec_generation &&
+		 !READ_ONCE(dcp->quiescing));
+}
+
+const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *dcp, u64 generation)
 {
 	struct apple_epic_service *service;
 	const struct drm_edid *edid;
 	unsigned long flags;
 
+	scoped_guard(mutex, &dcp->hpd_mutex) {
+		if (!dcpavserv_edid_current(dcp, generation))
+			return ERR_PTR(-ESTALE);
+	}
 	spin_lock_irqsave(&dcp->dcpavserv.lock, flags);
 	service = dcp->dcpavserv.enabled ? afk_service_get(dcp->dcpavserv.service) : NULL;
 	spin_unlock_irqrestore(&dcp->dcpavserv.lock, flags);
@@ -294,6 +337,13 @@ const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *dcp)
 	}
 	spin_unlock_irqrestore(&dcp->dcpavserv.lock, flags);
 	afk_service_put(service);
+	scoped_guard(mutex, &dcp->hpd_mutex) {
+		if (!dcpavserv_edid_current(dcp, generation)) {
+			if (!IS_ERR(edid))
+				drm_edid_free(edid);
+			edid = ERR_PTR(-ESTALE);
+		}
+	}
 	return edid;
 }
 
@@ -301,6 +351,7 @@ static const struct apple_epic_service_ops dpavservep_ops[] = {
 	{
 		.name = "dcpav-service-epic",
 		.reusable = true,
+		.prepare = dcpavserv_prepare,
 		.init = dcpavserv_init,
 		.teardown = dcpavserv_teardown,
 		.report = dcpavserv_report,
@@ -308,6 +359,7 @@ static const struct apple_epic_service_ops dpavservep_ops[] = {
 	{
 		.name = "dcpdp-service-epic",
 		.reusable = true,
+		.prepare = dcpdpserv_prepare,
 		.init = dcpdpserv_init,
 		.teardown = dcpdpserv_teardown,
 		.report = dcpdpserv_report,
@@ -322,7 +374,9 @@ int dpavservep_init(struct apple_dcp *dcp)
 
 	init_completion(&dcp->dcpavserv.enable_completion);
 
-	ep = afk_init(dcp, DPAVSERV_ENDPOINT, dpavservep_ops);
+	ep = afk_init(dcp, dcp->hw.iomfb_method_profile ==
+		      DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL ?
+		      DPAVSERV_ENDPOINT_V2 : DPAVSERV_ENDPOINT, dpavservep_ops);
 	if (IS_ERR(ep))
 		return PTR_ERR(ep);
 	/* Only the external H17P DPAV endpoint uses inline AFKV2 service calls. */
