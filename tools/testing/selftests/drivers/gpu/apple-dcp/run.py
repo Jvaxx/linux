@@ -18,6 +18,7 @@ import traceback
 
 from common import run_unit
 import edid
+import recovery
 import lifecycle
 import phy
 import pm
@@ -90,6 +91,8 @@ def main():
                 unit, cases = unit
             if unit is not None:
                 result['translation_unit_sha256'] = run_unit(name, unit, output, cases, includes if name == 'service-rebind' else (), flags)
+            if name == 'service-rebind':
+                recovery.check(root, output)
             if name == 'metadata-decoder':
                 rate.check_metadata(output)
             result['passed'] = True
