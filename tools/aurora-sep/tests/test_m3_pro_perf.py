@@ -22,7 +22,7 @@ class ProProfile(unittest.TestCase):
         self.write('identity', IDENTITY + '\n')
         self.write('opt/mesa-m3/libexec/mesa-m3-abi-check', '#!/bin/sh\ncat /tmp/fixture/identity\n', True)
         for profile, marker, source in (
-            ('native-pro', 't6030-native-gl-legacy-hal', '2dc61e4b462639d29ca846a3ad2dfd1f28629c4e'),
+            ('native-pro', 't6030-native-gl-legacy-hal', '99d5b9d16e779ad9a0879a71578da0a6536cf006'),
             ('pro-vulkan', 't6030-pro-vulkan-legacy-hal', 'b0f56952b7f06955b143fbfa90c07de4c5864964')):
             self.write(f'opt/mesa-m3/{profile}/share/mesa-m3/profile', marker + '\n')
             self.write(f'opt/mesa-m3/{profile}/share/mesa-m3/capabilities', 'source=' + source + '\n')
@@ -99,6 +99,7 @@ class ProProfile(unittest.TestCase):
         for path, content in [('proc/cmdline', 'root=test mesa_m3=off'),
                               ('etc/mesa-m3/disable', ''), ('etc/mesa-m3/pro-disable', ''),
                               ('home/.config/mesa-m3/disable', ''),
+                              ('opt/mesa-m3/native-pro/share/mesa-m3/capabilities', 'source=2dc61e4b462639d29ca846a3ad2dfd1f28629c4e\n'),
                               ('opt/mesa-m3/pro-vulkan/share/mesa-m3/profile', 'wrong\n')]:
             original = (self.root / path).read_text() if (self.root / path).exists() else None
             with self.subTest(path=path):
