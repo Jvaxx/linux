@@ -4,7 +4,7 @@ set -eu
 case " $(cat /proc/cmdline) " in *" mesa_m3=off "*) exit 1 ;; esac
 [ ! -e /etc/mesa-m3/disable ] || exit 1
 [ ! -e /etc/mesa-m3/pro-disable ] || exit 1
-[ ! -e "${XDG_CONFIG_HOME:-$HOME/.config}/mesa-m3/disable" ] || exit 1
+[ ! -e "${XDG_CONFIG_HOME:-${HOME:-/root}/.config}/mesa-m3/disable" ] || exit 1
 marker=/usr/lib/modules/$(uname -r)/aurora-m3pro-profile
 [ "$(cat "$marker" 2>/dev/null)" = 't6030-perf-v1
 source=d49021440d8ca02bbc8ecc17c19ce76c048b6236' ] || exit 1

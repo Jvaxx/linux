@@ -47,12 +47,14 @@ class ProProfile(unittest.TestCase):
         if executable:
             path.chmod(0o755)
 
-    def run_helper(self, *command):
+    def run_helper(self, *command, no_home=False):
         arguments = ['bwrap', '--ro-bind', '/', '/', '--tmpfs', '/tmp', '--dev', '/dev', '--bind', str(self.root), '/tmp/fixture']
         for source, target in [('opt', '/opt'), ('etc', '/etc'), ('sys', '/sys'),
                                ('proc', '/proc'), ('modules', '/usr/lib/modules')]:
             arguments += ['--bind', str(self.root / source), target]
         arguments += ['--setenv', 'HOME', '/tmp/fixture/home', '--setenv', 'PATH', '/tmp/fixture/bin:/usr/bin', *command]
+        if no_home:
+            arguments[-len(command):-len(command)] = ['--unsetenv', 'HOME', '--unsetenv', 'XDG_CONFIG_HOME']
         return subprocess.run(arguments, capture_output=True, text=True)
 
     def check(self):
@@ -67,6 +69,11 @@ class ProProfile(unittest.TestCase):
             self.assertEqual((self.root / ('sys/module/asahi/parameters/' + name)).read_text(), value)
         self.assertEqual((self.root / 'sys/kernel/debug/asahi-m3/completion_wait').read_text(), '25')
         self.assertEqual((self.root / 'sys/kernel/debug/asahi-m3/submit_overlap').read_text(), '1')
+
+    def test_system_service_without_home(self):
+        run = self.run_helper('/opt/mesa-m3/native-pro/libexec/mesa-m3-pro-performance', no_home=True)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual((self.root / 'sys/module/asahi/parameters/m3_mixed_batch').read_text(), '1')
 
     def test_environment_selects_both_packages(self):
         run = self.run_helper('/bin/sh', '-c', '. /opt/mesa-m3/native-pro/libexec/mesa-m3-pro-session-env; env')
