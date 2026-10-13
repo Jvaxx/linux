@@ -45,6 +45,8 @@ static void h17p_surface_wire_test(struct kunit *test)
 	KUNIT_EXPECT_MEMEQ(test, wire->swap, &request->swap, sizeof(wire->swap));
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32((u8 *)wire + 0x593),
 			DCP_FORMAT_BGRA);
+	KUNIT_EXPECT_EQ(test, ((u8 *)wire)[0x59b], (u8)DCP_XFER_FUNC_SDR);
+	KUNIT_EXPECT_EQ(test, ((u8 *)wire)[0x59c], (u8)DCP_COLORSPACE_NATIVE);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32((u8 *)wire + 0x59d), 10176U);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32((u8 *)wire + 0x5a9), 2408U);
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32((u8 *)wire + 0x5ad), 1506U);
@@ -58,6 +60,12 @@ static void h17p_surface_wire_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, get_unaligned_le64((u8 *)wire + 0xe38), iova);
 	KUNIT_EXPECT_EQ(test, wire->tail[sizeof(wire->tail) - 2], 0U);
 	KUNIT_EXPECT_EQ(test, wire->tail[sizeof(wire->tail) - 1], 0U);
+
+	/* Source-tag changes must reach the wire without changing transfer. */
+	surface->colorspace = DCP_COLORSPACE_BG_SRGB;
+	iomfb_serialize_present_h17p(wire, request);
+	KUNIT_EXPECT_EQ(test, ((u8 *)wire)[0x59b], (u8)DCP_XFER_FUNC_SDR);
+	KUNIT_EXPECT_EQ(test, ((u8 *)wire)[0x59c], (u8)DCP_COLORSPACE_BG_SRGB);
 }
 
 static void h17p_opaque_x_parameter_test(struct kunit *test)
