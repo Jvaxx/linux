@@ -211,7 +211,7 @@ static int dcpdpserv_prepare(struct apple_epic_service *service, const char *nam
 			    const char *class, s64 unit)
 {
 	/* No production command transport is needed for this H17P service. */
-	return service->ep->wire_v2 ? -ENODEV : 0;
+	return service->ep->wire_v2 ? -EOPNOTSUPP : 0;
 }
 
 static void dcpdpserv_init(struct apple_epic_service *service, const char *name,
@@ -487,6 +487,7 @@ static const struct apple_epic_service_ops dpavservep_ops[] = {
 	{
 		.name = "dcpdp-service-epic",
 		.reusable = true,
+		.optional = true,
 		.prepare = dcpdpserv_prepare,
 		.init = dcpdpserv_init,
 		.teardown = dcpdpserv_teardown,

@@ -84,6 +84,8 @@ struct apple_epic_service_ops {
 	const char name[32];
 	/* All retained pointers must be pinned before enabling slot reuse. */
 	bool reusable;
+	/* EOPNOTSUPP from prepare means intentional absence only for this role. */
+	bool optional;
 
 	/*
 	 * Optional admission, before OPEN/publication. Must not retain service

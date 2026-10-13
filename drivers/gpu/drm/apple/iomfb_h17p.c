@@ -452,7 +452,9 @@ static bool trampoline_provider_property_h17p(struct apple_dcp *dcp, int tag,
 		memset(reply, 0, sizeof(*reply));
 		memcpy(reply->data, property->legacy_data, property->length);
 		reply->length = cpu_to_le32(property->length);
-		dev_warn_once(dcp->dev, "using J700 provider data for an older loader\n");
+		dev_warn_once(dcp->dev,
+			      "missing provider property %s (%u bytes); using qualified J700 compatibility data\n",
+			      property->dt_name, property->length);
 		return true;
 	} else if (length != (int)property->length) {
 		dev_err(dcp->dev, "invalid provider property %s: %d bytes\n",

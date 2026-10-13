@@ -32,14 +32,16 @@ static void lock_release(struct lock_guard *g) { assert(*g->lock==1); *g->lock=0
 #define READ_ONCE(x) (x)
 #define IS_REACHABLE(x) USB_REACHABLE
 struct device_node { int id; };
-struct device { int refs; };
+struct device_driver { const char *name; };
+struct device { int refs; struct device *parent; struct device_driver *driver; };
 struct platform_device { struct device dev; };
 struct usb_device;
 struct usb_hcd;
 struct usb_bus { struct device *sysdev, *controller; struct usb_hcd *hcd; struct usb_device *root_hub; };
-struct usb_hcd { unsigned int rh_registered:1;
+struct usb_hcd { int state; unsigned int rh_registered:1;
  struct usb_bus self; unsigned long flags;
  struct usb_hcd *shared_hcd,*primary_hcd; struct {bool pending;} died_work; };
+enum { HC_STATE_RUNNING=1, HC_STATE_QUIESCING=0x85, HC_STATE_HALT=0 };
 enum { HCD_FLAG_RH_RUNNING,HCD_FLAG_DEAD,HCD_FLAG_POLL_RH,HCD_FLAG_HW_ACCESSIBLE };
 static int __attribute__((unused)) hcd_root_hub_lock;
 #define spin_lock_irqsave(lock, flags) do { assert(!*(lock));*(lock)=1;(flags)=0; } while(0)
@@ -53,14 +55,20 @@ static int __attribute__((unused)) hcd_root_hub_lock;
 #define bus_to_hcd(bus) ((bus)->hcd)
 #define HCD_DEAD(hcd) (!!((hcd)->flags&(1UL<<HCD_FLAG_DEAD)))
 #define HCD_HW_ACCESSIBLE(hcd) (!!((hcd)->flags&(1UL<<HCD_FLAG_HW_ACCESSIBLE)))
-struct usb_device { struct usb_device *parent; int speed,state,refs; struct usb_bus *bus; struct device dev; };
+struct usb_device { struct usb_device *parent; int speed,state,refs,maxchild; struct usb_bus *bus; struct device dev; };
 enum { USB_SPEED_SUPER=4, USB_STATE_NOTATTACHED=0 };
 static struct device_node ep_node,ctrl_node;
 static struct platform_device controller;
+static struct device host_device;
+static struct device_driver controller_driver={.name="dwc3-apple"}, host_driver={.name="xhci-hcd"};
+static bool controller_locked, host_locked;
 static struct device wrong_controller;
 static struct usb_bus bus,wrong_bus;
 static struct usb_hcd hcd;
-static struct usb_device roots[4];
+static struct usb_device roots[4], link_device;
+static bool link_present, link_suspended, link_locked;
+static int link_pm_refs, link_resumes, link_error, link_detach_on_resume, link_dead_on_resume;
+static int detach_at_lookup, quiesce_at_lookup;
 static struct apple_atcphy *pm_phy;
 static bool root_locked, graph_missing, controller_missing, root_missing;
 static int node_refs, pm_refs, resumes, resume_error, detach_on_lock, detach_on_resume;
@@ -70,25 +78,64 @@ static void node_put(struct device_node **n) { if(*n) node_refs--; }
 static struct device_node *of_graph_get_endpoint_by_regs(struct device_node *n,int p,int e) { (void)n; assert(p==1&&e==-1); if(graph_missing)return NULL;node_refs++;return &ep_node; }
 static struct device_node *of_graph_get_remote_port_parent(struct device_node *n) { assert(n==&ep_node);node_refs++;return &ctrl_node; }
 static struct platform_device *of_find_device_by_node(struct device_node *n) { assert(n==&ctrl_node);if(controller_missing)return NULL;controller.dev.refs++;return &controller; }
+static struct device *get_device(struct device *d) { assert(d);d->refs++;return d; }
+static void device_lock(struct device *d) {
+ if(d==&controller.dev){assert(!controller_locked&&!host_locked&&!root_locked);controller_locked=true;}
+ else {assert(d==&host_device&&controller_locked&&!host_locked&&!root_locked);host_locked=true;}
+}
+static void device_unlock(struct device *d) {
+ if(d==&host_device){assert(host_locked&&!root_locked);host_locked=false;}
+ else {assert(d==&controller.dev&&controller_locked&&!host_locked&&!root_locked);controller_locked=false;}
+}
 static void put_device(struct device *d) { assert(d->refs>0);d->refs--; }
 static struct usb_device *usb_get_dev(struct usb_device *u) { u->refs++;return u; }
 static void usb_put_dev(struct usb_device *u) { assert(u->refs>0);u->refs--; }
 static int usb_for_each_dev(void *data,int (*fn)(struct usb_device *,void *)) { if(root_missing)return 0;for(unsigned int i=0;i<4;i++){int r=fn(&roots[i],data);if(r)return r;}return 0; }
-static void usb_lock_device(struct usb_device *u) { assert(u==&roots[3]&&!root_locked);root_locked=true;if(detach_on_lock)u->state=0; }
-static void usb_unlock_device(struct usb_device *u) { assert(u==&roots[3]&&root_locked);root_locked=false; }
+static struct usb_device *usb_hub_find_child(struct usb_device *u, int port) { assert(u==&roots[3]&&root_locked&&port==1);
+ if(detach_at_lookup)usb_set_device_state(u,USB_STATE_NOTATTACHED);
+ if(quiesce_at_lookup)hcd.state=HC_STATE_QUIESCING;
+ return link_present?&link_device:NULL; }
+static void usb_lock_device(struct usb_device *u) {
+ if(u==&roots[3]){assert(!root_locked);if(REQUIRES_PLATFORM_LOCKS)assert(controller_locked&&host_locked);root_locked=true;if(detach_on_lock)u->state=0;}
+ else {assert(u==&link_device&&root_locked&&!link_locked);link_locked=true;}
+}
+static void usb_unlock_device(struct usb_device *u) {
+ if(u==&roots[3]){assert(root_locked&&!link_locked);root_locked=false;}
+ else {assert(u==&link_device&&link_locked&&root_locked);link_locked=false;}
+}
 static int pm_runtime_resume_and_get(struct device *d) {
- assert(d==&roots[3].dev&&root_locked&&!pm_phy->lock);resumes++;
+ assert(root_locked&&!pm_phy->lock);
+ if(d==&link_device.dev){
+  assert(link_locked);link_resumes++;
+  struct lock_guard g=lock_take(&pm_phy->lock);lock_release(&g);
+  if(link_error)return link_error;
+  link_pm_refs++;link_suspended=false;stuck_ack=false;
+  if(link_detach_on_resume)link_device.state=0;
+  if(link_dead_on_resume)set_bit(HCD_FLAG_DEAD,&hcd.flags);
+  return 0;
+ }
+ assert(d==&roots[3].dev);resumes++;
  /* A re-entrant PHY lock acquisition during resume must remain possible. */
  struct lock_guard g=lock_take(&pm_phy->lock);lock_release(&g);
  if(resume_error)return resume_error;
- pm_refs++;stuck_ack=false;if(detach_on_resume)roots[3].state=0;
+ pm_refs++;stuck_ack=link_present&&link_device.state!=USB_STATE_NOTATTACHED&&link_suspended;if(detach_on_resume)roots[3].state=0;
  if(inaccessible_on_resume)clear_bit(HCD_FLAG_HW_ACCESSIBLE,&hcd.flags);
  if(dead_on_resume)set_bit(HCD_FLAG_DEAD,&hcd.flags);
  return 0;
 }
-static void pm_runtime_put_noidle(struct device *d) { assert(d==&roots[3].dev&&pm_refs==1);pm_refs--; }
-static void usb_mark_last_busy(struct usb_device *u) { assert(u==&roots[3]&&root_locked&&!pm_phy->lock); }
-static void pm_runtime_put_autosuspend(struct device *d) { assert(d==&roots[3].dev&&root_locked&&!pm_phy->lock&&pm_refs==1);pm_refs--; }
+static void pm_runtime_put_noidle(struct device *d) {
+ if(d==&link_device.dev){assert(link_pm_refs==1);link_pm_refs--;}
+ else {assert(d==&roots[3].dev&&pm_refs==1);pm_refs--;}
+}
+static void usb_mark_last_busy(struct usb_device *u) {
+ assert(root_locked&&!pm_phy->lock);
+ if(u==&link_device)assert(link_locked);else assert(u==&roots[3]&&!link_locked);
+}
+static void pm_runtime_put_autosuspend(struct device *d) {
+ assert(root_locked&&!pm_phy->lock);
+ if(d==&link_device.dev){assert(link_locked&&link_pm_refs==1);link_pm_refs--;}
+ else {assert(d==&roots[3].dev&&!link_locked&&pm_refs==1);pm_refs--;}
+}
 '''
     suffix=ns['suffix'].replace('int main(', 'int __attribute__((unused)) fixture_main(',1)
     controls=r'''
@@ -96,16 +143,23 @@ static void prepare(struct apple_atcphy *p,bool fixed,bool t8140,bool swap)
 {
     hw.has_t8140_dp=t8140;initial(p,fixed,false,swap);
     p->np=&ctrl_node;pm_phy=p;
-    hcd=(struct usb_hcd){.rh_registered=true,.flags=1UL<<HCD_FLAG_HW_ACCESSIBLE};
-    bus.sysdev=&controller.dev;bus.hcd=&hcd;wrong_bus.sysdev=&wrong_controller;
+    hcd=(struct usb_hcd){.state=HC_STATE_RUNNING,.rh_registered=true,.flags=1UL<<HCD_FLAG_HW_ACCESSIBLE};
+    controller.dev.driver=&controller_driver;
+    host_device=(struct device){.parent=&controller.dev,.driver=&host_driver};
+    controller_locked=host_locked=false;
+    bus.sysdev=&controller.dev;bus.controller=&host_device;bus.hcd=&hcd;wrong_bus.sysdev=&wrong_controller;
     roots[0]=(struct usb_device){.speed=3,.state=1,.bus=&bus};
     roots[1]=(struct usb_device){.parent=&roots[0],.speed=4,.state=1,.bus=&bus};
     roots[2]=(struct usb_device){.speed=4,.state=1,.bus=&wrong_bus};
-    roots[3]=(struct usb_device){.speed=5,.state=1,.bus=&bus};
-    hcd.self.root_hub=&roots[3];hcd.self.controller=&controller.dev;
+    roots[3]=(struct usb_device){.speed=5,.state=1,.bus=&bus,.maxchild=1};
+    hcd.self.root_hub=&roots[3];hcd.self.controller=&host_device;
     root_locked=graph_missing=controller_missing=root_missing=false;
     node_refs=pm_refs=resumes=resume_error=detach_on_lock=detach_on_resume=0;controller.dev.refs=0;
     inaccessible_on_resume=dead_on_resume=0;
+    link_device=(struct usb_device){.parent=&roots[3],.bus=&bus,.speed=5,.state=1};
+    link_present=link_suspended=link_locked=false;
+    link_pm_refs=link_resumes=link_error=link_detach_on_resume=link_dead_on_resume=0;
+    detach_at_lookup=quiesce_at_lookup=0;
 }
 static int safe(struct apple_atcphy *p)
 {
@@ -114,7 +168,7 @@ static int safe(struct apple_atcphy *p)
 }
 static void balanced(struct apple_atcphy *p)
 {
- assert(!p->lock&&!root_locked&&!pm_refs&&!node_refs&&!controller.dev.refs);
+ assert(!controller_locked&&!host_locked&&!host_device.refs&&!p->lock&&!root_locked&&!link_locked&&!link_pm_refs&&!link_device.refs&&!pm_refs&&!node_refs&&!controller.dev.refs);
  for(unsigned int i=0;i<4;i++)assert(!roots[i].refs);
 }
 int main(void)
@@ -180,6 +234,49 @@ int main(void)
  prepare(&p,true,false,false);before=writes;assert(atcphy_mux_set(&mux,&same)==0&&resumes==0&&writes==before);balanced(&p);
  prepare(&p,true,true,false);before=writes;
  assert(atcphy_mux_set(&mux,&same)==0&&writes==before&&resumes==1);balanced(&p);
+ /* Binding/identity failure must not reach USB PM or PHY programming. */
+ for(unsigned int missing=0;missing<3;missing++){
+  prepare(&p,true,true,false);before=writes;
+  if(missing==0)controller.dev.driver=NULL;
+  if(missing==1)host_device.driver=NULL;
+  if(missing==2)host_device.parent=&wrong_controller;
+  assert(safe(&p)==(missing==2?-ENODEV:-EAGAIN)&&writes==before&&resumes==0);balanced(&p);
+ }
+ /* Root state can change during lookup despite USB device locks. */
+ for(unsigned int event=0;event<2;event++){
+  prepare(&p,true,true,false);before=writes;
+  if(event==0)detach_at_lookup=1;else quiesce_at_lookup=1;
+  int ret=safe(&p);fprintf(stderr,"post-child admission event %u returned %d writes %u\n",event,ret,writes-before);
+  assert(ret==-ENODEV&&writes==before);balanced(&p);
+ }
+ /* Selectively suspended upstream link is not resumed by root ownership alone. */
+ for(unsigned int swap=0;swap<2;swap++){
+  prepare(&p,true,true,swap);link_present=link_suspended=stuck_ack=true;
+  int link_ret=safe(&p);fprintf(stderr,"selective link SAFE returned %d, root resumes %d, link resumes %d\n",link_ret,resumes,link_resumes);
+  assert(link_ret==0&&resumes==1&&link_resumes==1&&!link_suspended);balanced(&p);
+ }
+ for(unsigned int fault=0;fault<3;fault++){
+  prepare(&p,true,true,false);link_present=link_suspended=true;before=writes;
+  unsigned int retained=p.dp_usb_context_valid,owners=p.dp_owned_pmas;
+  if(fault==0)link_error=-EIO;
+  if(fault==1)link_detach_on_resume=1;
+  if(fault==2)link_dead_on_resume=1;
+  assert(safe(&p)==(fault?-ENODEV:-EIO)&&writes==before&&p.dp_usb_context_valid==retained&&p.dp_owned_pmas==owners);balanced(&p);
+ }
+ prepare(&p,true,true,false);link_present=link_suspended=true;link_error=-EIO;
+ assert(safe(&p)==-EIO);balanced(&p);link_error=0;assert(safe(&p)==0);balanced(&p);
+ prepare(&p,true,true,false);link_present=link_suspended=true;fail_caller="atcphy_pipehandler_lock";before=writes;
+ assert(safe(&p)==-ETIMEDOUT&&writes==before&&p.mode_dirty&&p.pipe_state==ATCPHY_PIPEHANDLER_STATE_USB3);balanced(&p);
+ fail_caller=NULL;assert(safe(&p)==0);balanced(&p);
+ for(unsigned int count=0;count<2;count++){
+  prepare(&p,true,true,false);roots[3].maxchild=count?2:0;before=writes;
+  assert(safe(&p)==(count?-ENODEV:-EAGAIN)&&writes==before);balanced(&p);
+ }
+ prepare(&p,true,true,false);link_present=true;link_device.state=USB_STATE_NOTATTACHED;
+ assert(safe(&p)==0&&link_resumes==0);balanced(&p);
+ /* Startup with no old child is allowed; no fake dock or link is required. */
+ prepare(&p,true,true,false);assert(safe(&p)==0&&link_resumes==0);balanced(&p);
+ puts("PASS actual upstream-link ownership: both PMAs, selective suspend, resume/removal/death/ACK failures, retry, unknown port map and no-child startup");
  puts("PASS actual PM wrapper + actual parking/restore: both PMAs, gated clock, PM error/retry, fatal ACK/retry, graph/controller/root/removal gates, legacy/ordinary and cached mode");
  return 0;
 }
@@ -187,7 +284,10 @@ int main(void)
     helpers=''
     if has_pm:
      helpers=ns['block'](s,'struct atcphy_usb3_pm {')+';\n'
-     helpers+='#if IS_REACHABLE(CONFIG_USB)\n'+ns['function'](s,'atcphy_usb3_pm_find')+'\n#endif\n'
+     helpers+='#if IS_REACHABLE(CONFIG_USB)\n'
+     if 'static int atcphy_usb3_link_get(' in s:
+      helpers+=ns['function'](s,'atcphy_usb3_link_get')+'\n'+ns['function'](s,'atcphy_usb3_link_put')+'\n'
+     helpers+=ns['function'](s,'atcphy_usb3_pm_find')+'\n#endif\n'
      helpers+=ns['function'](s,'atcphy_usb3_pm_get')+'\n'+ns['function'](s,'atcphy_usb3_pm_put')+'\n'
      # The fixture extractor adapts the locked body; extract the wrapper directly.
      marker=re.search(r'^static int atcphy_mux_set\(',s,re.M).group()
@@ -201,7 +301,7 @@ int main(void)
     typec_caller=ns['block'](typec_source,'int typec_mux_set(')+'\n'
     hcd_source=(root/'drivers/usb/core/hcd.c').read_text()
     hcd_death=ns['block'](hcd_source,'void usb_hc_died (')+'\n'
-    text=prefix+prod+'\n#define USB_REACHABLE '+str(int(not usb_unreachable))+'\n#define HCD_DEAD_ONLY '+str(int(False))+'\n'+pmfixture+helpers+typec_caller+hcd_death+suffix+controls
+    text=prefix+prod+'\n#define REQUIRES_PLATFORM_LOCKS '+str(int('device_lock(&pm->controller->dev)' in s))+'\n#define USB_REACHABLE '+str(int(not usb_unreachable))+'\n#define HCD_DEAD_ONLY '+str(int(False))+'\n'+pmfixture+helpers+typec_caller+hcd_death+suffix+controls
     return text
 
 def probe(root):
@@ -368,7 +468,7 @@ def kconfig(root, output):
     compiler = Path(os.environ.get('KCONFIG_CONF', root / 'scripts/kconfig/conf'))
     if not compiler.is_file():
         subprocess.run(['make', '-C', str(root), 'O=' + str(directory / 'producer'),
-                        'ARCH=arm64', 'LLVM=1', 'scripts/kconfig/conf'], check=True)
+                        'ARCH=arm64', 'LLVM=1', 'allnoconfig'], check=True)
         compiler = directory / 'producer/scripts/kconfig/conf'
     for usb, phy_setting in [('n', 'y'), ('y', 'y'), ('m', 'y'), ('m', 'm')]:
         case = directory / (usb + '-' + phy_setting)
@@ -451,3 +551,88 @@ int main(void)
 }
 """
     return unit + '\n' + port + '\n' + controls
+
+
+def upstream_resume_boundary(root):
+    """Actual usbcore dispatch: root bus resume does not resume its child."""
+    source = (root / 'drivers/usb/core/generic.c').read_text()
+    function = block(source, 'int usb_generic_driver_resume(')
+    prefix = r"""
+#include <assert.h>
+#include <errno.h>
+#include <stdbool.h>
+#include <stdio.h>
+typedef int pm_message_t;
+struct usb_device { struct usb_device *parent; };
+static int bus_resumes, port_resumes, notifications, port_error;
+static bool child_suspended = true;
+static int hcd_bus_resume(struct usb_device *u, pm_message_t m)
+{ (void)m; assert(!u->parent); bus_resumes++; return 0; }
+static int usb_port_resume(struct usb_device *u, pm_message_t m)
+{ (void)m; assert(u->parent); port_resumes++; if(port_error)return port_error; child_suspended=false; return 0; }
+static void usbfs_notify_resume(struct usb_device *u)
+{ (void)u; notifications++; }
+"""
+    controls = r"""
+int main(void) {
+ struct usb_device root={0}, child={.parent=&root};
+ assert(usb_generic_driver_resume(&root,1)==0);
+ assert(bus_resumes==1&&port_resumes==0&&child_suspended&&notifications==1);
+ assert(usb_generic_driver_resume(&child,1)==0);
+ assert(bus_resumes==1&&port_resumes==1&&!child_suspended&&notifications==2);
+ child_suspended=true;port_error=-EIO;
+ assert(usb_generic_driver_resume(&child,1)==-EIO&&child_suspended&&notifications==2);
+ puts("PASS actual usbcore root/child resume dispatch and failed child resume");
+ return 0;
+}
+"""
+    return prefix + function + controls
+
+
+def controller_lifecycle(root):
+    from teardown_pm import unit_for
+    return unit_for(root)
+
+
+def asynchronous_root_state(root):
+    """Actual USB state API does not use the USB device mutex as its fence."""
+    source = (root / 'drivers/usb/core/hub.c').read_text()
+    prefix = r"""
+#include <assert.h>
+#include <stdbool.h>
+#include <stdio.h>
+enum usb_device_state { USB_STATE_NOTATTACHED, USB_STATE_CONFIGURED, USB_STATE_SUSPENDED };
+struct usb_device;
+struct usb_port { struct usb_device *child; };
+struct usb_hub { struct usb_port **ports; };
+struct device { int unused; };
+struct config { struct { unsigned bmAttributes; } desc; };
+struct usb_device { struct device dev; struct usb_device *parent; struct usb_hub *hub; enum usb_device_state state; int maxchild; unsigned quirks; struct config *actconfig; unsigned long active_duration; bool device_locked; };
+static unsigned long jiffies=10;
+static int device_state_lock;
+#define USB_QUIRK_IGNORE_REMOTE_WAKEUP 1
+#define USB_CONFIG_ATT_WAKEUP 2
+#define spin_lock_irqsave(l,f) do { assert(!*(l));*(l)=1;(f)=0; } while(0)
+#define spin_unlock_irqrestore(l,f) do { assert(*(l));*(l)=0;(void)(f); } while(0)
+static struct usb_hub *usb_hub_to_struct_hub(struct usb_device *u) { return u->hub; }
+static void update_port_device_state(struct usb_device *u) { (void)u; }
+static void trace_usb_set_device_state(struct usb_device *u) { (void)u; }
+static void device_set_wakeup_capable(struct device *d,int w) { (void)d;(void)w; }
+"""
+    controls = r"""
+int main(void) {
+ struct usb_device child={.state=USB_STATE_CONFIGURED,.device_locked=true};
+ struct usb_port port={.child=&child};struct usb_port *ports[]={&port};
+ struct usb_hub hub={.ports=ports};
+ struct usb_device root={.state=USB_STATE_CONFIGURED,.maxchild=1,.hub=&hub,.device_locked=true};
+ child.parent=&root;
+ usb_set_device_state(&root,USB_STATE_NOTATTACHED);
+ assert(root.state==USB_STATE_NOTATTACHED&&child.state==USB_STATE_NOTATTACHED);
+ assert(root.device_locked&&child.device_locked&&!device_state_lock);
+ usb_set_device_state(&child,USB_STATE_CONFIGURED);
+ assert(child.state==USB_STATE_NOTATTACHED);
+ puts("PASS actual asynchronous USB detach while device locks are held; no resurrection");
+ return 0;
+}
+"""
+    return prefix + block(source, 'static void update_usb_device_state(') + block(source, 'static void recursively_mark_NOTATTACHED(') + block(source, 'void usb_set_device_state(') + controls
