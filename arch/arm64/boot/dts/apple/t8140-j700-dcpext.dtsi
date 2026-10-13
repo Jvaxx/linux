@@ -2,9 +2,8 @@
 /*
  * T8140 external display resources measured through the public ADT API.
  *
- * The controller and route remain disabled. Their live firmware
- * profile, bandwidth request, routing selector and handoff must be qualified
- * before enabling the controller. The existing T8140 refusal remains in force.
+ * The controller remains disabled until the loader validates and preserves
+ * the inherited firmware and its complete dependency group.
  */
 
 &{/soc} {
