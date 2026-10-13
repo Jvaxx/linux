@@ -702,6 +702,21 @@ static inline bool dcp_fw_is_14_7(const struct apple_dcp *dcp)
 		dcp->hw.fw_14_7_endpoints);
 }
 
+/*
+ * The T8122 dcpext connects its DPTX port as AsahiLinux/linux#607 does,
+ * the kernel this firmware was first driven with: no validation of the
+ * target, a connect without the supports-HPD attribute, GET_SUPPORTS_HPD
+ * answered with 0, HPD asserted only after the link-configuration wait,
+ * and tiled display hints acknowledged with 0. Every other DCP keeps the
+ * Type-C model of dcp_dptx_connect_session().
+ */
+static inline bool dcp_ext_dptx_607(const struct apple_dcp *dcp)
+{
+	/* Not the generic M1/M2 DCPs this tree also runs on the template. */
+	return dcp->fw_compat == DCP_FIRMWARE_V_14_7_TEMPLATE &&
+	       dcp->hw.fw_14_7_endpoints;
+}
+
 #define DCP_AUDIO_MAX_CHANS 15
 
 #endif /* __APPLE_DCP_INTERNAL_H__ */

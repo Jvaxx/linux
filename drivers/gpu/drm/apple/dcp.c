@@ -27,6 +27,7 @@
 #include <linux/property.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
+#include <linux/soc/apple/pmp-report.h>
 #include <linux/string.h>
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
@@ -974,6 +975,8 @@ int dcp_get_connector_type(struct platform_device *pdev)
  */
 static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable)
 {
+	/* T8122 dcpext: HPD only after the link wait, see dcp_ext_dptx_607() */
+	bool late_hpd = dcp_ext_dptx_607(dcp);
 	unsigned long timeout;
 	u8 dfp_port;
 	int ret = 0, err;
@@ -1023,20 +1026,22 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 	dcp->dptxport[port].atcphy = dcp->phy;
 	/* a tiled display's second half comes in on the port's dpin1 */
 	dfp_port = port && READ_ONCE(dcp->split.active) ? 2 : dcp->dptx_dfp_port;
-	ret = dptxport_validate_connection(dcp->dptxport[port].service,
-					   dfp_port,
-					   dcp->dptx_phy, dcp->dptx_die);
-	if (ret) {
-		dev_err(dcp->dev,
-			"dcp_dptx_connect: failed to validate DPTX target %u:%u: %d\n",
-			dcp->dptx_die, dcp->dptx_phy, ret);
-		goto out_unlock;
+	if (!dcp_ext_dptx_607(dcp)) {
+		ret = dptxport_validate_connection(dcp->dptxport[port].service,
+						   dfp_port,
+						   dcp->dptx_phy, dcp->dptx_die);
+		if (ret) {
+			dev_err(dcp->dev,
+				"dcp_dptx_connect: failed to validate DPTX target %u:%u: %d\n",
+				dcp->dptx_die, dcp->dptx_phy, ret);
+			goto out_unlock;
+		}
 	}
 
 	ret = dptxport_connect(dcp->dptxport[port].service,
 			       dfp_port,
 			       dcp->dptx_phy, dcp->dptx_die,
-		       dcp_is_typec_output(dcp));
+			       dcp_is_typec_output(dcp) && !dcp_ext_dptx_607(dcp));
 	if (ret) {
 		dev_err(dcp->dev,
 			"dcp_dptx_connect: failed to connect DPTX target %u:%u: %d\n",
@@ -1052,7 +1057,7 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		goto out_release;
 	}
 	dcp->dptxport[port].connected = true;
-	if (dcp_is_typec_output(dcp)) {
+	if (dcp_is_typec_output(dcp) && !late_hpd) {
 		if (dcp_uses_t6020_tunnel_flow(dcp))
 			ret = dptxport_set_hpd_timeout(dcp->dptxport[port].service,
 						       true, 8000);
@@ -1081,23 +1086,32 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		  DPTX_TUNNEL_CONNECT_TIMEOUT : DPTX_CONNECT_TIMEOUT;
 	ret = wait_for_completion_timeout(&dcp->dptxport[port].linkcfg_completion,
 					  timeout);
-	if (!ret) {
+	if (!ret && late_hpd) {
+		/* Without HPD this firmware does not train: assert it now. */
+		dev_dbg(dcp->dev,
+			"dcp_dptx_connect: no link configuration on port %u yet, asserting HPD\n",
+			port);
+	} else if (!ret) {
 		dev_err(dcp->dev,
 			"dcp_dptx_connect: timed out waiting for port %u link configuration\n",
 			port);
 		ret = -ETIMEDOUT;
 		goto out_withdraw;
+	} else {
+		dev_dbg(dcp->dev, "dcp_dptx_connect: waited %d ms for link\n",
+			jiffies_to_msecs(timeout - ret));
 	}
-
-	dev_dbg(dcp->dev, "dcp_dptx_connect: waited %d ms for link\n",
-		jiffies_to_msecs(timeout - ret));
 
 	usleep_range(5, 10);
 
-	if (dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort) {
+	if (dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort || late_hpd) {
 		ret = dptxport_set_hpd(dcp->dptxport[port].service, true);
+		if (ret && late_hpd)
+			dev_err(dcp->dev,
+				"dcp_dptx_connect: failed to assert HPD after the link wait: %d\n",
+				ret);
 		/* T6030 external: out_withdraw drops the request as out_disconnect did. */
-		if (ret && dcp->external)
+		if (ret && (dcp->external || late_hpd))
 			goto out_withdraw;
 	}
 	if (dcp->external) {
@@ -3195,6 +3209,67 @@ static bool dcp_show_notch(struct apple_dcp *dcp)
 	return show_notch || t6030_show_notch;
 }
 
+/*
+ * T8122 dcpext (DCP_FIRMWARE_V_14_7_TEMPLATE): if the PMP runs, the display
+ * gate added its DISPEXT request and pointed the dcpext at it
+ * (apple,pmp-report). As on T6030, run the processor only once the PMP has
+ * acknowledged that request: the running PMP owns the SoC power and
+ * performance states and treats a block whose request it has not taken as
+ * idle. The internal display started the PMP long before this, so the wait
+ * is short; it is bounded, and without an acknowledgement the processor is
+ * started anyway (as before the request existed), with a warning.
+ */
+#define DCP_EXT_PMP_TIMEOUT_MS	3000
+
+/*
+ * The PMP report's wait-ready entry point is optional at link time: until a
+ * provider implements it, behave as its !CONFIG_APPLE_PMP_REPORT stub does.
+ */
+static int dcp_ext_pmp_wait_ready(struct device_node *entry,
+				  unsigned long timeout)
+{
+	typeof(&apple_pmp_report_wait_ready) wait;
+	int ret;
+
+	wait = symbol_get(apple_pmp_report_wait_ready);
+	if (!wait)
+		return -ENODEV;
+	ret = wait(entry, timeout);
+	symbol_put(apple_pmp_report_wait_ready);
+	return ret;
+}
+
+static void dcp_ext_wait_pmp(struct apple_dcp *dcp)
+{
+	struct device_node *entry;
+	unsigned long deadline;
+	int ret;
+
+	if (!dcp_ext_dptx_607(dcp))
+		return;
+	entry = of_parse_phandle(dcp->dev->of_node, "apple,pmp-report", 0);
+	if (!entry) {
+		dev_info(dcp->dev, "no PMP DISPEXT request; starting without one\n");
+		return;
+	}
+	deadline = jiffies + msecs_to_jiffies(DCP_EXT_PMP_TIMEOUT_MS);
+	for (;;) {
+		ret = dcp_ext_pmp_wait_ready(entry,
+					     msecs_to_jiffies(DCP_EXT_PMP_TIMEOUT_MS));
+		/* -EIO: the PMP runs, but has not acknowledged the request yet. */
+		if (ret != -EIO || time_after(jiffies, deadline))
+			break;
+		msleep(20);
+	}
+	of_node_put(entry);
+	if (ret)
+		dev_warn(dcp->dev,
+			 "the PMP has not acknowledged the DISPEXT request (%d); starting anyway\n",
+			 ret);
+	else
+		dev_info(dcp->dev, "PMP acknowledged the DISPEXT request\n");
+}
+
 static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *data)
 {
 	struct device_node *panel_np;
@@ -3379,6 +3454,8 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 			goto err_piodma;
 		}
 	}
+
+	dcp_ext_wait_pmp(dcp);
 
 	if (!dcp->hw.adopt_live_session) {
 		cpu_ctrl =
