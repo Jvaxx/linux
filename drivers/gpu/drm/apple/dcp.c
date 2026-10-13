@@ -139,20 +139,20 @@ static void dcp_release_rtkit(void *data)
 
 #define DCP_BOOT_TIMEOUT msecs_to_jiffies(1000)
 
-static bool experimental_h17p_external;
+static bool experimental_h17p_external = true;
 module_param(experimental_h17p_external, bool, 0444);
 MODULE_PARM_DESC(experimental_h17p_external,
-		 "Enable experimental T8140 external display protocol");
+		 "Enable T8140 external display protocol (default: enabled)");
 
 static int experimental_h17p_external_bw_scratch = -1;
 module_param(experimental_h17p_external_bw_scratch, int, 0444);
 MODULE_PARM_DESC(experimental_h17p_external_bw_scratch,
-		 "Experimental external bandwidth scratch offset; unset by default");
+		 "Override external bandwidth scratch offset (-1 uses the hardware profile)");
 
 static int experimental_h17p_external_bw_request = -1;
 module_param(experimental_h17p_external_bw_request, int, 0444);
 MODULE_PARM_DESC(experimental_h17p_external_bw_request,
-		 "Experimental external bandwidth request offset; unset by default");
+		 "Override external bandwidth request offset (-1 uses the hardware profile)");
 
 bool dcp_h17p_external_enabled(void)
 {
@@ -4232,14 +4232,16 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	if (dcp->hw.iomfb_method_profile ==
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL) {
 		if (!dcp->hw.firmware_clock ||
-		    !apple_dcp_external_bw_valid(resource_size(dcp->hw.firmware_clock),
+		    !apple_dcp_external_bw_resolve(resource_size(dcp->hw.firmware_clock),
+					 dcp->hw.firmware_scratch,
+					 dcp->hw.firmware_request,
 					 experimental_h17p_external_bw_scratch,
-					 experimental_h17p_external_bw_request))
+					 experimental_h17p_external_bw_request,
+					 &dcp->hw.firmware_scratch,
+					 &dcp->hw.firmware_request))
 			return dev_err_probe(dev, -EINVAL,
-					     "External bandwidth offsets are unset or invalid\n");
+					     "External bandwidth offsets are invalid\n");
 		iomfb_pause_presentation(dcp, true);
-		dcp->hw.firmware_scratch = experimental_h17p_external_bw_scratch;
-		dcp->hw.firmware_request = experimental_h17p_external_bw_request;
 	}
 
 
@@ -4594,6 +4596,9 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8140_external = {
 	.firmware_compat = DCP_FIRMWARE_H17P,
 	.firmware_clock = &t8140_firmware_clock,
 	.firmware_display_windows = 4,
+	/* Native PMGR BWR agent 2 and boost agent 3 for DISPEXT0. */
+	.firmware_scratch = 0x28000,
+	.firmware_request = 0x70000,
 };
 
 /*
