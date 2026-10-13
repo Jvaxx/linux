@@ -874,6 +874,8 @@ void dcp_hotplug(struct work_struct *work)
 		 connector->connected, READ_ONCE(dcp->mode_state.valid), dcp->nr_modes);
 
 	scoped_guard(mutex, &connector->base.dev->mode_config.mutex) {
+		if (READ_ONCE(connector->dcp) == pdev)
+			dcp_update_connector_dimensions(dcp, &connector->base);
 		if (!READ_ONCE(connector->connected))
 			dcp_clear_connector_edid(connector);
 	}
@@ -1302,6 +1304,7 @@ int dcp_get_modes(struct drm_connector *connector)
 	bool vrr_capable = false;
 	bool physical_edid;
 	u64 edid_generation = 0;
+	u64 service_epoch = 0;
 	unsigned int count;
 	int i;
 
@@ -1350,9 +1353,15 @@ int dcp_get_modes(struct drm_connector *connector)
 	if (physical_edid) {
 		mutex_lock(&dcp->hpd_mutex);
 		edid_generation = dcp->typec_generation;
-		if (apple_connector->drm_edid &&
-		    apple_connector->drm_edid_generation != edid_generation)
-			dcp_clear_connector_edid(apple_connector);
+	}
+	mutex_lock(&dcp->dcpavserv.lock);
+	/* Consume CLOSE invalidation under the publication/retirement lock. */
+	dcp_consume_edid_invalidation(apple_connector);
+	if (apple_connector->drm_edid &&
+	    (!dcpavserv_edid_service_current(dcp, apple_connector->drm_edid_service_epoch) ||
+	     (physical_edid && apple_connector->drm_edid_generation != edid_generation)))
+		dcp_clear_connector_edid(apple_connector);
+	if (physical_edid) {
 		if (!dcpavserv_edid_current(dcp, edid_generation)) {
 			dcp_clear_connector_edid(apple_connector);
 			goto edid_done;
@@ -1366,11 +1375,14 @@ int dcp_get_modes(struct drm_connector *connector)
 	if (count) {
 		const struct drm_edid *edid;
 		/* Let physical disconnect advance the generation during the request. */
+		mutex_unlock(&dcp->dcpavserv.lock);
 		if (physical_edid)
 			mutex_unlock(&dcp->hpd_mutex);
-		edid = dcpavserv_copy_edid(dcp, edid_generation);
-		if (physical_edid) {
+		edid = dcpavserv_copy_edid(dcp, edid_generation, &service_epoch);
+		if (physical_edid)
 			mutex_lock(&dcp->hpd_mutex);
+		mutex_lock(&dcp->dcpavserv.lock);
+		if (physical_edid) {
 			if (!dcpavserv_edid_current(dcp, edid_generation) ||
 			    READ_ONCE(apple_connector->dcp) != pdev) {
 				if (!IS_ERR_OR_NULL(edid))
@@ -1379,6 +1391,14 @@ int dcp_get_modes(struct drm_connector *connector)
 				goto edid_done;
 			}
 		}
+		if (!IS_ERR_OR_NULL(edid) &&
+		    !dcpavserv_edid_service_current(dcp, service_epoch)) {
+			drm_edid_free(edid);
+			dcp_clear_connector_edid(apple_connector);
+			goto edid_done;
+		}
+		/* Retirement may have queued cleanup while this request waited. */
+		dcp_consume_edid_invalidation(apple_connector);
 		if (IS_ERR_OR_NULL(edid)) {
 			/*
 			 * An internal panel has no AV service and so no EDID;
@@ -1392,6 +1412,7 @@ int dcp_get_modes(struct drm_connector *connector)
 			drm_edid_free(apple_connector->drm_edid);
 			apple_connector->drm_edid = edid;
 			apple_connector->drm_edid_generation = edid_generation;
+			apple_connector->drm_edid_service_epoch = service_epoch;
 		u64 generation;
 
 		/* The RPC can sleep while a disconnect or route change clears EDID. */
@@ -1444,6 +1465,7 @@ int dcp_get_modes(struct drm_connector *connector)
 	}
 
 edid_done:
+	mutex_unlock(&dcp->dcpavserv.lock);
 	if (physical_edid)
 		mutex_unlock(&dcp->hpd_mutex);
 	if (apple_connector->drm_edid)

@@ -1878,6 +1878,20 @@ void dcp_set_dimensions(struct apple_dcp *dcp, u64 generation)
 		connector->display_info.width_mm = width_mm;
 		connector->display_info.height_mm = height_mm;
 	}
+
+	/*
+	 * This callback runs on the ordered RTKit RX worker. A mode probe
+	 * can hold mode_config.mutex while waiting for an AFK reply which
+	 * that same worker still has to dispatch. Defer the DRM update.
+	 */
+	if (dcp->connector && !READ_ONCE(dcp->quiescing))
+		schedule_work(&dcp->connector->hotplug_wq);
+
+	/*
+	 * Fix up any probed modes. Modes are created when parsing
+	 * TimingElements, dimensions are calculated when parsing
+	 * DisplayAttributes, and TimingElements may be sent first
+	 */
 	for (i = 0; i < dcp->nr_modes; ++i) {
 		dcp->modes[i].mode.width_mm = width_mm;
 		dcp->modes[i].mode.height_mm = height_mm;
@@ -1886,6 +1900,21 @@ out_unlock:
 	mutex_unlock(&dcp->modes_lock);
 	if (connector)
 		mutex_unlock(&connector->dev->mode_config.mutex);
+}
+
+void dcp_update_connector_dimensions(struct apple_dcp *dcp,
+				     struct drm_connector *connector)
+{
+	int width_mm = READ_ONCE(dcp->width_mm);
+	int height_mm = READ_ONCE(dcp->height_mm);
+
+	lockdep_assert_held(&connector->dev->mode_config.mutex);
+	if (!width_mm || !height_mm) {
+		width_mm = dcp->panel.width_mm;
+		height_mm = dcp->panel.height_mm;
+	}
+	connector->display_info.width_mm = width_mm;
+	connector->display_info.height_mm = height_mm;
 }
 
 bool dcp_has_panel(struct apple_dcp *dcp)
@@ -5246,7 +5275,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	mutex_init(&dcp->tb_lock);
 	spin_lock_init(&dcp->mode_state.lock);
 	spin_lock_init(&dcp->metadata.lock);
-	spin_lock_init(&dcp->dcpavserv.lock);
+	mutex_init(&dcp->dcpavserv.lock);
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
 	if (dcp->hw.iomfb_method_profile ==
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL) {

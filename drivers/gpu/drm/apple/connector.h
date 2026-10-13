@@ -58,6 +58,7 @@ struct apple_connector {
 	bool drm_edid_firmware_derived;
 	bool edid_invalidation_pending;
 	u64 drm_edid_generation;
+	u64 drm_edid_service_epoch;
 
 	/* Workqueue for sending hotplug events to the associated device */
 	struct work_struct hotplug_wq;
