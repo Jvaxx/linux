@@ -24,7 +24,7 @@ struct ep { bool wire_v2; struct ring txbfr; };
 static int check_ring(struct ep *ep,u32 rptr,u32 wptr,size_t payload_len,size_t *total)
 {
  struct epic_hdr *ehdr;struct epic_sub_hdr *eshdr;struct afk_qe *hdr;
- bool compact=false;size_t total_epic_size,total_size;int ret=0;
+ size_t total_epic_size,total_size;int ret=0;
 '''
 suffix = r'''
  *total=total_size;

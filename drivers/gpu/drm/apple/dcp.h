@@ -12,7 +12,7 @@
 #include "dcp-internal.h"
 #include "parser.h"
 
-bool dcp_h17p_external_enabled(void);
+bool dcp_h17p_external_supported(struct device_node *np);
 bool dcp_h17p_external_ready(struct device_node *np);
 
 struct apple_crtc {

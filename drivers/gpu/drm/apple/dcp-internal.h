@@ -20,6 +20,7 @@
 #include "dcp_backlight.h"
 #include "dcp-display-metadata.h"
 #include "dcp-metadata-epoch.h"
+#include "dcp-180hz.h"
 #include "iomfb.h"
 #include "iomfb_h17p.h"
 #include "iomfb-state.h"
@@ -106,6 +107,10 @@ struct dcp_chunks {
 	bool contiguous;
 	bool payload_complete;
 	struct dcp_metadata_ticket metadata_ticket;
+	u64 av_service_epoch; /* Captured at property start, never at publication. */
+	struct dcp_metadata_ticket mode_ticket;
+	u64 automatic_connection_sequence;
+	bool automatic_service_pending;
 };
 
 #define DCP_MAX_MAPPINGS (128) /* should be enough */
@@ -179,7 +184,7 @@ struct dcp_panel {
 enum dcp_iomfb_method_profile {
 	DCP_IOMFB_METHODS_DEFAULT,
 	DCP_IOMFB_METHODS_H17G,
-	DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL,
+	DCP_IOMFB_METHODS_H17P_EXTERNAL,
 };
 
 struct apple_dcp_hw_data {
@@ -224,6 +229,8 @@ struct apple_dcp {
 	u64 external_rx_generation;
 	u64 external_stop_generation;
 	bool external_cable;
+	/* RX tombstone: initially unknown; only physical OOB events change it. */
+	bool external_physically_absent;
 	bool external_running;
 	bool external_power_attempted;
 	/* iomfb.lock: replay the latest callback after activation succeeds. */
@@ -231,8 +238,6 @@ struct apple_dcp {
 	bool external_hotplug_connected;
 	bool external_stopped;
 	int external_error;
-	u64 external_power_reply;
-	bool external_power_reply_valid;
 	struct work_struct external_stop_work;
 
 
@@ -286,6 +291,9 @@ struct apple_dcp {
 
 	/* Active chunked transfer. There can only be one at a time. */
 	struct dcp_chunks chunks;
+	struct dcp_180hz_proof rate_proof;
+	struct delayed_work rate_retry_wq;
+	bool rate_retry_initialized;
 	struct {
 		/* Protects connection tickets and cached metadata snapshots. */
 		spinlock_t lock;
@@ -461,8 +469,6 @@ struct apple_dcp {
 	struct dcp_present_h17p present_h17p;
 	struct dcp_present_state_h17p present_state_h17p;
 	DECLARE_BITMAP(unknown_callbacks, IOMFB_MAX_CB);
-	/* Runtime callbacks whose record size has been reported once. */
-	DECLARE_BITMAP(sized_callbacks, IOMFB_MAX_CB);
 
 	/* Serializes H17P transmit preparation with RTKit receive callbacks. */
 	struct {
