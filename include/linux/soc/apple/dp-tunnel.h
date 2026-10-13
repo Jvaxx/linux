@@ -44,6 +44,16 @@ int apple_dcp_tb_dp_tunnel(struct device_node *connector_np, unsigned int dpin,
  */
 int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate);
 
+/* T6030's even external sources feed DP IN0 through DPTX PCLK1. */
+static inline int apple_dp_tunnel_t6030_pclk(unsigned int source, unsigned int dpin)
+{
+	return !dpin && (source == 0 || source == 2) ? 0 : -EOPNOTSUPP;
+}
+
+/* T6030: keep the source owning the pixel clock across rate changes and stop. */
+int apple_atc_dp_tunnel_rate_source(struct phy *phy, unsigned int source,
+				    unsigned int dpin, u8 rate);
+
 /*
  * ATC PHY: wake the DP clock path of a PHY in Thunderbolt/USB4 mode ahead of
  * apple_atc_dp_tunnel_rate(), before DCP is told about the display.

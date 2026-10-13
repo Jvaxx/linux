@@ -806,6 +806,7 @@ struct apple_atcphy {
 	u8 tunnel_rate;
 	u8 tunnel_users;
 	u8 tunnel_dpin_rate[2];
+	unsigned int tunnel_source; /* T6030 source owning the single DP IN0 clock */
 
 	struct {
 		bool aux;
@@ -3849,6 +3850,38 @@ static bool apple_atc_tunnel_is_t8103_style(void)
 	       of_machine_is_compatible("apple,t8112") || apple_atc_tunnel_is_t600x();
 }
 
+int apple_atc_dp_tunnel_rate_source(struct phy *phy, unsigned int source,
+				    unsigned int dpin, u8 rate)
+{
+	struct apple_atcphy *atcphy;
+	int ret;
+
+	if (!phy || phy->ops != &apple_atc_dp_phy_ops || dpin > 1)
+		return -EINVAL;
+	atcphy = phy_get_drvdata(phy);
+	if (!apple_atc_tunnel_is_t6030(atcphy) ||
+	    apple_dp_tunnel_t6030_pclk(source, dpin) < 0)
+		return -EOPNOTSUPP;
+	guard(mutex)(&atcphy->lock);
+	atcphy_restore_after_pd_off(atcphy);
+	/* A stale source must not retune or stop another source's clock. */
+	if (atcphy->tunnel_clock_on && atcphy->tunnel_source != source)
+		return -ESTALE;
+	if (!rate)
+		return atc_t8122_tunnel_stop(atcphy);
+	if (atcphy->mode != APPLE_ATCPHY_MODE_USB4 &&
+	    atcphy->mode != APPLE_ATCPHY_MODE_TBT)
+		return -EBUSY;
+	/* Keep this owner if a failed start cannot shut the PLL down. */
+	atcphy->tunnel_source = source;
+	ret = atc_t8122_tunnel_start(atcphy, rate);
+	dev_dbg(atcphy->dev, "DP tunnel source %u rate 0x%x: %d (TX_DP_CTRL0=%08x PCLK_STAT=%08x)\n",
+		source, rate, ret,
+		readl(atcphy->regs.core + ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0),
+		readl(atcphy->regs.core + T8122_DP_PCLK_STATUS));
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_atc_dp_tunnel_rate_source);
 
 int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 {
@@ -3859,23 +3892,8 @@ int apple_atc_dp_tunnel_rate(struct phy *phy, unsigned int dpin, u8 rate)
 		return -EINVAL;
 	atcphy = phy_get_drvdata(phy);
 	/* Keep each supported SoC on its qualified clock sequence. */
-	if (apple_atc_tunnel_is_t6030(atcphy)) {
-		if (dpin)
-			return -EOPNOTSUPP;
-		guard(mutex)(&atcphy->lock);
-		atcphy_restore_after_pd_off(atcphy);
-		if (!rate)
-			return atc_t8122_tunnel_stop(atcphy);
-		if (atcphy->mode != APPLE_ATCPHY_MODE_USB4 &&
-		    atcphy->mode != APPLE_ATCPHY_MODE_TBT)
-			return -EBUSY;
-		ret = atc_t8122_tunnel_start(atcphy, rate);
-		dev_dbg(atcphy->dev, "DP tunnel clock rate 0x%x: %d (TX_DP_CTRL0=%08x PCLK_STAT=%08x)\n",
-			rate, ret,
-			readl(atcphy->regs.core + ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0),
-			readl(atcphy->regs.core + T8122_DP_PCLK_STATUS));
-		return ret;
-	}
+	if (apple_atc_tunnel_is_t6030(atcphy))
+		return apple_atc_dp_tunnel_rate_source(phy, 0, dpin, rate);
 	if (!apple_atc_tunnel_is_t8103_style()) {
 		bool valid_core = apple_atc_t602x_core_valid(atcphy->np, atcphy->res.core->start,
 							     resource_size(atcphy->res.core));
