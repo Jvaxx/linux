@@ -586,54 +586,70 @@ void dcp_v14_external_hotplug(struct apple_dcp *dcp, bool connected)
 }
 
 /*
- * The firmware withdrew the description of a connected display on a direct
- * Type-C route whose port still has HPD, and a retry is queued that redoes
- * the link if the description does not come back. Shortly after an attach
- * the firmware can do this and describe the display again a fraction of a
- * second later. Reporting the connector disconnected for that window lets a
- * compositor that found it connected a moment before read it back with no
- * modes and no EDID, and keep that empty output once the display is back.
- * Keep it connected with the modes and EDID it has, until the description is
- * back or the retry finds it is not (iomfb_v14_7_external_release()). A mode
- * set meanwhile waits for the description (dcp_v14_external_settle()). Only
- * the first withdrawal of a connection is held; later ones disconnect, so a
- * display that keeps being withdrawn is reported as it was before.
+ * The firmware withdrew the description of a connected display whose port
+ * still has HPD (@hdmi_hpd for the fixed HDMI output), and a retry is queued
+ * that redoes the link if the description does not come back. Reporting the
+ * connector disconnected until it is back lets a compositor that found it
+ * connected a moment before read it back with no modes and no EDID, keep
+ * that empty output once the display is back, or drop the output and add it
+ * again. Keep it connected with the modes and EDID it has, until the
+ * description is back or the retry finds it is not
+ * (iomfb_v14_7_external_release()). A mode set meanwhile waits for the
+ * description (dcp_v14_external_settle()).
+ *
+ * On a direct Type-C route the firmware can do this shortly after an attach.
+ * Only the first withdrawal of a Type-C connection is held; later ones
+ * disconnect, so a display that keeps being withdrawn is reported as it was
+ * before. On the fixed HDMI output it can do this after every connect and
+ * every mode set, so each withdrawal with HPD high is held. The queued retry
+ * bounds that: with no retry left, a withdrawal disconnects as before.
  */
-static bool dcp_v14_external_hold(struct apple_dcp *dcp)
+static bool dcp_v14_external_hold(struct apple_dcp *dcp, bool hdmi_hpd)
 {
 	struct apple_connector *connector = READ_ONCE(dcp->connector);
 	u64 connection = READ_ONCE(dcp->typec_generation) + 1;
+	bool typec = dcp_is_typec_output(dcp);
 	unsigned int action;
 
 	if (!dcp->external_native || READ_ONCE(dcp->external_detached) ||
-	    !dcp_is_typec_output(dcp) || dcp_is_usb4_output(dcp) ||
-	    !READ_ONCE(dcp->typec_cable_connected) || READ_ONCE(dcp->typec_crtc_off) ||
 	    !connector || !READ_ONCE(connector->connected) ||
-	    READ_ONCE(dcp->external_held_connection) == connection ||
 	    !delayed_work_pending(&dcp->external_retry_wq))
 		return false;
-	WRITE_ONCE(dcp->external_held_connection, connection);
+	if (typec) {
+		if (dcp_is_usb4_output(dcp) || !READ_ONCE(dcp->typec_cable_connected) ||
+		    READ_ONCE(dcp->typec_crtc_off) ||
+		    READ_ONCE(dcp->external_held_connection) == connection)
+			return false;
+		WRITE_ONCE(dcp->external_held_connection, connection);
+	} else if (!hdmi_hpd) {
+		return false;
+	}
 	atomic_set(&dcp->external_held, 1);
 	action = dcp_mode_withdraw(&dcp->mode_state);
 	if (!dcp->crtc)
 		action &= ~DCP_HOTPLUG_VBLANK;
 	dcp_handle_hotplug_actions(dcp, action);
-	dev_info(dcp->dev, "display withdrawn on a Type-C route with HPD: kept connected until it is described again\n");
+	dev_info(dcp->dev, "display withdrawn on %s with HPD: kept connected until it is described again\n",
+		 typec ? "a Type-C route" : "the HDMI port");
 	return true;
 }
 
 /*
  * The firmware withdrew the timings of the attached display. An HPD bounce
- * withdraws the description, and the firmware describes the display again
- * once its link is back. If that does not happen while the port still holds
- * the display, redo the link.
+ * withdraws the description, as can a connect or a mode set on the HDMI
+ * port, and the firmware describes the display again once its link is back.
+ * If that does not happen while the port still holds the display, redo the
+ * link.
  */
 void iomfb_v14_7_external_withdrawn(struct apple_dcp *dcp)
 {
-	if (READ_ONCE(dcp->typec_cable_connected) && !READ_ONCE(dcp->typec_crtc_off))
+	bool hdmi_hpd = dcp_hdmi_port_attached(dcp);
+
+	if ((READ_ONCE(dcp->typec_cable_connected) && !READ_ONCE(dcp->typec_crtc_off)) ||
+	    hdmi_hpd)
 		dcp_external_retry(dcp, "display withdrawn while its port has HPD",
 				   0, DCP_V14_DESC_RELINK_MS);
-	if (!dcp_v14_external_hold(dcp))
+	if (!dcp_v14_external_hold(dcp, hdmi_hpd))
 		dcp_v14_external_hotplug(dcp, false);
 }
 

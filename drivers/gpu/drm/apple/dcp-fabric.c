@@ -17,6 +17,8 @@
 
 #include <drm/drm_file.h>
 
+#include <kunit/static_stub.h>
+
 #include "afk.h"
 #include "dcp.h"
 #include "dcp-fabric.h"
@@ -118,6 +120,8 @@ bool dcp_uses_t6020_tunnel_flow(struct apple_dcp *dcp)
 
 bool dcp_hdmi_port_attached(struct apple_dcp *dcp)
 {
+	KUNIT_STATIC_STUB_REDIRECT(dcp_hdmi_port_attached, dcp);
+
 	return dcp->hdmi_hpd && !READ_ONCE(dcp->active_typec_route) &&
 	       gpiod_get_value_cansleep(dcp->hdmi_hpd) > 0;
 }
@@ -3586,8 +3590,12 @@ static void dcp_hdmi_connect_fixed(void *ctx)
 	struct apple_dcp *dcp = ctx;
 	int ret = dcp_fixed_output_select(dcp);
 
-	/* A new HDMI attach gets its own retries. */
-	if (dcp->external_native) {
+	/*
+	 * A new HDMI attach gets its own retries. The converter's HPD pulses
+	 * also land here: while a display is kept connected through a
+	 * withdrawal, keep the retry that bounds that.
+	 */
+	if (dcp->external_native && !atomic_read(&dcp->external_held)) {
 		atomic_set(&dcp->external_retries, 0);
 		cancel_delayed_work(&dcp->external_retry_wq);
 	}
