@@ -677,6 +677,53 @@ M3_PRO_MESA_NEEDS="expat glibc>=2.43 libdisplay-info libdrm libgcc>=3.0 libglvnd
 # The package's own switch-offs, read only to say so in the summary: this file, the user's
 # ~/.config/mesa-m3/disable, or mesa_m3=off on the kernel command line.
 M3_PRO_MESA_DISABLE=/etc/mesa-m3/disable
+M3_PRO_NATIVE_PACKAGE=""
+M3_PRO_VULKAN_PACKAGE=""
+M3_PRO_PERF_MIGRATOR=""
+M3_PRO_PERF_SELECTED=0
+
+M3_PRO_PERF_PRE_NATIVE=none M3_PRO_PERF_PRE_VULKAN=none
+m3_pro_perf_plan() {
+  is_m3_pro && ((M3_PRO_MESA)) && [[ -n $M3_PRO_NATIVE_PACKAGE && -n $M3_PRO_VULKAN_PACKAGE ]] || return 0
+  M3_PRO_PERF_PRE_NATIVE=$(pacman -Q mesa-m3-native-pro 2>/dev/null | cut -d' ' -f2) || M3_PRO_PERF_PRE_NATIVE=none
+  M3_PRO_PERF_PRE_VULKAN=$(pacman -Q mesa-m3-pro-vulkan 2>/dev/null | cut -d' ' -f2) || M3_PRO_PERF_PRE_VULKAN=none
+  if [[ -f $STATE/m3-pro-perf-state ]]; then
+    M3_PRO_PERF_PRE_NATIVE=$(sed -n 's/^pre_native=//p' "$STATE/m3-pro-perf-state")
+    M3_PRO_PERF_PRE_VULKAN=$(sed -n 's/^pre_vulkan=//p' "$STATE/m3-pro-perf-state")
+  fi
+}
+
+m3_pro_perf_files() {
+  is_m3_pro && ((M3_PRO_MESA)) && [[ -n $M3_PRO_NATIVE_PACKAGE && -n $M3_PRO_VULKAN_PACKAGE ]] || return 0
+  printf '%s\n' "$M3_PRO_NATIVE_PACKAGE" "$M3_PRO_VULKAN_PACKAGE"
+}
+
+m3_pro_perf_verify() {
+  local pin file digest name
+  is_m3_pro && ((M3_PRO_MESA)) && [[ -n $M3_PRO_NATIVE_PACKAGE && -n $M3_PRO_VULKAN_PACKAGE ]] || return 0
+  for name in mesa-m3-native-pro mesa-m3-pro-vulkan; do
+    if [[ $name == mesa-m3-native-pro ]]; then pin=$M3_PRO_NATIVE_PACKAGE; else pin=$M3_PRO_VULKAN_PACKAGE; fi
+    read -r file digest <<<"$pin"
+    [[ $(bsdtar -xOf "$work/$file" .PKGINFO | sed -n 's/^pkgname = //p') == "$name" ]] || die "paired Pro Mesa package identity differs"
+  done
+  [[ -n $M3_PRO_PERF_MIGRATOR ]] || die "paired Pro session helper is missing"
+  M3_PRO_PERF_SELECTED=1
+}
+
+m3_pro_perf_activate() {
+  ((M3_PRO_PERF_SELECTED)) || return 0
+  local user
+  [[ $(cat /opt/mesa-m3/native-pro/share/mesa-m3/profile) == t6030-native-gl-legacy-hal &&
+     $(cat /opt/mesa-m3/pro-vulkan/share/mesa-m3/profile) == t6030-pro-vulkan-legacy-hal ]] || die "paired Pro Mesa installation is incomplete"
+  user=$(m3_pro_mesa_user)
+  if [[ $user != root ]]; then
+    printf '%s' "$M3_PRO_PERF_MIGRATOR" | base64 -d > "$work/migrate-pro-session.py"
+    $sudo runuser -u "$user" -- python3 - "$user" < "$work/migrate-pro-session.py" || die "could not update the managed native Pro session"
+  fi
+  $sudo systemctl enable mesa-m3-pro-performance.service
+  printf 'pre_native=%s\npre_vulkan=%s\nnative=%s\nvulkan=%s\n' "$M3_PRO_PERF_PRE_NATIVE" "$M3_PRO_PERF_PRE_VULKAN"     "$(pacman -Q mesa-m3-native-pro | cut -d' ' -f2)" "$(pacman -Q mesa-m3-pro-vulkan | cut -d' ' -f2)" |     $sudo tee "$STATE/m3-pro-perf-state" >/dev/null
+  say "Paired native Pro OpenGL and Honeykrisp Vulkan installed; the guarded performance profile activates at the next boot"
+}
 # mesa-m3's own user-setup detector and the list file it reads: what counts as a user's own Mesa
 # setup, for the session hook and for this script alike. Once mesa-m3 is installed the record's
 # user_setup comes from that detector; before that (or without it) from this script's byte copies
@@ -2564,7 +2611,7 @@ m3_pro_mesa_files() {
 
 # After the download loop: keep the package out of the kernel's pacman -U ("$work"/*.pkg.tar.zst).
 m3_pro_mesa_set_aside() {
-  ((M3_GPU_PERSISTENT || FROZEN_PACKAGES)) && return 0
+  ((M3_GPU_PERSISTENT || FROZEN_PACKAGES || M3_PRO_PERF_SELECTED)) && return 0
   local file
   file=$(m3_pro_mesa_file)
   [[ -n $M3_PRO_MESA_PACKAGE && -f $work/$file ]] || return 0
@@ -3098,7 +3145,25 @@ m3_pro_mesa_render_kept() {
 # before this script first ran. The owner's own (installed by them, there before, or changed
 # since) stays, and so does one this script has no readable record of. This script created no
 # other file for it.
+m3_pro_perf_remove() {
+  local state=$STATE/m3-pro-perf-state role name pre have want
+  [[ -f $state ]] || return 0
+  for role in native vulkan; do
+    if [[ $role == native ]]; then name=mesa-m3-native-pro; else name=mesa-m3-pro-vulkan; fi
+    pre=$(sed -n "s/^pre_$role=//p" "$state")
+    want=$(sed -n "s/^$role=//p" "$state")
+    have=$(pacman -Q "$name" 2>/dev/null | cut -d' ' -f2) || continue
+    if [[ $pre == none && -n $want && $have == "$want" ]]; then
+      if [[ $role == native ]]; then $sudo systemctl disable --now mesa-m3-pro-performance.service || true; fi
+      $sudo pacman -Rn --noconfirm "$name" || die "could not remove owned Pro Mesa package $name"
+    else
+      say "Keeping $name $have: it predates this installer or changed afterwards"
+    fi
+  done
+}
+
 m3_pro_mesa_remove() {
+  m3_pro_perf_remove
   local rec=$STATE/$M3_PRO_MESA_RECORD_NAME
   # An M3 Pro as in 12.3; an Air only with a record (from 12.4 on), so an Air this script never
   # gave mesa-m3 runs --uninstall as before.
@@ -4087,6 +4152,7 @@ install_all() {
   m3_gpu_plan
   if ((M3_GPU_PERSISTENT)); then m3_gpu_check_plan; fi
   m3_pro_mesa_plan
+  m3_pro_perf_plan
   frozen_package_detection
   if ((M3_GPU_PERSISTENT)); then
     [[ $M3_PRO_MESA_RESULT != current ]] || M3_PRO_MESA_RESULT=""
@@ -4103,7 +4169,7 @@ install_all() {
   trap 'm3_install_cleanup' EXIT
   if is_neo && ! m1n1_for_this_mac; then say "Keeping this MacBook Neo's own m1n1 (m1n1-aurora has no T8140 support)"; fi
   if [[ $M3_MODE == kernel ]]; then say "Keeping this M3's own m1n1 and boot.bin"; fi
-  mapfile -t entries < <(packages_for_this_mac; m3_gpu_files; m3_pro_mesa_files; neo_gpu_files)
+  mapfile -t entries < <(packages_for_this_mac; m3_gpu_files; m3_pro_mesa_files; neo_gpu_files; m3_pro_perf_files)
   for entry in "${entries[@]}"; do
     read -r file sha <<<"$entry"
     say "Downloading $file"
@@ -4139,6 +4205,7 @@ install_all() {
     candidate_archives+=("$work/$file")
   done < <(desktop_fixes_files)
   if ((M3_GPU_PERSISTENT)); then m3_persistent_package_check "$work/${M3_PRO_MESA_PACKAGE%% *}"; fi
+  m3_pro_perf_verify
   m3_pro_mesa_set_aside
   frozen_dependency_prepare "${candidate_archives[@]}"
   if m1n1_for_this_mac; then
@@ -4267,6 +4334,7 @@ install_all() {
   $sudo systemctl daemon-reload
   sep_policy
   if is_neo; then neo_radio_notice; fi
+  m3_pro_perf_activate
   m3_pro_mesa_install
   m3_pro_mesa_render
   m3_pro_mesa_record
@@ -7054,6 +7122,7 @@ m3_install_packages() {
   else
     $sudo pacman -U --noconfirm --ask 4 "$work"/*.pkg.tar.zst
   fi
+  if ((M3_PRO_PERF_SELECTED)) && [[ -f $work/$(m3_pro_mesa_file) ]]; then M3_PRO_MESA_RESULT=installed; fi
   if ((M3_GPU_PERSISTENT)); then
     M3_PRO_MESA_RESULT=installed
     if [[ $M3_GPU_PROFILE == j613-25g83 ]]; then

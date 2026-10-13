@@ -25,7 +25,8 @@ NEO_KERNELS = (NEO_KERNEL, 'a6a62e586021d9f786d6a96b4ded6b0ad3b613fa',
                '0a7037c9871fd1bde2923c3c7f27732d53519ed2',
                'a85f8eee2fd54ed9e7237f25d1f085e9d7848111',
                '7cae5a72ccc6690a710e199c853f8e1c97a3d86c',
-               'f240960cc84cfda6f73e188050ccadb9435e938f')
+               'f240960cc84cfda6f73e188050ccadb9435e938f',
+               'd49021440d8ca02bbc8ecc17c19ce76c048b6236')
 # J615 native25 requires exact kernel, boot source and packaged binary bindings.
 J615_NATIVE25_PAIR = {
     'kernel': '9189760ca2222ba57d802d65ff3a0ebb2ca985ab',
@@ -62,6 +63,7 @@ J615_RELEASE15_NATIVE25_PAIR = {
     'm1n1': 'd05ba17dfb771871d608225be42968bbb1e75a18',
     'm1n1_bin_sha256': '396cf3ec1774ca9d15ca1b6f71b5e8a3639b27f80b95d530722b35a5ea35141d',
 }
+J615_RELEASE16_NATIVE25_PAIR = dict(J615_RELEASE15_NATIVE25_PAIR, kernel='d49021440d8ca02bbc8ecc17c19ce76c048b6236')
 # Reserved firmware DART tables require the matched Neo ESP producer.
 NEO_PREVIOUS_FW_ROOT_PAIR = {
     'kernel': '9b96a8f6a29ceb3f645ed75e220a71c10e7d8e1f',
@@ -114,6 +116,7 @@ NEO_RELEASE15_LIVE_FW_ROOT_PAIR = {
     'm1n1': '1b36287e04788f4a028e6180c64d3d96e49f06b1',
     'm1n1_bin_sha256': '1c61eea4da8bd4bd2e18de534d661ccc569e1b8e92b19d4af867d5b281516491',
 }
+NEO_RELEASE16_LIVE_FW_ROOT_PAIR = dict(NEO_RELEASE15_LIVE_FW_ROOT_PAIR, kernel='d49021440d8ca02bbc8ecc17c19ce76c048b6236')
 STANDARD_M1N1_SOURCE = "d05ba17dfb771871d608225be42968bbb1e75a18"
 PREVIOUS_STANDARD_M1N1_SOURCE = "31501778e863feb5d2afe77be3a1edc588c98119"
 J615_LEGACY_M1N1_SOURCES = ("74ba6bea52d1f865d204bb3f8168705a148fd5c5",
@@ -158,6 +161,8 @@ def check_j615_native25(sources, binary_sha, mesa):
         pair = J615_RELEASE14_NATIVE25_PAIR
     if sources['kernel'] == J615_RELEASE15_NATIVE25_PAIR['kernel']:
         pair = J615_RELEASE15_NATIVE25_PAIR
+    if sources['kernel'] == J615_RELEASE16_NATIVE25_PAIR['kernel']:
+        pair = J615_RELEASE16_NATIVE25_PAIR
     if not isinstance(pair, dict) or set(pair) != {'kernel', 'm1n1', 'm1n1_bin_sha256'}:
         raise ValueError('J615 native25 requires the recorded J615 boot/kernel pair (J615_NATIVE25_PAIR)')
     if sources['kernel'] != pair['kernel']: raise ValueError('J615 native25 requires the matched J615 kernel')
@@ -175,7 +180,7 @@ def check_neo_firmware_tables(kernel, sources, binary_sha):
                         NEO_LIVE_FW_ROOT_PAIR, NEO_TUNNEL_LIVE_FW_ROOT_PAIR,
                         NEO_NIC_LIVE_FW_ROOT_PAIR, NEO_DISPLAY_READY_LIVE_FW_ROOT_PAIR,
                         NEO_RELEASE14_LIVE_FW_ROOT_PAIR,
-                        NEO_RELEASE15_LIVE_FW_ROOT_PAIR) if kernel == p['kernel']]
+                        NEO_RELEASE15_LIVE_FW_ROOT_PAIR, NEO_RELEASE16_LIVE_FW_ROOT_PAIR) if kernel == p['kernel']]
     if not pairs:
         return
     if any(not re.fullmatch(r'[0-9a-f]{40}', p.get('m1n1') or '') for p in pairs):
@@ -273,6 +278,55 @@ def neo_data(manifest, directory):
     member(paths['mesa'], 'opt/mesa-neo/libexec/mesa-neo-probe.real')
     return pins
 
+def pro_data(manifest, directory):
+    pro = manifest.get('pro')
+    if pro is None:
+        return {}
+    if pro.get('profile') != 't6030-g15s-legacy-hal':
+        raise ValueError('Pro performance profile differs')
+    if manifest['source_commits']['kernel'] != 'd49021440d8ca02bbc8ecc17c19ce76c048b6236':
+        raise ValueError('Pro performance kernel differs')
+    expected = {'native': ('mesa-m3-native-pro', 'opt/mesa-m3/native-pro', '2dc61e4b462639d29ca846a3ad2dfd1f28629c4e', b't6030-native-gl-legacy-hal\n'),
+                'vulkan': ('mesa-m3-pro-vulkan', 'opt/mesa-m3/pro-vulkan', 'b0f56952b7f06955b143fbfa90c07de4c5864964', b't6030-pro-vulkan-legacy-hal\n')}
+    if set(pro.get('packages', {})) != set(expected):
+        raise ValueError('Pro package pair is incomplete')
+    kernel_path = directory / manifest['packages']['kernel']['file']
+    listing = subprocess.check_output(['bsdtar', '-tf', str(kernel_path)], text=True).splitlines()
+    markers = [name for name in listing if re.fullmatch(r'usr/lib/modules/[^/]+/aurora-m3pro-profile', name)]
+    if len(markers) != 1 or member(kernel_path, markers[0]) != b't6030-perf-v1\nsource=d49021440d8ca02bbc8ecc17c19ce76c048b6236\n':
+        raise ValueError('Pro kernel performance marker differs')
+    pins = {}
+    for role, (name, prefix, source, marker) in expected.items():
+        item = pro['packages'][role]
+        path = directory / item['file']
+        if path.name != item['file'] or not re.fullmatch(r'[A-Za-z0-9._+:-]+\.pkg\.tar\.zst', path.name):
+            raise ValueError('Pro package filename differs')
+        if hashlib.sha256(path.read_bytes()).hexdigest() != item['sha256']:
+            raise ValueError('Pro package hash differs')
+        if re.findall(r'^pkgname = (.+)$', member(path, '.PKGINFO').decode(), re.M) != [name]:
+            raise ValueError('Pro package identity differs')
+        if re.findall(r'^arch = (.+)$', member(path, '.PKGINFO').decode(), re.M) != ['aarch64']:
+            raise ValueError('Pro package architecture differs')
+        if pro['source_commits'].get(role) != source:
+            raise ValueError('Pro Mesa source differs')
+        if member(path, prefix + '/share/mesa-m3/profile') != marker:
+            raise ValueError('Pro installed marker differs')
+        if ('source=' + source).encode() not in member(path, prefix + '/share/mesa-m3/capabilities').splitlines():
+            raise ValueError('Pro packaged source differs')
+        if role == 'native':
+            for file in ('mesa-m3-pro-check', 'mesa-m3-pro-performance', 'mesa-m3-pro-session-env'):
+                if member(path, prefix + '/libexec/' + file) != Path(__file__).with_name('pro').joinpath(file).read_bytes():
+                    raise ValueError('Pro runtime helper differs')
+            if member(path, 'usr/share/uwsm/env.d/51-mesa-m3-pro') != Path(__file__).with_name('pro').joinpath('51-mesa-m3-pro').read_bytes():
+                raise ValueError('Pro session hook differs')
+            for installed, local in [('usr/lib/systemd/system/mesa-m3-pro-performance.service', 'mesa-m3-pro-performance.service'), (prefix + '/share/drirc.d/10-m3-pro.conf', '10-m3-pro.conf')]:
+                if member(path, installed) != Path(__file__).with_name('pro').joinpath(local).read_bytes():
+                    raise ValueError('Pro session integration differs')
+        key = 'M3_PRO_NATIVE_PACKAGE' if role == 'native' else 'M3_PRO_VULKAN_PACKAGE'
+        pins[key] = path.name + ' ' + item['sha256']
+    pins['M3_PRO_PERF_MIGRATOR'] = base64.b64encode(Path(__file__).with_name('pro').joinpath('migrate-session.py').read_bytes()).decode()
+    return pins
+
 def assemble(template, manifest, directory):
     if manifest.get('schema') != 'aurora.m3-matched-stack/1': raise ValueError('manifest schema differs')
     for field in ('version','tag'):
@@ -356,6 +410,7 @@ def assemble(template, manifest, directory):
                          M3_STAGE1_25_J615_VERSIONS=' '.join(manifest['stage1_25_j615_versions']) if 'j615' in native25 else '',
                          M1N1_PACKAGE=pins['m1n1'],M3_PRO_MESA_PACKAGE=pins['mesa'])
     substitutions.update(neo_pins)
+    substitutions.update(pro_data(manifest, directory))
     for key,value in substitutions.items():
         replacement = key+'="'+value+'"' if key not in ('VERSION','TAG','M1N1_BIN_SHA') else key+'='+value
         s,n = re.subn(r'^'+key+r'=.*$',lambda _:replacement,s,count=1,flags=re.M)

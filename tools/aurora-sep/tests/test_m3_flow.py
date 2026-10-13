@@ -351,6 +351,9 @@ M1N1_PACKAGE="{self.m1n1_pkg} {self.shas[self.m1n1_pkg]}"
 M1N1_BIN_SHA={self.bin_shas[self.m1n1_pkg]}
 M3_PRO_MESA_PACKAGE="{self.pro_mesa + ' ' + self.shas[self.pro_mesa] if self.pro_mesa else ''}"
 M3_PRO_MESA_NEEDS="{PRO_MESA_NEEDS}"
+M3_PRO_NATIVE_PACKAGE=""
+M3_PRO_VULKAN_PACKAGE=""
+M3_PRO_PERF_MIGRATOR=""
 M3_PRO_MESA_DETECTOR='{self.tmp}/opt/mesa-m3/libexec/mesa-m3-user-setup'
 M3_PRO_MESA_SETUP_ROOT='{self.sysroot}'
 m3_pro_mesa_user_home() {{ echo '{self.home_path}'; }}
