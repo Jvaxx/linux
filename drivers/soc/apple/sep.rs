@@ -562,6 +562,8 @@ struct SepData {
 
     #[pin]
     endpoints: Mutex<EndpointTable>,
+    #[pin]
+    trusted_ready: CondVar,
 
     #[pin]
     control: Mutex<control::ControlState>,
@@ -822,6 +824,7 @@ impl SepData {
                 mbox <- new_mutex!(None),
                 shmem <- new_mutex!(Some(buf)),
                 endpoints <- new_mutex!(EndpointTable::new()),
+                trusted_ready <- new_condvar!("SepData::trusted_ready"),
                 control <- new_mutex!(control::ControlState::new()),
                 control_wq <- new_condvar!("SepData::control_wq"),
                 sks_seq: Atomic::new(0),
@@ -1911,7 +1914,7 @@ impl SepData {
             );
             diag::attach(false);
             diag::bringup_ended();
-            this.phase.store(PHASE_READY, Relaxed);
+            this.finish_bringup();
             return;
         }
         dev_info!(
@@ -1933,7 +1936,7 @@ impl SepData {
                 e
             );
             diag::bringup_ended();
-            this.phase.store(PHASE_READY, Relaxed);
+            this.finish_bringup();
             return;
         }
 
@@ -1974,8 +1977,48 @@ impl SepData {
 
         this.run_bringup();
         diag::bringup_ended();
-        this.phase.store(PHASE_READY, Relaxed);
+        this.finish_bringup();
         Self::arm_settle(this);
+    }
+
+    // Publish completion under the same lock that trusted consumers wait on.
+    // PHASE_READY ends discovery/initialisation; it is not proof of success.
+    fn finish_bringup(&self) {
+        let _guard = self.endpoints.lock();
+        self.phase.store(PHASE_READY, Relaxed);
+        self.trusted_ready.notify_all();
+    }
+
+    /// Trusted-key callbacks can run as soon as probe publishes the source,
+    /// while endpoint discovery and key-store initialisation are still running.
+    /// Wait only in those consumers, leaving bringup free to establish the key.
+    pub(crate) fn wait_for_trusted_ready(&self) -> Result<()> {
+        let mut remaining = time::msecs_to_jiffies(EXCHANGE_TIMEOUT_MS);
+        let mut guard = self.endpoints.lock();
+        loop {
+            if self.shutting_down.load(Relaxed) {
+                return Err(ENODEV);
+            }
+            if self.phase.load(Relaxed) == PHASE_READY {
+                // A completed but failed attach must not look ready.
+                if !guard.eps.iter().any(|e| e.id == proto::EP_SKS) {
+                    return Err(ENODEV);
+                }
+                if !self.sks_initialized.load(Relaxed) {
+                    return Err(EIO);
+                }
+                return Ok(());
+            }
+            if remaining == 0 {
+                dev_err!(self.dev, "trusted-keys: key-store bringup timed out\n");
+                return Err(ETIMEDOUT);
+            }
+            match self.trusted_ready.wait_interruptible_timeout(&mut guard, remaining) {
+                CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
+                CondVarTimeoutResult::Signal { .. } => return Err(ERESTARTSYS),
+                CondVarTimeoutResult::Timeout => remaining = 0,
+            }
+        }
     }
 
     fn endpoint_present(&self, id: u8) -> bool {
@@ -2049,6 +2092,10 @@ impl SepData {
 
     fn remove(&self) {
         self.shutting_down.store(true, Relaxed);
+        {
+            let _guard = self.endpoints.lock();
+            self.trusted_ready.notify_all();
+        }
         bio::release(&mut self.bio_session.lock());
         self.worker_gone.notify_all();
         self.rng_shutdown.store(true, Relaxed);
