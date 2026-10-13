@@ -19,9 +19,12 @@
 
 #define AFK_MAX_CHANNEL 16
 #define MAX_PENDING_CMDS 16
+#define AFKV2_INTERFACES BIT(16)
 
 struct apple_epic_service_ops;
 struct apple_dcp_afkep;
+
+void afk_service_retry(struct apple_dcp_afkep *ep);
 
 struct epic_cmd_info {
 	u16 tag;
@@ -50,6 +53,7 @@ struct apple_epic_service {
 
 	struct epic_cmd_info cmds[MAX_PENDING_CMDS];
 	DECLARE_BITMAP(cmd_map, MAX_PENDING_CMDS);
+	/* Legacy EPIC sequence; AFKV2 history belongs to the interface. */
 	u8 cmd_tag;
 	spinlock_t lock;
 	/* Pins held by owners and synchronous callers; protected by lock. */
@@ -62,6 +66,11 @@ struct apple_epic_service {
 	/* Provider-owned prepare/init ticket; AFK core never interprets it. */
 	struct { u64 generation, epoch; } admission;
 	void *cookie;
+
+	/* Admitted reannouncement waiting for the previous channel to drain. */
+	bool pending_open;
+	const char *pending_name, *pending_class;
+	s64 pending_unit;
 
     struct {
         struct dentry *entry;
@@ -82,6 +91,9 @@ struct apple_epic_service_ops {
 	 */
 	int (*prepare)(struct apple_epic_service *service, const char *name,
 		       const char *class, s64 unit);
+	/* Check the original prepare ticket before a deferred OPEN. */
+	int (*revalidate)(struct apple_epic_service *service, const char *name,
+			  const char *class, s64 unit);
 	void (*init)(struct apple_epic_service *service, const char *name,
 			      const char *class, s64 unit);
 	int (*call)(struct apple_epic_service *service, u32 idx,
@@ -142,6 +154,7 @@ static inline void afk_service_put(struct apple_epic_service *service)
 	if (!WARN_ON(!service->users))
 		service->users--;
 	spin_unlock_irqrestore(&service->lock, flags);
+	afk_service_retry(service->ep);
 }
 
 static inline void afk_service_disable(struct apple_epic_service *service)
@@ -205,7 +218,7 @@ afk_service_reinit(struct apple_epic_service *service,
 		service->ep = ep;
 		service->channel = channel;
 		service->cookie = NULL;
-		/* Keep the command-tag sequence across service generations. */
+		/* Keep legacy slot history; AFKV2 history belongs to the interface. */
 	}
 	spin_unlock_irqrestore(&service->lock, flags);
 	return reusable;
@@ -347,7 +360,10 @@ struct apple_dcp_afkep {
 	bool wire_v2;
 	/* External H17P DPAV only; other endpoints retain owned-DMA commands. */
 	bool inline_v2;
+	/* Fixed 16-bit interface domain; survives slot and channel reuse. */
+	u8 *command_tags;
 	struct workqueue_struct *wq;
+	struct work_struct service_work;
 
 	struct completion started;
 	struct completion stopped;

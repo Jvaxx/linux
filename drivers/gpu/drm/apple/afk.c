@@ -56,6 +56,21 @@ enum rbep_msg_type {
 
 #define SEND_WPTR GENMASK(31, 0)
 
+static void afk_service_worker(struct work_struct *work);
+static void afk_discard_pending_open(struct apple_epic_service *service);
+
+void afk_service_retry(struct apple_dcp_afkep *ep)
+{
+	unsigned long flags;
+
+	if (!ep || !ep->wire_v2 || ep != ep->dcp->dcpavservep)
+		return;
+	spin_lock_irqsave(&ep->lock, flags);
+	if (!ep->stopping)
+		queue_work(ep->wq, &ep->service_work);
+	spin_unlock_irqrestore(&ep->lock, flags);
+}
+
 static void afk_send(struct apple_dcp_afkep *ep, u64 message)
 {
 	dcp_send_message(ep->dcp, ep->endpoint, message);
@@ -66,8 +81,10 @@ static void afk_release_context(void *data)
 	struct apple_dcp_afkep *afkep = data;
 
 	afk_quiesce(afkep);
-	if (!afkep->dcp->retain_dma)
+	if (!afkep->dcp->retain_dma) {
+		kvfree(afkep->command_tags);
 		kfree(afkep);
+	}
 }
 
 struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
@@ -90,6 +107,7 @@ struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 		goto out_free_afkep;
 	}
 
+	INIT_WORK(&afkep->service_work, afk_service_worker);
 	init_completion(&afkep->started);
 	init_completion(&afkep->stopped);
 	spin_lock_init(&afkep->lock);
@@ -108,12 +126,21 @@ out_free_afkep:
 
 void afk_quiesce(struct apple_dcp_afkep *afkep)
 {
+	unsigned long flags;
+	u32 i;
+
 	if (IS_ERR_OR_NULL(afkep))
 		return;
+	spin_lock_irqsave(&afkep->lock, flags);
+	afkep->stopping = true;
+	spin_unlock_irqrestore(&afkep->lock, flags);
 	if (afkep->wq) {
 		destroy_workqueue(afkep->wq);
 		afkep->wq = NULL;
 	}
+	for (i = 0; i < afkep->num_channels; i++)
+		if (afkep->services[i].pending_open)
+			afk_discard_pending_open(&afkep->services[i]);
 	debugfs_remove_recursive(afkep->debugfs_entry);
 	afkep->debugfs_entry = NULL;
 }
@@ -187,6 +214,14 @@ static int afk_start_polled(struct apple_dcp_afkep *ep)
 int afk_start(struct apple_dcp_afkep *ep)
 {
 	int ret;
+
+	/* Allocate before firmware can announce services or issue commands. */
+	if (ep->wire_v2 && !ep->command_tags) {
+		ep->command_tags = kvcalloc(AFKV2_INTERFACES, sizeof(*ep->command_tags),
+					    GFP_KERNEL);
+		if (!ep->command_tags)
+			return -ENOMEM;
+	}
 
 	reinit_completion(&ep->started);
 	ret = apple_rtkit_start_ep(ep->dcp->rtk, ep->endpoint);
@@ -360,12 +395,74 @@ static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 			       enum epic_type etype, enum epic_category ecat, u8 stype,
 			       const void *payload, size_t payload_len, u64 token);
 
+/* Pending identities are owned only by the ordered endpoint workqueue. */
+static void afk_discard_pending_open(struct apple_epic_service *service)
+{
+	service->pending_open = false;
+	kfree(service->pending_name);
+	kfree(service->pending_class);
+	service->pending_name = NULL;
+	service->pending_class = NULL;
+	afk_service_discard(service);
+}
+
+static void afk_retry_service_init(struct apple_dcp_afkep *ep)
+{
+	u32 i;
+
+	for (i = 0; i < ep->num_channels; i++) {
+		struct apple_epic_service *service = &ep->services[i];
+		const struct apple_epic_service_ops *ops = service->ops;
+		int ret;
+
+		if (!service->pending_open)
+			continue;
+		ret = ops->revalidate(service, service->pending_name,
+				      service->pending_class, service->pending_unit);
+		if (ret) {
+			afk_discard_pending_open(service);
+			continue;
+		}
+		/* Old replies keep their original slot, tag and buffers until drained. */
+		if (afk_epic_find_service(ep, service->channel))
+			continue;
+		ret = afk_send_epic(ep, service->channel, 0, EPIC_TYPE_NOTIFY,
+				    EPIC_CAT_REPORT, AFKV2_OPEN, NULL, 0);
+		if (ret) {
+			dev_err(ep->dcp->dev, "AFKV2 interface %u deferred OPEN failed: %d\n",
+				service->channel, ret);
+			afk_discard_pending_open(service);
+			continue;
+		}
+		service->pending_open = false;
+		afk_service_publish(service);
+		ops->init(service, service->pending_name, service->pending_class,
+			  service->pending_unit);
+		if (service->enabled)
+			afk_populate_service_debugfs(service);
+		kfree(service->pending_name);
+		kfree(service->pending_class);
+		service->pending_name = NULL;
+		service->pending_class = NULL;
+	}
+}
+
+static void afk_service_worker(struct work_struct *work)
+{
+	struct apple_dcp_afkep *ep = container_of(work, struct apple_dcp_afkep, service_work);
+
+	if (!READ_ONCE(ep->stopping))
+		afk_retry_service_init(ep);
+}
+
 static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 				 u8 *payload, size_t payload_size)
 {
 	char name[32];
 	s64 epic_unit = -1;
-	struct apple_epic_service *service = NULL;
+	struct apple_epic_service *service = NULL, *previous;
+	unsigned long flags;
+	bool retired = false;
 	u32 ch_idx;
 	const char *service_name = name;
 	const char *epic_name = NULL, *epic_class = NULL;
@@ -374,8 +471,25 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 	u8 *props = payload + sizeof(name);
 	size_t props_size = payload_size - sizeof(name);
 
-	if (afk_epic_find_service(ep, channel))
-		return;
+	previous = afk_epic_find_service(ep, channel);
+	if (previous) {
+		spin_lock_irqsave(&previous->lock, flags);
+		retired = previous->torndown;
+		spin_unlock_irqrestore(&previous->lock, flags);
+		if (!ep->wire_v2 || ep != ep->dcp->dcpavservep ||
+		    !retired || !previous->ops->revalidate)
+			return;
+	}
+	for (ch_idx = 0; ch_idx < ep->num_channels; ch_idx++) {
+		struct apple_epic_service *pending = &ep->services[ch_idx];
+
+		if (!pending->pending_open || pending->channel != channel)
+			continue;
+		if (!pending->ops->revalidate(pending, pending->pending_name,
+					      pending->pending_class, pending->pending_unit))
+			return;
+		afk_discard_pending_open(pending);
+	}
 
 	if (payload_size < sizeof(name)) {
 		dev_err(ep->dcp->dev, "AFK[ep:%02x]: payload too small: %lx\n",
@@ -455,6 +569,15 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 			goto free;
 		}
 	}
+	if (previous && retired && ops->revalidate) {
+		/* Preserve the admitted identity and its original provider ticket. */
+		service->pending_open = true;
+		service->pending_name = epic_name;
+		service->pending_class = epic_class;
+		service->pending_unit = epic_unit;
+		afk_service_retry(ep);
+		return;
+	}
 	if (ep->wire_v2) {
 		int ret = afk_send_epic(ep, channel, 0, EPIC_TYPE_NOTIFY,
 					EPIC_CAT_REPORT, AFKV2_OPEN, NULL, 0);
@@ -494,6 +617,14 @@ static void afk_recv_handle_teardown(struct apple_dcp_afkep *ep, u32 channel)
 	struct apple_epic_service *service;
 	const struct apple_epic_service_ops *ops;
 	unsigned long flags;
+
+	/* Accepted CLOSE/CLOSED supersedes unpublished recovery for this interface. */
+	for (u32 i = 0; i < ep->num_channels; i++) {
+		struct apple_epic_service *pending = &ep->services[i];
+
+		if (pending->pending_open && pending->channel == channel)
+			afk_discard_pending_open(pending);
+	}
 
 	service = afk_epic_find_service(ep, channel);
 	if (!service) {
@@ -1566,6 +1697,28 @@ static int afk_send_command_full(struct apple_epic_service *service, u8 type,
 					MSEC_PER_SEC);
 }
 
+static u16 afk_command_tag(struct apple_epic_service *service, u8 slot)
+{
+	struct apple_dcp_afkep *ep = service->ep;
+	unsigned long flags;
+	u16 tag;
+
+	lockdep_assert_held(&service->lock);
+	if (!ep->wire_v2)
+		return ((service->cmd_tag++ & 0xff) << 8) | slot;
+
+	/* Send already nests the endpoint lock below the service lock. */
+	spin_lock_irqsave(&ep->lock, flags);
+	tag = afkv2_command_id(ep->command_tags[service->channel]++, slot);
+	spin_unlock_irqrestore(&ep->lock, flags);
+	return tag;
+}
+
+static int afk_send_command_timeout_len(struct apple_epic_service *service, u8 type,
+					const void *payload, size_t payload_len,
+					void *output, size_t output_len, u32 *retcode,
+					unsigned int timeout_ms, size_t *received);
+
 int afk_send_command_timeout(struct apple_epic_service *service, u8 type,
 			     const void *payload, size_t payload_len,
 			     void *output, size_t output_len, u32 *retcode,
@@ -1596,6 +1749,11 @@ int afk_send_command_timeout(struct apple_epic_service *service, u8 type,
 	if (!service)
 		return -ENODEV;
 	ep = service->ep;
+	if (ep->wire_v2 && (!service->channel || service->channel >= AFKV2_INTERFACES ||
+			    !ep->command_tags)) {
+		ret = -ENODEV;
+		goto err_put_service;
+	}
 	if (READ_ONCE(ep->dcp->quiescing)) {
 		ret = -ENODEV;
 		goto err_put_service;
@@ -1651,9 +1809,7 @@ int afk_send_command_timeout(struct apple_epic_service *service, u8 type,
 		goto err_unlock;
 	}
 
-	tag = ep->wire_v2 ? afkv2_command_id(service->cmd_tag, idx) :
-		((service->cmd_tag & 0xff) << 8) | idx;
-	service->cmd_tag++;
+	tag = afk_command_tag(service, idx);
 
 	service->cmds[idx].tag = tag;
 	service->cmds[idx].type = type;
