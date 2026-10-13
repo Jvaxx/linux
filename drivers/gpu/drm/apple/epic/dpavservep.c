@@ -41,7 +41,8 @@ static bool dcpavserv_identity(struct apple_epic_service *service, const char *n
 		return unit == 0;
 	/* H17P's lower-case interface-id is dynamic, not a physical-port unit. */
 	return service->ep->endpoint == DPAVSERV_ENDPOINT_V2 && class &&
-		!strcmp(class, "AppleDCPDP2HDMI") && service->channel &&
+		(!strcmp(class, "AppleDCPDP2HDMI") ||
+		 !strcmp(class, "DCPDP13Service")) && service->channel &&
 		service->channel <= U16_MAX && unit == service->channel;
 }
 
