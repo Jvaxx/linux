@@ -79,8 +79,11 @@ int main(void)
  too_long=0;wire_error=1;
  assert(afk_service_call_timeout_len(&service,1,7,input,4,4096,output,128,0,1000,&received)==-ETIMEDOUT);
  wire_error=0; ep.inline_v2=false;
+ received=999;
+ assert(!afk_service_call_timeout_len(&service,1,7,input,4,4096,output,128,0,1000,&received));
+ assert(received==4 && output[0]==0xde && output[3]==0xef && output[4]==0);
  assert(!afk_service_call_timeout_len(&service,1,7,input,4,4096,output,128,0,1000,NULL));
- puts("PASS: extracted production service-call actual request / legacy padding / short reply / status / context / length tests");
+ puts("PASS: extracted production service-call actual request / OOB padding and short reply / legacy / status / context / length tests");
 }
 '''
 pathlib.Path(sys.argv[2]).write_text(prefix + source[start:end] + suffix)

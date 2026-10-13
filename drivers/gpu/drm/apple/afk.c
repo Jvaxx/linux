@@ -215,7 +215,7 @@ void afk_trace_ring_snapshot(struct apple_dcp_afkep *ep)
 	u32 rx_rptr = 0, rx_wptr = 0, tx_rptr = 0, tx_wptr = 0;
 	bool rx_ready, tx_ready;
 
-	if (!ep || !ep->inline_v2 || !trace_afk_ring_snapshot_enabled())
+	if (!ep || !ep->wire_v2 || !trace_afk_ring_snapshot_enabled())
 		return;
 	spin_lock_irqsave(&ep->lock, flags);
 	if (ep->stopping) {

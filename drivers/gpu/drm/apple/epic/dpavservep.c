@@ -24,7 +24,7 @@ static void dcpavserv_notify_edid(struct apple_epic_service *service)
 	struct apple_dcp *dcp = service->ep->dcp;
 	struct apple_connector *connector = READ_ONCE(dcp->connector);
 
-	if (!service->ep->inline_v2 || READ_ONCE(dcp->quiescing) || !connector ||
+	if (!service->ep->wire_v2 || READ_ONCE(dcp->quiescing) || !connector ||
 	    !READ_ONCE(dcp->nr_modes) || !READ_ONCE(connector->connected) ||
 	    READ_ONCE(connector->base.registration_state) != DRM_CONNECTOR_REGISTERED ||
 	    READ_ONCE(connector->dcp) != to_platform_device(dcp->dev))
@@ -42,7 +42,7 @@ static int dcpavserv_prepare(struct apple_epic_service *service, const char *nam
 
 	if (!name || strcmp(name, "dcpav-service-epic"))
 		return -ENODEV;
-	if (service->ep->inline_v2) {
+	if (service->ep->wire_v2) {
 		if (service->ep->endpoint != DPAVSERV_ENDPOINT_V2 || !class ||
 		    strcmp(class, "AppleDCPDP2HDMI") || unit != 1)
 			return -ENODEV;
@@ -78,8 +78,8 @@ static void dcpavserv_init(struct apple_epic_service *service, const char *name,
 		service->cookie = &dcp->dcpavserv;
 		complete(&dcp->dcpavserv.enable_completion);
 		mutex_unlock(&dcp->dcpavserv.lock);
-		if (service->ep->inline_v2) {
-			dev_info(dcp->dev, "DCPAVSERV: inline EDID service ready on channel %u\n",
+		if (service->ep->wire_v2) {
+			dev_info(dcp->dev, "DCPAVSERV: AFKV2 EDID service ready on channel %u\n",
 				 service->channel);
 			dcpavserv_notify_edid(service);
 		}
@@ -143,7 +143,7 @@ static int dcpdpserv_prepare(struct apple_epic_service *service, const char *nam
 			    const char *class, s64 unit)
 {
 	/* No production command transport is needed for this H17P service. */
-	return service->ep->inline_v2 ? -ENODEV : 0;
+	return service->ep->wire_v2 ? -ENODEV : 0;
 }
 
 static void dcpdpserv_init(struct apple_epic_service *service, const char *name,
@@ -383,6 +383,7 @@ const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *dcp, u64 generation
 
 	edid = dcpavserv_read_edid(service);
 	edid = service->ep->inline_v2 ? dcpavserv_read_edid_inline(service) :
+	edid = service->ep->wire_v2 ? dcpavserv_read_edid_inline(service) :
 		dcpavserv_read_edid_legacy(service);
 	mutex_lock(&dcp->dcpavserv.lock);
 	if (dcp->dcpavserv.service != service ||
@@ -435,10 +436,10 @@ int dpavservep_init(struct apple_dcp *dcp)
 		      DPAVSERV_ENDPOINT_V2 : DPAVSERV_ENDPOINT, dpavservep_ops);
 	if (IS_ERR(ep))
 		return PTR_ERR(ep);
-	/* Only the external H17P DPAV endpoint uses inline AFKV2 service calls. */
+	/* External H17P uses AFKV2 service calls with host-owned OOB buffers. */
 	ep->wire_v2 = dcp->hw.iomfb_method_profile ==
 		DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL;
-	ep->inline_v2 = ep->wire_v2;
+	ep->inline_v2 = false;
 	dcp->dcpavservep = ep;
 
 	dcp->dcpavservep->match_epic_name = true;

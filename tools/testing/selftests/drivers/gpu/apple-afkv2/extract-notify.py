@@ -23,7 +23,7 @@ prefix = r'''
 struct base { int registration_state; };
 struct apple_connector { bool connected;struct base base;void *dcp;int hotplug_wq; };
 struct apple_dcp { struct apple_connector *connector;bool quiescing;unsigned int nr_modes;void *dev; };
-struct ep { struct apple_dcp *dcp;bool inline_v2; };
+struct ep { struct apple_dcp *dcp;bool wire_v2; };
 struct apple_epic_service { struct ep *ep; };
 static unsigned int queued;
 static void *to_platform_device(void *p) { return p; }
@@ -33,7 +33,7 @@ suffix = r'''
 int main(void)
 {
  int device,other;struct apple_dcp dcp={.dev=&device};
- struct ep ep={.dcp=&dcp,.inline_v2=true};struct apple_epic_service service={.ep=&ep};
+ struct ep ep={.dcp=&dcp,.wire_v2=true};struct apple_epic_service service={.ep=&ep};
  struct apple_connector connector={.dcp=&device};
  dcpavserv_notify_edid(&service);assert(queued==0);
  dcp.connector=&connector;dcpavserv_notify_edid(&service);assert(queued==0);
@@ -42,8 +42,8 @@ int main(void)
  dcpavserv_notify_edid(&service);assert(queued==1 && connector.hotplug_wq==1);
  dcp.quiescing=true;dcpavserv_notify_edid(&service);assert(queued==1);
  dcp.quiescing=false;connector.dcp=&other;dcpavserv_notify_edid(&service);assert(queued==1);
- connector.dcp=&device;ep.inline_v2=false;dcpavserv_notify_edid(&service);assert(queued==1);
- ep.inline_v2=true;connector.connected=false;dcpavserv_notify_edid(&service);assert(queued==1);
+ connector.dcp=&device;ep.wire_v2=false;dcpavserv_notify_edid(&service);assert(queued==1);
+ ep.wire_v2=true;connector.connected=false;dcpavserv_notify_edid(&service);assert(queued==1);
  puts("PASS: actual late-EDID notification queues ready connector only; legacy/quiesce/unrouted/unregistered guarded");
 }
 '''
