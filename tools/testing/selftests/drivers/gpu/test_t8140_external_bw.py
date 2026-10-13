@@ -14,18 +14,7 @@ class BandwidthBounds(unittest.TestCase):
 #include "dcp-external-bw.h"
 int main(void) {
  const u64 n=0xbc000;
- u32 scratch=1, request=2;
- assert(apple_dcp_external_bw_resolve(n,0x28000,0x70000,-1,-1,&scratch,&request));
- assert(scratch==0x28000 && request==0x70000);
- assert(apple_dcp_external_bw_resolve(n,0x28000,0x70000,0x30000,-1,&scratch,&request));
- assert(scratch==0x30000 && request==0x70000);
- assert(apple_dcp_external_bw_resolve(n,0x28000,0x70000,-1,0x74000,&scratch,&request));
- assert(scratch==0x28000 && request==0x74000);
- assert(!apple_dcp_external_bw_resolve(n,0x28000,0x70000,-2,-1,&scratch,&request));
- assert(!apple_dcp_external_bw_resolve(n,0x28000,0x70000,-1,0x28000,&scratch,&request));
- assert(!apple_dcp_external_bw_resolve(n,0x28000,0x70000,0x28002,-1,&scratch,&request));
- assert(!apple_dcp_external_bw_resolve(n,0x28000,0x70000,-1,n,&scratch,&request));
- assert(scratch==0x28000 && request==0x74000);
+ assert(apple_dcp_external_bw_valid(n,0x28000,0x70000));
  assert(!apple_dcp_external_bw_valid(n,-1,-1));
  assert(!apple_dcp_external_bw_valid(n,0,-1));
  assert(!apple_dcp_external_bw_valid(n,-1,0));

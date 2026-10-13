@@ -18,6 +18,7 @@
 #include <linux/overflow.h>
 #include <linux/pm_runtime.h>
 #include <linux/slab.h>
+#include <linux/unaligned.h>
 
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_fourcc.h>
@@ -933,7 +934,30 @@ static u8 dcpep_cb_prop_start(struct apple_dcp *dcp, u32 *length)
 #endif
 
 	dcp->chunks.length = *length;
-	dcp_firmware_metadata_begin(dcp);
+	dcp->chunks.av_service_epoch = 0;
+	dcp->chunks.automatic_service_pending = false;
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL) {
+		/* Match the receipt's start, not a replacement service at its end. */
+		mutex_lock(&dcp->dcpavserv.lock);
+		dcp->chunks.av_service_epoch = dcp->dcpavserv.epoch;
+		dcp->chunks.automatic_service_pending =
+			!dcp->dcpavserv.enabled && !dcp->dcpavserv.service;
+		dcp_firmware_metadata_begin(dcp);
+		{
+			unsigned long flags;
+
+			spin_lock_irqsave(&dcp->metadata.lock, flags);
+			dcp->chunks.automatic_connection_sequence = dcp->rate_proof.connection_sequence;
+			dcp->chunks.mode_ticket = dcp_metadata_begin(&dcp->metadata.epoch);
+			dcp->chunks.mode_ticket.associated =
+				dcp->metadata.epoch.generation == READ_ONCE(dcp->typec_generation) &&
+				READ_ONCE(dcp->typec_cable_connected);
+			spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+		}
+		mutex_unlock(&dcp->dcpavserv.lock);
+	} else {
+		dcp_firmware_metadata_begin(dcp);
+	}
 	dcp->chunks.data = kzalloc(*length, GFP_KERNEL);
 
 	if (!dcp->chunks.data) {
@@ -979,7 +1003,7 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 	}
 
 	/* Validate serialized extent outside the metadata spinlock. */
-	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		dcp->chunks.payload_complete = dcp->chunks.contiguous &&
 			dcp_property_complete(dcp->chunks.data, dcp->chunks.received,
 					      dcp->chunks.length);
@@ -991,27 +1015,71 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 
 	if (ret) {
 		dev_warn(dcp->dev, "bad header on dcpav props\n");
+		/* A failed replacement cannot keep an unsafe catalog admitted. */
+		if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL &&
+		    !strcmp(req->key, "TimingElements")) {
+			unsigned long flags;
+
+			spin_lock_irqsave(&dcp->metadata.lock, flags);
+			dcp->rate_proof.catalog_sequence++;
+			spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+			dcp_180hz_catalog_changed(dcp);
+		}
 		return false;
 	}
 
 	if (!strcmp(req->key, "TimingElements")) {
-		dcp->modes = enumerate_modes(&ctx, &dcp->nr_modes,
+		struct dcp_display_mode *modes;
+		struct dcp_metadata_ticket rate_ticket = {};
+		u64 rate_service_epoch = 0;
+		unsigned int nr_modes = 0, i;
+		unsigned long flags;
+
+		if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL &&
+		    dcp->chunks.payload_complete && dcp->chunks.mode_ticket.associated) {
+			ctx.automatic_1080p180_rgb8 = true;
+			rate_ticket = dcp->chunks.mode_ticket;
+			rate_service_epoch = dcp->chunks.av_service_epoch;
+		}
+		modes = enumerate_modes(&ctx, &nr_modes,
 					     dcp->width_mm, dcp->height_mm,
 					     dcp->notch_height,
 					     dcp->fixed_connector_type ==
 						     DRM_MODE_CONNECTOR_eDP,
 					     dcp->hw.iomfb_method_profile ==
-						     DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL);
+						     DCP_IOMFB_METHODS_H17P_EXTERNAL);
 
-		if (IS_ERR(dcp->modes)) {
+		if (IS_ERR(modes)) {
 			dev_warn(dcp->dev, "failed to parse modes\n");
-			dcp->modes = NULL;
-			dcp->nr_modes = 0;
+			modes = NULL;
+			nr_modes = 0;
+		} else {
+			for (i = 0; i < nr_modes; i++)
+				if (modes[i].automatic_rgb8_quirk) {
+					modes[i].unsafe_rgb8_ticket = rate_ticket;
+					modes[i].unsafe_rgb8_service_epoch = rate_service_epoch;
+					modes[i].automatic_connection_sequence = dcp->chunks.automatic_connection_sequence;
+					modes[i].automatic_service_pending = dcp->chunks.automatic_service_pending;
+				}
+		}
+		/* Publish one catalog revision with its immutable receipt tickets. */
+		spin_lock_irqsave(&dcp->metadata.lock, flags);
+		dcp->rate_proof.catalog_sequence++;
+		for (i = 0; i < nr_modes; i++)
+			if (modes[i].automatic_rgb8_quirk)
+				modes[i].automatic_catalog_sequence = dcp->rate_proof.catalog_sequence;
+		dcp->modes = modes;
+		dcp->nr_modes = nr_modes;
+		spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+		/* Notify removals as well as newly eligible modes, outside the lock. */
+		dcp_180hz_catalog_changed(dcp);
+		if (!modes) {
 			dcp_firmware_metadata_timing(dcp);
 			return false;
 		}
-		if (dcp->nr_modes == 0)
+		if (nr_modes == 0)
 			dev_warn(dcp->dev, "TimingElements without valid modes!\n");
+		dcp_180hz_notify(dcp);
 		dcp_firmware_metadata_timing(dcp);
 	} else if (!strcmp(req->key, "DisplayAttributes")) {
 		struct dcp_parse_ctx metadata_ctx = ctx;
@@ -1025,7 +1093,7 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 		}
 
 		dcp_set_dimensions(dcp);
-		if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL) {
+		if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL) {
 			struct dcp_display_metadata metadata;
 
 			ret = parse_display_metadata(&metadata_ctx, &metadata);
@@ -2125,11 +2193,16 @@ void iomfb_present_backlight_h17p(struct apple_dcp *dcp)
 }
 #endif
 
+static void dcp_post_swap_a428(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	do_swap(dcp, out, cookie);
+}
+
 static void dcp_pre_swap_a428(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	u32 identity = 0x10000;
 
-	dcp_pipe_set_428(dcp, false, &identity, do_swap, cookie);
+	dcp_pipe_set_428(dcp, false, &identity, dcp_post_swap_a428, cookie);
 }
 #endif
 
@@ -2230,12 +2303,12 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 
 	if (DCP_INHERIT_BOOT_MODE &&
 	    dcp->hw.iomfb_method_profile !=
-	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL) {
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL) {
 		dev_dbg(dcp->dev, "inheriting the bootloader's display mode\n");
 		complete_set_digital_out_mode(dcp, NULL, cookie);
 	} else if (mode->vrr &&
 		   dcp->hw.iomfb_method_profile !=
-		   DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
+		   DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		dcp_set_adaptive_sync(dcp,
 				      crtc_state->vrr_enabled ? mode->min_vrr : 0,
 				      cookie);
@@ -2356,7 +2429,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		 * Keep YUV, other source spaces and other profiles unchanged.
 		 */
 		if (dcp->hw.iomfb_method_profile ==
-			    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL &&
+			    DCP_IOMFB_METHODS_H17P_EXTERNAL &&
 		    !new_state->fb->format->is_yuv &&
 		    req->surf[l].base.colorspace == DCP_COLORSPACE_NATIVE)
 			req->surf[l].base.colorspace = DCP_COLORSPACE_BG_SRGB;

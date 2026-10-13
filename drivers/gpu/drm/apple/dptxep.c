@@ -15,6 +15,7 @@
 #include "afk.h"
 #include "dcp.h"
 #include "dptxep.h"
+#include "dcp-180hz.h"
 #include "dptx-service.h"
 #include "parser.h"
 #include "trace.h"
@@ -218,6 +219,7 @@ int dptxport_release_display(struct apple_epic_service *service)
 	struct dptx_port *dptx = service->cookie;
 	int ret;
 
+	dcp_180hz_invalidate(service->ep->dcp);
 	dptx->release_calls++;
 	dev_dbg(service->ep->dcp->dev,
 		 "DPTX release_display: call #%u this boot caller=%pS\n",
@@ -500,6 +502,7 @@ dptxport_call_will_change_link_config(struct apple_epic_service *service)
 {
 	struct dptx_port *dptx = service->cookie;
 
+	dcp_180hz_invalidate(service->ep->dcp);
 	dptx->phy_ops.dp.set_lanes = 0;
 	dptx->phy_ops.dp.set_rate = 0;
 	dptx->phy_ops.dp.set_voltages = 0;
@@ -688,6 +691,7 @@ dptxport_call_deactivate(struct apple_epic_service *service,
 	struct dptx_port *dptx = service->cookie;
 	struct apple_dcp *dcp = service->ep->dcp;
 
+	dcp_180hz_invalidate(dcp);
 	dev_info(dcp->dev, "DPTXPort: DEACTIVATE\n");
 	if (dcp->dptx_tunnel)
 		dcp_tunnel_dpin_activate(dcp, false);
@@ -701,6 +705,40 @@ dptxport_call_deactivate(struct apple_epic_service *service,
 	return 0;
 }
 
+static int dptxport_call_qualified_config(struct apple_epic_service *service, bool lanes,
+					const void *data, size_t size, void *reply, size_t room)
+{
+	struct dcp_180hz_token token = dcp_180hz_config_begin(service, lanes);
+	struct dptx_port *port = service->cookie;
+	bool success = false;
+	u32 value = 0;
+	int ret;
+
+	if (lanes) {
+		ret = dptxport_call_set_active_lane_count(service, data, size, reply, room);
+		if (!ret && size >= sizeof(struct dptxport_apcall_set_active_lane_count) &&
+		    room >= sizeof(struct dptxport_apcall_set_active_lane_count)) {
+			const struct dptxport_apcall_set_active_lane_count *request = data;
+			const struct dptxport_apcall_set_active_lane_count *response = reply;
+
+			value = le64_to_cpu(request->lane_count);
+			success = !le32_to_cpu(response->retcode) && value == 2 && port->lane_count == 2;
+		}
+	} else {
+		ret = dptxport_call_set_link_rate(service, data, size, reply, room);
+		if (!ret && size >= sizeof(struct dptxport_apcall_link_rate) &&
+		    room >= sizeof(struct dptxport_apcall_link_rate)) {
+			const struct dptxport_apcall_link_rate *request = data;
+			const struct dptxport_apcall_link_rate *response = reply;
+
+			value = le32_to_cpu(request->link_rate);
+			success = !le32_to_cpu(response->retcode) && value == LINK_RATE_HBR3 && port->link_rate == value;
+		}
+	}
+	dcp_180hz_config_complete(service, lanes, token, value, success);
+	return ret;
+}
+
 static int dptxport_call(struct apple_epic_service *service, u32 idx,
 			 const void *data, size_t data_size, void *reply,
 			 size_t reply_size)
@@ -710,7 +748,7 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 	dev_dbg(service->ep->dcp->dev, "DPTXPort: APCALL %u (%zu bytes)\n",
 		 idx, data_size);
 	if (data_size && service->ep->dcp->hw.iomfb_method_profile !=
-	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		print_hex_dump_debug("DPTXPort: apcall data: ",
 				     DUMP_PREFIX_OFFSET, 16, 1, data,
 				     min(data_size, (size_t)64), true);
@@ -738,8 +776,7 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 	case DPTX_APCALL_GET_LINK_RATE:
 		return dptxport_call_get_link_rate(service, reply, reply_size);
 	case DPTX_APCALL_SET_LINK_RATE:
-		return dptxport_call_set_link_rate(service, data, data_size,
-						   reply, reply_size);
+		return dptxport_call_qualified_config(service, false, data, data_size, reply, reply_size);
 	case DPTX_APCALL_GET_MAX_LANE_COUNT:
 		return dptxport_call_get_max_lane_count(service, reply, reply_size);
 	case DPTX_APCALL_GET_ACTIVE_LANE_COUNT: {
@@ -752,8 +789,7 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 		return 0;
 	}
         case DPTX_APCALL_SET_ACTIVE_LANE_COUNT:
-		return dptxport_call_set_active_lane_count(service, data, data_size,
-							   reply, reply_size);
+		return dptxport_call_qualified_config(service, true, data, data_size, reply, reply_size);
 	case DPTX_APCALL_GET_SUPPORTS_HPD:
 		return dptxport_call_get_supports_hpd(service, reply,
 						      reply_size);
@@ -766,6 +802,7 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 	case DPTX_APCALL_DEVICE_NOT_RESPONDING:
 	case DPTX_APCALL_DEVICE_BUSY_TIMEOUT:
 	case DPTX_APCALL_DEVICE_NOT_STARTED:
+		dcp_180hz_invalidate(service->ep->dcp);
 		dev_warn(service->ep->dcp->dev,
 			 "DPTXPort: firmware reports link fault %u on target %u:%u\n",
 			 idx, service->ep->dcp->dptx_die,
@@ -809,7 +846,7 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 		return 0;
 	default:
 		if (service->ep->dcp->hw.iomfb_method_profile ==
-		    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
+		    DCP_IOMFB_METHODS_H17P_EXTERNAL)
 			return -EOPNOTSUPP;
 		/* just try to ACK and hope for the best... */
 		dev_info(service->ep->dcp->dev, "DPTXPort: acking unhandled call %u\n",
@@ -846,7 +883,7 @@ static void dptxport_init(struct apple_epic_service *service, const char *name,
 	complete(&port->enable_completion);
 	/* Publication may follow the startup wait or the bounded retry window. */
 	if (service->ep->dcp->hw.iomfb_method_profile ==
-	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL &&
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL &&
 	    READ_ONCE(service->ep->dcp->typec_cable_connected) &&
 	    !READ_ONCE(service->ep->dcp->quiescing) &&
 	    !READ_ONCE(service->ep->dcp->external_error))
@@ -938,11 +975,17 @@ static int dptxport_group_call(struct apple_epic_service *service, u16 group,
 	return 0;
 }
 
+static void dptxport_qualified_teardown(struct apple_epic_service *service)
+{
+	dcp_180hz_invalidate(service->ep->dcp);
+	dptx_service_unbind(service);
+}
+
 static const struct apple_epic_service_ops dptxep_ops[] = {
 	{
 		.name = "AppleDCPDPTXRemotePort",
 		.prepare = dptxport_prepare,
-		.teardown = dptx_service_unbind,
+		.teardown = dptxport_qualified_teardown,
 		.init = dptxport_init,
 		.call = dptxport_call,
 		.call_v2 = dptxport_group_call,
@@ -975,7 +1018,7 @@ int dptx_controller_init(struct apple_dcp *dcp)
 		return PTR_ERR(ep);
 	/* Controller interfaces require the same OPEN handshake as the port. */
 	ep->wire_v2 = dcp->hw.iomfb_method_profile ==
-		DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL;
+		DCP_IOMFB_METHODS_H17P_EXTERNAL;
 	dcp->dptx_controller_ep = ep;
 
 	ret = afk_start(ep);
@@ -992,7 +1035,7 @@ int dptxep_init(struct apple_dcp *dcp)
 {
 	struct apple_dcp_afkep *ep;
 	bool wire_v2 = dcp->hw.iomfb_method_profile ==
-		DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL;
+		DCP_IOMFB_METHODS_H17P_EXTERNAL;
 	int ret;
 	u32 port;
 	unsigned long timeout = msecs_to_jiffies(1000);
@@ -1025,5 +1068,5 @@ int dptxep_init(struct apple_dcp *dcp)
 		timeout = ret;
 	}
 
-	return 0;
+	return dcp_180hz_init(dcp);
 }

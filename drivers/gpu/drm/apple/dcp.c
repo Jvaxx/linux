@@ -88,7 +88,7 @@ static int dcp_pin_live_session(struct apple_dcp *dcp)
 
 	if ((!dcp->hw.adopt_live_session &&
 	     dcp->hw.iomfb_method_profile !=
-	     DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL) ||
+	     DCP_IOMFB_METHODS_H17P_EXTERNAL) ||
 	    dcp->fw_compat != DCP_FIRMWARE_H17P ||
 	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G || dcp->retain_dma)
 		return 0;
@@ -139,24 +139,22 @@ static void dcp_release_rtkit(void *data)
 
 #define DCP_BOOT_TIMEOUT msecs_to_jiffies(1000)
 
-static bool experimental_h17p_external = true;
-module_param(experimental_h17p_external, bool, 0444);
-MODULE_PARM_DESC(experimental_h17p_external,
-		 "Enable T8140 external display protocol (default: enabled)");
-
-static int experimental_h17p_external_bw_scratch = -1;
-module_param(experimental_h17p_external_bw_scratch, int, 0444);
-MODULE_PARM_DESC(experimental_h17p_external_bw_scratch,
-		 "Override external bandwidth scratch offset (-1 uses the hardware profile)");
-
-static int experimental_h17p_external_bw_request = -1;
-module_param(experimental_h17p_external_bw_request, int, 0444);
-MODULE_PARM_DESC(experimental_h17p_external_bw_request,
-		 "Override external bandwidth request offset (-1 uses the hardware profile)");
-
-bool dcp_h17p_external_enabled(void)
+bool dcp_h17p_external_supported(struct device_node *np)
 {
-	return experimental_h17p_external;
+	u32 firmware[DCP_EXTERNAL_FW_CELLS], compat[DCP_EXTERNAL_FW_CELLS];
+	int firmware_cells, compat_cells;
+
+	if (!of_machine_is_compatible("apple,j700") ||
+	    !of_device_is_compatible(np, "apple,t8140-dcpext"))
+		return false;
+	firmware_cells = of_property_read_variable_u32_array(
+		np, "apple,firmware-version", firmware,
+		DCP_EXTERNAL_FW_CELLS, DCP_EXTERNAL_FW_CELLS);
+	compat_cells = of_property_read_variable_u32_array(
+		np, "apple,firmware-compat", compat,
+		DCP_EXTERNAL_FW_CELLS, DCP_EXTERNAL_FW_CELLS);
+	return apple_dcp_external_firmware_supported(firmware, firmware_cells,
+						    compat, compat_cells);
 }
 
 bool dcp_h17p_external_ready(struct device_node *np)
@@ -165,7 +163,7 @@ bool dcp_h17p_external_ready(struct device_node *np)
 	struct apple_dcp *dcp;
 	bool ready = false;
 
-	if (!dcp_h17p_external_enabled())
+	if (!dcp_h17p_external_supported(np))
 		return false;
 	pdev = of_find_device_by_node(np);
 	if (!pdev)
@@ -303,7 +301,7 @@ static bool dcp_typec_route_fits(struct apple_dcp_typec_route *route,
 
 static bool dcp_is_external_h17p(struct apple_dcp *dcp)
 {
-	return dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL;
+	return dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL;
 }
 
 static int dcp_external_stop_locked(struct apple_dcp *dcp, u64 generation);
@@ -1827,7 +1825,7 @@ void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now)
 
 static bool dcp_firmware_metadata_enabled(struct apple_dcp *dcp)
 {
-	return dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL;
+	return dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL;
 }
 
 void dcp_firmware_metadata_connection(struct apple_dcp *dcp, u64 generation, bool connected)
@@ -1838,6 +1836,10 @@ void dcp_firmware_metadata_connection(struct apple_dcp *dcp, u64 generation, boo
 		return;
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
 	if (generation != dcp->metadata.epoch.generation || !connected) {
+		dcp->rate_proof.connection_sequence++;
+		dcp->rate_proof.sequence++;
+		dcp->rate_proof.rate.valid = false;
+		dcp->rate_proof.lanes.valid = false;
 		dcp->metadata.attributes_valid = false;
 		dcp->metadata.timing_valid = false;
 		dcp->metadata.hpd_seen = false;
@@ -1848,6 +1850,7 @@ void dcp_firmware_metadata_connection(struct apple_dcp *dcp, u64 generation, boo
 
 void dcp_firmware_metadata_hotplug(struct apple_dcp *dcp, bool connected)
 {
+	struct apple_connector *con = READ_ONCE(dcp->connector);
 	unsigned long flags;
 
 	if (!dcp_firmware_metadata_enabled(dcp))
@@ -1855,13 +1858,29 @@ void dcp_firmware_metadata_hotplug(struct apple_dcp *dcp, bool connected)
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
 	if (connected) {
 		dcp->metadata.hpd_seen = true;
+		/*
+		 * Fresh proof may precede HPD assertion after a same-cable loss.
+		 * Keep invalidated firmware metadata and old receipt tickets revoked.
+		 */
+		if (READ_ONCE(dcp->typec_cable_connected) &&
+		    dcp->metadata.epoch.generation == READ_ONCE(dcp->typec_generation))
+			dcp->metadata.epoch.connected = true;
 	} else if (dcp->metadata.hpd_seen) {
+		dcp->metadata.hpd_seen = false;
+		dcp->rate_proof.connection_sequence++;
+		dcp->rate_proof.sequence++;
+		dcp->rate_proof.rate.valid = false;
+		dcp->rate_proof.lanes.valid = false;
+		if (con && READ_ONCE(con->dcp) == to_platform_device(dcp->dev))
+			WRITE_ONCE(con->edid_invalidation_pending, true);
 		dcp_metadata_epoch_connection(&dcp->metadata.epoch,
 					      dcp->metadata.epoch.generation, false);
 		dcp->metadata.attributes_valid = false;
 		dcp->metadata.timing_valid = false;
 	}
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+	if (connected)
+		dcp_180hz_notify(dcp);
 }
 
 void dcp_firmware_metadata_begin(struct apple_dcp *dcp)
@@ -2312,6 +2331,12 @@ int dcp_crtc_atomic_check(struct drm_crtc *crtc, struct drm_atomic_commit *commi
 
 	crtc_state = drm_atomic_get_new_crtc_state(commit, crtc);
 
+	/* External H17P does not program adaptive sync. */
+	if (dcp->hw.iomfb_method_profile ==
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL &&
+	    crtc_state->vrr_enabled)
+		return -EINVAL;
+
 	needs_modeset = drm_atomic_crtc_needs_modeset(crtc_state) ||
 			!READ_ONCE(dcp->mode_state.valid);
 	if (!needs_modeset && (!dcp->connector || !dcp->connector->connected)) {
@@ -2469,6 +2494,8 @@ static void dcp_external_report_disconnected(struct apple_dcp *dcp)
 	unsigned int action;
 
 	guard(mutex)(&dcp->iomfb.lock);
+	/* A paused callback from the old sink must not be replayed on wake. */
+	dcp->external_hotplug_pending = false;
 	action = dcp_mode_hotplug(&dcp->mode_state, false,
 				  dcp->connector ? &dcp->connector->connected : NULL);
 	if (dcp->connector) {
@@ -2598,6 +2625,7 @@ static int dcp_external_disconnect(struct apple_dcp *dcp, bool physical)
 	guard(mutex)(&dcp->external_lock);
 	/* Invalidate physical EDID before waiting for firmware power/link teardown. */
 	if (physical) {
+		WRITE_ONCE(dcp->external_physically_absent, true);
 		scoped_guard(mutex, &dcp->hpd_mutex) {
 			WRITE_ONCE(dcp->typec_cable_connected, false);
 			dcp->typec_generation++;
@@ -2642,7 +2670,7 @@ bool dcp_external_hotplug(struct apple_dcp *dcp, bool connected)
 		return false;
 	/* No lifecycle or HPD mutex may be acquired from the RX callback. */
 	lockdep_assert_held(&dcp->iomfb.lock);
-	if (READ_ONCE(dcp->quiescing))
+	if (READ_ONCE(dcp->quiescing) || READ_ONCE(dcp->external_physically_absent))
 		return true;
 	if (dcp->iomfb.presentation_paused) {
 		dcp->external_hotplug_pending = true;
@@ -2664,6 +2692,8 @@ bool dcp_external_hotplug(struct apple_dcp *dcp, bool connected)
 		return true;
 	}
 	if (!connected && !READ_ONCE(dcp->iomfb.presentation_paused)) {
+		/* Fence admission in RX before a busy actor can delay teardown. */
+		dcp_firmware_metadata_hotplug(dcp, false);
 		dcp->external_stop_generation = dcp->external_rx_generation;
 		schedule_work(&dcp->external_stop_work);
 		return true;
@@ -2820,6 +2850,7 @@ int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 		if (new_cable)
 			dcp->external_generation++;
 		dcp->external_cable = true;
+		WRITE_ONCE(dcp->external_physically_absent, false);
 		dcp_external_publish_generation(dcp);
 		scoped_guard(mutex, &dcp->hpd_mutex) {
 			WRITE_ONCE(dcp->typec_cable_connected, true);
@@ -2984,7 +3015,7 @@ int dcp_start(struct platform_device *pdev)
 	}
 
 	/* Make the H17P allocator available before external service discovery. */
-	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL) {
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL) {
 		ret = apple_rtkit_start_ep(dcp->rtk, REMOTE_ALLOC_ENDPOINT);
 		if (ret)
 			return dev_err_probe(dcp->dev, ret, "Failed to start remote allocator\n");
@@ -3009,7 +3040,7 @@ int dcp_start(struct platform_device *pdev)
 				 ret);
 
 		if (dcp->hw.iomfb_method_profile ==
-		    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL) {
+		    DCP_IOMFB_METHODS_H17P_EXTERNAL) {
 			ret = dptx_controller_init(dcp);
 			if (ret)
 				return dev_err_probe(dcp->dev, ret,
@@ -3672,7 +3703,7 @@ static int dcp_get_disp_regs(struct apple_dcp *dcp)
 	if (dcp->hw.firmware_clock) {
 		unsigned int windows = dcp->hw.firmware_display_windows;
 		bool external = dcp->hw.iomfb_method_profile ==
-			DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL;
+			DCP_IOMFB_METHODS_H17P_EXTERNAL;
 
 		if (!windows || windows >= MAX_DISP_REGISTERS)
 			return -EINVAL;
@@ -3906,7 +3937,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	}
 
 	if (dcp->hw.iomfb_method_profile ==
-	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL &&
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL &&
 	    !dcp_external_is_idle(dcp))
 		return dev_err_probe(dev, -EBUSY,
 				     "External DCP is not in the inherited idle state\n");
@@ -3985,7 +4016,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	}
 
 	if (dcp->hw.iomfb_method_profile ==
-	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL &&
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL &&
 	    (!dcp->clk_194 || !clk_get_rate(dcp->clk) ||
 	     !clk_get_rate(dcp->clk_194))) {
 		ret = dev_err_probe(dev, -EINVAL,
@@ -4001,7 +4032,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	INIT_DELAYED_WORK(&dcp->swap_watchdog_wq, dcp_swap_watchdog);
 
 	if (dcp->hw.iomfb_method_profile ==
-	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL) {
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL) {
 		/* Pin before the first write or mailbox wake can expose DMA. */
 		ret = dcp_pin_live_session(dcp);
 		if (ret)
@@ -4026,7 +4057,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 		goto err_piodma;
 	/* External H17P supplies shared-buffer addresses during RTKit startup. */
 	if (dcp->hw.iomfb_method_profile ==
-	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		dcp->rtk = apple_rtkit_init(dev, dcp, "mbox", 0,
 					    &external_h17p_rtkit_ops);
 	else
@@ -4045,7 +4076,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 
 	/* Announce host readiness before awaiting external IOP readiness. */
 	if (dcp->hw.iomfb_method_profile ==
-	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		ret = apple_rtkit_wake_early_ap(dcp->rtk);
 	else
 		ret = apple_rtkit_wake(dcp->rtk);
@@ -4181,10 +4212,10 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	if (dcp_session_retained(dev))
 		return dev_err_probe(dev, -EBUSY, "Previous live DCP session requires a reboot\n");
 
-	/* Not part of the display subsystem yet; see apple_dcp_usable(). */
+	/* Reject unsupported external firmware before replacing the boot display. */
 	if (of_device_is_compatible(dev->of_node, "apple,t8140-dcpext") &&
-	    !dcp_h17p_external_enabled()) {
-		dev_info(dev, "external display coprocessor not supported yet\n");
+	    !dcp_h17p_external_supported(dev->of_node)) {
+		dev_err(dev, "Unsupported external display hardware or firmware handoff\n");
 		return -ENODEV;
 	}
 
@@ -4230,17 +4261,13 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	mutex_init(&dcp->dcpavserv.lock);
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
 	if (dcp->hw.iomfb_method_profile ==
-	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL) {
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL) {
 		if (!dcp->hw.firmware_clock ||
-		    !apple_dcp_external_bw_resolve(resource_size(dcp->hw.firmware_clock),
+		    !apple_dcp_external_bw_valid(resource_size(dcp->hw.firmware_clock),
 					 dcp->hw.firmware_scratch,
-					 dcp->hw.firmware_request,
-					 experimental_h17p_external_bw_scratch,
-					 experimental_h17p_external_bw_request,
-					 &dcp->hw.firmware_scratch,
-					 &dcp->hw.firmware_request))
+					 dcp->hw.firmware_request))
 			return dev_err_probe(dev, -EINVAL,
-					     "External bandwidth offsets are invalid\n");
+					     "Invalid external profile bandwidth resources\n");
 		iomfb_pause_presentation(dcp, true);
 	}
 
@@ -4404,7 +4431,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		return ret;
 
 	if (dcp->hw.iomfb_method_profile ==
-	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL) {
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL) {
 		/* Complete optional startup before the DRM master can depend on it. */
 		ret = dcp_comp_bind(dev, NULL, NULL);
 		if (ret) {
@@ -4431,7 +4458,7 @@ static void dcp_platform_shutdown(struct platform_device *pdev)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
 	if (dcp && dcp->retain_dma && dcp->hw.iomfb_method_profile ==
-	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL) {
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL) {
 		dcp_comp_unbind(&pdev->dev, NULL, NULL);
 		return;
 	}
@@ -4591,7 +4618,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8140 = {
 /* Separate from the established internal-panel H17P profile. */
 static const struct apple_dcp_hw_data apple_dcp_hw_t8140_external = {
 	.num_dptx_ports = 1,
-	.iomfb_method_profile = DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL,
+	.iomfb_method_profile = DCP_IOMFB_METHODS_H17P_EXTERNAL,
 	.adopt_live_session = false,
 	.firmware_compat = DCP_FIRMWARE_H17P,
 	.firmware_clock = &t8140_firmware_clock,

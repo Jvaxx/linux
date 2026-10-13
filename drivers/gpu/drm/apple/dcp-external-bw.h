@@ -5,6 +5,19 @@
 
 #include <linux/types.h>
 
+#define DCP_EXTERNAL_FW_CELLS 3
+
+/* The external H17P wire contract is supported only for this firmware release. */
+static inline bool
+apple_dcp_external_firmware_supported(const u32 *firmware, int firmware_cells,
+				      const u32 *compat, int compat_cells)
+{
+	return firmware && compat && firmware_cells == DCP_EXTERNAL_FW_CELLS &&
+		compat_cells == DCP_EXTERNAL_FW_CELLS &&
+		firmware[0] == 26 && firmware[1] == 6 && firmware[2] == 2 &&
+		compat[0] == 26 && compat[1] == 6 && compat[2] == 2;
+}
+
 static inline bool apple_dcp_external_bw_valid(u64 size, int scratch, int request)
 {
 	if (size < sizeof(u32) || scratch < 0 || request < 0)
@@ -21,19 +34,5 @@ static inline bool apple_dcp_external_clock_window(u64 start, u64 size,
 	return start == expected_start && size == expected_size;
 }
 
-/* Resolve optional diagnostic overrides without changing the SoC defaults. */
-static inline bool apple_dcp_external_bw_resolve(u64 size, int default_scratch,
-						int default_request, int override_scratch,
-						int override_request, u32 *scratch, u32 *request)
-{
-	int s = override_scratch == -1 ? default_scratch : override_scratch;
-	int r = override_request == -1 ? default_request : override_request;
-
-	if (!apple_dcp_external_bw_valid(size, s, r))
-		return false;
-	*scratch = s;
-	*request = r;
-	return true;
-}
 
 #endif

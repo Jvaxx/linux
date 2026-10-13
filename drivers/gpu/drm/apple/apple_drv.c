@@ -643,12 +643,12 @@ static const struct of_device_id apple_dcp_id_tbl[] = {
 	{},
 };
 
-/* An explicitly enabled external provider participates in component matching. */
+/* A supported firmware-described external provider participates in component matching. */
 static bool apple_dcp_usable(struct device_node *np)
 {
 	return of_device_is_available(np) &&
 	       (!of_device_is_compatible(np, "apple,t8140-dcpext") ||
-		dcp_h17p_external_enabled());
+		dcp_h17p_external_supported(np));
 }
 
 static int apple_drm_init_dcp(struct device *dev)

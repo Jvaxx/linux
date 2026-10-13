@@ -361,7 +361,7 @@ bool dcpavserv_edid_current(struct apple_dcp *dcp, u64 generation)
 {
 	lockdep_assert_held(&dcp->hpd_mutex);
 	return dcp->hw.iomfb_method_profile !=
-		DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL ||
+		DCP_IOMFB_METHODS_H17P_EXTERNAL ||
 		(dcp->typec_cable_connected && generation == dcp->typec_generation &&
 		 !READ_ONCE(dcp->quiescing));
 }
@@ -439,13 +439,13 @@ int dpavservep_init(struct apple_dcp *dcp)
 	init_completion(&dcp->dcpavserv.enable_completion);
 
 	ep = afk_init(dcp, dcp->hw.iomfb_method_profile ==
-		      DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL ?
+		      DCP_IOMFB_METHODS_H17P_EXTERNAL ?
 		      DPAVSERV_ENDPOINT_V2 : DPAVSERV_ENDPOINT, dpavservep_ops);
 	if (IS_ERR(ep))
 		return PTR_ERR(ep);
 	/* External H17P uses AFKV2 service calls with host-owned OOB buffers. */
 	ep->wire_v2 = dcp->hw.iomfb_method_profile ==
-		DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL;
+		DCP_IOMFB_METHODS_H17P_EXTERNAL;
 	ep->inline_v2 = false;
 	dcp->dcpavservep = ep;
 
