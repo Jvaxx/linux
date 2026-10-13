@@ -12,6 +12,7 @@
 
 #define T6030_DCP_IMAGE	"DDF38191-93B3-324A-BC8F-643006F5AC82"
 #define J613_DCP_IMAGE	"90F849E1-B422-367E-B389-50246F8DEC47"
+#define J516C_DCP_IMAGE	"F493F03E-CC40-3D89-9A08-5F259BA2B246"
 
 struct board_ctx {
 	const char *dcp;
@@ -62,7 +63,7 @@ static void v14_board_j516c(struct kunit *test)
 	KUNIT_EXPECT_STREQ(test, b->debugfs, "dcp-j516c");
 	KUNIT_EXPECT_STREQ(test, b->machine, "apple,j516c");
 	KUNIT_EXPECT_STREQ(test, b->handoff, "apple,t6031-handoff");
-	KUNIT_EXPECT_STREQ(test, b->firmware_uuid, T6030_DCP_IMAGE);
+	KUNIT_EXPECT_STREQ(test, b->firmware_uuid, J516C_DCP_IMAGE);
 	KUNIT_EXPECT_EQ(test, b->panel_width, 3456);
 	KUNIT_EXPECT_EQ(test, b->panel_height, 2234);
 	KUNIT_EXPECT_TRUE(test, b->promotion);
@@ -86,7 +87,7 @@ static void v14_board_t6031_other_boards(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, known);
 }
 
-/* The DCP image the record admits: the validated one, exactly. */
+/* The DCP image the record admits: this Mac's own, exactly. */
 static void v14_board_j516c_image(struct kunit *test)
 {
 	const struct dcp_v14_board *b;
@@ -94,15 +95,17 @@ static void v14_board_j516c_image(struct kunit *test)
 
 	b = board_for("apple,t6031-dcp", j516c, &known);
 	KUNIT_ASSERT_NOT_NULL(test, b);
-	KUNIT_EXPECT_TRUE(test, dcp_v14_board_admits(b, T6030_DCP_IMAGE));
+	KUNIT_EXPECT_TRUE(test, dcp_v14_board_admits(b, J516C_DCP_IMAGE));
 	KUNIT_EXPECT_FALSE(test, dcp_v14_board_admits(b, NULL));
 	KUNIT_EXPECT_FALSE(test, dcp_v14_board_admits(b, ""));
+	/* The other 14.7 DCP images are not this Mac's. */
+	KUNIT_EXPECT_FALSE(test, dcp_v14_board_admits(b, T6030_DCP_IMAGE));
 	KUNIT_EXPECT_FALSE(test, dcp_v14_board_admits(b, J613_DCP_IMAGE));
-	/* The T6030 PMP image is not a DCP image. */
-	KUNIT_EXPECT_FALSE(test, dcp_v14_board_admits(b, "2F4EB4C4-001B-3ACF-A9A0-68D8E42FC3A7"));
-	KUNIT_EXPECT_FALSE(test, dcp_v14_board_admits(b, "ddf38191-93b3-324a-bc8f-643006f5ac82"));
-	KUNIT_EXPECT_FALSE(test, dcp_v14_board_admits(b, T6030_DCP_IMAGE " "));
-	KUNIT_EXPECT_FALSE(test, dcp_v14_board_admits(b, "DDF38191-93B3-324A-BC8F-643006F5AC8"));
+	/* This Mac's PMP image is not a DCP image. */
+	KUNIT_EXPECT_FALSE(test, dcp_v14_board_admits(b, "07FF4C5B-CB2E-3DE6-95FF-3B107D19B7AB"));
+	KUNIT_EXPECT_FALSE(test, dcp_v14_board_admits(b, "f493f03e-cc40-3d89-9a08-5f259ba2b246"));
+	KUNIT_EXPECT_FALSE(test, dcp_v14_board_admits(b, J516C_DCP_IMAGE " "));
+	KUNIT_EXPECT_FALSE(test, dcp_v14_board_admits(b, "F493F03E-CC40-3D89-9A08-5F259BA2B24"));
 	KUNIT_EXPECT_FALSE(test, dcp_v14_board_admits(b, "00000000-0000-0000-0000-000000000000"));
 }
 

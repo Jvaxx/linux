@@ -98,16 +98,17 @@ with tempfile.TemporaryDirectory(prefix='dcp14-panels-') as directory:
      notch=64;height=1800;stride++;assert(dcp_v14_geometry(&v)==-EINVAL);stride--;
      width=2560;stride=width*4;assert(dcp_v14_geometry(&v)==-EINVAL);
      width=2880;stride=width*4;notch=101;assert(dcp_v14_geometry(&v)==-EINVAL);
-     /* J516C (T6031): only the T6030 DCP image, the J516S panel. */
+     /* J516C (T6031): its own DCP image, the J516S panel. */
      dcp.compatible="apple,t6031-dcp";machine="apple,j516c";
      const struct dcp_v14_board*c=iomfb_v14_7_board(&dev);
      assert(!IS_ERR(c)&&c&&!strcmp(c->name,"J516C")&&c->panel_width==3456&&c->panel_height==2234&&c->promotion);
      assert(!strcmp(c->handoff,"apple,t6031-handoff")&&!c->ctm_set&&!c->ctm_get);
-     image_uuid="DDF38191-93B3-324A-BC8F-643006F5AC82";assert(probe_gate(&dev,c)==0);
+     image_uuid="F493F03E-CC40-3D89-9A08-5F259BA2B246";assert(probe_gate(&dev,c)==0);
+     image_uuid="DDF38191-93B3-324A-BC8F-643006F5AC82";assert(probe_gate(&dev,c)==-ENODEV);
      image_uuid="90F849E1-B422-367E-B389-50246F8DEC47";assert(probe_gate(&dev,c)==-ENODEV);
-     image_uuid="DDF38191-93B3-324A-BC8F-643006F5AC8";assert(probe_gate(&dev,c)==-ENODEV);
+     image_uuid="F493F03E-CC40-3D89-9A08-5F259BA2B24";assert(probe_gate(&dev,c)==-ENODEV);
      image_uuid=NULL;assert(probe_gate(&dev,c)==-ENODEV);
-     image_uuid="DDF38191-93B3-324A-BC8F-643006F5AC82";marker_value=0;assert(probe_gate(&dev,c)==-ENODEV);marker_value=1;
+     image_uuid="F493F03E-CC40-3D89-9A08-5F259BA2B246";marker_value=0;assert(probe_gate(&dev,c)==-ENODEV);marker_value=1;
      struct apple_dcp_v14 m={.dev=&dev,.board=c};width=3456;height=2160;stride=width*4;notch=74;
      assert(dcp_v14_geometry(&m)==0&&m.panel_height==2234&&m.notch_rows==74);
      height=2234;assert(dcp_v14_geometry(&m)==0&&m.panel_height==2234);

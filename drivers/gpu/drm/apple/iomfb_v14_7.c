@@ -50,6 +50,7 @@
 /* The images whose method and callback layouts this file implements. */
 #define DCP_V14_FIRMWARE_UUID	"DDF38191-93B3-324A-BC8F-643006F5AC82"	/* T6030 */
 #define DCP_V14_J613_FIRMWARE_UUID "90F849E1-B422-367E-B389-50246F8DEC47" /* J613 */
+#define DCP_V14_J516C_FIRMWARE_UUID "F493F03E-CC40-3D89-9A08-5F259BA2B246" /* J516C */
 
 #define DCP_V14_CPU_CONTROL	0x44
 #define DCP_V14_CPU_STATUS	0x48
@@ -128,8 +129,10 @@ static const struct dcp_v14_board dcp_v14_board_j615 = {
 /*
  * J516C (MacBook Pro 16", M3 Max): the J516S panel, 3456x2234 with 74 notch
  * rows above the 3456x2160 boot framebuffer, at 60 or 120 Hz, on the T6031
- * DCP. Only the T6030 DCP image has validated IOMFB layouts, so a J516C DCP
- * running any other image is refused and the boot framebuffer stays. Every
+ * DCP, running this Mac's own 14.7 DCP image (the J516C ADT names it). The
+ * 14.7 IOMFB interface follows the firmware version and has run unchanged on
+ * the T6030 and T8122 images; this image's layouts are shown by its first
+ * boots. Any other image is refused and the boot framebuffer stays. Every
  * panel timing and the display clock the firmware is told are logged: the
  * first boots on this board are read from the kernel log. The clock is the
  * T6030 rate (clk_disp0), unconfirmed on T6031.
@@ -139,7 +142,7 @@ static const struct dcp_v14_board dcp_v14_board_j516c = {
 	.debugfs = "dcp-j516c",
 	.dcp_compatible = "apple,t6031-dcp",
 	.machine = "apple,j516c",
-	.firmware_uuid = DCP_V14_FIRMWARE_UUID,
+	.firmware_uuid = DCP_V14_J516C_FIRMWARE_UUID,
 	.handoff = "apple,t6031-handoff",
 	.panel_width = 3456,
 	.panel_height = 2234,
