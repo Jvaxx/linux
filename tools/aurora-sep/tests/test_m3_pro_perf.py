@@ -22,7 +22,7 @@ class ProProfile(unittest.TestCase):
         self.write('identity', IDENTITY + '\n')
         self.write('opt/mesa-m3/libexec/mesa-m3-abi-check', '#!/bin/sh\ncat /tmp/fixture/identity\n', True)
         for profile, marker, source in (
-            ('native-pro', 't6030-native-gl-legacy-hal', '99d5b9d16e779ad9a0879a71578da0a6536cf006'),
+            ('native-pro', 't6030-native-gl-legacy-hal', '7cdff9c6e87b0a95b92d94ddbc037369c6005cd7'),
             ('pro-vulkan', 't6030-pro-vulkan-legacy-hal', 'b0f56952b7f06955b143fbfa90c07de4c5864964')):
             self.write(f'opt/mesa-m3/{profile}/share/mesa-m3/profile', marker + '\n')
             self.write(f'opt/mesa-m3/{profile}/share/mesa-m3/capabilities', 'source=' + source + '\n')
@@ -90,6 +90,17 @@ class ProProfile(unittest.TestCase):
                          IDENTITY.replace('rev=0x11', 'rev=0x20')):
             with self.subTest(identity=identity):
                 self.write('identity', identity + '\n')
+                self.assertNotEqual(self.check().returncode, 0)
+                run = self.run_helper('/opt/mesa-m3/native-pro/libexec/mesa-m3-pro-performance')
+                self.assertEqual(run.returncode, 0)
+                self.assertEqual((self.root / 'sys/module/asahi/parameters/m3_mixed_batch').read_text(), '0')
+
+    def test_previous_native_source_is_not_activated(self):
+        for source in ('99d5b9d16e779ad9a0879a71578da0a6536cf006',
+                       'f287f282940ec0c8b0de50db2df1f98d423e84fa'):
+            with self.subTest(source=source):
+                self.write('opt/mesa-m3/native-pro/share/mesa-m3/capabilities',
+                           'source=' + source + '\n')
                 self.assertNotEqual(self.check().returncode, 0)
                 run = self.run_helper('/opt/mesa-m3/native-pro/libexec/mesa-m3-pro-performance')
                 self.assertEqual(run.returncode, 0)
