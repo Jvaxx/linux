@@ -22,7 +22,7 @@ class ProProfile(unittest.TestCase):
         self.write('identity', IDENTITY + '\n')
         self.write('opt/mesa-m3/libexec/mesa-m3-abi-check', '#!/bin/sh\ncat /tmp/fixture/identity\n', True)
         for profile, marker, source in (
-            ('native-pro', 't6030-native-gl-legacy-hal', '7cdff9c6e87b0a95b92d94ddbc037369c6005cd7'),
+            ('native-pro', 't6030-native-gl-legacy-hal', 'd0c0cdb0624ab4b438b694808ac1776551be4bca'),
             ('pro-vulkan', 't6030-pro-vulkan-legacy-hal', 'b0f56952b7f06955b143fbfa90c07de4c5864964')):
             self.write(f'opt/mesa-m3/{profile}/share/mesa-m3/profile', marker + '\n')
             self.write(f'opt/mesa-m3/{profile}/share/mesa-m3/capabilities', 'source=' + source + '\n')

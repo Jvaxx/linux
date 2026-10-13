@@ -286,7 +286,7 @@ def pro_data(manifest, directory):
         raise ValueError('Pro performance profile differs')
     if manifest['source_commits']['kernel'] != 'd49021440d8ca02bbc8ecc17c19ce76c048b6236':
         raise ValueError('Pro performance kernel differs')
-    expected = {'native': ('mesa-m3-native-pro', 'opt/mesa-m3/native-pro', '7cdff9c6e87b0a95b92d94ddbc037369c6005cd7', b't6030-native-gl-legacy-hal\n'),
+    expected = {'native': ('mesa-m3-native-pro', 'opt/mesa-m3/native-pro', 'd0c0cdb0624ab4b438b694808ac1776551be4bca', b't6030-native-gl-legacy-hal\n'),
                 'vulkan': ('mesa-m3-pro-vulkan', 'opt/mesa-m3/pro-vulkan', 'b0f56952b7f06955b143fbfa90c07de4c5864964', b't6030-pro-vulkan-legacy-hal\n')}
     if set(pro.get('packages', {})) != set(expected):
         raise ValueError('Pro package pair is incomplete')
