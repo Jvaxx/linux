@@ -341,6 +341,7 @@ impl SepData {
             cpx_encryption_mode,
         } = self.profile.key_store
         else {
+            self.sks_initialized.store(true, Relaxed);
             return true;
         };
 

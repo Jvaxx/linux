@@ -199,6 +199,9 @@ unsafe extern "C" fn tk_get_random(key: *mut u8, key_len: usize) -> c_int {
         if key_len == 0 {
             return 0;
         }
+        if let Err(e) = sep.wait_for_trusted_ready() {
+            return e.to_errno();
+        }
         // SAFETY: the framework guarantees `key` is writable for `key_len` bytes.
         let buf = unsafe { core::slice::from_raw_parts_mut(key, key_len) };
         match sep.sep_random(buf) {

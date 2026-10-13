@@ -246,6 +246,7 @@ impl SepData {
     }
 
     pub(crate) fn refkey_seal_trusted(&self, key: &[u8]) -> Result<KVec<u8>> {
+        self.wait_for_trusted_ready()?;
         self.ensure_machine_refkey()?;
         let guard = self.machine_refkey.lock();
         let mk = guard.as_ref().ok_or(ENODEV)?;
@@ -253,6 +254,7 @@ impl SepData {
     }
 
     pub(crate) fn refkey_unseal_trusted(&self, sealed: &[u8]) -> Result<KVec<u8>> {
+        self.wait_for_trusted_ready()?;
         self.ensure_machine_refkey()?;
         let blob = {
             let guard = self.machine_refkey.lock();
