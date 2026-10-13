@@ -86,6 +86,13 @@ void dcp_unlink(struct drm_device *drm);
 int dcp_tunnel_crossbar_up(struct apple_dcp *dcp, u32 unit);
 int dcp_tunnel_crossbar_down(struct apple_dcp *dcp, u32 unit);
 int dcp_direct_crossbar_link(struct apple_dcp *dcp, bool up);
+/*
+ * T6030 ATC PHY: keep the source owning the pixel clock across rate changes
+ * and stop (linux/soc/apple/dp-tunnel.h, 170-usb). Declared here until that
+ * header has it; called through symbol_get() only.
+ */
+int apple_atc_dp_tunnel_rate_source(struct phy *phy, unsigned int source,
+				    unsigned int dpin, u8 rate);
 int dcp_tunnel_set_rate(struct apple_dcp *dcp, struct phy *phy, u32 unit,
 			u32 link_rate);
 int dcp_tunnel_dpin_activate(struct apple_dcp *dcp, u32 unit, bool active);

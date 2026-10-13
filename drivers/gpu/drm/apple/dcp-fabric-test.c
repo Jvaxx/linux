@@ -1920,50 +1920,48 @@ static void fabric_t6030_init(struct fabric_fixture *f)
 static void fabric_t6030_clock_routes_test(struct kunit *test)
 {
 	struct fabric_fixture f;
-	struct dcp_fabric_route *route;
-	int error;
 
 	fabric_t6030_init(&f);
+	/* Reserve the hybrid processor for HDMI, even before HDMI arrives. */
 	KUNIT_ASSERT_EQ(test, fabric_tunnel(&f, 0, 0), 0);
-	KUNIT_EXPECT_PTR_EQ(test, f.port[0].owner[0], &f.route[0][0]);
+	KUNIT_EXPECT_PTR_EQ(test, f.port[0].owner[0], &f.route[0][1]);
+	KUNIT_EXPECT_FALSE(test, f.pipeline[0].owned);
+	f.pipeline[0].fixed_busy = true;
+	KUNIT_EXPECT_EQ(test, fabric_tunnel(&f, 0, 0), 0);
 	fabric_release(&f, 0, 0);
-	/* Unusable engines cannot override readiness of the supported engine. */
-	f.pipeline[1].terminal = true;
-	f.pipeline[1].services_ready = false;
+	/* HDMI first: the USB-C-only processor still drives the dock. */
 	KUNIT_ASSERT_EQ(test, fabric_tunnel(&f, 0, 0), 0);
-	KUNIT_EXPECT_PTR_EQ(test, f.port[0].owner[0], &f.route[0][0]);
+	KUNIT_EXPECT_PTR_EQ(test, f.port[0].owner[0], &f.route[0][1]);
 	fabric_release(&f, 0, 0);
-	f.pipeline[1].terminal = false;
-	f.pipeline[1].services_ready = true;
-	/* The Type-C-only engine wins direct DP, but cannot clock a tunnel. */
+	f.pipeline[0].fixed_busy = false;
+	/* A direct USB-C display can hold source 2; source 0 remains a fallback. */
 	KUNIT_ASSERT_EQ(test, fabric_direct(&f, 1), 0);
 	KUNIT_EXPECT_PTR_EQ(test, f.port[1].owner[0], &f.route[1][1]);
 	KUNIT_ASSERT_EQ(test, fabric_tunnel(&f, 0, 0), 0);
 	KUNIT_EXPECT_PTR_EQ(test, f.port[0].owner[0], &f.route[0][0]);
 	fabric_release(&f, 0, 0);
-	fabric_release(&f, 1, 0);
-	/* HDMI owns source 0: do not hand off the unclockable source 2. */
 	f.pipeline[0].fixed_busy = true;
 	KUNIT_EXPECT_EQ(test, fabric_tunnel(&f, 0, 0), -EBUSY);
 	KUNIT_EXPECT_PTR_EQ(test, f.port[0].owner[0], NULL);
-	KUNIT_EXPECT_FALSE(test, f.pipeline[1].owned);
+	fabric_release(&f, 1, 0);
 	f.pipeline[0].fixed_busy = false;
-	f.pipeline[0].services_ready = false;
-	KUNIT_EXPECT_EQ(test, fabric_tunnel(&f, 0, 0), -EAGAIN);
-	f.pipeline[0].services_ready = true;
+	/* A processor still starting does not displace the ready fallback. */
+	f.pipeline[1].services_ready = false;
 	KUNIT_ASSERT_EQ(test, fabric_tunnel(&f, 0, 0), 0);
 	KUNIT_EXPECT_PTR_EQ(test, f.port[0].owner[0], &f.route[0][0]);
 	fabric_release(&f, 0, 0);
+	f.pipeline[0].services_ready = false;
+	f.pipeline[1].services_ready = false;
+	KUNIT_EXPECT_EQ(test, fabric_tunnel(&f, 0, 0), -EAGAIN);
+	f.pipeline[1].services_ready = true;
+	KUNIT_ASSERT_EQ(test, fabric_tunnel(&f, 0, 0), 0);
+	KUNIT_EXPECT_PTR_EQ(test, f.port[0].owner[0], &f.route[0][1]);
+	fabric_release(&f, 0, 0);
+	/* A second stream on the same dock is still unsupported on T6030. */
 	KUNIT_EXPECT_EQ(test, fabric_tunnel(&f, 0, 1), -EOPNOTSUPP);
 	KUNIT_EXPECT_PTR_EQ(test, f.port[0].owner[1], NULL);
-	f.port[0].routes = &f.route[0][1];
-	KUNIT_EXPECT_EQ(test, fabric_tunnel(&f, 0, 0), -EOPNOTSUPP);
-	f.port[0].routes = NULL;
-	KUNIT_EXPECT_EQ(test, fabric_tunnel(&f, 0, 0), -EBUSY);
-	route = dcp_fabric_tunnel_candidate(&f.port[0], &f.policy, NULL,
-					    false, 2, true, &error);
-	KUNIT_EXPECT_PTR_EQ(test, route, NULL);
-	KUNIT_EXPECT_EQ(test, error, -EINVAL);
+	KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_clock_blocked(true, 1), (u8)3);
+	KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_clock_blocked(true, 4), (u8)3);
 	KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_clock_blocked(false, 0), (u8)0);
 	KUNIT_EXPECT_EQ(test, dcp_fabric_tunnel_clock_blocked(false, 2), (u8)0);
 }
@@ -1977,12 +1975,12 @@ static void fabric_t6030_plan_test(struct kunit *test)
 	KUNIT_EXPECT_PTR_EQ(test, f.plan[0].target[0], &f.route[0][0]);
 	f.pipeline[0].fixed_busy = true;
 	dcp_fabric_plan(f.pipeline, f.port, &f.port[0], 0);
-	KUNIT_EXPECT_PTR_EQ(test, f.plan[0].target[0], NULL);
-	/* The same available source remains usable by a direct USB-C display. */
+	KUNIT_EXPECT_PTR_EQ(test, f.plan[0].target[0], &f.route[0][1]);
 	f.port[1].wanted = true;
 	f.port[1].hpd = true;
 	dcp_fabric_plan(f.pipeline, f.port, &f.port[0], 0);
-	KUNIT_EXPECT_PTR_EQ(test, f.plan[1].target[0], &f.route[1][1]);
+	/* HDMI and the dock exhaust both external processors. */
+	KUNIT_EXPECT_PTR_EQ(test, f.plan[1].target[0], NULL);
 	dcp_fabric_plan(f.pipeline, f.port, &f.port[0], 1);
 	KUNIT_EXPECT_PTR_EQ(test, f.plan[0].target[1], NULL);
 }
@@ -1995,17 +1993,13 @@ static void fabric_t6030_follow_test(struct kunit *test)
 	f.route[0][0].tunnel = true;
 	f.route[0][0].dpin = 0;
 	KUNIT_EXPECT_EQ(test, dcp_fabric_follow(&f.route[0][0], &f.route[0][1],
+					      NULL, NULL, false, &f.policy), DCP_FABRIC_FOLLOW_MOVE);
+	f.route[0][0].dpin = 1;
+	KUNIT_EXPECT_EQ(test, dcp_fabric_follow(&f.route[0][0], &f.route[0][1],
 					      NULL, NULL, false, &f.policy), DCP_FABRIC_FOLLOW_REFUSE);
-	/* Direct streams do not acquire a tunnel clock restriction. */
 	f.route[0][0].tunnel = false;
 	KUNIT_EXPECT_EQ(test, dcp_fabric_follow(&f.route[0][0], &f.route[0][1],
 					      NULL, NULL, false, &f.policy), DCP_FABRIC_FOLLOW_MOVE);
-	/* A swap must also preserve the holder's clockable source. */
-	f.route[1][0].tunnel = true;
-	f.route[1][0].dpin = 0;
-	KUNIT_EXPECT_EQ(test, dcp_fabric_follow(&f.route[0][1], &f.route[0][0],
-					      &f.route[1][0], &f.route[1][1], true, &f.policy),
-			DCP_FABRIC_FOLLOW_REFUSE);
 }
 
 static struct kunit_case fabric_tests[] = {

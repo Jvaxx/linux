@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only OR MIT */
 #include <assert.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -77,15 +78,15 @@ int main(void)
             assert(source0.core.next == &source2.core);
             assert(!source2.core.next);
             assert(source0.core.tunnel_clock_blocked == (soc ? BIT(1) : 0));
-            assert(source2.core.tunnel_clock_blocked == (soc ? BIT(0) | BIT(1) : 0));
+            assert(source2.core.tunnel_clock_blocked == (soc ? BIT(1) : 0));
             assert(dcp_typec_tunnel_ctl(&source0, 0) == &chip.mux[1]);
             assert(dcp_typec_tunnel_ctl(&source0, 1) == (soc ? NULL : &chip.mux[2]));
-            assert(dcp_typec_tunnel_ctl(&source2, 0) == (soc ? NULL : &chip.mux[1]));
+            assert(dcp_typec_tunnel_ctl(&source2, 0) == &chip.mux[1]);
             assert(dcp_typec_tunnel_ctl(&source2, 1) == (soc ? NULL : &chip.mux[2]));
             assert(!dcp_typec_tunnel_ctl(&source0, 2));
             /* Late migration checks the real route, even with a stale snapshot. */
             source2.core.tunnel_clock_blocked = 0;
-            assert(dcp_typec_tunnel_ctl(&source2, 0) == (soc ? NULL : &chip.mux[1]));
+            assert(dcp_typec_tunnel_ctl(&source2, 0) == &chip.mux[1]);
         }
     }
     puts("PASS: DCP snapshot, named/legacy controls, invalid DP IN, stale snapshot");

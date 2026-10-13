@@ -2,6 +2,7 @@
 #ifndef __APPLE_DCP_FABRIC_CORE_H__
 #define __APPLE_DCP_FABRIC_CORE_H__
 
+#include <linux/errno.h>
 #include <linux/types.h>
 
 enum dcp_fabric_presence_state {
@@ -75,6 +76,15 @@ enum dcp_fabric_wiring {
 enum dcp_fabric_wiring dcp_fabric_wiring(bool dpin0, bool dpin1, bool legacy,
 					 unsigned int endpoints);
 bool dcp_fabric_t6020_flow(bool usb4, bool soc_support, bool connector_wired);
+/*
+ * T6030's even external sources feed DP IN0 through DPTX PCLK1. A local copy
+ * of apple_dp_tunnel_t6030_pclk() (linux/soc/apple/dp-tunnel.h, 170-usb),
+ * which the dp-tunnel.h this tree builds against does not have yet.
+ */
+static inline int dcp_fabric_t6030_pclk(unsigned int source, unsigned int dpin)
+{
+	return !dpin && (source == 0 || source == 2) ? 0 : -EOPNOTSUPP;
+}
 u8 dcp_fabric_tunnel_clock_blocked(bool t6030, unsigned int source);
 
 enum dcp_fabric_capacity_action {
