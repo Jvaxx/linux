@@ -28,6 +28,7 @@ typedef int64_t s64;
 typedef u64 dma_addr_t;
 #define U16_MAX UINT16_MAX
 #define EBUSY 16
+#define EOPNOTSUPP 95
 #define ENOENT 2
 #define MAX_PENDING_CMDS 16
 #define AFK_MAX_CHANNEL 16
@@ -43,9 +44,10 @@ static void bitmap_release_region(unsigned long *p,unsigned int bit,int order) {
 #define le32_to_cpu(x) (x)
 #define cpu_to_le32(x) (x)
 #define dev_warn(...) ((void)0)
-#define dev_err(...) ((void)0)
-#define dev_info(...) ((void)0)
+#define dev_err(...) do { diagnostic_errors++; } while (0)
+#define dev_info(...) do { diagnostic_information++; } while (0)
 
+static unsigned diagnostic_errors,diagnostic_information;
 #define DCP_FIRMWARE_H17P 17
 #define EPIC_TYPE_NOTIFY 0
 #define EPIC_CAT_REPORT 0
@@ -72,7 +74,7 @@ struct work_struct { bool pending; };
 static bool queue_work(void *wq,struct work_struct *w) { assert(wq);bool fresh=!w->pending;w->pending=true;return fresh; }
 struct apple_dcp;struct apple_dcp_afkep;struct apple_epic_service;
 void afk_service_retry(struct apple_dcp_afkep *ep);
-struct apple_epic_service_ops { char name[32];bool reusable;void (*init)(struct apple_epic_service *,const char *,const char *,s64);int (*prepare)(struct apple_epic_service *,const char *,const char *,s64);int (*revalidate)(struct apple_epic_service *,const char *,const char *,s64);void (*teardown)(struct apple_epic_service *); };
+struct apple_epic_service_ops { char name[32];bool reusable,optional;void (*init)(struct apple_epic_service *,const char *,const char *,s64);int (*prepare)(struct apple_epic_service *,const char *,const char *,s64);int (*revalidate)(struct apple_epic_service *,const char *,const char *,s64);void (*teardown)(struct apple_epic_service *); };
 struct epic_cmd_info { u16 tag;u8 type;size_t reply_length;void *rxbuf,*txbuf;dma_addr_t rxbuf_dma,txbuf_dma;size_t rxlen,txlen;u32 retcode;bool done,free_on_ack;int *completion; };
 struct apple_epic_service {
     struct apple_dcp_afkep *ep;const struct apple_epic_service_ops *ops;
@@ -136,7 +138,9 @@ static char *parse_string(struct dcp_parse_ctx *h)
 {
     struct item *i=&h->items[h->index];const char *p;
     if(h->key) { p=i->key;h->key=false; } else { p=i->value;h->index++;h->key=true; }
-    if(!p) return ERR_PTR(-EINVAL);char *copy=malloc(strlen(p)+1);assert(copy);strcpy(copy,p);return copy;
+    if(!p)
+        return ERR_PTR(-EINVAL);
+    char *copy=malloc(strlen(p)+1);assert(copy);strcpy(copy,p);return copy;
 }
 static int parse_int(struct dcp_parse_ctx *h,s64 *out)
 { assert(!h->key);*out=h->items[h->index++].integer;h->key=true;return 0; }
@@ -165,8 +169,8 @@ static void run_retries(void) { assert(!ep.lock);if(ep.service_work.pending) { e
 static const struct apple_epic_service_ops ops={.name="dcpav-service-epic",.reusable=true,.prepare=dcpavserv_prepare,.revalidate=dcpavserv_revalidate,.init=dcpavserv_init,.teardown=dcpavserv_teardown};
 static const struct apple_epic_service_ops announcement_ops[]={
     {.name="dcpav-service-epic",.reusable=true,.prepare=dcpavserv_prepare,.revalidate=dcpavserv_revalidate,.init=dcpavserv_init,.teardown=dcpavserv_teardown},
-    {.name="dcpdp-service-epic",.reusable=true,.prepare=dcpdpserv_prepare,.teardown=dcpdpserv_teardown},
-    {0}
+    {.name="dcpdp-service-epic",.reusable=true,.optional=true,.prepare=dcpdpserv_prepare,.teardown=dcpdpserv_teardown},
+    {.name=""}
 };
 static const char *name="dcpav-service-epic",*class="AppleDCPDP2HDMI";
 static const char *native_class="DCPDP13Service";
@@ -414,12 +418,42 @@ static void deferred_announcements(void)
     }
     puts("PASS: 64 actual CLOSED/reannounce/late-ACK cycles with deferred OPEN, unchanged attachment, duplicate announcement/reply, stale generation/epoch, cable/quiesce/owner/stop and OPEN-error controls");
 }
+static int injected_prepare_error;
+static int failed_prepare(struct apple_epic_service *s,const char *n,const char *c,s64 u)
+{ (void)s;(void)n;(void)c;(void)u;return injected_prepare_error; }
+static void optional_admission_controls(void)
+{
+    ep.ops=announcement_ops;ep.match_epic_name=true;ep.num_channels=0;d.fw_compat=DCP_FIRMWARE_H17P;
+    diagnostic_errors=diagnostic_information=0;
+    unsigned before=opens;
+    announce(3,"dcpdp-service-epic",class,3);
+    announce(5,"dcpdp-service-epic",native_class,5);
+    assert(!diagnostic_errors && diagnostic_information==2 && opens==before);
+    assert(!d.dcpavserv.enabled && !d.dcpavserv.service);
+    for(unsigned i=0;i<ep.num_channels;i++)
+        assert(!ep.services[i].enabled && !ep.services[i].users && !ep.services[i].pending_open);
+    struct apple_epic_service_ops faulty[]={announcement_ops[1],{.name=""}};
+    faulty[0].prepare=failed_prepare;ep.ops=faulty;
+    const int faults[]={-EIO,-ENODEV};
+    for(unsigned i=0;i<2;i++) {
+        injected_prepare_error=faults[i];diagnostic_errors=diagnostic_information=0;
+        announce(7,"dcpdp-service-epic",class,7);
+        assert(diagnostic_errors==1 && !diagnostic_information && opens==before);
+    }
+    faulty[0].optional=false;injected_prepare_error=-EOPNOTSUPP;
+    diagnostic_errors=diagnostic_information=0;
+    announce(9,"dcpdp-service-epic",class,9);
+    assert(diagnostic_errors==1 && !diagnostic_information && opens==before);
+    memset(ep.services,0,sizeof(ep.services));ep.num_channels=AFK_MAX_CHANNEL;ep.ops=announcement_ops;
+    puts("PASS optional absence remains closed; required unsupported and genuine optional failures remain errors");
+}
 int main(void)
 {
     d.hw.iomfb_method_profile=2;d.typec_cable_connected=true;d.typec_generation=1;d.nr_modes=1;d.connector=&con;d.dev=&d;
     con.dcp=&d;con.connected=true;con.base.registration_state=1;
     ep.dcp=&d;ep.wire_v2=true;ep.endpoint=0x2a;ep.num_channels=AFK_MAX_CHANNEL;d.dcpavservep=&ep;
     hpd_lock=&d.hpd_mutex;av_lock=&d.dcpavserv.lock;
+    optional_admission_controls();
     struct item h17p[]={{"compartment","dcpav-service-epic",0},{"name","AppleDCPDP2HDMI",0},{"interface-id",NULL,13}};
     struct dcp_parse_ctx parse_ctx={.items=h17p,.count=3};const char *parsed_name,*parsed_class;s64 parsed_unit=-1;
     assert(!parse_epic_service_init(&parse_ctx,&parsed_name,&parsed_class,&parsed_unit,true));
@@ -645,7 +679,7 @@ int main(void)
     assert(dcpavserv_prepare(&s,NULL,class,1)==-ENODEV);
     assert(dcpavserv_prepare(&s,name,NULL,1)==-ENODEV);
     av.endpoint=0x28; assert(dcpavserv_prepare(&s,name,class,1)==-ENODEV); av.endpoint=0x2a;
-    assert(dcpdpserv_prepare(&s,"dcpdp-service-epic",class,3)==-ENODEV);
+    assert(dcpdpserv_prepare(&s,"dcpdp-service-epic",class,3)==-EOPNOTSUPP);
     d.dcpavserv.enabled=true; assert(dcpavserv_prepare(&s,name,class,1)==-EBUSY);
     d.dcpavserv.service=&s; d.dcpavserv.epoch=1; d.typec_generation=1; d.typec_cable_connected=true;
     const struct drm_edid *e=dcpavserv_copy_edid(&d,1,&epoch);

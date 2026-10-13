@@ -24,6 +24,7 @@ import phy
 import pm
 import idle
 import rate
+import boot
 
 
 def parking_unit(root):
@@ -35,7 +36,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', type=Path, default=Path(__file__).resolve().parents[6])
     parser.add_argument('--output', type=Path, help='retain generated C, commands and results here')
-    parser.add_argument('--group', choices=('all', 'edid', 'rate', 'phy', 'lifecycle'), default='all')
+    parser.add_argument('--group', choices=('all', 'edid', 'rate', 'phy', 'lifecycle', 'boot'), default='all')
     args = parser.parse_args()
     root = args.source.resolve()
     output = args.output or Path(tempfile.mkdtemp(prefix='apple-dcp-selftest-'))
@@ -46,6 +47,7 @@ def main():
                                        'orientation-faults', 'backend-change', 'safe-first',
                                        'failed-flip-return', 'live-park'))
     tests = [
+        ('boot', 'oslog-events', boot.oslog, ((),), ()),
         ('edid', 'service-rebind', edid.rebind, ((),), ()),
         ('edid', 'provider-admission', edid.admission, ((),), ()),
         ('edid', 'ordered-rx', edid.rx_progress, ((),), ('-pthread',)),
@@ -54,6 +56,9 @@ def main():
         ('rate', 'metadata-decoder', lambda r: rate.metadata(r, output), ((),), ('-Wno-sign-compare',)),
         ('rate', 'bounded-retry', rate.retry, ((),), ()),
         ('phy', 'pm-ownership', pm.ownership, ((),), ()),
+        ('phy', 'controller-lifecycle', pm.controller_lifecycle, ((),), ('-pthread',)),
+        ('phy', 'asynchronous-root-state', pm.asynchronous_root_state, ((),), ()),
+        ('phy', 'upstream-resume-boundary', pm.upstream_resume_boundary, ((),), ()),
         ('phy', 'usb-unreachable', lambda r: pm.ownership(r, True), ((),), ()),
         ('lifecycle', 'cpuidle-s2idle', idle.s2idle, ((),), ('-Wno-unused-parameter', '-Wno-unused-variable')),
         ('lifecycle', 'typec-probe', pm.probe, ((),), ()),

@@ -506,8 +506,13 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 		int ret = ops->prepare(service, epic_name, epic_class, epic_unit);
 
 		if (ret) {
-			dev_err(ep->dcp->dev, "AFK service %s admission failed: %d\n",
-				service_name, ret);
+			if (ops->optional && ret == -EOPNOTSUPP)
+				dev_info(ep->dcp->dev,
+					 "AFK optional %s (%s) is unsupported on channel %u\n",
+					 ops->name, service_name, channel);
+			else
+				dev_err(ep->dcp->dev, "AFK service %s admission failed: %d\n",
+					service_name, ret);
 			afk_service_discard(service);
 			goto free;
 		}

@@ -10,7 +10,7 @@ Or keep translation units, commands, failure logs and source hashes:
   tools/testing/selftests/drivers/gpu/apple-dcp/run.sh --output /tmp/apple-dcp-results
 
 An installed copy needs --source /path/to/kernel. --group edid, rate, phy or
-lifecycle selects one group. HOSTCC selects the host compiler (default clang).
+lifecycle or boot selects one group. HOSTCC selects the host compiler (default clang).
 Python 3 and a compiler supporting AddressSanitizer/UndefinedBehaviorSanitizer
 are required. No target access, firmware command, captured fixture or kernel
 configuration is required.
@@ -68,3 +68,10 @@ still reproduce, alongside nonvacuous mutations and passing corrected safety
 controls. A passing host suite does not establish a replay-exclusion contract
 or admit a hardware trial. Token/sequence semantics remain a separate protocol
 fact to establish; the tests do not manufacture a firmware echo guarantee.
+
+The boot group executes the actual OSLOG dispatcher with synthetic fixed-width
+words. Known opaque event types remain visible, unknown types retain warnings,
+and only the existing buffer-request path can allocate/ACK buffers. The EDID
+service-rebind group also distinguishes intentional optional EOPNOTSUPP from
+required admission failures and genuine optional-service errors, and proves
+refused services never OPEN or publish. No captured firmware values are used.
