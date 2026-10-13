@@ -963,7 +963,8 @@ static void afk_v2_receive(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 		if (frame.type == EPIC_SUBTYPE_ANNOUNCE_H17P)
 			afk_recv_handle_init(ep, frame.interface, (void *)frame.payload,
 					     frame.payload_size);
-		else if (frame.type == AFKV2_CLOSE && frame.interface_flags == 1)
+		else if ((frame.type == AFKV2_CLOSE && frame.interface_flags == 1) ||
+			 (ep == ep->dcp->dcpavservep && afkv2_closed_report(&frame)))
 			afk_recv_handle_teardown(ep, frame.interface);
 		return;
 	}

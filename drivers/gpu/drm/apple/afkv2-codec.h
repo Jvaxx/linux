@@ -17,6 +17,7 @@
 #define AFKV2_RESPONSE 2U
 #define AFKV2_OPEN 0x12U
 #define AFKV2_CLOSE 0x13U
+#define AFKV2_CLOSED 0x14U
 
 struct afkv2_frame {
 	u8 sequence;
@@ -111,6 +112,15 @@ static inline int afkv2_decode_frame(const void *record, size_t size,
 	result.padding_size = size - 8 - length;
 	*out = result;
 	return 0;
+}
+
+/* Closed notification: flags occupy the low byte; the high byte is opaque. */
+static inline bool afkv2_closed_report(const struct afkv2_frame *frame)
+{
+	return frame && !frame->token && frame->category == AFKV2_REPORT &&
+		frame->type == AFKV2_CLOSED &&
+		(frame->interface_flags & 0xff) == 1 && frame->payload_size == 1 &&
+		frame->payload && !frame->payload[0];
 }
 
 static inline int afkv2_encode_frame(void *record, size_t capacity, u8 sequence,

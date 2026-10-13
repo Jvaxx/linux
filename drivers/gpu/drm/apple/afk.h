@@ -59,6 +59,8 @@ struct apple_epic_service {
 	bool enabled;
 	bool torndown;
 
+	/* Provider-owned prepare/init ticket; AFK core never interprets it. */
+	struct { u64 generation, epoch; } admission;
 	void *cookie;
 
     struct {
@@ -148,6 +150,17 @@ static inline void afk_service_disable(struct apple_epic_service *service)
 
 	spin_lock_irqsave(&service->lock, flags);
 	service->enabled = false;
+	spin_unlock_irqrestore(&service->lock, flags);
+}
+
+/* Retire local ownership while keeping timed-out commands discoverable. */
+static inline void afk_service_retire(struct apple_epic_service *service)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&service->lock, flags);
+	service->enabled = false;
+	service->torndown = true;
 	spin_unlock_irqrestore(&service->lock, flags);
 }
 
