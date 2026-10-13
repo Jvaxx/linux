@@ -3030,6 +3030,18 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 		return DCP_FIRMWARE_UNKNOWN;
 	}
 
+	/*
+	 * The T8122 external processor: Linux starts it and drives 14.7
+	 * firmware through the classic IOMFB template, as on M1/M2.
+	 */
+	if (of_device_is_compatible(dev->of_node, "apple,t8122-dcpext")) {
+		if (!strcmp(compat_str, "14.7.0"))
+			return DCP_FIRMWARE_V_14_7_TEMPLATE;
+		dev_err(dev, "T8122 external display not started: DCP firmware-compat %s is not 14.7.0\n",
+			compat_str);
+		return DCP_FIRMWARE_UNKNOWN;
+	}
+
 	/* The internal panels with a board record (T6030, J613): the same. */
 	v14_board = iomfb_v14_7_board(dev);
 	if (IS_ERR(v14_board))
@@ -4364,6 +4376,11 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t6030_dcpext = {
 	.num_dptx_ports = 1,
 };
 
+static const struct apple_dcp_hw_data apple_dcp_hw_t8122_dcpext = {
+	.num_dptx_ports = 2,
+	.fw_14_7_endpoints = true,
+};
+
 static const struct apple_dcp_hw_data apple_dcp_hw_dcpext = {
 	.num_dptx_ports = 2,
 };
@@ -4379,6 +4396,7 @@ static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t6030-dcpext", .data = &apple_dcp_hw_t6030_dcpext, },
 	{ .compatible = "apple,t8122-dcp", .data = &apple_dcp_hw_t8122, },
 	{ .compatible = "apple,t6031-dcp", .data = &apple_dcp_hw_t6031, },
+	{ .compatible = "apple,t8122-dcpext", .data = &apple_dcp_hw_t8122_dcpext, },
 	{ .compatible = "apple,dcp",       .data = &apple_dcp_hw_dcp,    },
 	{ .compatible = "apple,dcpext",    .data = &apple_dcp_hw_dcpext, },
 	{}

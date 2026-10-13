@@ -194,6 +194,12 @@ struct apple_dcp_hw_data {
 	u32 firmware_request;
 	/* M2 Pro/Max laptop T6020 Thunderbolt flow, from the match data */
 	bool t6020_tunnel_flow;
+	/*
+	 * A processor Linux starts itself on 14.7 firmware through the IOMFB
+	 * template whose AFK, DPTX and DPAV endpoints speak the 14.7 protocol
+	 * (the T8122 dcpext), see dcp_fw_is_14_7().
+	 */
+	bool fw_14_7_endpoints;
 };
 
 enum dcp_test_point {
@@ -673,6 +679,20 @@ int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);
 s32 dcp_ext_backlight_value(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);
+
+/*
+ * Does @dcp's firmware speak the 14.7 AFK, DPTX and DPAV endpoint protocol,
+ * whichever IOMFB path drives it? DCP_FIRMWARE_V_14_7 is the native DCPLink
+ * session; on DCP_FIRMWARE_V_14_7_TEMPLATE only the processors marked by
+ * their match data (the T8122 dcpext): generic M1/M2 DCPs on 14.7.0 keep the
+ * endpoint handling they had.
+ */
+static inline bool dcp_fw_is_14_7(const struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_14_7 ||
+	       (dcp->fw_compat == DCP_FIRMWARE_V_14_7_TEMPLATE &&
+		dcp->hw.fw_14_7_endpoints);
+}
 
 #define DCP_AUDIO_MAX_CHANS 15
 

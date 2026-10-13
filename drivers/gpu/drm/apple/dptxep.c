@@ -904,7 +904,7 @@ static int dptxport_prepare(struct apple_epic_service *service, const char *name
 	 * T6030 14.7 also announces the low-power port service, and may leave
 	 * its class empty.
 	 */
-	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7 && name &&
+	if (dcp_fw_is_14_7(dcp) && name &&
 	    (!strcmp(name, "dcpdptx-port-epic") ||
 	     !strcmp(name, "dcp-lpdptx-port-epic")) &&
 	    (!class || !class[0] || !strcmp(class, "AppleDCPDPTXRemotePort")))
@@ -1128,7 +1128,7 @@ int dptxep_init(struct apple_dcp *dcp)
 			 * kIOReturnNoDevice (0xe00002c0). Leave the endpoint
 			 * up so a later announce can still bind.
 			 */
-			if (dcp->fw_compat == DCP_FIRMWARE_V_14_7) {
+			if (dcp_fw_is_14_7(dcp)) {
 				dev_info(dcp->dev,
 					 "DPTX port %u not announced yet\n", port);
 				return 0;

@@ -1722,7 +1722,7 @@ int dcp_attributes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *handle,
 	 * carry no external backlight level.
 	 */
 	ext = !ret && backlight_control && !dcp_has_panel(dcp) &&
-	      dcp->fw_compat != DCP_FIRMWARE_V_14_7;
+	      !dcp_fw_is_14_7(dcp);
 	if (ext != READ_ONCE(dcp->ext_backlight)) {
 		WRITE_ONCE(dcp->ext_backlight, ext);
 		if (dcp->connector)
