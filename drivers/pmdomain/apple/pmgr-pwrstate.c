@@ -50,6 +50,7 @@ struct apple_pmgr_ps {
 	bool externally_clocked;
 	bool retained_25g83;
 	bool system_sleep;
+	bool firmware_owned;
 };
 
 #define genpd_to_apple_pmgr_ps(_genpd) container_of(_genpd, struct apple_pmgr_ps, genpd)
@@ -164,6 +165,10 @@ static int apple_pmgr_ps_power_on(struct generic_pm_domain *genpd)
 	struct apple_pmgr_ps *ps = genpd_to_apple_pmgr_ps(genpd);
 	int ret;
 
+	/* Its coprocessor's firmware owns the state; Linux only holds a vote. */
+	if (ps->firmware_owned)
+		return 0;
+
 	ret = apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_ACTIVE, true);
 	if (ret && !ps->system_sleep)
 		apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_PWRGATE, false);
@@ -213,6 +218,8 @@ static int apple_pmgr_reset_assert(struct reset_controller_dev *rcdev, unsigned 
 
 	if (ps->retained_25g83)
 		return -EBUSY;
+	if (ps->firmware_owned)
+		return -EPERM;
 
 	spin_lock_irqsave(&ps->genpd.slock, flags);
 
@@ -239,6 +246,8 @@ static int apple_pmgr_reset_deassert(struct reset_controller_dev *rcdev, unsigne
 
 	if (ps->retained_25g83)
 		return -EBUSY;
+	if (ps->firmware_owned)
+		return -EPERM;
 
 	spin_lock_irqsave(&ps->genpd.slock, flags);
 
@@ -354,6 +363,13 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	ps->genpd.power_on = apple_pmgr_ps_power_on;
 	ps->genpd.power_off = apple_pmgr_ps_power_off;
 
+	/*
+	 * A domain whose coprocessor the boot loader hands over running (the DCP) is
+	 * owned by that coprocessor's firmware: writing its state faults. Only read
+	 * it, keep it on and never change its target or automatic gating.
+	 */
+	ps->firmware_owned = of_property_read_bool(node, "apple,firmware-owned");
+
 	ret = of_property_read_u32(node, "apple,min-state", &ps->min_state);
 	if (!ps->retained_25g83 && ret == 0 && ps->min_state <= APPLE_PMGR_PS_ACTIVE)
 		regmap_update_bits(regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_PS_MIN,
@@ -375,6 +391,13 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 		ps->genpd.flags |= GENPD_FLAG_ALWAYS_ON;
 	}
 	if (of_property_read_bool(node, "apple,always-on")) {
+	if (ps->firmware_owned) {
+		/* Consumers (the boot framebuffer) need it; never try to turn it on. */
+		if (!active)
+			dev_warn(dev, "firmware-owned domain %s does not read as on\n", name);
+		ps->genpd.flags |= GENPD_FLAG_ALWAYS_ON;
+		active = true;
+	} else if (of_property_read_bool(node, "apple,always-on")) {
 		ps->genpd.flags |= GENPD_FLAG_ALWAYS_ON;
 		if (!active) {
 			dev_warn(dev, "always-on domain %s is not on at boot\n", name);
