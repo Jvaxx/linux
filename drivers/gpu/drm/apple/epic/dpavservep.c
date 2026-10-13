@@ -50,7 +50,8 @@ static bool dcpavserv_admission_current(struct apple_dcp *dcp, u64 generation)
 {
 	lockdep_assert_held(&dcp->hpd_mutex);
 	/* Initial service discovery may precede the first Type-C attachment. */
-	return !READ_ONCE(dcp->quiescing) && generation == dcp->typec_generation &&
+	return !READ_ONCE(dcp->quiescing) && !READ_ONCE(dcp->external_physically_absent) &&
+		generation == dcp->typec_generation &&
 		(!generation || dcp->typec_cable_connected);
 }
 
@@ -78,6 +79,26 @@ static int dcpavserv_prepare(struct apple_epic_service *service, const char *nam
 	mutex_unlock(&dcp->dcpavserv.lock);
 	if (v2)
 		mutex_unlock(&dcp->hpd_mutex);
+	return ret;
+}
+
+static int dcpavserv_revalidate(struct apple_epic_service *service, const char *name,
+				const char *class, s64 unit)
+{
+	struct apple_dcp *dcp = service->ep->dcp;
+	int ret = 0;
+
+	if (!dcpavserv_identity(service, name, class, unit))
+		return -ENODEV;
+	mutex_lock(&dcp->hpd_mutex);
+	mutex_lock(&dcp->dcpavserv.lock);
+	if (dcp->dcpavserv.enabled)
+		ret = -EBUSY;
+	else if (service->admission.epoch != dcp->dcpavserv.epoch ||
+		 !dcpavserv_admission_current(dcp, service->admission.generation))
+		ret = -ENODEV;
+	mutex_unlock(&dcp->dcpavserv.lock);
+	mutex_unlock(&dcp->hpd_mutex);
 	return ret;
 }
 
@@ -363,14 +384,16 @@ bool dcpavserv_edid_current(struct apple_dcp *dcp, u64 generation)
 	return dcp->hw.iomfb_method_profile !=
 		DCP_IOMFB_METHODS_H17P_EXTERNAL ||
 		(dcp->typec_cable_connected && generation == dcp->typec_generation &&
-		 !READ_ONCE(dcp->quiescing));
+		 !READ_ONCE(dcp->quiescing) && !READ_ONCE(dcp->external_physically_absent));
 }
 
 bool dcpavserv_edid_service_current(struct apple_dcp *dcp, u64 epoch)
 {
 	lockdep_assert_held(&dcp->dcpavserv.lock);
 	return dcp->dcpavserv.enabled && dcp->dcpavserv.service &&
-		epoch == dcp->dcpavserv.epoch;
+		epoch == dcp->dcpavserv.epoch &&
+		(dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17P_EXTERNAL ||
+		 !READ_ONCE(dcp->external_physically_absent));
 }
 
 const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *dcp, u64 generation,
@@ -416,6 +439,7 @@ static const struct apple_epic_service_ops dpavservep_ops[] = {
 		.name = "dcpav-service-epic",
 		.reusable = true,
 		.prepare = dcpavserv_prepare,
+		.revalidate = dcpavserv_revalidate,
 		.init = dcpavserv_init,
 		.teardown = dcpavserv_teardown,
 		.report = dcpavserv_report,

@@ -30,6 +30,8 @@ prefix = r'''
 #define SZ_1M 1048576U
 #define GFP_KERNEL 0
 #define MAX_PENDING_CMDS 16
+#define AFKV2_INTERFACES (1U << 16)
+#define lockdep_assert_held(l) ((void)(l))
 #define cpu_to_le32(x) (x)
 #define le32_to_cpu(x) (x)
 #define cpu_to_le64(x) (x)
@@ -56,7 +58,7 @@ struct cmd_info {
  bool done,free_on_ack; int *completion;
 };
 struct dcp { void *dev; bool quiescing; };
-struct apple_dcp_afkep { struct dcp *dcp; bool wire_v2,inline_v2; int endpoint; };
+struct apple_dcp_afkep { struct dcp *dcp; bool wire_v2,inline_v2; int endpoint,lock;u8 *command_tags; };
 struct ops { const char *name; };
 struct apple_epic_service {
  struct apple_dcp_afkep *ep; struct ops *ops; unsigned int channel; unsigned long cmd_map[1];
@@ -106,7 +108,8 @@ static int afk_send_epic(struct apple_dcp_afkep *ep,u32 channel,u16 tag,int type
 suffix = r'''
 int main(void)
 {
- struct dcp dcp={0};struct apple_dcp_afkep ep={.dcp=&dcp,.wire_v2=true,.inline_v2=true};
+ u8 tags[AFKV2_INTERFACES]={0};
+ struct dcp dcp={0};struct apple_dcp_afkep ep={.dcp=&dcp,.wire_v2=true,.inline_v2=true,.command_tags=tags};
  struct ops ops={.name="test"};struct apple_epic_service s={.ep=&ep,.ops=&ops,.channel=4,.enabled=true,.users=1};
  u8 request[112]={0x5a},*output=calloc(1,32888);size_t received;u32 status=99;
  active=&s;
@@ -155,4 +158,11 @@ int main(void)
  puts("PASS: extracted production sender, 128-byte command envelope / 32888-byte reply, short OOB, strict/legacy callers and actual late-ACK ownership");
 }
 '''
-pathlib.Path(sys.argv[2]).write_text(prefix + source[start:end] + source[reply_match.start():reply_end] + suffix)
+tag_match = re.search(r"static u16 afk_command_tag\([^;]*?\)\n\{", source)
+if not tag_match:
+    raise RuntimeError("production interface tag allocator not found")
+tag_end, tag_depth = tag_match.end(), 1
+while tag_depth:
+    tag_depth += (source[tag_end] == "{") - (source[tag_end] == "}")
+    tag_end += 1
+pathlib.Path(sys.argv[2]).write_text(prefix + source[tag_match.start():tag_end] + source[start:end] + source[reply_match.start():reply_end] + suffix)

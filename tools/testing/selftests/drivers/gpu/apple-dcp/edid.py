@@ -21,6 +21,8 @@ def rebind(root):
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <stddef.h>
+#define container_of(p,t,m) ((t *)((char *)(p)-offsetof(t,m)))
 #include "afkv2-codec.h"
 typedef int64_t s64;
 typedef u64 dma_addr_t;
@@ -29,6 +31,7 @@ typedef u64 dma_addr_t;
 #define ENOENT 2
 #define MAX_PENDING_CMDS 16
 #define AFK_MAX_CHANNEL 16
+#define AFKV2_INTERFACES (1U << 16)
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x,v) ((x)=(v))
 #define WARN_ON(x) (x)
@@ -65,25 +68,30 @@ static void mutex_unlock(bool *p) { assert(*p);*p=false; }
 static void complete(int *p) { (*p)++; }
 static void reinit_completion(int *p) { *p=0; }
 static void schedule_work(unsigned int *p) { (*p)++; }
+struct work_struct { bool pending; };
+static bool queue_work(void *wq,struct work_struct *w) { assert(wq);bool fresh=!w->pending;w->pending=true;return fresh; }
 struct apple_dcp;struct apple_dcp_afkep;struct apple_epic_service;
-struct apple_epic_service_ops { char name[32];bool reusable;void (*init)(struct apple_epic_service *,const char *,const char *,s64);int (*prepare)(struct apple_epic_service *,const char *,const char *,s64);void (*teardown)(struct apple_epic_service *); };
+void afk_service_retry(struct apple_dcp_afkep *ep);
+struct apple_epic_service_ops { char name[32];bool reusable;void (*init)(struct apple_epic_service *,const char *,const char *,s64);int (*prepare)(struct apple_epic_service *,const char *,const char *,s64);int (*revalidate)(struct apple_epic_service *,const char *,const char *,s64);void (*teardown)(struct apple_epic_service *); };
 struct epic_cmd_info { u16 tag;u8 type;size_t reply_length;void *rxbuf,*txbuf;dma_addr_t rxbuf_dma,txbuf_dma;size_t rxlen,txlen;u32 retcode;bool done,free_on_ack;int *completion; };
 struct apple_epic_service {
     struct apple_dcp_afkep *ep;const struct apple_epic_service_ops *ops;
     bool lock,enabled,torndown;unsigned int users;u32 channel;u8 cmd_tag;
     unsigned long cmd_map[1];struct epic_cmd_info cmds[MAX_PENDING_CMDS];
     struct { u64 generation,epoch; } admission;void *cookie;
+    bool pending_open;const char *pending_name,*pending_class;s64 pending_unit;
 };
-struct apple_dcp_afkep { struct apple_dcp *dcp;const struct apple_epic_service_ops *ops;bool wire_v2,inline_v2,match_epic_name;u32 endpoint;unsigned int num_channels;struct apple_epic_service services[AFK_MAX_CHANNEL]; };
+struct apple_dcp_afkep { u8 *command_tags;bool lock,stopping;void *wq;struct work_struct service_work;struct apple_dcp *dcp;const struct apple_epic_service_ops *ops;bool wire_v2,inline_v2,match_epic_name;u32 endpoint;unsigned int num_channels;struct apple_epic_service services[AFK_MAX_CHANNEL]; };
 struct apple_connector { void *dcp;bool connected,edid_invalidation_pending;struct { int registration_state; } base;unsigned int hotplug_wq; };
 struct apple_dcp {
     void *dev;int fw_compat;struct apple_dcp_afkep *dcpavservep;struct apple_connector *connector;
-    bool hpd_mutex,quiescing,typec_cable_connected;u64 typec_generation;unsigned int nr_modes;
+    bool external_physically_absent,hpd_mutex,quiescing,typec_cable_connected;u64 typec_generation;unsigned int nr_modes;
     struct { int iomfb_method_profile; } hw;
     struct { bool lock,enabled;u64 epoch;int enable_completion;struct apple_epic_service *service; } dcpavserv;
 };
 struct epic_cmd { u32 retcode;u64 rxbuf,txbuf;u32 rxlen,txlen; };
 static unsigned int dma_frees,opens;
+
 static int open_error,open_action;
 void dpavservep_detach(struct apple_dcp *dcp);
 static void inject_owner(struct apple_dcp_afkep *ep,u32 pending_channel);
@@ -105,6 +113,7 @@ static int afk_send_epic(struct apple_dcp_afkep *e,u32 channel,u16 tag,int type,
     if(open_action==4) inject_owner(e,channel);
     if(open_action==5) e->dcp->typec_cable_connected=false;
     if(open_action==6) e->dcp->quiescing=true;
+    if(open_action==7) e->dcp->external_physically_absent=true;
     if(open_action==3) {
         for(unsigned int i=0;i<e->num_channels;i++)
             if(e->services[i].channel==channel && !e->services[i].torndown) e->services[i].channel++;
@@ -133,18 +142,18 @@ static int parse_int(struct dcp_parse_ctx *h,s64 *out)
 { assert(!h->key);*out=h->items[h->index++].integer;h->key=true;return 0; }
 static int skip(struct dcp_parse_ctx *h) { assert(!h->key);h->index++;h->key=true;return 0; }
 '''
-    parts=[function('parser.c','int parse_epic_service_init('),function('afk.h','static inline struct apple_epic_service *afk_service_get('),
+    parts=[function('afk.c','static u16 afk_command_tag('),function('afk.c','void afk_service_retry('),function('parser.c','int parse_epic_service_init('),function('afk.h','static inline struct apple_epic_service *afk_service_get('),
            function('afk.h','static inline void afk_service_put('),function('afk.h','static inline void afk_service_retire('),function('afk.h','static inline void afk_service_disable('),
            function('afk.h','static inline bool afk_service_matches('),function('afk.h','static inline bool afk_service_reclaimable('),
            function('afk.h','static inline bool\nafk_service_reinit('),function('afk.h','static inline void afk_service_discard('),
            function('afk.h','static inline void afk_service_publish('),
            function('epic/dpavservep.c','static void dcpavserv_notify_edid('),function('epic/dpavservep.c','static bool dcpavserv_identity('),
            function('epic/dpavservep.c','static bool dcpavserv_admission_current('),function('epic/dpavservep.c','static int dcpavserv_prepare('),
-           function('epic/dpavservep.c','static void dcpavserv_init('),function('epic/dpavservep.c','static void dcpavserv_invalidate_edid('),
+           function('epic/dpavservep.c','static int dcpavserv_revalidate('),function('epic/dpavservep.c','static void dcpavserv_init('),function('epic/dpavservep.c','static void dcpavserv_invalidate_edid('),
            function('epic/dpavservep.c','static void dcpavserv_teardown('),function('epic/dpavservep.c','void dpavservep_detach('),
            function('afk.c','static const struct apple_epic_service_ops *\nafk_match_service('),
            function('afk.c','static struct apple_epic_service *afk_epic_find_service('),
-           function('afk.c','static void afk_recv_handle_init('),
+           function('afk.c','static void afk_discard_pending_open('),function('afk.c','static void afk_retry_service_init('),function('afk.c','static void afk_service_worker('),function('afk.c','static void afk_recv_handle_init('),
            function('epic/dpavservep.c','static int dcpdpserv_prepare('),
            function('epic/dpavservep.c','static void dcpdpserv_teardown('),function('afk.c','static void afk_recv_handle_teardown('),
            function('afk.c','static void afk_recv_handle_reply('),function('afk.c','static void afk_v2_receive(')]
@@ -152,9 +161,10 @@ static int skip(struct dcp_parse_ctx *h) { assert(!h->key);h->index++;h->key=tru
 static struct apple_dcp d;
 static struct apple_dcp_afkep ep;
 static struct apple_connector con;
-static const struct apple_epic_service_ops ops={.name="dcpav-service-epic",.reusable=true,.prepare=dcpavserv_prepare,.init=dcpavserv_init,.teardown=dcpavserv_teardown};
+static void run_retries(void) { assert(!ep.lock);if(ep.service_work.pending) { ep.service_work.pending=false;afk_service_worker(&ep.service_work); } }
+static const struct apple_epic_service_ops ops={.name="dcpav-service-epic",.reusable=true,.prepare=dcpavserv_prepare,.revalidate=dcpavserv_revalidate,.init=dcpavserv_init,.teardown=dcpavserv_teardown};
 static const struct apple_epic_service_ops announcement_ops[]={
-    {.name="dcpav-service-epic",.reusable=true,.prepare=dcpavserv_prepare,.init=dcpavserv_init,.teardown=dcpavserv_teardown},
+    {.name="dcpav-service-epic",.reusable=true,.prepare=dcpavserv_prepare,.revalidate=dcpavserv_revalidate,.init=dcpavserv_init,.teardown=dcpavserv_teardown},
     {.name="dcpdp-service-epic",.reusable=true,.prepare=dcpdpserv_prepare,.teardown=dcpdpserv_teardown},
     {0}
 };
@@ -268,14 +278,39 @@ static void repeated_announcements(void)
     assert(injected_owner->users==1);dpavservep_detach(&d);assert(!injected_owner->users);
     open_action=0;announce(13,name,native_class,13);assert(opens==++before && d.dcpavserv.service);
     struct apple_epic_service *old=d.dcpavserv.service;
-    assert(afk_service_get(old)==old);old->cmd_map[0]=1;
+    assert(afk_service_get(old)==old);ep.command_tags[13]=1;old->cmd_map[0]=1;
     disconnect();connect();
     announce(13,name,native_class,13); /* Same channel still owns a pending reply. */
     assert(opens==before && !d.dcpavserv.service && old->users==1 && old->channel==13);
+    /* The firmware need not announce again after the old reply drains. */
+    old->cmds[0]=(struct epic_cmd_info){.tag=0,.type=0xc0,.rxlen=32,.txlen=32,.free_on_ack=true};
+    old->cmds[0].rxbuf=calloc(1,32);old->cmds[0].txbuf=calloc(1,32);
+    old->cmds[0].rxbuf_dma=(uintptr_t)old->cmds[0].rxbuf;
+    old->cmds[0].txbuf_dma=(uintptr_t)old->cmds[0].txbuf;
+    u8 drain_oob[32],drain_reply[56];size_t drain_written;
+    assert(!afkv2_encode_oob_command(drain_oob,sizeof(drain_oob),0,old->cmds[0].rxbuf_dma,32,old->cmds[0].txbuf_dma,32));
+    afkv2_put32(drain_oob+4,0);
+    assert(!afkv2_encode_frame(drain_reply,sizeof(drain_reply),1,13,0,0xc0,AFKV2_RESPONSE,0,drain_oob,sizeof(drain_oob),&drain_written));
+    afk_v2_receive(&ep,0,0,drain_reply,drain_written);
+    run_retries();
+    assert(d.dcpavserv.service && "a blocked reannouncement must recover after the old ACK without another announcement");
+    assert(d.dcpavserv.service!=old && opens==++before && old->users==1 && !old->cmd_map[0]);
+    struct apple_epic_service *resumed=d.dcpavserv.service;
+    resumed->cmd_map[0]=1;
+    /* The DMA allocator can reuse both old addresses for the new command. */
+    resumed->lock=true;
+    resumed->cmds[0]=(struct epic_cmd_info){.tag=afk_command_tag(resumed,0),.type=0xc0,
+        .rxbuf_dma=old->cmds[0].rxbuf_dma,.txbuf_dma=old->cmds[0].txbuf_dma,.rxlen=32,.txlen=32};
+    resumed->lock=false;
+    afk_v2_receive(&ep,0,0,drain_reply,drain_written);
+    assert(!resumed->cmds[0].done && resumed->cmd_map[0] && "old ACK must not complete the next owner's command");
+    resumed->cmd_map[0]=0;
+    dpavservep_detach(&d);
     announce(1,name,class,1);assert(opens==++before && d.dcpavserv.service!=old);
     struct apple_epic_service *fresh=d.dcpavserv.service;u64 epoch=d.dcpavserv.epoch;
     dcpavserv_teardown(old);assert(d.dcpavserv.service==fresh && d.dcpavserv.epoch==epoch);
     old->cmd_map[0]=0;afk_service_put(old);disconnect();connect();
+    run_retries();
     announce(13,name,native_class,13);assert(opens==++before && d.dcpavserv.service);
     struct apple_epic_service *owner=d.dcpavserv.service;
     u64 owner_epoch=d.dcpavserv.epoch;
@@ -294,7 +329,7 @@ static void repeated_announcements(void)
     dpavservep_detach(&d);
     assert(!d.hpd_mutex && !d.dcpavserv.lock);
     /* Legacy remains unit-zero and class-agnostic, with its original epoch fence. */
-    ep.wire_v2=false;ep.endpoint=0x28;
+    ep.wire_v2=false;ep.endpoint=0x28;d.external_physically_absent=true;
     assert(!prepare(13,13,name,native_class));
     struct apple_epic_service *legacy=prepare(13,0,name,native_class);assert(legacy);
     dpavservep_detach(&d);afk_service_publish(legacy);dcpavserv_init(legacy,name,native_class,0);
@@ -303,10 +338,81 @@ static void repeated_announcements(void)
     d.typec_generation++;afk_service_publish(legacy);dcpavserv_init(legacy,name,native_class,0);
     assert(d.dcpavserv.service==legacy && legacy->users==1);dpavservep_detach(&d);
     assert(dcpdpserv_prepare(legacy,"dcpdp-service-epic",native_class,0)==0);
-    ep.wire_v2=true;ep.endpoint=0x2a;
+    ep.wire_v2=true;ep.endpoint=0x2a;d.external_physically_absent=false;
     announce(U16_MAX,name,native_class,U16_MAX);assert(d.dcpavserv.service && d.dcpavserv.service->channel==U16_MAX);
     dpavservep_detach(&d);
     puts("PASS: actual AFKV2 HDMI/native DP alternating over 64 cycles: flip/revalidation/return, strict identity, stale OPEN generation/epoch/owner, auxiliary isolation, reader/command pins and legacy controls");
+}
+
+static void deferred_announcements(void)
+{
+    for(unsigned int cycle=0;cycle<64;cycle++) {
+        unsigned int event=cycle%10,before=opens,freed=dma_frees;
+        u16 channel=1+4*(cycle%4);
+        const char *provider=(cycle%2)?native_class:class;
+        announce(channel,name,provider,channel);
+        struct apple_epic_service *old=d.dcpavserv.service;
+        assert(old && opens==++before && afk_service_get(old)==old);
+        old->cmd_map[0]=1;
+        old->cmds[0]=(struct epic_cmd_info){.tag=0,.type=0xc0,.rxlen=32,.txlen=32,.free_on_ack=true};
+        old->cmds[0].rxbuf=calloc(1,32);old->cmds[0].txbuf=calloc(1,32);
+        old->cmds[0].rxbuf_dma=(uintptr_t)old->cmds[0].rxbuf;
+        old->cmds[0].txbuf_dma=(uintptr_t)old->cmds[0].txbuf;
+        u8 oob[32],reply[56];size_t written;
+        assert(!afkv2_encode_oob_command(oob,sizeof(oob),0,old->cmds[0].rxbuf_dma,32,old->cmds[0].txbuf_dma,32));
+        afkv2_put32(oob+4,0);
+        assert(!afkv2_encode_frame(reply,sizeof(reply),1,channel,0,0xc0,AFKV2_RESPONSE,0,oob,sizeof(oob),&written));
+        u64 generation=d.typec_generation;
+        closed(channel,0x6a01,0);
+        assert(!d.dcpavserv.service && old->users==1 && old->torndown && d.typec_generation==generation);
+        u64 epoch=d.dcpavserv.epoch;
+        announce(channel,name,provider,channel);
+        run_retries();
+        assert(opens==before && !d.dcpavserv.service && dma_frees==freed);
+        for(unsigned int i=0;i<ep.num_channels;i++) {
+            struct apple_epic_service *pending=&ep.services[i];
+            if(!pending->pending_open) continue;
+            assert(dcpavserv_revalidate(pending,pending->pending_name,pending->pending_class,pending->pending_unit)==0);
+            d.dcpavserv.enabled=true;
+            assert(dcpavserv_revalidate(pending,pending->pending_name,pending->pending_class,pending->pending_unit)==-EBUSY);
+            d.dcpavserv.enabled=false;
+        }
+        if(event==1) d.typec_generation++;
+        if(event==2) dpavservep_detach(&d);
+        if(event==3) d.typec_cable_connected=false;
+        if(event==4) d.quiescing=true;
+        struct apple_epic_service *other=NULL;
+        if(event==5) { other=prepare(channel+2,channel+2,name,class);publish(other,channel+2); }
+        if(event==6) assert(!ep.stopping);
+        if(event==7) open_error=-EIO;
+        if(event==8) announce(channel,name,provider,channel);
+        if(event==9) { d.typec_generation++;announce(channel,name,provider,channel); }
+        afk_v2_receive(&ep,0,0,reply,written);
+        if(event==6) { assert(ep.service_work.pending);ep.stopping=true; }
+        run_retries();
+        assert(dma_frees==freed+2 && old->users==1 && !old->cmd_map[0]);
+        if(event==0 || event==8 || event==9) {
+            assert(d.dcpavserv.service && d.dcpavserv.service!=old);
+            assert(d.dcpavserv.service->channel==channel && opens==++before);
+            assert(d.dcpavserv.epoch>epoch && d.dcpavserv.service->users==1);
+        } else if(event==5) {
+            assert(d.dcpavserv.service==other && opens==before);
+        } else {
+            assert(!d.dcpavserv.service && opens==before+(event==7));
+        }
+        afk_v2_receive(&ep,0,0,reply,written); /* Duplicate late ACK cannot touch the new owner. */
+        assert(dma_frees==freed+2);
+        afk_service_put(old);run_retries();
+        assert(!old->users);
+        if(event==6) {
+            for(unsigned int i=0;i<ep.num_channels;i++)
+                if(ep.services[i].pending_open) afk_discard_pending_open(&ep.services[i]);
+        }
+        ep.stopping=false;open_error=0;d.quiescing=false;d.typec_cable_connected=true;
+        dpavservep_detach(&d);run_retries();
+        for(unsigned int i=0;i<ep.num_channels;i++) assert(!ep.services[i].pending_open);
+    }
+    puts("PASS: 64 actual CLOSED/reannounce/late-ACK cycles with deferred OPEN, unchanged attachment, duplicate announcement/reply, stale generation/epoch, cable/quiesce/owner/stop and OPEN-error controls");
 }
 int main(void)
 {
@@ -324,6 +430,7 @@ int main(void)
     parse_ctx=(struct dcp_parse_ctx){.items=legacy,.count=3};
     assert(!parse_epic_service_init(&parse_ctx,&parsed_name,&parsed_class,&parsed_unit,false));assert(parsed_unit==0);
     free((void *)parsed_name);free((void *)parsed_class);
+    ep.wq=&ep;ep.command_tags=calloc(AFKV2_INTERFACES,1);assert(ep.command_tags);
     struct apple_epic_service *old=prepare(1,1,name,class);assert(old);publish(old,1);
     assert(d.dcpavserv.service==old && old->users==1);
     assert(afk_service_get(old)==old); /* Delayed EDID reader pins the retired slot. */
@@ -375,6 +482,8 @@ int main(void)
     assert(!pending->users && !d.hpd_mutex && !d.dcpavserv.lock);
     memset(&ep.services,0,sizeof(ep.services));ep.wire_v2=true;ep.endpoint=0x2a;d.hw.iomfb_method_profile=2;
     repeated_announcements();
+    deferred_announcements();
+    free(ep.command_tags);ep.command_tags=NULL;
     puts("PASS: actual dynamic 1/5/9/13 binding, forged identities, prepare/init epochs, physical retirement, reader pins, real old CLOSED/late ACK isolation and legacy unit 0");
 }
 '''
@@ -461,7 +570,7 @@ struct apple_dcp {
     struct { bool lock, enabled; u64 epoch; int enable_completion; struct apple_epic_service *service; } dcpavserv;
     struct apple_connector *connector; unsigned int nr_modes;
     struct { int iomfb_method_profile; } hw;
-    bool hpd_mutex, typec_cable_connected, quiescing;
+    bool external_physically_absent,hpd_mutex, typec_cable_connected, quiescing;
     u64 typec_generation;
     int fw_compat;
     void *dev;
@@ -571,6 +680,8 @@ int main(void)
     d.dcpavserv.service=&s; d.dcpavserv.enabled=true; s.enabled=true; s.users=1; event=0;
     d.typec_cable_connected=false; e=dcpavserv_copy_edid(&d,0,&epoch);
     assert(!IS_ERR(e) && legacy_reads==1 && s.users==1); drm_edid_free(e);
+    d.hw.iomfb_method_profile=0;av.wire_v2=false;d.external_physically_absent=true;
+    mutex_lock(&d.hpd_mutex);assert(dcpavserv_edid_current(&d,0));mutex_unlock(&d.hpd_mutex);
     assert(!allocations && !d.hpd_mutex && !d.dcpavserv.lock);
     puts("PASS: production old/new lookup and receive, exact service admission before OPEN, delayed disconnect/replug, service detach pins, legacy transport");
 }

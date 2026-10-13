@@ -54,3 +54,17 @@ The cpuidle group executes the actual Apple table/probe, generic registration
 and s2idle selector/entry, and tick_freeze/unfreeze. It checks source behavior
 only; RTC, elapsed suspend time and simultaneous hardware execution remain
 separate qualification gates. The original human cpuidle patch is preserved.
+
+The service-rebind group also runs retained reviewer controls through the
+actual sender, receive worker, recovery, quiesce and EDID wrapper. It covers
+CLOSED cancellation before lookup, first late ACK versus already consumed
+duplicates, reader-pinned cross-slot/channel reuse, and the explicit physical
+absence window. Per-interface sequence history has a fixed 64-KiB bound per
+AFKV2 endpoint; reply routing still ignores reader-only retired services.
+
+Two wrap controls intentionally retain the command-17 replay assertion
+failure, for OOB and inline. The group verifies that these counterexamples
+still reproduce, alongside nonvacuous mutations and passing corrected safety
+controls. A passing host suite does not establish a replay-exclusion contract
+or admit a hardware trial. Token/sequence semantics remain a separate protocol
+fact to establish; the tests do not manufacture a firmware echo guarantee.
