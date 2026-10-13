@@ -22,7 +22,7 @@ class ProProfile(unittest.TestCase):
         self.write('identity', IDENTITY + '\n')
         self.write('opt/mesa-m3/libexec/mesa-m3-abi-check', '#!/bin/sh\ncat /tmp/fixture/identity\n', True)
         for profile, marker, source in (
-            ('native-pro', 't6030-native-gl-legacy-hal', 'd0c0cdb0624ab4b438b694808ac1776551be4bca'),
+            ('native-pro', 't6030-native-gl-legacy-hal', 'd616d0650d6fa80f72a750a0121442ab917ed6cf'),
             ('pro-vulkan', 't6030-pro-vulkan-legacy-hal', 'b0f56952b7f06955b143fbfa90c07de4c5864964')):
             self.write(f'opt/mesa-m3/{profile}/share/mesa-m3/profile', marker + '\n')
             self.write(f'opt/mesa-m3/{profile}/share/mesa-m3/capabilities', 'source=' + source + '\n')
@@ -95,9 +95,19 @@ class ProProfile(unittest.TestCase):
                 self.assertEqual(run.returncode, 0)
                 self.assertEqual((self.root / 'sys/module/asahi/parameters/m3_mixed_batch').read_text(), '0')
 
+    def test_release16_and_release18_kernels_admitted_others_refused(self):
+        for source, admitted in (('d49021440d8ca02bbc8ecc17c19ce76c048b6236', True),
+                                 ('6f63677751854d57bcfac172314957bc2197c05f', True),
+                                 ('f240960cc84cfda6f73e188050ccadb9435e938f', False),
+                                 ('0000000000000000000000000000000000000000', False)):
+            with self.subTest(source=source):
+                self.write('modules/test-kernel/aurora-m3pro-profile', 't6030-perf-v1\nsource=' + source + '\n')
+                self.assertEqual(self.check().returncode == 0, admitted)
+
     def test_previous_native_source_is_not_activated(self):
         for source in ('99d5b9d16e779ad9a0879a71578da0a6536cf006',
-                       'f287f282940ec0c8b0de50db2df1f98d423e84fa'):
+                       'f287f282940ec0c8b0de50db2df1f98d423e84fa',
+                       'd0c0cdb0624ab4b438b694808ac1776551be4bca'):
             with self.subTest(source=source):
                 self.write('opt/mesa-m3/native-pro/share/mesa-m3/capabilities',
                            'source=' + source + '\n')
