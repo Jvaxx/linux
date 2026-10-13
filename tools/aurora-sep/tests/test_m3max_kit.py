@@ -504,11 +504,33 @@ class VariantTest(KitBase):
                 self.assertIn("diskutil", proc.stderr)
                 self.assertIn("NEXT STEPS: M3 MAX BOOT LOADER VARIANT", proc.stdout)
                 self.assertIn("--m3-report", proc.stdout)
-                self.uninstall()
+                out = self.uninstall()
                 self.assertEqual(self.boot.read_bytes(), self.boot_before)
                 self.assertFalse(self.m1n1_conf.exists())
-                self.assertFalse(self.update_conf.exists())
+                # This release's T6031 m1n1 stays installed, so update-m1n1 stays frozen: a
+                # rebuild without the switches would run the GPU handoff at every boot.
+                self.assertEqual(self.update_conf.read_text(), flow.OUR_FREEZE)
+                self.assertIn("update-m1n1 stays frozen", out.stdout + out.stderr)
                 self.assertFalse(self.state.exists())
+
+    def test_uninstall_puts_back_the_images_own_update_m1n1_configuration(self):
+        self.naeem("j516c")
+        own = "DTBS=/boot/dtbs/image-own/*.dtb\n"
+        self.update_conf.write_text(own + flow.OUR_FREEZE)
+        self.install(try_=1)
+        self.assertIn("# aurora-sep: build m1n1", self.update_conf.read_text())
+        self.uninstall()
+        self.assertEqual(self.boot.read_bytes(), self.boot_before)
+        self.assertEqual(self.update_conf.read_text(), own + flow.OUR_FREEZE)
+
+    def test_a_kernel_only_max_uninstall_still_lifts_the_freeze(self):
+        # Its m1n1 is the image's own (no T6031 handoff), as before the variant existed.
+        self.naeem("j516c")
+        self.install()
+        out = self.uninstall()
+        self.assertEqual(self.boot.read_bytes(), self.boot_before)
+        self.assertFalse(self.update_conf.exists())
+        self.assertNotIn("update-m1n1 stays frozen", out.stdout + out.stderr)
 
     def test_the_switch_names_are_the_boot_loaders(self):
         # The bootloader workstream's names (CONTRACT-CHANGES.md): the display and GPU handoffs.
@@ -1212,6 +1234,18 @@ class KitRunTest(KitBase):
         self.assertFalse(self.libexec.exists())
         self.assertFalse((self.units / "aurora-m3max-kit.service").exists())
         self.assertTrue((self.kit / "status").exists())             # the results stay
+        self.assertEqual(self.update_conf.read_text(), flow.OUR_FREEZE)
+
+    def test_restore_then_uninstall_keeps_update_m1n1_frozen(self):
+        self.start()
+        self.next_boot()
+        self.step("--restore")
+        self.assertEqual(self.boot.read_bytes(), self.boot_before)
+        self.kitbin.write_text("#!/bin/bash\nexit 0\n")
+        out = self.kit_sh("uninstall_all")
+        self.assertEqual(self.boot.read_bytes(), self.boot_before)
+        self.assertEqual(self.update_conf.read_text(), flow.OUR_FREEZE)
+        self.assertIn("update-m1n1 stays frozen", out.stdout + out.stderr)
 
     def test_tarball_contents_and_masking(self):
         self.start()

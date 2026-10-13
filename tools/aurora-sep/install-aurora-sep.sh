@@ -4496,7 +4496,7 @@ install_all() {
 }
 
 uninstall_all() {
-  local previous=linux-asahi m3_mode=none neo_restore=0 max_variant=0
+  local previous=linux-asahi m3_mode=none neo_restore=0 max_variant=0 max_m1n1=0
   if is_neo && [[ -f $STATE/neo-before.json ]]; then neo_restore=1; fi
   require_supported_soc "Uninstalling, which rebuilds boot.bin with the stock m1n1,"
   # An M3 Max on its boot loader variant gets the boot.bin it booted before the variant back,
@@ -4533,6 +4533,9 @@ uninstall_all() {
   else
     m3_mode=none
   fi
+  # An M3 Max keeps the m1n1 it has; after the variant (or the kit's --restore) that is this
+  # release's T6031 build, so its freeze stays at the end.
+  if is_m3_max && m3max_m1n1_installed; then max_m1n1=1; fi
   if [[ $(boot_chain) == limine ]] && m3_limine_cleanup_needed; then
     m3_limine_remove_check
   fi
@@ -4600,7 +4603,16 @@ uninstall_all() {
     $sudo grub-mkconfig -o /boot/grub/grub.cfg
   fi
   case $m3_mode in
-    kernel) m3_unfreeze ;;
+    kernel)
+      if ((max_m1n1)); then
+        say "update-m1n1 stays frozen ($UPDATE_M1N1_CONF): the installed m1n1 is this release's M3 Max
+    build, not the one this Mac had, and a boot.bin rebuilt from it would run its GPU handoff at
+    every boot. boot.bin stays as it is. Reinstall the m1n1 package this Mac had before you remove
+    the lines from \"$M3_FREEZE_BEGIN\" to \"$M3_FREEZE_END\"."
+      else
+        m3_unfreeze
+      fi
+      ;;
     handoff) m3_restore_bringup ;;
   esac
   $sudo rm -f "$MODPROBE_CONF"
@@ -8656,12 +8668,17 @@ m3max_bootbin_record() {
   echo "$keep $sha" | $sudo tee "$STATE/m3max-bootbin-backup" >/dev/null
 }
 
-# update-m1n1's configuration as a kernel-only M3 has it: without the DTBS block m1n1_update
-# wrote for the variant's rebuilds, and frozen by this script (m3_freeze), so no kernel or m1n1
-# update rebuilds the boot.bin that was put back.
+# update-m1n1's configuration as a kernel-only M3 has it: the one this Mac had before the first
+# install (snapshot_boot_state), with the image's own DTBS line; without that copy, the current
+# one without the DTBS block m1n1_update wrote for the variant's rebuilds. Then frozen by this
+# script (m3_freeze), so no kernel or m1n1 update rebuilds the boot.bin that was put back.
 m3max_conf_kernel_only() {
   local tmp
-  if [[ -f $UPDATE_M1N1_CONF ]]; then
+  if [[ -f $STATE/update-m1n1.default.saved ]]; then
+    $sudo install -m 644 "$STATE/update-m1n1.default.saved" "$UPDATE_M1N1_CONF"
+  elif [[ -e $STATE/update-m1n1.absent ]]; then
+    $sudo rm -f "$UPDATE_M1N1_CONF"
+  elif [[ -f $UPDATE_M1N1_CONF ]]; then
     tmp=$(mktemp)
     $sudo sed -e '/^# aurora-sep: build m1n1/,/^DTBS=/d' -e '/^DTBS=/d' "$UPDATE_M1N1_CONF" >"$tmp"
     if grep -q '[^[:space:]]' "$tmp"; then
@@ -8672,6 +8689,20 @@ m3max_conf_kernel_only() {
     rm -f "$tmp"
   fi
   m3_freeze
+}
+
+# True when the installed m1n1 ($M1N1_BIN) is a T6031 build, which runs the M3 Max handoffs
+# unless a switch says =0 (M3_MAX_SWITCHES). The variant installs one, and putting the earlier
+# boot.bin back leaves it installed: a boot.bin rebuilt from it without those switches would run
+# the GPU handoff at every boot.
+m3max_m1n1_installed() {
+  local bin rc=1
+  [[ -f $M1N1_BIN ]] || return 1
+  bin=$(mktemp)
+  # One string per line, in a file, as m1n1_pkg_has_handoff reads a package's.
+  if tr '\0' '\n' <"$M1N1_BIN" >"$bin" 2>/dev/null && grep -qaxF asahi,t6031-gpu "$bin"; then rc=0; fi
+  rm -f "$bin"
+  return "$rc"
 }
 
 # Puts that boot.bin back (checked by its sha256, replaced through a compared copy), and drops
@@ -10702,8 +10733,12 @@ m3max_kit_mesa_install() {
     say "The test kernel has no GPU start experiment, so the kit's Mesa (for GPU jobs) is not installed"
     return 0
   fi
-  if bsdtar -tf "$file" 2>/dev/null | grep -v '^\.' | grep -qv '^opt/'; then
-    warn "the kit's Mesa package has files outside /opt, so it was left out (no GPU jobs)"
+  # The whole listing first, then one grep with no pipe: grep -q stops reading at its first
+  # match, and a writer's SIGPIPE under pipefail would turn a package with files elsewhere into
+  # a pass.
+  local listing
+  if ! listing=$(bsdtar -tf "$file" 2>/dev/null) || grep -qvE '^(\.|opt/)' <<<"$listing"; then
+    warn "the kit's Mesa package has files outside /opt, or could not be listed, so it was left out (no GPU jobs)"
     return 0
   fi
   local -a deps=()
