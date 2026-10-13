@@ -446,7 +446,7 @@ static bool trampoline_provider_property_h17p(struct apple_dcp *dcp, int tag,
 	} else if (!of_property_present(node, property->dt_name) &&
 		   of_machine_is_compatible("apple,j700") &&
 		   (of_device_is_compatible(node, "apple,t8140-dcp") ||
-		    (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL &&
+		    (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL &&
 		     of_device_is_compatible(node, "apple,t8140-dcpext")))) {
 		/* Qualified older loaders lack the newly described table properties. */
 		memset(reply, 0, sizeof(*reply));
@@ -696,26 +696,10 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 	[599] = trampoline_nop, /* find_swap_function_gated */
 };
 
-/*
- * Validate a callback record and, the first time each runtime callback whose
- * length is only bounded arrives with a different length, report the length
- * actually seen.  Those reports are the first capture of these records.
- */
 bool iomfb_check_callback_h17p(struct apple_dcp *dcp, int tag, u32 in_len,
 			       u32 out_len)
 {
-	const struct dcp_callback_size *size;
-
-	if (!iomfb_validate_callback_h17p(tag, in_len, out_len))
-		return false;
-	size = &callback_sizes[tag];
-	if (size->minimum &&
-	    (in_len != size->in_len || out_len != size->out_len) &&
-	    !test_and_set_bit(tag, dcp->sized_callbacks))
-		dev_info(dcp->dev,
-			 "callback D%03d record is %#x/%#x bytes; its handler uses %#x/%#x\n",
-			 tag, in_len, out_len, size->in_len, size->out_len);
-	return true;
+	return iomfb_validate_callback_h17p(tag, in_len, out_len);
 }
 
 static_assert(sizeof(struct dcp_set_power_state_resp) == 8);
@@ -738,10 +722,6 @@ static void iomfb_external_power_complete(struct apple_dcp *dcp, void *out, void
 		    header->out_len == sizeof(struct dcp_set_power_state_resp)) {
 			u64 reply = get_unaligned_le64(out);
 
-			WRITE_ONCE(dcp->external_power_reply, reply);
-			WRITE_ONCE(dcp->external_power_reply_valid, true);
-			dev_info(dcp->dev, "A473 power=%u reply=%#llx\n",
-				 cookie->on, reply);
 			ret = reply == (u64)cookie->on ? 0 : -EREMOTEIO;
 		}
 	}
@@ -798,7 +778,6 @@ int iomfb_external_power_h17p(struct apple_dcp *dcp, bool on)
 	if (!cookie)
 		return -ENOMEM;
 	cookie->on = on;
-	WRITE_ONCE(dcp->external_power_reply_valid, false);
 	cookie->wait.status = -ETIMEDOUT;
 	init_completion(&cookie->wait.done);
 	kref_init(&cookie->wait.refcount);

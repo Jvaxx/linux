@@ -400,7 +400,14 @@ unsafe fn add_u32(
     }
 }
 
-pub(crate) fn enable_spi_sensor(base: u64, cs: u32) -> Result<()> {
+// The public J700 DTS enables SPI2. A disabled controller at handoff is a
+// firmware hardware-presence decision; older platforms still need activation.
+fn sensor_controller_refused(controller: &DtNode) -> bool {
+    crate::profile::machine_has(b"apple,j700") && !controller.is_available()
+}
+
+/// Returns false when the bootloader explicitly withheld J700's controller.
+pub(crate) fn enable_spi_sensor(base: u64, cs: u32) -> Result<bool> {
     // A machine that describes the sensor in its own device tree (compatible
     // apple,mesa-fingerprint) is handled machine-agnostically: enable that node
     // and its SPI controller wherever they sit, with the power/IRQ GPIOs coming
@@ -411,6 +418,9 @@ pub(crate) fn enable_spi_sensor(base: u64, cs: u32) -> Result<()> {
             pr_err!("apple_sep: sensor node has no parent SPI controller\n");
             ENODEV
         })?;
+        if sensor_controller_refused(&controller) {
+            return Ok(false);
+        }
         pr_info!(
             "apple_sep: sensor node present in the device tree; enabling it and its SPI bus\n"
         );
@@ -425,7 +435,7 @@ pub(crate) fn enable_spi_sensor(base: u64, cs: u32) -> Result<()> {
                 queued = true;
             }
             Ok(queued)
-        });
+        }).map(|()| true);
     }
 
     let controller = node_at_address(base).ok_or_else(|| {
@@ -436,6 +446,9 @@ pub(crate) fn enable_spi_sensor(base: u64, cs: u32) -> Result<()> {
         ENODEV
     })?;
 
+    if sensor_controller_refused(&controller) {
+        return Ok(false);
+    }
     let controller_ok = controller.is_available();
     let existing = controller.child_with_reg(cs);
     pr_info!(
@@ -447,7 +460,7 @@ pub(crate) fn enable_spi_sensor(base: u64, cs: u32) -> Result<()> {
     );
 
     if controller_ok && existing.is_some() {
-        return Ok(());
+        return Ok(true);
     }
 
     if existing.is_some() && !controller_ok {
@@ -456,7 +469,7 @@ pub(crate) fn enable_spi_sensor(base: u64, cs: u32) -> Result<()> {
         return with_changeset(|cs_handle| {
             queue_status_okay(cs_handle, &controller)?;
             Ok(true)
-        });
+        }).map(|()| true);
     }
 
     pr_info!(
@@ -470,7 +483,7 @@ pub(crate) fn enable_spi_sensor(base: u64, cs: u32) -> Result<()> {
         }
         queue_sensor_node(cs_handle, &controller)?;
         Ok(true)
-    })
+    }).map(|()| true)
 }
 
 /// Resolve a reserved-memory region by name on the SEP node's device.

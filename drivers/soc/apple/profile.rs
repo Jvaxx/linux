@@ -447,7 +447,7 @@ static_assert!(T8122.wide_dma_mask);
 ///
 /// The root property is a NUL-separated list, so whole entries are compared
 /// instead of substrings: `apple,t8103` cannot match a longer unrelated value.
-fn machine_has(compatible: &[u8]) -> bool {
+pub(crate) fn machine_has(compatible: &[u8]) -> bool {
     let Some(root) = of::root() else {
         return false;
     };

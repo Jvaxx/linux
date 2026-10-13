@@ -1,0 +1,56 @@
+Apple external display host regressions
+======================================
+
+Run from a kernel source checkout:
+
+  make -C tools/testing/selftests TARGETS=drivers/gpu/apple-dcp run_tests
+
+Or keep translation units, commands, failure logs and source hashes:
+
+  tools/testing/selftests/drivers/gpu/apple-dcp/run.sh --output /tmp/apple-dcp-results
+
+An installed copy needs --source /path/to/kernel. --group edid, rate, phy or
+lifecycle selects one group. HOSTCC selects the host compiler (default clang).
+Python 3 and a compiler supporting AddressSanitizer/UndefinedBehaviorSanitizer
+are required. No target access, firmware command, captured fixture or kernel
+configuration is required.
+
+One TAP entry point uses shared production extraction and compiler handling.
+The modules contain public synthetic host boundaries and retained assertions:
+
+* edid: actual AFK admission and OPEN/CLOSE handling; native/HDMI providers
+  alternating over 64 epochs; foreign owners, stale replies, reader/command
+  pins, ordered receive progress and legacy service behavior.
+* rate: actual binary parser, EDID/capacity policy, receipt ingress, getters
+  and lookup; all arrival orders, conflicting/discarded siblings, rejected
+  replacement catalogs, HPD retirement and recovery; malformed/duplicate
+  metadata and independent EDID decoding; eight bounded delayed retries.
+* phy: actual parking/mux/init/reset/configure callbacks, masked PMA context,
+  faulted ACK/BIST cleanup, dirty-route retry, OFF/new-calibration epochs,
+  warm reset and legacy T8103/T8122/T8140/T8142 route controls.
+* lifecycle: actual physical-disconnect authority and ownership despite failed
+  teardown; DWC3/core/PHY PM and reset-reference recovery; exact firmware
+  tuple/resource admission, unsupported VRR rejection and power reply bounds;
+  15,552 D134 dispatcher scope/length/context and legacy reply cases.
+
+Transport, MMIO, kernel locks and work scheduling are host mocks. These tests
+establish source behavior; electrical readiness, firmware/FDT ownership,
+concurrency and system suspend require separate kernel/hardware qualification.
+Kernel KUnit tests and apple-afkv2 remain separate tests in their existing
+standard layouts. No archived diagnostic script is a dependency of this suite.
+
+The runner preserves host artifacts on failure as well as success. Existing
+physical-disconnect fixture warnings for unused mock boundaries and signed
+host/kernel ABI comparisons are handled only by those fixtures' original
+compiler options; production source compilation uses the normal Kbuild policy.
+
+The bounded-PM group shares the PHY fixture and executes the actual PM get/put
+and mux wrapper, usb_hc_died and typec_mux_set. The probe group executes real
+CD321x register/unregister/rollback and retry-state functions. USB n/y/m uses
+the actual optional dependency and a real Kconfig producer (KCONFIG_CONF may
+select an existing producer). Legacy lane/teardown groups keep executing the
+same locked mux body; they do not pretend their old USB mocks own runtime PM.
+The cpuidle group executes the actual Apple table/probe, generic registration
+and s2idle selector/entry, and tick_freeze/unfreeze. It checks source behavior
+only; RTC, elapsed suspend time and simultaneous hardware execution remain
+separate qualification gates. The original human cpuidle patch is preserved.

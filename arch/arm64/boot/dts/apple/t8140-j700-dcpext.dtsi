@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
  * T8140 external display resources measured through the public ADT API.
- * Generated-by: LLM
- * Assisted-by: LLM
  *
  * The controller remains disabled until the loader validates and preserves
  * the inherited firmware and its complete dependency group.

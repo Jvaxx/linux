@@ -69,13 +69,6 @@ static void dcp_swap_submit(struct apple_dcp *dcp, bool oob,
 	const void *data = request;
 
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
-		for (i = 0; i < SWAP_SURFACES; i++) {
-			const struct dcp_surface *surface = &request->surf[i].base;
-
-			if (!request->surf_null[i])
-				trace_iomfb_surface(dcp, i, surface->format, surface->xfer_func,
-						    surface->colorspace, surface->is_premultiplied);
-		}
 		iomfb_serialize_present_h17p(&dcp->present_h17p, request);
 		if (!iomfb_apply_backlight_h17p(dcp, request, &dcp->present_h17p)) {
 			if (cb)
@@ -981,7 +974,30 @@ static u8 dcpep_cb_prop_start(struct apple_dcp *dcp, u32 *length)
 
 	dcp->chunks.modes_generation = dcp_modes_transfer_begin(dcp);
 	dcp->chunks.length = *length;
-	dcp_firmware_metadata_begin(dcp);
+	dcp->chunks.av_service_epoch = 0;
+	dcp->chunks.automatic_service_pending = false;
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL) {
+		/* Match the receipt's start, not a replacement service at its end. */
+		mutex_lock(&dcp->dcpavserv.lock);
+		dcp->chunks.av_service_epoch = dcp->dcpavserv.epoch;
+		dcp->chunks.automatic_service_pending =
+			!dcp->dcpavserv.enabled && !dcp->dcpavserv.service;
+		dcp_firmware_metadata_begin(dcp);
+		{
+			unsigned long flags;
+
+			spin_lock_irqsave(&dcp->metadata.lock, flags);
+			dcp->chunks.automatic_connection_sequence = dcp->rate_proof.connection_sequence;
+			dcp->chunks.mode_ticket = dcp_metadata_begin(&dcp->metadata.epoch);
+			dcp->chunks.mode_ticket.associated =
+				dcp->metadata.epoch.generation == READ_ONCE(dcp->typec_generation) &&
+				READ_ONCE(dcp->typec_cable_connected);
+			spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+		}
+		mutex_unlock(&dcp->dcpavserv.lock);
+	} else {
+		dcp_firmware_metadata_begin(dcp);
+	}
 	dcp->chunks.data = kzalloc(*length, GFP_KERNEL);
 
 	if (!dcp->chunks.data) {
@@ -2120,7 +2136,6 @@ static void dcp_pre_swap_a428(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	u32 identity = 0x10000;
 
-	trace_iomfb_control_result(dcp, 423, !!out, out ? get_unaligned_le32(out) : 0);
 	dcp_pipe_set_428(dcp, false, &identity, dcp_post_swap_a428, cookie);
 }
 #endif
@@ -2335,7 +2350,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		 * Keep YUV, other source spaces and other profiles unchanged.
 		 */
 		if (dcp->hw.iomfb_method_profile ==
-			    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL &&
+			    DCP_IOMFB_METHODS_H17P_EXTERNAL &&
 		    !new_state->fb->format->is_yuv &&
 		    req->surf[l].base.colorspace == DCP_COLORSPACE_NATIVE)
 			req->surf[l].base.colorspace = DCP_COLORSPACE_BG_SRGB;
@@ -2400,7 +2415,6 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 			mat.matrix[0] = mat.matrix[4] = mat.matrix[8] = 1LLU << 32;
 		}
 
-		trace_iomfb_ctm(dcp, mat.location, mat.matrix, mat.matrix_null);
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
 		iomfb_set_matrix(dcp, false, &mat, dcp_pre_swap_a428, NULL);
 #else

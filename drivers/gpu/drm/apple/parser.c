@@ -362,6 +362,8 @@ static int parse_dimension(struct dcp_parse_ctx *handle, struct dimension *dim, 
 static int parse_dimension(struct dcp_parse_ctx *handle, struct dimension *dim,
 			   bool require_rate)
 {
+	static const char * const fields[] = { "Active", "Total", "FrontPorch", "SyncWidth", "PreciseSyncRate" };
+	unsigned int seen = 0;
 	struct iterator it;
 	unsigned int fields = 0;
 	int ret = 0;
@@ -372,6 +374,14 @@ static int parse_dimension(struct dcp_parse_ctx *handle, struct dimension *dim,
 
 	for (; it.idx < it.len; ++it.idx) {
 		char *key = parse_string(it.handle);
+		unsigned int field;
+
+		if (!IS_ERR(key) && handle->automatic_1080p180_rgb8)
+			for (field = 0; field < 5; field++)
+				if (!strcmp(key, fields[field])) {
+					handle->ambiguous_180hz |= !!(seen & (1U << field));
+					seen |= 1U << field;
+				}
 
 		if (IS_ERR(key)) {
 			ret = PTR_ERR(key);
@@ -581,10 +591,11 @@ static int parse_timing_color_restrictions(struct dcp_parse_ctx *handle,
 
 static int parse_color_modes(struct dcp_parse_ctx *handle,
 			     struct dcp_display_mode *out, bool external_sdr,
-			     const struct timing_color_restrictions *limits)
+			     const struct timing_color_restrictions *limits,
+			     struct dcp_color_mode *unsafe_rgb8)
 {
 	struct iterator outer_it;
-	unsigned int best_sdr_rank = 0;
+	unsigned int best_sdr_rank = 0, best_unsafe_rank = 0;
 	int ret = 0;
 	out->sdr_444.score = -1;
 	out->sdr_rgb.score = -1;
@@ -597,6 +608,8 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 
 	for (; outer_it.idx < outer_it.len; ++outer_it.idx) {
 		struct iterator it;
+		static const char * const fields[] = { "Colorimetry", "Depth", "DynamicRange", "EOTF", "ID", "PixelEncoding", "Score", "IsVirtual" };
+		unsigned int seen = 0;
 		bool is_virtual = true;
 		struct color_mode cmode = {
 			.colorimetry = -1, .depth = -1, .dynamic_range = -1,
@@ -609,6 +622,14 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 
 		for (; it.idx < it.len; ++it.idx) {
 			char *key = parse_string(it.handle);
+			unsigned int field;
+
+			if (!IS_ERR(key) && handle->automatic_1080p180_rgb8)
+				for (field = 0; field < 8; field++)
+					if (!strcmp(key, fields[field])) {
+						handle->ambiguous_180hz |= !!(seen & (1U << field));
+						seen |= 1U << field;
+					}
 
 			if (IS_ERR(key))
 				ret = PTR_ERR(key);
@@ -652,10 +673,25 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 			unsigned int rank;
 
 			if (cmode.id <= U32_MAX &&
-			    (timing_color_contains(&limits->unsafe, cmode.id) ||
-			     timing_color_contains(&limits->dsc_required, cmode.id)))
+			    timing_color_contains(&limits->dsc_required, cmode.id))
 				continue;
 			rank = external_sdr_rank(&cmode);
+			if (cmode.id <= U32_MAX &&
+			    timing_color_contains(&limits->unsafe, cmode.id)) {
+				/*
+				 * Collect only a timing-local bounded RGB8 candidate.
+				 * Admission still requires current EDID and link proof.
+				 */
+				if (unsafe_rgb8 && cmode.depth == 8 && rank &&
+				    cmode.colorimetry == DCP_COLORIMETRY_SRGB &&
+				    rank >= best_unsafe_rank) {
+					if (rank > best_unsafe_rank)
+						unsafe_rgb8->score = -1;
+					fill_color_mode(unsafe_rgb8, &cmode);
+					best_unsafe_rank = rank;
+				}
+				continue;
+			}
 			if (!rank || rank < best_sdr_rank)
 				continue;
 			if (rank > best_sdr_rank)
@@ -698,10 +734,17 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		      struct dcp_display_mode *out, s64 *score, int width_mm,
 		      int height_mm, unsigned notch_height, bool internal, bool external_sdr)
 {
+	static const char * const fields[] = {
+		"ID", "Score", "MinimumVariableRefreshRate", "MaximumVariableRefreshRate",
+	};
+	unsigned int seen = 0;
 	int ret = 0;
 	struct iterator it;
 	struct dimension horiz = { .active = -1 }, vert = { .active = -1 };
 	struct timing_color_restrictions limits = {};
+	struct dcp_color_mode unsafe_rgb8 = { .score = -1 };
+	bool have_horiz = false, have_vert = false, have_virtual = false;
+	bool duplicate_scope = false;
 	struct dimension horiz = {}, vert = {};
 	u64 clock;
 	s64 min_vrr = 0, max_vrr = 0;
@@ -719,6 +762,7 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 	out->sdr.score = -1;
 	out->best.score = -1;
 	*score = -1;
+	handle->ambiguous_180hz = false;
 
 	if (external_sdr) {
 		struct dcp_parse_ctx scan = *handle;
@@ -734,26 +778,44 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 
 	for (; it.idx < it.len; ++it.idx) {
 		char *key = parse_string(it.handle);
+		unsigned int field;
+
+		if (!IS_ERR(key) && handle->automatic_1080p180_rgb8)
+			for (field = 0; field < ARRAY_SIZE(fields); field++)
+				if (!strcmp(key, fields[field])) {
+					handle->ambiguous_180hz |= !!(seen & (1U << field));
+					seen |= 1U << field;
+				}
 
 		if (IS_ERR(key))
 			ret = PTR_ERR(key);
 		else if (is_virtual)
 			ret = skip(it.handle);
-		else if (!strcmp(key, "HorizontalAttributes"))
-			ret = parse_dimension(it.handle, &horiz, false);
-		else if (!strcmp(key, "VerticalAttributes"))
-			ret = parse_dimension(it.handle, &vert, true);
-		else if (!strcmp(key, "MinimumVariableRefreshRate"))
+		else if (!strcmp(key, "HorizontalAttributes")) {
+			duplicate_scope |= have_horiz;
+			have_horiz = true;
+			ret = parse_dimension(it.handle, &horiz, external_sdr);
+		} else if (!strcmp(key, "VerticalAttributes")) {
+			duplicate_scope |= have_vert;
+			have_vert = true;
+			ret = parse_dimension(it.handle, &vert, external_sdr);
+		} else if (!strcmp(key, "MinimumVariableRefreshRate"))
 			ret = parse_int_bound(it.handle, &min_vrr, 0, U32_MAX);
 		else if (!strcmp(key, "MaximumVariableRefreshRate"))
 			ret = parse_int_bound(it.handle, &max_vrr, 0, U32_MAX);
 		else if (!strcmp(key, "ColorModes"))
-			ret = parse_color_modes(it.handle, out, external_sdr, &limits);
+			ret = parse_color_modes(it.handle, out, external_sdr, &limits,
+					handle->automatic_1080p180_rgb8 ?
+					&unsafe_rgb8 : NULL);
 		else if (!strcmp(key, "ID"))
 			ret = parse_int(it.handle, &id);
 		else if (!strcmp(key, "IsVirtual"))
+			ret = parse_int_bound(it.handle, &id, 0, U32_MAX);
+		else if (!strcmp(key, "IsVirtual")) {
+			duplicate_scope |= have_virtual;
+			have_virtual = true;
 			ret = parse_bool(it.handle, &is_virtual);
-		else if (external_sdr && !strcmp(key, "IsPreferred")) {
+		} else if (external_sdr && !strcmp(key, "IsPreferred")) {
 			if (have_preferred)
 				ret = -EINVAL;
 			else
@@ -779,6 +841,27 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 			trace_iomfb_parse_mode_fail(id, &horiz, &vert, best_color_mode, is_virtual, *score);
 			return ret;
 		}
+	}
+	/*
+	 * Never replace a normal candidate or create a timing/color pairing.
+	 * Only the bounded automatic policy may publish or use this candidate.
+	 * Its EDID identity and successful link callbacks must remain current.
+	 * The observed 2080x1106 total and 11796583/65536 Hz are deliberate:
+	 * do not widen this to arbitrary nominal-180 Hz blanking or rates.
+	 */
+	if (external_sdr && !internal &&
+	    handle->automatic_1080p180_rgb8 &&
+	    !handle->ambiguous_180hz &&
+	    out->sdr_rgb.score < 0 && unsafe_rgb8.score >= 0 &&
+	    !duplicate_scope && have_horiz && have_vert && have_virtual && !is_virtual &&
+	    have_interlaced && !interlaced && !notch_height &&
+	    horiz.active == 1920 && vert.active == 1080 &&
+	    horiz.total == 2080 && vert.total == 1106 &&
+	    vert.precise_sync_rate == 11796583 &&
+	    horiz.pixel_repetition == 0 && vert.pixel_repetition == 0 &&
+	    horiz.sync_polarity >= 0 && vert.sync_polarity >= 0) {
+		out->sdr_rgb = unsafe_rgb8;
+		out->automatic_rgb8_quirk = handle->automatic_1080p180_rgb8;
 	}
 	if (out->sdr_rgb.score >= 0)
 		best_color_mode = out->sdr_rgb.id;
@@ -824,8 +907,12 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		out->vrr = true;
 	}
 
-	/* Refresh rates are reported by DCP as 16.16 fixed-point Hz. */
-	if (min_vrr && max_vrr > min_vrr) {
+	/*
+	 * Refresh rates are reported by DCP as 16.16 fixed-point Hz.
+	 * External H17P skips adaptive-sync programming: keep the fixed timing
+	 * available, but do not advertise its sink VRR range as driver support.
+	 */
+	if (!external_sdr && min_vrr && max_vrr > min_vrr) {
 		out->min_vrr = min_vrr;
 		out->max_vrr = max_vrr;
 		out->vrr = true;
@@ -861,7 +948,8 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 	if (external_sdr && horiz.sync_polarity >= 0 && vert.sync_polarity >= 0)
 		mode->flags = (horiz.sync_polarity ? DRM_MODE_FLAG_PHSYNC : DRM_MODE_FLAG_NHSYNC) |
 			      (vert.sync_polarity ? DRM_MODE_FLAG_PVSYNC : DRM_MODE_FLAG_NVSYNC);
-	out->metadata_timing_valid = external_sdr && have_preferred && preferred &&
+	out->metadata_timing_valid = external_sdr && !out->automatic_rgb8_quirk &&
+		have_preferred && preferred &&
 		have_interlaced && !interlaced && horiz.pixel_repetition == 0 &&
 		vert.pixel_repetition == 0 && horiz.sync_polarity >= 0 && vert.sync_polarity >= 0;
 	drm_mode_set_name(mode);
@@ -876,11 +964,110 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 	return 0;
 }
 
+/*
+ * Inspect command identities before filtering can discard conflicting siblings.
+ * Only automatic exceptions use this conservative receipt-wide check.
+ */
+static bool dcp_180hz_color_ids_current(struct dcp_parse_ctx *handle, u32 id)
+{
+	static const char * const fields[] = {
+		"ID", "Depth", "DynamicRange", "EOTF", "PixelEncoding", "Colorimetry",
+	};
+	struct iterator colors;
+
+	if (iterator_begin(handle, &colors, false))
+		return false;
+	for (; colors.idx < colors.len; colors.idx++) {
+		struct color_mode color = { .id = -1, .depth = -1, .dynamic_range = -1,
+			.eotf = -1, .pixel_encoding = -1, .colorimetry = -1 };
+		s64 *values[] = { &color.id, &color.depth, &color.dynamic_range,
+			&color.eotf, &color.pixel_encoding, &color.colorimetry };
+		bool is_virtual = true, virtual_seen = false;
+		unsigned int seen = 0;
+		struct iterator entry;
+
+		if (iterator_begin(handle, &entry, true))
+			return false;
+		for (; entry.idx < entry.len; entry.idx++) {
+			char *key = parse_string(handle);
+			unsigned int field;
+			int ret;
+
+			if (IS_ERR(key))
+				return false;
+			for (field = 0; field < ARRAY_SIZE(fields); field++)
+				if (!strcmp(key, fields[field]))
+					break;
+			if (field < ARRAY_SIZE(fields)) {
+				ret = seen & (1U << field) ? -EINVAL :
+					parse_int_bound(handle, values[field], 0, U32_MAX);
+				seen |= 1U << field;
+			} else if (!strcmp(key, "IsVirtual")) {
+				ret = virtual_seen ? -EINVAL : parse_bool(handle, &is_virtual);
+				virtual_seen = true;
+			} else {
+				ret = skip(handle);
+			}
+			kfree(key);
+			if (ret)
+				return false;
+		}
+		if (color.id == id &&
+		    (is_virtual || !virtual_seen || color.depth != 8 ||
+		     color.dynamic_range != DCP_COLOR_YCBCR_RANGE_FULL ||
+		     color.eotf != DCP_EOTF_SDR_GAMMA ||
+		     color.pixel_encoding != DCP_COLOR_FORMAT_RGB ||
+		     color.colorimetry != DCP_COLORIMETRY_SRGB))
+			return false;
+	}
+	return true;
+}
+
+static bool dcp_180hz_ids_current(struct dcp_parse_ctx handle,
+				const struct dcp_display_mode *mode)
+{
+	struct iterator timings;
+	unsigned int matches = 0;
+
+	if (iterator_begin(&handle, &timings, false))
+		return false;
+	for (; timings.idx < timings.len; timings.idx++) {
+		struct iterator entry;
+
+		if (iterator_begin(&handle, &entry, true))
+			return false;
+		for (; entry.idx < entry.len; entry.idx++) {
+			char *key = parse_string(&handle);
+			int ret = 0;
+
+			if (IS_ERR(key))
+				return false;
+			if (!strcmp(key, "ID")) {
+				s64 id;
+
+				ret = parse_int_bound(&handle, &id, 0, U32_MAX);
+				if (!ret && id == mode->timing_mode_id)
+					matches++;
+			} else if (!strcmp(key, "ColorModes")) {
+				if (!dcp_180hz_color_ids_current(&handle, mode->color_mode_id))
+					ret = -EINVAL;
+			} else {
+				ret = skip(&handle);
+			}
+			kfree(key);
+			if (ret || matches > 1)
+				return false;
+		}
+	}
+	return matches == 1;
+}
+
 struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 					 unsigned int *count, int width_mm,
 					 int height_mm, unsigned notch_height,
 					 bool internal, bool external_sdr)
 {
+	struct dcp_parse_ctx catalog = *handle;
 	struct iterator it;
 	int ret;
 	struct dcp_display_mode *mode, *modes;
@@ -933,7 +1120,7 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 		/* Process a successful mode */
 		(*count)++;
 
-		if (score > best_score) {
+		if (!mode->automatic_rgb8_quirk && score > best_score) {
 			best_score = score;
 			best_mode = mode;
 		}
@@ -942,6 +1129,17 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 	if (best_mode != NULL)
 		best_mode->mode.type |= DRM_MODE_TYPE_PREFERRED;
 
+	if (handle->automatic_1080p180_rgb8) {
+		unsigned int i, kept = 0;
+
+		for (i = 0; i < *count; i++) {
+			if (modes[i].automatic_rgb8_quirk &&
+			    !dcp_180hz_ids_current(catalog, &modes[i]))
+				continue;
+			modes[kept++] = modes[i];
+		}
+		*count = kept;
+	}
 	return modes;
 }
 
@@ -1192,7 +1390,7 @@ static int parse_metadata_product(struct dcp_parse_ctx *handle, struct dcp_displ
 	for (unsigned int i = 0; i < 3; i++)
 		if (out->manufacturer[i] < 'A' || out->manufacturer[i] > 'Z')
 			return -EINVAL;
-	if ((seen & 32) && legacy != ((out->manufacturer[0] - '@') << 10 |
+	if ((seen & 32) && legacy != (u32)((out->manufacturer[0] - '@') << 10 |
 				   (out->manufacturer[1] - '@') << 5 |
 				   (out->manufacturer[2] - '@')))
 		return -EINVAL;

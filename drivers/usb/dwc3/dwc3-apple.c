@@ -254,6 +254,52 @@ static int dwc3_apple_core_init(struct dwc3_apple *appledwc)
 	return ret;
 }
 
+/* Keep failed releases owned by the glue, without repeating completed teardown. */
+static int dwc3_apple_core_stop(struct dwc3_apple *appledwc)
+{
+	struct dwc3 *dwc = &appledwc->dwc;
+	int i, ret;
+
+	lockdep_assert_held(&appledwc->lock);
+	if (appledwc->core_active) {
+		if (!appledwc->core_exit_pending) {
+			dwc3_enable_susphy(dwc, true);
+			dwc3_event_buffers_cleanup(dwc);
+			appledwc->core_exit_pending = true;
+		}
+		for (i = 0; i < dwc->num_usb3_ports; i++) {
+			if (!(appledwc->usb3_power_off_pending & BIT(i)))
+				continue;
+			ret = phy_power_off(dwc->usb3_generic_phy[i]);
+			if (ret)
+				return ret;
+			appledwc->usb3_power_off_pending &= ~BIT(i);
+		}
+		for (i = 0; i < dwc->num_usb2_ports; i++) {
+			if (!(appledwc->usb2_power_off_pending & BIT(i)))
+				continue;
+			ret = phy_power_off(dwc->usb2_generic_phy[i]);
+			if (ret)
+				return ret;
+			appledwc->usb2_power_off_pending &= ~BIT(i);
+		}
+		usb_phy_set_suspend(dwc->usb3_phy, 1);
+		usb_phy_set_suspend(dwc->usb2_phy, 1);
+		dwc3_core_exit_after_phy_power_off(dwc);
+		appledwc->core_active = false;
+		appledwc->core_exit_pending = false;
+	}
+	if (appledwc->reset_pending) {
+		ret = reset_control_assert(appledwc->reset);
+		if (ret)
+			return ret;
+		appledwc->reset_pending = false;
+	}
+	dev_pm_syscore_device(appledwc->dev, false);
+
+	return 0;
+}
+
 /*
  * Bring the core up for the given role: configure the USB2 PHY, release the reset and probe
  * (on the first call) or initialise the core.
@@ -264,6 +310,11 @@ static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_st
 	int ret, ret_reset;
 
 	lockdep_assert_held(&appledwc->lock);
+
+	/* A failed exit must finish before any new PHY reference is acquired. */
+	ret = dwc3_apple_core_stop(appledwc);
+	if (ret)
+		return ret;
 
 	/*
 	 * The USB2 PHY on this platform must be configured for device mode before dwc3 tries to
@@ -297,6 +348,9 @@ static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_st
 		return ret;
 	}
 
+	appledwc->reset_pending = true;
+	/* Keep register access powered until both PHY shutdown and reset finish. */
+	dev_pm_syscore_device(appledwc->dev, true);
 	ret = dwc3_apple_core_init(appledwc);
 	if (ret) {
 		ret_reset = reset_control_assert(appledwc->reset);
@@ -596,9 +650,11 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	scoped_guard(mutex, &appledwc->lock)
 		ret = dwc3_apple_init(appledwc, DWC3_APPLE_HOST);
 	if (ret) {
-		/* dwc3_apple_init() has already undone the core initialisation */
+		/* A failed cleanup remains visible even when probe cannot be retried. */
+		if (appledwc->core_active || appledwc->reset_pending)
+			dev_err(dev, "Host startup left pending PHY/reset cleanup\n");
 		if (appledwc->state != DWC3_APPLE_PROBE_PENDING)
-			dwc3_core_remove(&appledwc->dwc);
+			dwc3_core_remove_no_shutdown(&appledwc->dwc);
 		usb_role_switch_unregister(appledwc->role_sw);
 		return dev_err_probe(dev, ret, "Failed to start host mode\n");
 	}
@@ -622,7 +678,7 @@ static void dwc3_apple_remove(struct platform_device *pdev)
 	 */
 	dwc3_apple_exit(appledwc);
 	if (appledwc->state != DWC3_APPLE_PROBE_PENDING)
-		dwc3_core_remove(&appledwc->dwc);
+		dwc3_core_remove_no_shutdown(&appledwc->dwc);
 }
 
 static const struct of_device_id dwc3_apple_of_match[] = {

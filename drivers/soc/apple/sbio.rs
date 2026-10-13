@@ -304,14 +304,24 @@ impl SepData {
             return;
         }
 
-        if let Err(e) = dt::enable_spi_sensor(sensor::CONTROLLER_BASE, sensor::CHIP_SELECT) {
-            dev_warn!(
-                self.dev,
-                "sensor: could not enable the SPI bus at 0x{:x} or create the sensor node ({:?}); no sensor\n",
-                sensor::CONTROLLER_BASE,
-                e
-            );
-            return;
+        match dt::enable_spi_sensor(sensor::CONTROLLER_BASE, sensor::CHIP_SELECT) {
+            Ok(true) => {},
+            Ok(false) => {
+                dev_info!(
+                    self.dev,
+                    "sensor: SPI controller withheld by the J700 firmware handoff; Touch ID unavailable\n"
+                );
+                return;
+            }
+            Err(e) => {
+                dev_warn!(
+                    self.dev,
+                    "sensor: could not enable the SPI bus at 0x{:x} or create the sensor node ({:?}); no sensor\n",
+                    sensor::CONTROLLER_BASE,
+                    e
+                );
+                return;
+            }
         }
 
         let bound = sensor::is_bound();

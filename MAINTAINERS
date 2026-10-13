@@ -2043,6 +2043,7 @@ F:	tools/diagnostics/test-apple-j700-provider.py
 F:	tools/diagnostics/test-apple-j700-tuning.py
 F:	tools/diagnostics/wayland-output-frame-test.py
 F:	tools/testing/apple/
+F:	tools/testing/selftests/drivers/gpu/apple-dcp/
 
 APPLETALK NETWORK LAYER
 L:	netdev@vger.kernel.org

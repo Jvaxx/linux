@@ -28,14 +28,18 @@
 #include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/of_graph.h>
+#include <linux/of_platform.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
 #include <linux/pm.h>
 #include <linux/pm_domain.h>
+#include <linux/pm_runtime.h>
 #include <linux/reset-controller.h>
 #include <linux/soc/apple/dp-tunnel.h>
 #include <linux/soc/apple/tunable.h>
 #include <linux/types.h>
+#include <linux/usb.h>
+#include <linux/usb/hcd.h>
 #include <linux/usb/pd.h>
 #include <linux/usb/typec.h>
 #include <linux/usb/typec_altmode.h>
@@ -678,9 +682,15 @@ struct atcphy_hw {
  *           behind the T6030 HDMI port; it maps only its core window
  * @dp_tunables: The complete T8140 DisplayPort bundle was supplied
  * @aux_power_requested: AUX power-up began and needs matching shutdown
- * @mode_dirty: J700 mode transition needs cleanup before it can be retried
+ * @mode_dirty: Mode transition needs cleanup before it can be retried
  * @dp_idle_pmas: J700 PMAs with an incomplete routing idle sequence
  * @dp_owned_pmas: J700 PMAs requiring main-link cleanup
+ * @dp_usb_context_valid: Physical PMAs retaining their pre-DP USB field values
+ * @dp_usb_context_dirty: PMAs whose static fields were programmed by DP
+ * @usb_off_pending: Failed full OFF must finish before a new powered epoch
+ * @usb_off_drained: Masked recovery data was discharged before OFF began
+ * @pipe_pending: PIPE handoff still requires acknowledged dummy parking
+ * @dp_usb_context: Saved bits from the public per-PMA DP write masks
  * @dp_spread_spectrum: J700 main-link spread-spectrum state
  * @dp_presets: Firmware-derived per-rate drive presets
  * @dp_presets_valid: Firmware supplied each drive-preset table
@@ -758,6 +768,9 @@ struct apple_atcphy {
 	bool mode_dirty;
 	u8 dp_idle_pmas;
 	u8 dp_owned_pmas;
+	u8 dp_usb_context_valid, dp_usb_context_dirty;
+	u32 dp_usb_context[2][27];
+	bool usb_off_pending, usb_off_drained, pipe_pending;
 	bool dp_spread_spectrum;
 	u32 dp_presets[5][16];
 	bool dp_presets_valid[5];
@@ -1060,6 +1073,13 @@ static const struct atcphy_mode_configuration *atcphy_get_mode_config(struct app
 		return &atcphy_modes[mode].normal;
 }
 
+/* Readback only; callers hold the PHY mutex and keep the fixed host live. */
+static inline u32 core_read32(struct apple_atcphy *atcphy, u32 reg)
+{
+	return readl(atcphy->regs.core + reg);
+}
+
+/* Static configuration fields already read/modified by the public DP path. */
 static void j700_dp_tunables(struct apple_atcphy *atcphy)
 {
 	apple_tunable_apply(atcphy->regs.axi2af, atcphy->tunables.axi2af);
@@ -1133,12 +1153,14 @@ static int atcphy_pipehandler_lock(struct apple_atcphy *atcphy)
 	int ret;
 	u32 reg;
 
-	if (readl(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ) & PIPEHANDLER_LOCK_EN) {
-		dev_warn(atcphy->dev, "Pipehandler already locked\n");
-		return 0;
+	dev_dbg(atcphy->dev, "PIPE request: req=%#x mode=%u pipe=%u host=%u dirty=%u\n",
+		requested, atcphy->mode, atcphy->pipe_state,
+		atcphy->host_active, atcphy->mode_dirty);
+	if (requested & PIPEHANDLER_LOCK_EN) {
+		dev_dbg(atcphy->dev, "Pipehandler lock already requested\n");
+	} else {
+		set32(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ, PIPEHANDLER_LOCK_EN);
 	}
-
-	set32(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ, PIPEHANDLER_LOCK_EN);
 
 	ret = readl_poll_timeout(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_ACK, reg,
 				 reg & PIPEHANDLER_LOCK_EN, 10, PIPEHANDLER_LOCK_ACK_TIMEOUT_US);
@@ -1158,8 +1180,11 @@ static int atcphy_pipehandler_unlock(struct apple_atcphy *atcphy)
 	clear32(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ, PIPEHANDLER_LOCK_EN);
 	ret = readl_poll_timeout(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_ACK, reg,
 				 !(reg & PIPEHANDLER_LOCK_EN), 10, PIPEHANDLER_LOCK_ACK_TIMEOUT_US);
-	if (ret)
+	if (ret) {
+		dev_dbg(atcphy->dev, "PIPE unlock timeout: ack=%#x mode=%u pipe=%u dirty=%u\n",
+			reg, atcphy->mode, atcphy->pipe_state, atcphy->mode_dirty);
 		dev_warn(atcphy->dev, "Pipehandler lock release not acked.\n");
+	}
 
 	return ret;
 }
@@ -1215,8 +1240,9 @@ static void atcphy_usb3_bist_step_dbg(struct apple_atcphy *atcphy, int step)
 }
 
 static void atcphy_configure_pipehandler_usb3_host_t8122(struct apple_atcphy *atcphy)
+static int atcphy_configure_pipehandler_usb3_host_t8122(struct apple_atcphy *atcphy)
 {
-	int ret;
+	int ret, error = 0;
 	u32 reg;
 
 	core_set32(atcphy, ACIOPHY_BIST_CFG1, ACIOPHY_BIST_CFG1_CLOCK_EN);
@@ -1229,13 +1255,22 @@ static void atcphy_configure_pipehandler_usb3_host_t8122(struct apple_atcphy *at
 	core_set32(atcphy, ACIOPHY_BIST_CFG1, ACIOPHY_BIST_CFG1_USB_EN);
 	ret = readl_poll_timeout(atcphy->regs.core + ACIOPHY_BIST_CFG1, reg,
 				 (reg & ACIOPHY_BIST_CFG1_USB_EN), 10, 10000);
-	if (ret)
+	if (ret) {
+		if (!error)
+			error = ret;
+		dev_dbg(atcphy->dev, "BIST USB_EN phase=1 value=%#x mode=%u pipe=%u\n",
+			reg, atcphy->mode, atcphy->pipe_state);
 		dev_warn(atcphy->dev,
 			 "Timed out waiting for ACIOPHY_BIST_CFG1_USB_EN\n");
+	}
 	core_clear32(atcphy, ACIOPHY_BIST_CFG1, ACIOPHY_BIST_CFG1_USB_EN);
 	ret = readl_poll_timeout(atcphy->regs.core + ACIOPHY_BIST_MAC_USBPHY_STATUS2, reg,
 				 !(reg & ACIOPHY_BIST_MAC_USBPHY_STATUS2_LN0_PHY_STATUS2), 10, 10000);
-	if (ret)
+	if (ret) {
+		if (!error)
+			error = ret;
+		dev_dbg(atcphy->dev, "BIST STATUS2 phase=1 value=%#x swap=%u mode=%u pipe=%u\n",
+			reg, atcphy->swap_lanes, atcphy->mode, atcphy->pipe_state);
 		dev_warn(atcphy->dev,
 			 "Timed out waiting for ACIOPHY_BIST_MAC_USBPHY_STATUS2_LN0_PHY_STATUS2\n");
 	atcphy_usb3_bist_step_dbg(atcphy, 1);
@@ -1251,13 +1286,22 @@ static void atcphy_configure_pipehandler_usb3_host_t8122(struct apple_atcphy *at
 	core_set32(atcphy, ACIOPHY_BIST_CFG1, ACIOPHY_BIST_CFG1_USB_EN);
 	ret = readl_poll_timeout(atcphy->regs.core + ACIOPHY_BIST_CFG1, reg,
 				 (reg & ACIOPHY_BIST_CFG1_USB_EN), 10, 10000);
-	if (ret)
+	if (ret) {
+		if (!error)
+			error = ret;
+		dev_dbg(atcphy->dev, "BIST USB_EN phase=2 value=%#x mode=%u pipe=%u\n",
+			reg, atcphy->mode, atcphy->pipe_state);
 		dev_warn(atcphy->dev,
 			 "Timed out waiting for ACIOPHY_BIST_CFG1_USB_EN 2nd toggle\n");
+	}
 	core_clear32(atcphy, ACIOPHY_BIST_CFG1, ACIOPHY_BIST_CFG1_USB_EN);
 	ret = readl_poll_timeout(atcphy->regs.core + ACIOPHY_BIST_MAC_USBPHY_STATUS2, reg,
 				 !(reg & ACIOPHY_BIST_MAC_USBPHY_STATUS2_LN0_PHY_STATUS2), 10, 10000);
-	if (ret)
+	if (ret) {
+		if (!error)
+			error = ret;
+		dev_dbg(atcphy->dev, "BIST STATUS2 phase=2 value=%#x swap=%u mode=%u pipe=%u\n",
+			reg, atcphy->swap_lanes, atcphy->mode, atcphy->pipe_state);
 		dev_warn(atcphy->dev,
 			 "Timed out waiting for ACIOPHY_BIST_MAC_USBPHY_STATUS2_LN0_PHY_STATUS2 2nd time\n");
 	atcphy_usb3_bist_step_dbg(atcphy, 2);
@@ -1272,17 +1316,23 @@ static void atcphy_configure_pipehandler_usb3_host_t8122(struct apple_atcphy *at
 	core_set32(atcphy, ACIOPHY_BIST_CFG1, ACIOPHY_BIST_CFG1_USB_EN);
 	ret = readl_poll_timeout(atcphy->regs.core + ACIOPHY_BIST_CFG1, reg,
 				 (reg & ACIOPHY_BIST_CFG1_USB_EN), 10, 10000);
-	if (ret)
+	if (ret) {
+		if (!error)
+			error = ret;
+		dev_dbg(atcphy->dev, "BIST USB_EN phase=3 value=%#x mode=%u pipe=%u\n",
+			reg, atcphy->mode, atcphy->pipe_state);
 		dev_warn(atcphy->dev,
 			 "Timed out waiting for ACIOPHY_BIST_CFG1_USB_EN 3rd toggle\n");
+	}
 	core_clear32(atcphy, ACIOPHY_BIST_CFG1, ACIOPHY_BIST_CFG1_USB_EN);
 	atcphy_usb3_bist_step_dbg(atcphy, 3);
 	core_clear32(atcphy, ACIOPHY_BIST_CFG1, ACIOPHY_BIST_CFG1_CLOCK_EN);
+	return error;
 }
 
-static void atcphy_configure_pipehandler_usb3_host_t8103(struct apple_atcphy *atcphy)
+static int atcphy_configure_pipehandler_usb3_host_t8103(struct apple_atcphy *atcphy)
 {
-	int ret;
+	int ret, error = 0;
 	u32 reg;
 
 	core_set32(atcphy, ACIOPHY_TOP_BIST_PHY_CFG0,
@@ -1290,9 +1340,12 @@ static void atcphy_configure_pipehandler_usb3_host_t8103(struct apple_atcphy *at
 	core_set32(atcphy, ACIOPHY_TOP_BIST_OV_CFG, ACIOPHY_TOP_BIST_OV_CFG_LN0_RESET_N_OV);
 	ret = readl_poll_timeout(atcphy->regs.core + ACIOPHY_TOP_PHY_STAT, reg,
 				 !(reg & ACIOPHY_TOP_PHY_STAT_LN0_UNK23), 10, 10000);
-	if (ret)
+	if (ret) {
+		if (!error)
+			error = ret;
 		dev_warn(atcphy->dev,
 			 "Timed out waiting for ACIOPHY_TOP_PHY_STAT_LN0_UNK23\n");
+	}
 
 	core_set32(atcphy, ACIOPHY_TOP_BIST_READ_CTRL,
 		   ACIOPHY_TOP_BIST_READ_CTRL_LN0_PHY_STATUS_RE);
@@ -1313,15 +1366,21 @@ static void atcphy_configure_pipehandler_usb3_host_t8103(struct apple_atcphy *at
 
 	ret = readl_poll_timeout(atcphy->regs.core + ACIOPHY_TOP_PHY_STAT, reg,
 				 (reg & ACIOPHY_TOP_PHY_STAT_LN0_UNK0), 10, 10000);
-	if (ret)
+	if (ret) {
+		if (!error)
+			error = ret;
 		dev_warn(atcphy->dev,
 			 "timed out waiting for ACIOPHY_TOP_PHY_STAT_LN0_UNK0\n");
+	}
 
 	ret = readl_poll_timeout(atcphy->regs.core + ACIOPHY_TOP_PHY_STAT, reg,
 				 !(reg & ACIOPHY_TOP_PHY_STAT_LN0_UNK23), 10, 10000);
-	if (ret)
+	if (ret) {
+		if (!error)
+			error = ret;
 		dev_warn(atcphy->dev,
 			 "timed out waiting for ACIOPHY_TOP_PHY_STAT_LN0_UNK23\n");
+	}
 
 	atcphy_clear_nonselected_phy_reset(atcphy);
 
@@ -1331,6 +1390,7 @@ static void atcphy_configure_pipehandler_usb3_host_t8103(struct apple_atcphy *at
 		   ACIOPHY_TOP_BIST_CIOPHY_CFG1_CLK_EN);
 	core_set32(atcphy, ACIOPHY_TOP_BIST_CIOPHY_CFG1,
 		   ACIOPHY_TOP_BIST_CIOPHY_CFG1_BIST_EN);
+	return error;
 }
 
 static int atcphy_configure_pipehandler_usb3(struct apple_atcphy *atcphy, bool host)
@@ -1362,8 +1422,21 @@ static int atcphy_configure_pipehandler_usb3(struct apple_atcphy *atcphy, bool h
 
 		/* BIST dance */
 		if (atcphy->hw->gen == ATCPHY_GENERATION_T8103)
-			atcphy_configure_pipehandler_usb3_host_t8103(atcphy);
+			ret = atcphy_configure_pipehandler_usb3_host_t8103(atcphy);
 		else
+			ret = atcphy_configure_pipehandler_usb3_host_t8122(atcphy);
+		if (ret) {
+			int cleanup;
+
+			clear32(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE,
+				PIPEHANDLER_OVERRIDE_RXVALID | PIPEHANDLER_OVERRIDE_RXDETECT);
+			cleanup = atcphy_pipehandler_unlock(atcphy);
+			if (cleanup)
+				dev_warn(atcphy->dev, "PIPE cleanup after BIST: %d\n", cleanup);
+			/* Native BIST changed state; a retry must rebuild after parking. */
+			atcphy->mode_dirty = true;
+			return ret;
+		}
 			atcphy_configure_pipehandler_usb3_host_t8122(atcphy);
 		if (atcphy->hw->dp_t8122)
 			dev_dbg(atcphy->dev, "USB3 host BIST done: status2=%08x ov1=%08x ov2=%08x\n",
@@ -1375,6 +1448,8 @@ static int atcphy_configure_pipehandler_usb3(struct apple_atcphy *atcphy, bool h
 	/* Configure PIPE mux to USB3 PHY */
 	atcphy_pipehandler_set_mux(atcphy, PIPEHANDLER_MUX_CTRL_DATA_USB3,
 				   PIPEHANDLER_MUX_CTRL_CLK_USB3);
+	/* Track the selected backend even if its completion ACK fails. */
+	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_USB3;
 
 	/* Remove link detection override */
 	clear32(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE, PIPEHANDLER_OVERRIDE_RXVALID);
@@ -1383,8 +1458,11 @@ static int atcphy_configure_pipehandler_usb3(struct apple_atcphy *atcphy, bool h
 	/* Pipehandler was only locked when the BIST sequence was applied for host mode */
 	if (host) {
 		ret = atcphy_pipehandler_unlock(atcphy);
-		if (ret)
+		if (ret) {
 			dev_warn(atcphy->dev, "Failed to unlock pipehandler");
+			atcphy->mode_dirty = true;
+			return ret;
+		}
 	}
 
 	return 0;
@@ -1456,11 +1534,18 @@ static bool atcphy_needs_dummy_phy(struct apple_atcphy *atcphy)
 
 static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy, bool lock)
 {
+	bool live_usb3 = atcphy->pipe_pending ||
+		(atcphy->hw->has_t8140_dp && atcphy->fixed_usb2 && atcphy->host_active &&
+		 atcphy->pipe_state == ATCPHY_PIPEHANDLER_STATE_USB3);
 	int ret;
 
 	ret = atcphy_pipehandler_check(atcphy);
-	if (ret)
+	if (ret) {
+		if (live_usb3)
+			if (atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY)
+				atcphy->mode_dirty = true;
 		return ret;
+	}
 
 	/* Force disable link detection */
 	clear32(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE_VALUES,
@@ -1468,6 +1553,15 @@ static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy, bool 
 	set32(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE, PIPEHANDLER_OVERRIDE_RXVALID);
 	set32(atcphy->regs.pipehandler + PIPEHANDLER_OVERRIDE, PIPEHANDLER_OVERRIDE_RXDETECT);
 
+	ret = atcphy_pipehandler_lock(atcphy);
+	if (ret) {
+		/* A live controller must acknowledge before its backend changes. */
+		if (live_usb3) {
+			if (atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY)
+				atcphy->mode_dirty = true;
+			return ret;
+		}
+		dev_warn(atcphy->dev, "Failed to lock pipehandler");
 	if (lock) {
 		ret = atcphy_pipehandler_lock(atcphy);
 		if (ret)
@@ -1478,6 +1572,15 @@ static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy, bool 
 	atcphy_pipehandler_set_mux(atcphy, PIPEHANDLER_MUX_CTRL_DATA_DUMMY,
 				   PIPEHANDLER_MUX_CTRL_CLK_DUMMY);
 
+	ret = atcphy_pipehandler_unlock(atcphy);
+	if (ret) {
+		/* The mux changed, but the handoff has not completed. Retain ownership. */
+		if (live_usb3) {
+			if (atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY)
+				atcphy->mode_dirty = true;
+			return ret;
+		}
+		dev_warn(atcphy->dev, "Failed to unlock pipehandler");
 	if (lock) {
 		ret = atcphy_pipehandler_unlock(atcphy);
 		if (ret)
@@ -1530,6 +1633,10 @@ static int atcphy_configure_pipehandler(struct apple_atcphy *atcphy, bool host)
 			readl(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN),
 			readl(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE));
 	atcphy->pipe_state = state;
+	if (!ret) {
+		atcphy->pipe_state = state;
+		atcphy->pipe_pending = false;
+	}
 
 	return ret;
 }
@@ -1549,15 +1656,24 @@ static void atcphy_park_pipehandler(struct apple_atcphy *atcphy, bool stopped)
 
 	lockdep_assert_held(&atcphy->lock);
 
-	if (atcphy->pipe_state == ATCPHY_PIPEHANDLER_STATE_DUMMY)
-		return;
+	dev_dbg(atcphy->dev, "PIPE park: mode=%u pipe=%u host=%u dirty=%u owned=%u idle=%u\n",
+		atcphy->mode, atcphy->pipe_state, atcphy->host_active, atcphy->mode_dirty,
+		atcphy->dp_owned_pmas, atcphy->dp_idle_pmas);
+	if (atcphy->pipe_state == ATCPHY_PIPEHANDLER_STATE_DUMMY && !atcphy->pipe_pending)
+		return 0;
 
+	ret = atcphy_configure_pipehandler_dummy(atcphy);
+	if (ret) {
 	if (!lock)
 		dev_dbg(atcphy->dev, "Parking the PIPE of a stopped controller\n");
 	ret = atcphy_configure_pipehandler_dummy(atcphy, lock);
 	if (ret)
 		dev_warn(atcphy->dev, "Failed to switch PIPE to dummy: %d\n", ret);
+		return ret;
+	}
 	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
+	atcphy->pipe_pending = false;
+	return 0;
 }
 
 static void atcphy_setup_pipehandler(struct apple_atcphy *atcphy)
@@ -1568,6 +1684,8 @@ static void atcphy_setup_pipehandler(struct apple_atcphy *atcphy)
 				   PIPEHANDLER_MUX_CTRL_CLK_DUMMY);
 	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
 	if (atcphy_needs_dummy_phy(atcphy))
+	atcphy->pipe_pending = false;
+	if (!atcphy->hw->has_usb4)
 		atcphy_enable_dummy_phy(atcphy);
 }
 
@@ -2068,6 +2186,9 @@ static int atcphy_dp_configure(struct apple_atcphy *atcphy, enum atcphy_dp_link_
 	u32 reg;
 
 	guard(mutex)(&atcphy->lock);
+	/* A failed transition may have asserted the PHY resets already. */
+	if (atcphy->mode_dirty || atcphy->pipe_pending)
+		return -EBUSY;
 	/* the AUSPLL is in use as the Thunderbolt DP tunnel pixel clock */
 	if (atcphy->tunnel_clock_on || atcphy->tunnel_saved)
 		return -EBUSY;
@@ -3165,6 +3286,13 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 	u32 reg;
 
 	lockdep_assert_held(&atcphy->lock);
+	if (atcphy->pipe_pending)
+		return -EBUSY;
+	if (atcphy->usb_off_pending && mode != APPLE_ATCPHY_MODE_OFF)
+		return -EBUSY;
+	if (atcphy->hw->has_t8140_dp && atcphy->fixed_usb2 &&
+	    atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY)
+		return -EBUSY;
 	if (atcphy->hw->has_t8140_dp && atcphy->dp_owned_pmas &&
 	    (mode != atcphy->mode || atcphy->mode_dirty)) {
 		atcphy->mode_dirty = true;
@@ -3204,17 +3332,48 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 		atcphy_dp_stop_t8122(atcphy);
 
 	if (mode == APPLE_ATCPHY_MODE_OFF) {
+		if (atcphy->hw->has_t8140_dp && atcphy->fixed_usb2 &&
+		    (atcphy->dp_usb_context_valid || atcphy->usb_off_pending)) {
+			atcphy->usb_off_pending = true;
+			if (!atcphy->usb_off_drained) {
+				ret = j700_usb_restore(atcphy, APPLE_ATCPHY_MODE_OFF);
+				if (ret)
+					return ret;
+				atcphy->usb_off_drained = true;
+			}
+		}
 		ret = atcphy_power_off(atcphy);
 		if (ret)
 			return ret;
+		/* Recovery data was discharged before OFF, not discarded while dirty. */
+		atcphy->dp_usb_context_valid = 0;
+		atcphy->dp_usb_context_dirty = 0;
+		atcphy->usb_off_pending = false;
+		atcphy->usb_off_drained = false;
 		atcphy->mode = mode;
 		atcphy->mode_dirty = false;
 		return 0;
 	}
 
+	/*
+	 * Fixed-hub SAFE keeps USB2 up rather than taking the block OFF.
+	 * With PIPE parked and DP owners released, reinitialize USB3 before
+	 * programming its lanes; the existing sequence releases this reset.
+	 */
+	if (atcphy->hw->has_t8140_dp && atcphy->fixed_usb2)
+		core_clear32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_PHY_RESET_N);
+
 	ret = atcphy_power_on(atcphy);
 	if (ret)
 		return ret;
+
+	if (atcphy->hw->has_t8140_dp && atcphy->fixed_usb2) {
+		ret = j700_usb_capture(atcphy, mode);
+		if (!ret)
+			ret = j700_usb_restore(atcphy, mode);
+		if (ret)
+			return ret;
+	}
 
 	atcphy_apply_tunables(atcphy, mode);
 
@@ -3421,10 +3580,23 @@ static int atcphy_usb2_init(struct phy *phy)
 {
 	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
 
-	if (!atcphy->fixed_usb2)
-		return 0;
-
 	guard(mutex)(&atcphy->lock);
+	if (atcphy->usb_off_pending)
+		return -EBUSY;
+	if (atcphy->pipe_pending &&
+	    (atcphy->mode == APPLE_ATCPHY_MODE_OFF || atcphy->mode_dirty)) {
+		int ret = atcphy_park_pipehandler(atcphy);
+
+		if (ret)
+			return ret;
+	}
+
+	/* A delayed shutdown may have completed after the last Type-C event. */
+	if (!atcphy->fixed_usb2) {
+		if (atcphy->mode == APPLE_ATCPHY_MODE_OFF || atcphy->mode_dirty)
+			return atcphy_configure(atcphy, atcphy->typec_mode);
+		return 0;
+	}
 	atcphy_restore_after_pd_off(atcphy);
 
 	/*
@@ -3436,7 +3608,7 @@ static int atcphy_usb2_init(struct phy *phy)
 	 * the Type-C mux last asked for, USB2 until a cable event says otherwise.
 	 */
 	set32(atcphy->regs.usb2phy + USB2PHY_SIG, USB2PHY_SIG_HOST);
-	if (atcphy->mode == APPLE_ATCPHY_MODE_OFF)
+	if (atcphy->mode == APPLE_ATCPHY_MODE_OFF || atcphy->mode_dirty)
 		return atcphy_configure(atcphy, atcphy->typec_mode);
 
 	atcphy_usb2_power_on(atcphy);
@@ -3453,10 +3625,19 @@ static const struct phy_ops apple_atc_usb2_phy_ops = {
 static int atcphy_usb3_power_off(struct phy *phy)
 {
 	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
+	int ret;
 
 	guard(mutex)(&atcphy->lock);
 	atcphy_restore_after_pd_off(atcphy);
 
+	ret = atcphy_park_pipehandler(atcphy);
+	if (ret)
+		return ret;
+	if (atcphy->mode != APPLE_ATCPHY_MODE_OFF || atcphy->mode_dirty) {
+		ret = atcphy_configure(atcphy, APPLE_ATCPHY_MODE_OFF);
+		if (ret)
+			return ret;
+	}
 	atcphy_park_pipehandler(atcphy, true);
 	atcphy->host_active = false;
 
@@ -3483,6 +3664,9 @@ static int atcphy_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode
 	guard(mutex)(&atcphy->lock);
 	atcphy_restore_after_pd_off(atcphy);
 
+	if (atcphy->usb_off_pending)
+		return -EBUSY;
+
 	switch (mode) {
 	case PHY_MODE_USB_HOST:
 		atcphy->host_active = true;
@@ -3500,7 +3684,17 @@ static int atcphy_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode
 	 * PIPE handler once. Nothing needs to be done either when the PIPE is already routed to
 	 * the backend the current mode uses, which includes the dummy backend of the USB2 modes.
 	 */
-	if (atcphy->pipe_state == atcphy_modes[atcphy->mode].pipehandler_state)
+	/* A failed lane/domain transition must be restored before routing PIPE. */
+	if (atcphy->mode_dirty)
+		return -EBUSY;
+	if (atcphy->pipe_pending) {
+		int ret = atcphy_park_pipehandler(atcphy);
+
+		if (ret)
+			return ret;
+	}
+	if (atcphy->pipe_state == atcphy_modes[atcphy->mode].pipehandler_state &&
+	    !atcphy->pipe_pending)
 		return 0;
 
 	return atcphy_configure_pipehandler(atcphy, mode == PHY_MODE_USB_HOST);
@@ -3800,9 +3994,15 @@ static void _atcphy_dwc3_reset_assert(struct apple_atcphy *atcphy)
 static int atcphy_dwc3_reset_assert(struct reset_controller_dev *rcdev, unsigned long id)
 {
 	struct apple_atcphy *atcphy = container_of(rcdev, struct apple_atcphy, rcdev);
+	int ret;
 
 	guard(mutex)(&atcphy->lock);
 	atcphy_restore_after_pd_off(atcphy);
+
+	/* Do not reset the controller or USB2 PHY if PIPE parking fails. */
+	ret = atcphy_park_pipehandler(atcphy);
+	if (ret)
+		return ret;
 
 	_atcphy_dwc3_reset_assert(atcphy);
 	atcphy_park_pipehandler(atcphy, true);
@@ -3852,18 +4052,26 @@ static int atcphy_probe_rcdev(struct apple_atcphy *atcphy)
 static int atcphy_sw_set(struct typec_switch_dev *sw, enum typec_orientation orientation)
 {
 	struct apple_atcphy *atcphy = typec_switch_get_drvdata(sw);
+	bool swap_lanes;
 
 	guard(mutex)(&atcphy->lock);
 
 	switch (orientation) {
 	case TYPEC_ORIENTATION_NONE:
-		break;
+		return 0;
 	case TYPEC_ORIENTATION_NORMAL:
 		atcphy->swap_lanes = false;
 		break;
 	case TYPEC_ORIENTATION_REVERSE:
 		atcphy->swap_lanes = true;
 		break;
+	default:
+		return -EINVAL;
+	}
+	/* The mode alone cannot describe a route after its orientation changes. */
+	if (atcphy->swap_lanes != swap_lanes) {
+		atcphy->swap_lanes = swap_lanes;
+		atcphy->mode_dirty = true;
 	}
 	dev_dbg(atcphy->dev, "orientation %d, lanes swapped %d\n", orientation,
 		atcphy->swap_lanes);
@@ -3892,7 +4100,109 @@ static int atcphy_probe_switch(struct apple_atcphy *atcphy)
 	return devm_add_action_or_reset(atcphy->dev, atcphy_typec_switch_unregister, sw);
 }
 
-static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *state)
+/*
+ * The fixed USB2 hub keeps the host controller active, but its independent
+ * SuperSpeed root hub may autosuspend while PIPE still needs it awake.
+ * Own a bounded root-hub resume reference across a Type-C handoff. Resume
+ * precedes the ATC lock: USB PM can call back into the PHY on recovery.
+ */
+struct atcphy_usb3_pm {
+	struct platform_device *controller;
+	struct usb_device *root;
+};
+
+#if IS_REACHABLE(CONFIG_USB)
+static int atcphy_usb3_pm_find(struct usb_device *udev, void *data)
+{
+	struct atcphy_usb3_pm *pm = data;
+
+	if (udev->parent || udev->speed < USB_SPEED_SUPER ||
+	    udev->bus->sysdev != &pm->controller->dev)
+		return 0;
+
+	pm->root = usb_get_dev(udev);
+	return 1;
+}
+#endif
+
+static int atcphy_usb3_pm_get(struct apple_atcphy *atcphy, struct atcphy_usb3_pm *pm)
+{
+#if IS_REACHABLE(CONFIG_USB)
+	struct device_node *ep __free(device_node) = NULL;
+	struct device_node *ctrl __free(device_node) = NULL;
+	struct usb_hcd *hcd;
+	int ret;
+#endif
+
+	if (!atcphy->fixed_usb2 || !atcphy->hw->has_t8140_dp)
+		return 0;
+
+#if IS_REACHABLE(CONFIG_USB)
+	ep = of_graph_get_endpoint_by_regs(atcphy->np, 1, -1);
+	ctrl = ep ? of_graph_get_remote_port_parent(ep) : NULL;
+	if (!ctrl)
+		return -ENODEV;
+	pm->controller = of_find_device_by_node(ctrl);
+	if (!pm->controller)
+		return -EAGAIN;
+
+	/* Firmware identity, not a bus number, binds this PHY to its root hub. */
+	usb_for_each_dev(pm, atcphy_usb3_pm_find);
+	if (!pm->root) {
+		ret = -EAGAIN;
+		goto put_controller;
+	}
+
+	/* Exclude root-hub teardown while its controller backs the handoff. */
+	usb_lock_device(pm->root);
+	hcd = bus_to_hcd(pm->root->bus);
+	if (READ_ONCE(pm->root->state) == USB_STATE_NOTATTACHED || HCD_DEAD(hcd)) {
+		ret = -ENODEV;
+		goto unlock_root;
+	}
+	ret = pm_runtime_resume_and_get(&pm->root->dev);
+	if (ret < 0)
+		goto unlock_root;
+	if (READ_ONCE(pm->root->state) == USB_STATE_NOTATTACHED ||
+	    HCD_DEAD(hcd) || !HCD_HW_ACCESSIBLE(hcd)) {
+		pm_runtime_put_noidle(&pm->root->dev);
+		ret = -ENODEV;
+		goto unlock_root;
+	}
+	return 0;
+
+unlock_root:
+	usb_unlock_device(pm->root);
+	usb_put_dev(pm->root);
+	pm->root = NULL;
+put_controller:
+	put_device(&pm->controller->dev);
+	pm->controller = NULL;
+	return ret;
+#else
+	/* typec_mux_set() skips EOPNOTSUPP, which would report a false success. */
+	return -ENODEV;
+#endif
+}
+
+static void atcphy_usb3_pm_put(struct atcphy_usb3_pm *pm)
+{
+#if IS_REACHABLE(CONFIG_USB)
+	if (!pm->root)
+		return;
+
+	/* Restore normal runtime policy after both success and failed parking. */
+	usb_mark_last_busy(pm->root);
+	pm_runtime_put_autosuspend(&pm->root->dev);
+	usb_unlock_device(pm->root);
+	usb_put_dev(pm->root);
+	put_device(&pm->controller->dev);
+	pm->root = NULL;
+	pm->controller = NULL;
+#endif
+}
+
+static int atcphy_mux_set_locked(struct typec_mux_dev *mux, struct typec_mux_state *state)
 {
 	struct apple_atcphy *atcphy = typec_mux_get_drvdata(mux);
 	enum atcphy_mode target_mode;
@@ -3966,7 +4276,21 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 		return -EOPNOTSUPP;
 
 	if (atcphy->mode == target_mode)
+	dev_dbg(atcphy->dev, "mux target=%u\n", target_mode);
+	if (atcphy->mode == target_mode && !atcphy->mode_dirty) {
+		/* Retry a failed PIPE setup without disturbing the configured lanes. */
+		if (atcphy->fixed_usb2 && atcphy->host_active &&
+		    (atcphy->pipe_state != atcphy_modes[target_mode].pipehandler_state ||
+		     atcphy->pipe_pending)) {
+			if (atcphy->pipe_pending) {
+				ret = atcphy_park_pipehandler(atcphy);
+				if (ret)
+					return ret;
+			}
+			return atcphy_configure_pipehandler(atcphy, true);
+		}
 		return 0;
+	}
 
 	switch (target_mode) {
 	case APPLE_ATCPHY_MODE_TBT:
@@ -4008,17 +4332,26 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 		 * mode without a USB3 backend, and route it to the new backend
 		 * afterwards while dwc3 is up in host mode.
 		 */
-		if (pipe_state != ATCPHY_PIPEHANDLER_STATE_USB3)
-			atcphy_park_pipehandler(atcphy, false);
+		ret = atcphy_park_pipehandler(atcphy);
+		if (ret)
+			return ret;
 
 		ret = atcphy_configure(atcphy, target_mode);
 		if (ret)
 			return ret;
 
+
 		if (atcphy->host_active && atcphy->pipe_state != pipe_state)
 			ret = atcphy_configure_pipehandler(atcphy, true);
 
 		return ret;
+	}
+
+	/* A failed USB3 handoff must finish parking before ordinary-port lane work. */
+	if (atcphy->pipe_pending) {
+		ret = atcphy_park_pipehandler(atcphy);
+		if (ret)
+			return ret;
 	}
 
 	/*
@@ -4028,6 +4361,20 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 	 */
 	WARN_ON_ONCE(atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY);
 	return atcphy_configure(atcphy, target_mode);
+}
+
+static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *state)
+{
+	struct apple_atcphy *atcphy = typec_mux_get_drvdata(mux);
+	struct atcphy_usb3_pm pm = {};
+	int ret;
+
+	ret = atcphy_usb3_pm_get(atcphy, &pm);
+	if (ret)
+		return ret;
+	ret = atcphy_mux_set_locked(mux, state);
+	atcphy_usb3_pm_put(&pm);
+	return ret;
 }
 
 static void atcphy_typec_mux_unregister(void *data)

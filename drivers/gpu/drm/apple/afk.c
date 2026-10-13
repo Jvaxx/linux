@@ -198,7 +198,7 @@ int afk_start(struct apple_dcp_afkep *ep)
 
 	ret = wait_for_completion_timeout(&ep->started, msecs_to_jiffies(1000));
 	if (ret <= 0 && ep->dcp->hw.iomfb_method_profile ==
-	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		dev_warn(ep->dcp->dev,
 			 "external AFK startup ep=%#x tx_ready=%u rx_ready=%u bytes=%zu\n",
 			 ep->endpoint, ep->txbfr.ready, ep->rxbfr.ready, ep->bfr_size);
@@ -206,37 +206,6 @@ int afk_start(struct apple_dcp_afkep *ep)
 		return -ETIMEDOUT;
 	else
 		return 0;
-}
-
-/* Read only host-owned ring headers; never consume an entry or notify firmware. */
-void afk_trace_ring_snapshot(struct apple_dcp_afkep *ep)
-{
-	unsigned long flags;
-	u32 rx_rptr = 0, rx_wptr = 0, tx_rptr = 0, tx_wptr = 0;
-	bool rx_ready, tx_ready;
-
-	if (!ep || !ep->wire_v2 || !trace_afk_ring_snapshot_enabled())
-		return;
-	spin_lock_irqsave(&ep->lock, flags);
-	if (ep->stopping) {
-		spin_unlock_irqrestore(&ep->lock, flags);
-		return;
-	}
-	rx_ready = READ_ONCE(ep->rxbfr.ready) && ep->rxbfr.rptr && ep->rxbfr.wptr;
-	tx_ready = READ_ONCE(ep->txbfr.ready) && ep->txbfr.rptr && ep->txbfr.wptr;
-	dma_rmb();
-	if (rx_ready) {
-		rx_rptr = le32_to_cpu(READ_ONCE(*ep->rxbfr.rptr));
-		rx_wptr = le32_to_cpu(READ_ONCE(*ep->rxbfr.wptr));
-	}
-	if (tx_ready) {
-		tx_rptr = le32_to_cpu(READ_ONCE(*ep->txbfr.rptr));
-		tx_wptr = le32_to_cpu(READ_ONCE(*ep->txbfr.wptr));
-	}
-	trace_afk_ring_snapshot(ep, rx_ready, rx_rptr, rx_wptr,
-				READ_ONCE(ep->rxbfr.bufsz), tx_ready, tx_rptr,
-				tx_wptr, READ_ONCE(ep->txbfr.bufsz));
-	spin_unlock_irqrestore(&ep->lock, flags);
 }
 
 static void afk_getbuf(struct apple_dcp_afkep *ep, u64 message)
@@ -751,7 +720,7 @@ static void afk_recv_handle_std_service(struct apple_dcp_afkep *ep, u32 channel,
 		"AFK[ep:%02x]: channel %d received unhandled standard service message: %x / %x\n",
 		ep->endpoint, channel, type, eshdr->category);
 	if (ep->dcp->hw.iomfb_method_profile !=
-	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		print_hex_dump(KERN_INFO, "AFK: ", DUMP_PREFIX_NONE, 16, 1,
 			       payload, payload_size, true);
 }
@@ -1031,8 +1000,6 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 	u8 *payload = data + sizeof(*ehdr) + sizeof(*eshdr);
 	size_t payload_size;
 
-	trace_afk_recv_header(ep, channel, type, data_size, data);
-
 	if (ep->wire_v2) {
 		afk_v2_receive(ep, channel, type, data, data_size);
 		return;
@@ -1152,7 +1119,7 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 	dev_err(ep->dcp->dev, "AFK[ep:%02x]: channel %d received unhandled message "
 		"(type %x subtype %x)\n", ep->endpoint, channel, type, subtype);
 	if (ep->dcp->hw.iomfb_method_profile !=
-	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		print_hex_dump(KERN_INFO, "AFK: ", DUMP_PREFIX_NONE, 16, 1,
 			       payload, payload_size, true);
 	return;
@@ -1341,37 +1308,15 @@ static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	u8 v2_command[AFKV2_COMMAND_SIZE + AFKV2_OOB_SIZE];
 	u8 v2_category = 0;
 	u16 v2_flags = 0;
-	bool compact = !ep->wire_v2 && ep->dcp->hw.iomfb_method_profile ==
-		DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL;
 	int ret;
 
-	/*
-	 * H17P frames EPIC messages differently (see afk_recv_handle()): an
-	 * 8-byte sub-header, with the service channel carried in the EPIC
-	 * header on queue channel 0.  Only the receive side of that format is
-	 * known, and the 24-byte framing below would be misparsed, so send
-	 * nothing for the established internal profile. The external-only
-	 * experiment below tests receive-layout symmetry. Internal callers are: the
-	 * callers are optional (verbose firmware logging, EDID copy, audio,
-	 * DPTX, debugfs) or replies to calls only DPTX services make.
-	 */
-	if (ep->dcp->fw_compat == DCP_FIRMWARE_H17P && !compact && !ep->wire_v2) {
+	/* External H17P services use AFKV2; the internal profile has no EPIC sender. */
+	if (ep->dcp->fw_compat == DCP_FIRMWARE_H17P && !ep->wire_v2) {
 		dev_dbg_once(ep->dcp->dev,
 			     "AFK[ep:%02x]: not sending EPIC message on H17P\n",
 			     ep->endpoint);
 		return -EOPNOTSUPP;
 	}
-
-	/* Only existing DPTX/EDID service commands participate in this trial. */
-	if (compact &&
-	    (channel > U16_MAX || payload_len > SZ_1M ||
-	     (payload_len && !payload) || stype != EPIC_SUBTYPE_STD_SERVICE ||
-	     (ep->endpoint != DPTX_ENDPOINT && ep->endpoint != DPAVSERV_ENDPOINT) ||
-	     !((ecat == EPIC_CAT_COMMAND && etype == EPIC_TYPE_COMMAND &&
-		payload_len == sizeof(struct epic_cmd)) ||
-	       (ecat == EPIC_CAT_REPLY &&
-		(etype == EPIC_TYPE_REPLY || etype == EPIC_TYPE_NOTIFY_ACK)))))
-		return -EOPNOTSUPP;
 
 	if (ep->wire_v2) {
 		if (!channel || channel > U16_MAX || tag > U8_MAX || payload_len > SZ_1M)
@@ -1418,7 +1363,7 @@ static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 		goto out;
 	}
 
-	if ((compact || ep->wire_v2) &&
+	if (ep->wire_v2 &&
 	    (!ep->txbfr.ready || !ep->txbfr.rptr || !ep->txbfr.wptr || !ep->txbfr.buf)) {
 		ret = -ESHUTDOWN;
 		goto out;
@@ -1429,11 +1374,11 @@ static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	wptr = le32_to_cpu(*ep->txbfr.wptr);
 	trace_afk_send_rwptr_pre(ep, rptr, wptr);
 	total_epic_size = sizeof(*ehdr) +
-		((compact || ep->wire_v2) ? sizeof(struct epic_sub_hdr_h17p) : sizeof(*eshdr)) +
+		(ep->wire_v2 ? sizeof(struct epic_sub_hdr_h17p) : sizeof(*eshdr)) +
 		payload_len;
 	total_size = sizeof(*hdr) + total_epic_size;
 
-	if (compact || ep->wire_v2) {
+	if (ep->wire_v2) {
 		u32 available, needed;
 
 		if (!ep->txbfr.ready || !ep->txbfr.stride ||
@@ -1536,7 +1481,7 @@ static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 
 	hdr->magic = cpu_to_le32(QE_MAGIC);
 	hdr->size = cpu_to_le32(total_epic_size);
-	hdr->channel = cpu_to_le32((compact || ep->wire_v2) ? 0 : channel);
+	hdr->channel = cpu_to_le32(ep->wire_v2 ? 0 : channel);
 	hdr->type = cpu_to_le32(ep->wire_v2 ? 0 : etype);
 	if (hdr2)
 		memcpy(hdr2, hdr, sizeof(*hdr));
@@ -1550,18 +1495,6 @@ static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 		if (ret)
 			goto out;
 		wptr += written;
-	} else if (compact) {
-		u8 *wire = ep->txbfr.buf + wptr;
-
-		/* Experimental symmetry with the published H17P receive layout. */
-		memset(wire, 0, sizeof(*ehdr) + sizeof(struct epic_sub_hdr_h17p));
-		wire[0] = ep->qe_seq++;
-		put_unaligned_le16(channel, wire + 2);
-		put_unaligned_le32(total_epic_size - 8, wire + 4);
-		wire[16] = stype;
-		wire[17] = ecat;
-		put_unaligned_le32(tag, wire + 20);
-		wptr += sizeof(*ehdr) + sizeof(struct epic_sub_hdr_h17p);
 	} else {
 		ehdr = ep->txbfr.buf + wptr;
 		memset(ehdr, 0, sizeof(*ehdr));

@@ -3,6 +3,7 @@ config PHY_APPLE_ATC
 	tristate "Apple Type-C PHY"
 	depends on (ARM64 && ARCH_APPLE) || (COMPILE_TEST && !GENERIC_ATOMIC64)
 	depends on TYPEC
+	depends on USB || !USB
 	select GENERIC_PHY
 	select APPLE_TUNABLE
 	help

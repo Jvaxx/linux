@@ -195,7 +195,7 @@ static int iomfb_enqueue_opaque_x(struct apple_dcp *dcp)
 	lockdep_assert_held(&dcp->iomfb.lock);
 	/* DCPEXT rejects enableGPAlphaDiv; retain the panel-only workaround. */
 	if (dcp->hw.iomfb_method_profile ==
-	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		return 0;
 	if (atomic_read(&dcp->iomfb.opaque_x_state) != IOMFB_OPAQUE_X_NEEDED)
 		return 0;
@@ -924,7 +924,7 @@ static bool dcp_external_zero_reply(struct apple_dcp *dcp, int tag,
 	return tag == 134 && context == DCP_CONTEXT_ASYNC &&
 	       in_len == 0 && out_len == sizeof(u32) &&
 	       dcp->hw.iomfb_method_profile ==
-	       DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL &&
+	       DCP_IOMFB_METHODS_H17P_EXTERNAL &&
 	       of_machine_is_compatible("apple,j700") &&
 	       of_device_is_compatible(dcp->dev->of_node, "apple,t8140-dcpext");
 }
@@ -984,7 +984,7 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 				 hdr->tag[3], hdr->tag[2], hdr->tag[1], hdr->tag[0],
 				 hdr->in_len, hdr->out_len, context);
 		if (dcp->hw.iomfb_method_profile ==
-		    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL && !zero_reply) {
+		    DCP_IOMFB_METHODS_H17P_EXTERNAL && !zero_reply) {
 			/* Retain the failed session without inventing a successful reply. */
 			dcp->crashed = true;
 			complete(&dcp->start_done);
@@ -1290,6 +1290,53 @@ void dcp_modes_release(void *data)
 	kfree(dcp->modes);
 	dcp->modes = NULL;
 	dcp->nr_modes = 0;
+/* Retained arrays are not freed while mode readers can still refer to them. */
+static struct dcp_display_mode *dcp_modes_snapshot(struct apple_dcp *dcp,
+						 unsigned int *count)
+{
+	struct dcp_display_mode *modes;
+	unsigned long flags;
+
+	spin_lock_irqsave(&dcp->metadata.lock, flags);
+	modes = dcp->modes;
+	*count = dcp->nr_modes;
+	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+	return modes;
+}
+
+/* Caller holds hpd_mutex -> dcpavserv.lock -> metadata.lock. */
+static bool dcp_exception_mode_current_locked(struct apple_dcp *dcp,
+					     const struct dcp_display_mode *mode)
+{
+	if (!mode->automatic_rgb8_quirk)
+		return true;
+	return dcp_180hz_mode_current(dcp, mode);
+}
+
+static bool dcp_publish_mode(struct apple_dcp *dcp, struct drm_connector *connector,
+			     const struct dcp_display_mode *source,
+			     struct drm_display_mode *copy)
+{
+	unsigned long flags;
+	bool eligible;
+
+	/* Ordinary modes keep their existing publication policy. */
+	if (!source->automatic_rgb8_quirk) {
+		drm_mode_probed_add(connector, copy);
+		return true;
+	}
+	/* External get_modes holds hpd_mutex after its final EDID generation check. */
+	/* Allocation happened outside metadata.lock; recheck before linking. */
+	spin_lock_irqsave(&dcp->metadata.lock, flags);
+	eligible = dcp->connector && &dcp->connector->base == connector &&
+		dcp_exception_mode_current_locked(dcp, source);
+	if (eligible)
+		/* drm_mode_probed_add only links a list under mode_config.mutex. */
+		drm_mode_probed_add(connector, copy);
+	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+	if (!eligible)
+		drm_mode_destroy(connector->dev, copy);
+	return eligible;
 }
 
 int dcp_get_modes(struct drm_connector *connector)
@@ -1300,11 +1347,15 @@ int dcp_get_modes(struct drm_connector *connector)
 
 	struct drm_device *dev = connector->dev;
 	struct drm_display_mode *mode;
+	struct dcp_display_mode *modes;
+	unsigned int nr_modes, published = 0;
 	u16 min_vfreq = 0, max_vfreq = 0;
 	bool vrr_capable = false;
 	bool physical_edid;
+	bool pending_180hz = false, published_180hz = false;
 	u64 edid_generation = 0;
 	u64 service_epoch = 0;
+	unsigned int i;
 	unsigned int count;
 	int i;
 
@@ -1320,6 +1371,7 @@ int dcp_get_modes(struct drm_connector *connector)
 		return 0;
 	}
 	dcp = platform_get_drvdata(pdev);
+	modes = dcp_modes_snapshot(dcp, &nr_modes);
 
 	mutex_lock(&dcp->modes_lock);
 	count = dcp_modes_for_connector(dcp, apple_connector) ? dcp->nr_modes : 0;
@@ -1348,7 +1400,7 @@ int dcp_get_modes(struct drm_connector *connector)
 	drm_connector_set_vrr_capable_property(connector, vrr_capable);
 
 	physical_edid = dcp->hw.iomfb_method_profile ==
-		DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL;
+		DCP_IOMFB_METHODS_H17P_EXTERNAL;
 	/* get_modes holds mode_config.mutex; HPD paths never acquire it. */
 	if (physical_edid) {
 		mutex_lock(&dcp->hpd_mutex);
@@ -1369,7 +1421,7 @@ int dcp_get_modes(struct drm_connector *connector)
 	}
 
 	/* Internal H17P still has no supported EDID command transport. */
-	if (dcp->nr_modes && !apple_connector->drm_edid &&
+	if (nr_modes && !apple_connector->drm_edid &&
 	    (dcp->fw_compat != DCP_FIRMWARE_H17P ||
 	     (dcp->dcpavservep && dcp->dcpavservep->wire_v2))) {
 	     (dcp->dcpavservep && dcp->dcpavservep->inline_v2))) {
@@ -1426,12 +1478,18 @@ int dcp_get_modes(struct drm_connector *connector)
 							     generation, edid);
 		}
 	}
-	if (dcp->nr_modes && apple_connector->drm_edid) {
-		apple_connector->drm_edid_firmware_derived = false;
-		drm_edid_connector_update(connector, apple_connector->drm_edid);
+	if (nr_modes && apple_connector->drm_edid) {
+		int update = drm_edid_connector_update(connector, apple_connector->drm_edid);
+
+		if (update) {
+			dev_info(dcp->dev, "raw EDID publication failed: %d\n", update);
+			dcp_clear_connector_edid(apple_connector);
+		} else {
+			apple_connector->drm_edid_firmware_derived = false;
+		}
 	} else {
 		u64 generation = 0;
-		const struct drm_edid *derived = dcp->nr_modes ?
+		const struct drm_edid *derived = nr_modes ?
 			dcp_firmware_edid(dcp, &generation) : ERR_PTR(-ENODATA);
 
 		if (!IS_ERR(derived)) {
@@ -1466,9 +1524,38 @@ int dcp_get_modes(struct drm_connector *connector)
 	}
 
 edid_done:
+	/* Publish after a possibly delayed raw read, under its physical generation. */
+	for (i = 0; i < nr_modes; ++i) {
+		mode = drm_mode_duplicate(dev, &modes[i].mode);
+		if (!mode) {
+			dev_err(dev->dev, "Failed to duplicate display mode\n");
+			published = 0;
+			goto modes_done;
+		}
+		pending_180hz |= modes[i].automatic_rgb8_quirk &&
+			dcp_180hz_pending(dcp, &modes[i]);
+		if (!dcp_publish_mode(dcp, connector, &modes[i], mode))
+			continue;
+		published_180hz |= modes[i].automatic_rgb8_quirk;
+		published++;
+		if (modes[i].vrr) {
+			u16 lo = modes[i].min_vrr >> 16;
+			u16 hi = modes[i].max_vrr >> 16;
+
+			if (!min_vfreq || lo < min_vfreq)
+				min_vfreq = lo;
+			if (hi > max_vfreq)
+				max_vfreq = hi;
+		}
+		vrr_capable |= modes[i].vrr;
+	}
+	drm_connector_set_vrr_capable_property(connector, vrr_capable);
+modes_done:
 	mutex_unlock(&dcp->dcpavserv.lock);
 	if (physical_edid)
 		mutex_unlock(&dcp->hpd_mutex);
+	if (pending_180hz && !published_180hz)
+		dcp_180hz_retry(dcp);
 	if (apple_connector->drm_edid)
 		dcp_retry_placeholder_edid(dcp, apple_connector->drm_edid);
 
@@ -1484,6 +1571,7 @@ edid_done:
 		connector->display_info.monitor_range.max_vfreq = max_vfreq;
 	}
 
+	return published;
 	return count;
 }
 
@@ -1492,6 +1580,10 @@ static bool lookup_mode_locked(struct apple_dcp *dcp,
 			       const struct drm_display_mode *mode,
 			       struct dcp_display_mode *out)
 {
+	struct dcp_display_mode *modes;
+	unsigned int count, i;
+	unsigned long flags;
+	bool eligible;
 	bool found = false;
 	int i;
 
@@ -1505,6 +1597,22 @@ static bool lookup_mode_locked(struct apple_dcp *dcp,
 				*out = dcp->modes[i];
 			found = true;
 			break;
+	modes = dcp_modes_snapshot(dcp, &count);
+	for (i = 0; i < count; ++i) {
+		if (drm_mode_match(mode, &modes[i].mode,
+				   DRM_MODE_MATCH_TIMINGS |
+					   DRM_MODE_MATCH_CLOCK)) {
+			if (!modes[i].automatic_rgb8_quirk)
+				return &modes[i];
+			mutex_lock(&dcp->hpd_mutex);
+			mutex_lock(&dcp->dcpavserv.lock);
+			spin_lock_irqsave(&dcp->metadata.lock, flags);
+			eligible = dcp_exception_mode_current_locked(dcp, &modes[i]);
+			spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+			mutex_unlock(&dcp->dcpavserv.lock);
+			mutex_unlock(&dcp->hpd_mutex);
+			if (eligible)
+				return &modes[i];
 		}
 	}
 out_unlock:
@@ -1535,7 +1643,7 @@ static bool dcp_mode_settable(struct apple_dcp *dcp,
 
 	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
 	    dcp->hw.iomfb_method_profile !=
-	    DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
+	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		return dcp_mode->mode.type & DRM_MODE_TYPE_PREFERRED;
 
 	return true;
@@ -1570,7 +1678,7 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 
 	/* Disconnect cannot pass the admission check before these RPCs finish. */
 	guard(mutex)(&dcp->external_lock);
-	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL &&
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL &&
 	    (!dcp->external_running || dcp->external_error || READ_ONCE(dcp->quiescing) ||
 	     READ_ONCE(dcp->crashed) || READ_ONCE(dcp->iomfb.presentation_paused)))
 		return -EPIPE;
@@ -2156,7 +2264,7 @@ int iomfb_start_rtkit(struct apple_dcp *dcp)
 	 * display DART faults.
 	 */
 	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
-	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL) {
+	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17P_EXTERNAL) {
 		ret = apple_rtkit_start_ep(dcp->rtk, REMOTE_ALLOC_ENDPOINT);
 		if (ret)
 			return ret;

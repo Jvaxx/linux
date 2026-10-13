@@ -811,11 +811,12 @@ static void apple_drm_quiesce_connectors(struct drm_device *drm)
  * does not have yet.  Leave it out of the display subsystem, so that an
  * enabled node cannot hold back the internal panel's component master.
  */
+/* A supported firmware-described external provider participates in component matching. */
 static bool apple_dcp_usable(struct device_node *np)
 {
 	return of_device_is_available(np) &&
 	       (!of_device_is_compatible(np, "apple,t8140-dcpext") ||
-		dcp_h17p_external_enabled());
+		dcp_h17p_external_supported(np));
 }
 
 static int apple_drm_init_dcp(struct device *dev)

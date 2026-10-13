@@ -8,6 +8,7 @@
 #include <drm/drm_modes.h>
 
 #include "dcp-display-metadata.h"
+#include "dcp-metadata-epoch.h"
 
 struct apple_dcp;
 struct apple_connector;
@@ -17,6 +18,9 @@ struct dcp_parse_ctx {
 	struct apple_dcp *dcp;
 	const void *blob;
 	u32 pos, len;
+	/* External H17P candidates require separate publication/lookup proof. */
+	bool automatic_1080p180_rgb8;
+	bool ambiguous_180hz;
 };
 
 enum dcp_color_eotf {
@@ -99,6 +103,13 @@ struct dcp_display_mode {
 	struct dcp_color_mode best;
 	bool vrr;
 	bool metadata_timing_valid;
+	bool automatic_rgb8_quirk;
+	u64 automatic_connection_sequence;
+	u64 automatic_catalog_sequence;
+	bool automatic_service_pending;
+	/* Immutable receipt provenance; never retag a cached exception. */
+	struct dcp_metadata_ticket unsafe_rgb8_ticket;
+	u64 unsafe_rgb8_service_epoch;
 };
 
 struct dimension {

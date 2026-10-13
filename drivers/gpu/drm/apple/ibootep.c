@@ -766,7 +766,7 @@ int ibootep_init(struct apple_dcp *dcp)
 	}
 	const struct apple_epic_service_ops *ops = ibootep_ops;
 
-	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL_EXPERIMENTAL)
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		ops = external_ibootep_ops;
 	dcp->ibootep = afk_init(dcp, DISP0_ENDPOINT, ops);
 	if (IS_ERR(dcp->ibootep))
