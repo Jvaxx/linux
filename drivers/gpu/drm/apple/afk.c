@@ -1647,7 +1647,7 @@ static int afk_send_command_timeout_len(struct apple_epic_service *service, u8 t
 	ret = 0;
 	if (retcode)
 		*retcode = service->cmds[idx].retcode;
-	if (ep->inline_v2 && received)
+	if (ep->wire_v2 && received)
 		copy_len = service->cmds[idx].reply_length;
 	if (ep->wire_v2 && !service->cmds[idx].retcode &&
 	    service->cmds[idx].reply_length < copy_len)
