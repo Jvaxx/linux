@@ -53,6 +53,8 @@ struct apple_dcp_typec_route {
 bool dcp_is_typec_output(struct apple_dcp *dcp);
 bool dcp_is_usb4_output(struct apple_dcp *dcp);
 bool dcp_uses_t6020_tunnel_flow(struct apple_dcp *dcp);
+/* The fixed HDMI output, not lent to a Type-C display, has HPD high. */
+bool dcp_hdmi_port_attached(struct apple_dcp *dcp);
 
 bool dcp_has_typec_routes(struct platform_device *pdev);
 

@@ -116,6 +116,12 @@ bool dcp_uses_t6020_tunnel_flow(struct apple_dcp *dcp)
 				     dcp->hw.t6020_tunnel_flow, connector_wired);
 }
 
+bool dcp_hdmi_port_attached(struct apple_dcp *dcp)
+{
+	return dcp->hdmi_hpd && !READ_ONCE(dcp->active_typec_route) &&
+	       gpiod_get_value_cansleep(dcp->hdmi_hpd) > 0;
+}
+
 static bool dcp_typec_route_is_dp(const struct typec_mux_state *state)
 {
 	return state->alt && state->alt->svid == USB_TYPEC_DP_SID &&
