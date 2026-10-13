@@ -22,7 +22,8 @@ struct dcpavserv {
 	struct apple_epic_service *opened;
 };
 
-const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *dcp);
+bool dcpavserv_edid_current(struct apple_dcp *dcp, u64 generation);
+const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *dcp, u64 generation);
 void dpavservep_detach(struct apple_dcp *dcp);
 
 #endif /* _DRM_APPLE_EPIC_DPAVSERV_H */
