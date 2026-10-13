@@ -129,6 +129,12 @@ static const char gate_pmp_uuid[] __initconst = "2F4EB4C4-001B-3ACF-A9A0-68D8E42
 static const char gate_t8122_pmp_uuid[] __initconst = "3B18C886-4C70-349B-B1C4-70F35DE2C5CD";
 
 /*
+ * The T6031 PMP image, as the J516C ADT names it (iop-pmp-nub, passed on by
+ * the boot loader in /chosen/asahi,t6031-pmp). It is not the T6030 image.
+ */
+static const char gate_t6031_pmp_uuid[] __initconst = "07FF4C5B-CB2E-3DE6-95FF-3B107D19B7AB";
+
+/*
  * apple_t6030_display.enable and apple_t8122_display.enable: the native
  * display is on unless one of them is 0.
  */
@@ -216,9 +222,10 @@ static const struct gate_soc gate_t8122 __initconst = {
 /*
  * T6031 (M3 Max): the T6030 handoff at the T6031 addresses, off unless
  * apple_t6031_display.enable=1. The PMP values must come from the boot
- * loader: there is no built-in fallback. The PMP image is the one the
- * T6030 support was brought up with (the PMP firmware is one t603x image);
- * any other is refused. The internal display's PMP request is bit 0x10.
+ * loader: there is no built-in fallback. The PMP image is T6031's own;
+ * any other, the T6030 image included, is refused. The report driver checks
+ * the image's SRAM layout before it starts the PMP. The internal display's
+ * PMP request is bit 0x10.
  */
 static const struct gate_soc gate_t6031 __initconst = {
 	.machine = "apple,t6031",
@@ -230,7 +237,7 @@ static const struct gate_soc gate_t6031 __initconst = {
 	.pwrstate_compat = "apple,t6031-pmgr-pwrstate",
 	.dcp_full_name = "dcp@386c00000",
 	.pmp_values = "/chosen/asahi,t6031-pmp",
-	.pmp_uuid = gate_pmp_uuid,
+	.pmp_uuid = gate_t6031_pmp_uuid,
 	.report_compat = "apple,t6031-pmp-v2-report",
 	.disp_entry = "report@10",
 	.pmp_dtbo = __dtbo_t6031_pmp_begin,

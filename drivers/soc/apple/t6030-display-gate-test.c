@@ -30,6 +30,7 @@ struct gt_soc {
 	const char *dcp, *display, *values, *aic;
 	const char *ps[PMP_PS_NR];		/* as PMP_PS_* */
 	const char *report_compat, *disp_entry, *pmp_compat, *pmp_dart, *pmp_mbox;
+	const char *pmp_uuid;			/* the PMP image of the fixture */
 };
 
 static const struct gt_soc gt_t6031 __initconst = {
@@ -54,6 +55,7 @@ static const struct gt_soc gt_t6031 __initconst = {
 	.pmp_compat = "apple,t6031-pmp-v2",
 	.pmp_dart = "iommu@290300000",
 	.pmp_mbox = "mailbox@290c08000",
+	.pmp_uuid = "07FF4C5B-CB2E-3DE6-95FF-3B107D19B7AB",
 };
 
 static const struct gt_soc gt_t6030 __initconst = {
@@ -78,6 +80,7 @@ static const struct gt_soc gt_t6030 __initconst = {
 	.pmp_compat = "apple,t6030-pmp-v2",
 	.pmp_dart = "iommu@350300000",
 	.pmp_mbox = "mailbox@350c08000",
+	.pmp_uuid = "2F4EB4C4-001B-3ACF-A9A0-68D8E42FC3A7",
 };
 
 static int gt_fixture_t6031 __initdata = -1;
@@ -213,7 +216,7 @@ static void __init gt_expect_enabled(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, of_device_is_compatible(pmp, s->pmp_compat));
 	KUNIT_EXPECT_FALSE(test, of_device_is_available(pmp));
 	KUNIT_ASSERT_EQ(test, of_property_read_string(pmp, "apple,tunable-uuid", &uuid), 0);
-	KUNIT_EXPECT_STREQ(test, uuid, "2F4EB4C4-001B-3ACF-A9A0-68D8E42FC3A7");
+	KUNIT_EXPECT_STREQ(test, uuid, s->pmp_uuid);
 	KUNIT_EXPECT_TRUE(test, of_property_present(pmp, "apple,tunable-test"));
 	KUNIT_EXPECT_TRUE(test, of_property_present(pmp, "apple,board-id"));
 	KUNIT_EXPECT_TRUE(test, of_property_present(pmp, "apple,dram-vendor-id"));
@@ -420,6 +423,16 @@ static void __init gate_t6031_incomplete_pmp_values(struct kunit *test)
 	gt_expect_untouched(test);
 }
 
+/* The T6030 PMP image is not T6031's. */
+static void __init gate_t6031_t6030_pmp_image(struct kunit *test)
+{
+	KUNIT_ASSERT_EQ(test, gate_setup_t6031("1"), 0);
+	gt_set_string(test, gt_t6031.values, "apple,tunable-uuid",
+		      "2F4EB4C4-001B-3ACF-A9A0-68D8E42FC3A7");
+	gt_run(test);
+	gt_expect_untouched(test);
+}
+
 static void __init gate_t6031_other_pmp_image(struct kunit *test)
 {
 	KUNIT_ASSERT_EQ(test, gate_setup_t6031("1"), 0);
@@ -520,6 +533,7 @@ static struct kunit_case gate_t6031_cases[] __refdata = {
 	KUNIT_CASE(gate_t6031_t6030_marker),
 	KUNIT_CASE(gate_t6031_no_pmp_values),
 	KUNIT_CASE(gate_t6031_incomplete_pmp_values),
+	KUNIT_CASE(gate_t6031_t6030_pmp_image),
 	KUNIT_CASE(gate_t6031_other_pmp_image),
 	KUNIT_CASE(gate_t6031_t6030_power_layout),
 	KUNIT_CASE(gate_t6031_not_inherited_on),
