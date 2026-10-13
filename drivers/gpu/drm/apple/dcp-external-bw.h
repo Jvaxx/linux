@@ -21,4 +21,19 @@ static inline bool apple_dcp_external_clock_window(u64 start, u64 size,
 	return start == expected_start && size == expected_size;
 }
 
+/* Resolve optional diagnostic overrides without changing the SoC defaults. */
+static inline bool apple_dcp_external_bw_resolve(u64 size, int default_scratch,
+						int default_request, int override_scratch,
+						int override_request, u32 *scratch, u32 *request)
+{
+	int s = override_scratch == -1 ? default_scratch : override_scratch;
+	int r = override_request == -1 ? default_request : override_request;
+
+	if (!apple_dcp_external_bw_valid(size, s, r))
+		return false;
+	*scratch = s;
+	*request = r;
+	return true;
+}
+
 #endif
