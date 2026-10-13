@@ -86,6 +86,13 @@ static const struct gt_soc gt_t6030 __initconst = {
 static int gt_fixture_t6031 __initdata = -1;
 static int gt_fixture_t6030 __initdata = -1;
 
+/*
+ * Whether the booted tree has its own /soc, checked before the first fixture
+ * is applied (-1 until then). The fixtures disable /soc, which on a real Mac
+ * would remove every SoC device, so there the suites skip instead.
+ */
+static int gt_live_soc __initdata = -1;
+
 struct gate_test {
 	const struct gt_soc *s;
 	struct of_changeset cs;	/* this case's own edits to the test tree */
@@ -250,6 +257,14 @@ static void __init gt_expect_enabled(struct kunit *test)
 
 static int __init gt_apply_fixture(const struct gt_soc *s, int *id)
 {
+	if (gt_live_soc < 0) {
+		struct device_node *soc = of_find_node_by_path("/soc");
+
+		gt_live_soc = !!soc;
+		of_node_put(soc);
+	}
+	if (gt_live_soc)
+		return 0;
 	return of_overlay_fdt_apply(s->fixture, s->fixture_end - s->fixture, id, NULL);
 }
 
@@ -280,6 +295,8 @@ static int __init gt_init(struct kunit *test, const struct gt_soc *s)
 	gate_pmp_ovcs = 0;
 	gate_requested = true;
 	gate_t6031_requested = false;
+	if (gt_live_soc)
+		kunit_skip(test, "the booted device tree has its own /soc");
 	return 0;
 }
 
