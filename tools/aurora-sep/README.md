@@ -34,8 +34,10 @@ extent passes the driver's narrow ownership checks: one physical extent, no snap
 state, and a single extent reference owned by the `.gl` inode. The kernel
 resolves that extent from checksum-validated APFS metadata; unsupported layouts
 fail closed. Set `options apple_sep xart_writes=0 provision_keybag=0` in a
-modprobe configuration to retain read-only operation. Identity-keybag creation
-still requires `provision_keybag=1`; `load-driver` supplies that option.
+modprobe configuration to retain read-only operation. `provision_keybag=1`
+is also the default: first boot creates the Linux identity needed for trusted
+keys, and later boots recover that identity and its machine reference key.
+An existing unreadable or invalid identity is not silently replaced.
 Enabling writes has been tested on m2 with identity-keybag provisioning,
 trusted-key seal/unseal, and reboot reload. The raw iBoot container hash did not
 change in those tests, so an actual xART write was **not** validated. Do not
