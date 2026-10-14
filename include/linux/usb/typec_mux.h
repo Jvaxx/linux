@@ -86,6 +86,9 @@ struct typec_mux_state {
 	void *data;
 };
 
+typedef void (*typec_mux_notify_fn_t)(struct typec_mux_dev *mux,
+				     struct typec_mux_state *state);
+
 typedef int (*typec_mux_set_fn_t)(struct typec_mux_dev *mux,
 				  struct typec_mux_state *state);
 
@@ -94,12 +97,26 @@ struct typec_mux_desc {
 	typec_mux_set_fn_t set;
 	const char *name;
 	void *drvdata;
+	/* Quiesce consumers before any provider changes the shared route. */
+	typec_mux_set_fn_t prepare;
+	/* Fallible finalization retains ownership; commit cannot fail. */
+	typec_mux_set_fn_t finish;
+	typec_mux_notify_fn_t commit;
+	typec_mux_notify_fn_t abort;
 };
 
 #if IS_ENABLED(CONFIG_TYPEC)
 
 struct typec_mux *fwnode_typec_mux_get(struct fwnode_handle *fwnode);
 void typec_mux_put(struct typec_mux *mux);
+/* begin/end must run in the same task; failure retains provider recovery state. */
+/* Same-task begin/end; retain the handle and state pointees until end/abort. */
+int typec_mux_begin(struct typec_mux *mux, struct typec_mux_state *state);
+/* Apply the providers while retaining the transaction and ownership. */
+int typec_mux_apply(struct typec_mux *mux);
+int typec_mux_end(struct typec_mux *mux);
+void typec_mux_abort(struct typec_mux *mux);
+int typec_mux_prepare(struct typec_mux *mux, struct typec_mux_state *state);
 int typec_mux_set(struct typec_mux *mux, struct typec_mux_state *state);
 
 struct typec_mux_dev *
@@ -117,6 +134,21 @@ static inline struct typec_mux *fwnode_typec_mux_get(struct fwnode_handle *fwnod
 }
 
 static inline void typec_mux_put(struct typec_mux *mux) {}
+
+static inline int typec_mux_begin(struct typec_mux *mux, struct typec_mux_state *state)
+{
+	return 0;
+}
+
+static inline int typec_mux_apply(struct typec_mux *mux) { return 0; }
+
+static inline int typec_mux_end(struct typec_mux *mux) { return 0; }
+static inline void typec_mux_abort(struct typec_mux *mux) {}
+
+static inline int typec_mux_prepare(struct typec_mux *mux, struct typec_mux_state *state)
+{
+	return 0;
+}
 
 static inline int typec_mux_set(struct typec_mux *mux, struct typec_mux_state *state)
 {
