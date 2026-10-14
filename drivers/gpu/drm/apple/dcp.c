@@ -1144,7 +1144,8 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
  * the sink, which retrains the link once the hub has settled, as a cable
  * replug does.
  *
- * The retries cover one connection: the replay itself does not reset them.
+ * The retries cover one connection or one DPMS wake: the replay itself
+ * does not reset them, dcp_poweron() does.
  */
 static bool dcp_typec_relink_start(struct apple_dcp *dcp, const char *why)
 {
@@ -1756,6 +1757,12 @@ void dcp_poweron(struct platform_device *pdev)
 				    READ_ONCE(dcp->typec_cable_connected);
 		WRITE_ONCE(dcp->typec_crtc_off, false);
 		WRITE_ONCE(dcp->typec_follow_start, false);
+		/*
+		 * A DPMS wake retrains the link like a replug: give it a fresh
+		 * relink budget. No relink runs while the CRTC was off.
+		 */
+		if (wait_for_typec_hpd)
+			dcp->relink_tries = 0;
 
 		/*
 		 * A Type-C CRTC disable releases its DPTX session. Re-establish it
