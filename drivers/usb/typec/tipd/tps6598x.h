@@ -305,7 +305,7 @@ struct tipd_data {
 	irq_handler_t irq_handler;
 	u64 irq_mask1;
 	size_t tps_struct_size;
-	void (*remove)(struct tps6598x *tps);
+	int (*remove)(struct tps6598x *tps);
 	int (*register_port)(struct tps6598x *tps, struct fwnode_handle *node);
 	void (*unregister_port)(struct tps6598x *tps);
 	void (*ready)(struct tps6598x *tps);
@@ -323,6 +323,9 @@ struct tipd_data {
 };
 
 struct tps6598x {
+	struct typec_mux *mux;
+	/* CD remove leaves one open SAFE transaction for generic completion. */
+	bool remove_safe_prepared;
 	struct device *dev;
 	struct regmap *regmap;
 	struct mutex lock; /* device lock */
