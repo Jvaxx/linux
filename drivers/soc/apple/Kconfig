@@ -116,6 +116,7 @@ config APPLE_SEP_FV_INTERFACE
 
 config APPLE_SEP
 	tristate "Apple SEP (Secure Enclave Processor)"
+	default m if ARCH_APPLE
 	depends on ARCH_APPLE
 	depends on PM
 	depends on RUST
@@ -141,10 +142,10 @@ config APPLE_SEP
 	  the iBoot system container, locating its .gl extent through read-only,
 	  checksum-validated APFS metadata. It validates the complete store and
 	  both root records before registering with SEP.
-	  Raw APFS xART writes are disabled by default. An explicit xart_writes
-	  opt-in is accepted only when the driver validates narrow physical
-	  extent ownership invariants; this does not prove all macOS-compatible
-	  update behavior. Keep it off until the target machine has been checked.
+	  xART writes are enabled by default, but accepted only when the driver
+	  validates the physical extent ownership invariants. Unsupported APFS
+	  layouts fail closed. Set xart_writes=0 for read-only operation.
+	  Identity-keybag provisioning remains a separate opt-in.
 	  With writes off the driver still attaches, but refuses Touch ID enrol
 	  and verify: the enclave saves anti-replay state after every match.
 

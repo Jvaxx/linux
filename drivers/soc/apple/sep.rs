@@ -2316,8 +2316,11 @@ impl WorkItem<VERIFY_WORK_ID> for SepData {
 
 struct SepDriver(Arc<SepData>);
 
-const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, (), 1> =
-    kernel::device_id::IdArray::new([(of::DeviceId::new(c"apple,sep"), &())]);
+kernel::of_device_table!(
+    OF_TABLE,
+    (),
+    [(of::DeviceId::new(c"apple,sep"), ())]
+);
 
 impl platform::Driver for SepDriver {
     type IdInfo = ();
@@ -2443,8 +2446,8 @@ module! {
     license: "Dual MIT/GPL",
     params: {
         xart_writes: u8 {
-            default: 0,
-            description: "Opt in to shared xART writes only if APFS proves a single unsnapshotted .gl extent; Touch ID enrol and verify need it",
+            default: 1,
+            description: "Allow shared xART writes only if APFS proves a single unsnapshotted .gl extent; set to 0 for read-only operation",
         },
         xart_start_sector: u64 {
             default: 0,
