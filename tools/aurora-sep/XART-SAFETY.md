@@ -4,8 +4,9 @@
 
 `xart_writes=1` is the driver default. The APFS extent-ownership checks,
 record validation and write-ordering checks remain mandatory; unsupported
-layouts fail closed. `xart_writes=0` explicitly selects read-only operation.
-Identity-keybag creation remains a separate `provision_keybag=1` opt-in.
+layouts fail closed. `xart_writes=0 provision_keybag=0` explicitly selects
+read-only operation. `provision_keybag=1` is the default: create the Linux
+identity if missing and recover an existing identity without replacing it.
 The historical evidence below records the earlier opt-in deployments and
 does not establish qualification on every supported Mac or APFS layout.
 

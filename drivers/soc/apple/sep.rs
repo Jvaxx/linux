@@ -2476,7 +2476,7 @@ module! {
         },
         provision_keybag: u8 {
             default: 1,
-            description: "Create the Linux identity keybag when none exists; requires xart_writes=1",
+            description: "Create the Linux identity keybag when none exists; set to 0 to disable first-boot provisioning; requires xart_writes=1",
         },
         os_uuid_hi: u64 {
             default: 0,
