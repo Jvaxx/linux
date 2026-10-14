@@ -484,6 +484,13 @@ static int aic_irq_set_type(struct irq_data *d, unsigned int type)
 	return (type == IRQ_TYPE_LEVEL_HIGH || type == IRQ_TYPE_EDGE_RISING) ? 0 : -EINVAL;
 }
 
+/*
+ * The only system sleep state on these SoCs is suspend-to-idle, in which the
+ * AIC stays powered and keeps delivering every unmasked interrupt to the CPUs
+ * idling in WFI. There is no separate wake logic to configure, so any IRQ may
+ * be a wakeup source: let enable_irq_wake() succeed and leave it to the IRQ
+ * core to keep wake-armed interrupts enabled across suspend_device_irqs().
+ */
 static struct irq_chip aic_chip = {
 	.name = "AIC",
 	.irq_mask = aic_irq_mask,
@@ -491,6 +498,7 @@ static struct irq_chip aic_chip = {
 	.irq_eoi = aic_irq_eoi,
 	.irq_set_affinity = aic_irq_set_affinity,
 	.irq_set_type = aic_irq_set_type,
+	.flags = IRQCHIP_SKIP_SET_WAKE,
 };
 
 static struct irq_chip aic2_chip = {
@@ -499,6 +507,7 @@ static struct irq_chip aic2_chip = {
 	.irq_unmask = aic_irq_unmask,
 	.irq_eoi = aic_irq_eoi,
 	.irq_set_type = aic_irq_set_type,
+	.flags = IRQCHIP_SKIP_SET_WAKE,
 };
 
 /*
