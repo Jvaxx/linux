@@ -28,12 +28,15 @@ for example with `systemctl edit aurora-sep.service`:
 Environment=AURORA_SEP_READY_TIMEOUT=180
 ```
 
-`xart_writes=0` remains the default. `load-driver` explicitly opts into writes
-and must only be enabled on a machine whose APFS `.gl` extent passes the
-driver's narrow ownership checks: one physical extent, no snapshots or revert
+The driver defaults to `xart_writes=1` and exports the `apple,sep` module
+alias for automatic loading. Writes are accepted only when the APFS `.gl`
+extent passes the driver's narrow ownership checks: one physical extent, no snapshots or revert
 state, and a single extent reference owned by the `.gl` inode. The kernel
 resolves that extent from checksum-validated APFS metadata; unsupported layouts
-fail closed. The opt-in has been tested on m2 with identity-keybag provisioning,
+fail closed. Set `options apple_sep xart_writes=0 provision_keybag=0` in a
+modprobe configuration to retain read-only operation. Identity-keybag creation
+still requires `provision_keybag=1`; `load-driver` supplies that option.
+Enabling writes has been tested on m2 with identity-keybag provisioning,
 trusted-key seal/unseal, and reboot reload. The raw iBoot container hash did not
 change in those tests, so an actual xART write was **not** validated. Do not
 infer that all SEP or Touch ID operations work with a read-only GigaLocker.
