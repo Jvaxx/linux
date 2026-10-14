@@ -1020,6 +1020,19 @@ static void bt7932_hw_error(struct hci_dev *hdev, u8 code)
 	bt_dev_err(hdev, "hardware error 0x%2.2x", code);
 }
 
+/*
+ * Follows the wakeup setting of the PCI function, which is off by default.
+ * Only while it is on does hci_suspend_sync() leave page scan and LE passive
+ * scan set up for the devices flagged for remote wakeup. The transport is
+ * quiesced for system sleep either way, and no interrupt is armed for wakeup.
+ */
+static bool bt7932_wakeup(struct hci_dev *hdev)
+{
+	struct bt7932 *bt = hci_get_drvdata(hdev);
+
+	return device_may_wakeup(&bt->pdev->dev);
+}
+
 static int bt7932_iommu(struct bt7932 *bt)
 {
 	struct device *dev = &bt->pdev->dev;
@@ -1224,6 +1237,7 @@ static int bt7932_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	bt->hdev->setup = bt7932_setup;
 	bt->hdev->reset = bt7932_reset;
 	bt->hdev->hw_error = bt7932_hw_error;
+	bt->hdev->wakeup = bt7932_wakeup;
 	hci_set_quirk(bt->hdev, HCI_QUIRK_RESET_ON_CLOSE);
 	hci_set_quirk(bt->hdev, HCI_QUIRK_NON_PERSISTENT_SETUP);
 	/* System sleep suspends HCI from bt7932_suspend(), after the freeze. */
