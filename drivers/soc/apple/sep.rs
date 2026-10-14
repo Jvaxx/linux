@@ -2455,8 +2455,8 @@ module! {
             description: "Expected 512-byte start sector of the APFS .gl extent in the iBoot container. Zero accepts the APFS result; nonzero must match it and cannot override it",
         },
         provision_keybag: u8 {
-            default: 0,
-            description: "Create the Linux identity keybag when none exists; requires xart_writes=1",
+            default: 1,
+            description: "Create the Linux identity keybag when none exists; set to 0 to disable first-boot provisioning; requires xart_writes=1",
         },
         os_uuid_hi: u64 {
             default: 0,
