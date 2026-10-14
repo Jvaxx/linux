@@ -22,6 +22,9 @@ import recovery
 import lifecycle
 import phy
 import pm
+import quiesce
+import transaction
+import accounting
 import idle
 import rate
 import boot
@@ -36,7 +39,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', type=Path, default=Path(__file__).resolve().parents[6])
     parser.add_argument('--output', type=Path, help='retain generated C, commands and results here')
-    parser.add_argument('--group', choices=('all', 'edid', 'rate', 'phy', 'lifecycle', 'boot'), default='all')
+    parser.add_argument('--group', choices=('all', 'edid', 'rate', 'phy', 'lifecycle', 'boot', 'quiesce'), default='all')
     args = parser.parse_args()
     root = args.source.resolve()
     output = args.output or Path(tempfile.mkdtemp(prefix='apple-dcp-selftest-'))
@@ -62,6 +65,7 @@ def main():
         ('phy', 'usb-unreachable', lambda r: pm.ownership(r, True), ((),), ()),
         ('lifecycle', 'cpuidle-s2idle', idle.s2idle, ((),), ('-Wno-unused-parameter', '-Wno-unused-variable')),
         ('lifecycle', 'typec-probe', pm.probe, ((),), ()),
+        ('lifecycle', 'quiesce-before-safe', quiesce.make_unit, tuple((c,) for c in ('ordered','power','ack','role','bolt','mux','duplicate','error-latched','legacy','fabric','tunnel')), ()),
         ('lifecycle', 'probe-mux-pm-dispatch', pm.probe_dispatch, ((),), ()),
         ('phy', 'parking', lambda r: parking_unit(r), parking_cases, ()),
         ('phy', 'adverse-retry', phy.adverse, tuple((c,) for c in ('bist', 'init', 'mux', 'gate', 'dp-cache', 'off', 'success')), ()),
@@ -81,8 +85,11 @@ def main():
         ('lifecycle', 'power-reply', lifecycle.power_reply, ((),), ()),
         ('lifecycle', 'dispatcher-scope', lifecycle.dispatcher, ((),), ()),
     ]
+    transaction_tests = transaction.controls(root) + accounting.controls(root)
+    tests.extend(('lifecycle', name, lambda r, u=unit: u, cases, flags)
+                 for name, unit, cases, flags in transaction_tests)
     tests.append(('phy', 'usb-kconfig', lambda r: pm.kconfig(r, output), (), ()))
-    tests = [t for t in tests if args.group in ('all', t[0])]
+    tests = [t for t in tests if args.group in ('all', t[0]) or (args.group == 'quiesce' and t[1] in ('quiesce-before-safe',) + tuple(n for n, _, _, _ in transaction_tests))]
     print('TAP version 13', flush=True)
     print('1..' + str(len(tests)), flush=True)
     results = []

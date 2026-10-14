@@ -16,9 +16,22 @@ def ownership(root, usb_unreachable=False):
     prefix=ns['prefix']+'\nstruct device_node;\nstatic int atcphy_mux_set(struct typec_mux_dev *, struct typec_mux_state *);\n'
     prefix=prefix.replace('struct typec_mux_dev { struct apple_atcphy *data; };',
      '''struct typec_mux_dev { struct apple_atcphy *data;
- int (*set)(struct typec_mux_dev *, struct typec_mux_state *); };
- struct typec_mux { unsigned int num_mux_devs; struct typec_mux_dev **mux_devs; };
+ int (*set)(struct typec_mux_dev *, struct typec_mux_state *);
+ int (*prepare)(struct typec_mux_dev *, struct typec_mux_state *);
+ int (*finish)(struct typec_mux_dev *, struct typec_mux_state *);
+ void (*commit)(struct typec_mux_dev *, struct typec_mux_state *);
+ void (*abort)(struct typec_mux_dev *, struct typec_mux_state *);bool removed; };
+ struct typec_mux_context { struct { bool held; } lock; };
+ struct task_struct { int unused; };static struct task_struct test_task;
+ #define current (&test_task)
+ static int typec_mux_srcu;
+ static int srcu_read_lock(int *s) { (void)s;return 0; }
+ static void srcu_read_unlock(int *s,int i) { (void)s;(void)i; }
+ #define mutex_trylock(m) ((m)->held ? 0 : ((m)->held=true))
+ #define mutex_unlock(m) ((m)->held=false)
+ struct typec_mux { unsigned int num_mux_devs; struct typec_mux_dev **mux_devs; struct typec_mux_context *context; struct typec_mux_state transaction; struct task_struct *owner; int srcu_index; unsigned prepared; bool applied; };
  #define IS_ERR_OR_NULL(p) (!(p))''')
+    prefix=prefix.replace('#define WARN_ON_ONCE(v) assert(!(v))', 'static bool checked_warn(bool v) { assert(!v);return v; }\n#define WARN_ON_ONCE(v) checked_warn(v)')
     prefix=prefix.replace('#define guard(kind) (void)',r'''
 struct lock_guard { int *lock; };
 static struct lock_guard lock_take(int *lock) { assert(!*lock); *lock=1; return (struct lock_guard){lock}; }
@@ -177,7 +190,7 @@ int main(void)
 #if !USB_REACHABLE
  { prepare(&p,true,true,false);unsigned int before=writes;
  struct typec_mux_dev provider={.data=&p,.set=atcphy_mux_set};
- struct typec_mux_dev *providers[]={&provider};struct typec_mux mux={1,providers};
+ struct typec_mux_dev *providers[]={&provider};struct typec_mux_context typec_test_context={0};struct typec_mux mux={.num_mux_devs=1,.mux_devs=providers,.context=&typec_test_context};
  struct typec_mux_state state={.mode=TYPEC_STATE_SAFE};
  assert(typec_mux_set(&mux,&state)==-ENODEV&&writes==before);balanced(&p);
  puts("PASS USB-unreachable fixed route blocks before MMIO");return 0; }
@@ -298,7 +311,8 @@ int main(void)
     if usb_unreachable:
      pmfixture=pmfixture.replace('static ', 'static __attribute__((unused)) ')
     typec_source=(root/'drivers/usb/typec/mux.c').read_text()
-    typec_caller=ns['block'](typec_source,'int typec_mux_set(')+'\n'
+    typec_caller='\n'.join(ns['block'](typec_source, marker) for marker in
+      ('static void typec_mux_unlock(', 'void typec_mux_abort(', 'int typec_mux_begin(', 'int typec_mux_apply(', 'int typec_mux_end(', 'int typec_mux_set('))+'\n'
     hcd_source=(root/'drivers/usb/core/hcd.c').read_text()
     hcd_death=ns['block'](hcd_source,'void usb_hc_died (')+'\n'
     text=prefix+prod+'\n#define REQUIRES_PLATFORM_LOCKS '+str(int('device_lock(&pm->controller->dev)' in s))+'\n#define USB_REACHABLE '+str(int(not usb_unreachable))+'\n#define HCD_DEAD_ONLY '+str(int(False))+'\n'+pmfixture+helpers+typec_caller+hcd_death+suffix+controls
@@ -531,7 +545,7 @@ int main(void)
     struct cd321x c={};
     struct typec_mux_dev provider={.data=&p,.set=atcphy_mux_set};
     struct typec_mux_dev *providers[]={&provider};
-    struct typec_mux route={1,providers};probe_port.mux=&route;
+    struct typec_mux_context typec_test_context={0};struct typec_mux route={.num_mux_devs=1,.mux_devs=providers,.context=&typec_test_context};probe_port.mux=&route;
     prepare(&p,true,true,false);root_missing=true;unsigned int before=writes;
     assert(cd321x_register_port(&c.tps,&connector)==-EPROBE_DEFER);
     assert(!c.state_valid&&!resumes&&writes==before);balanced(&p);port_balance();
