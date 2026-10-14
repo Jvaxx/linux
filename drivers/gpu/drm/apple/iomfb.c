@@ -1200,6 +1200,14 @@ void dcp_hotplug(struct work_struct *work)
 			dcp_external_relink(dcp, connector);
 	} else if (!notify_only && connector->base.state &&
 		   !READ_ONCE(dcp->mode_state.valid) && connected &&
+		   /*
+		    * Not for a Type-C CRTC powered off with the display
+		    * attached: it has no link, and dcp_poweron() retrains one
+		    * on wake. A link reported bad then makes wlroots replace
+		    * the output on wake, which powers the CRTC off and on
+		    * again, and that wake does the same, forever.
+		    */
+		   !READ_ONCE(dcp->typec_crtc_off) &&
 		   !dcp_uses_t6020_tunnel_flow(dcp)) {
 		drm_connector_set_link_status_property(&connector->base,
 						       DRM_MODE_LINK_STATUS_BAD);
