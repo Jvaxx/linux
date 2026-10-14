@@ -426,13 +426,22 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 	 * crossbar nor restart the tunnel pixel clock behind our back.
 	 */
 	scoped_guard(mutex, &dcp->tb_lock) {
-		if (!route->tunnel || route->xbar_up)
-			ret = mux_control_deselect(route->active_xbar ?: route->xbar);
-		else
-			dcp_dpxbar_preselect(route->active_xbar, MUX_IDLE_DISCONNECT);
-		if (ret)
-			return ret;
-		route->xbar_up = false;
+		if (route->deactivate_error)
+			return route->deactivate_error;
+		if (!route->deactivate_xbar_done) {
+			if (!route->tunnel || route->xbar_up)
+				ret = mux_control_deselect(route->active_xbar ?: route->xbar);
+			else
+				ret = dcp_dpxbar_preselect(route->active_xbar, MUX_IDLE_DISCONNECT);
+			/* Deselect always unlocks: never consume that selection twice. */
+			route->deactivate_xbar_done = true;
+			route->xbar_up = false;
+			if (ret) {
+				/* Idle is unproven; retain the owner and the real error. */
+				route->deactivate_error = ret;
+				return ret;
+			}
+		}
 
 	route->selected = false;
 	if (dcp->active_typec_route == route)
@@ -826,6 +835,8 @@ dcp_typec_rebalance_locked(struct apple_dcp_typec_port *arriving,
 		struct apple_dcp_typec_route *owner = port->owner;
 		struct apple_dcp *dcp;
 
+		if (port->safe_pending)
+			continue;
 		if (!owner || owner->tunnel || owner == port->target)
 			continue;
 
@@ -914,19 +925,192 @@ void dcp_typec_reorder(void)
 	return dcp->tb_dpin_set_active(dcp->tb_dpin_ctx, active);
 }
 
-/*
- * Thunderbolt DP IN, from DCP's DidChangeLinkConfiguration once a link rate
- * is set: bring the crossbar connection up (FIFO/PCLK/ATC enables) now that
- * the tunnel pixel clock runs, and re-assert the DP IN adapter's
- * DPTX_INACTIVE=0 afterwards. The first time this is the mux selection;
- * after a re-link only the clocks are brought back (the mux selection and
- * the ATC output enable are kept, see dcp_tunnel_crossbar_down()). Runs
- * inside a DCP apcall: only tb_lock, which nobody holds across a DCP call.
- */
-int dcp_tunnel_crossbar_up(struct apple_dcp *dcp)
+static int dcp_typec_route_prepare(struct typec_mux_dev *mux,
+				   struct typec_mux_state *state)
+{
+	struct apple_dcp_typec_route *route = typec_mux_get_drvdata(mux);
+	struct apple_dcp_typec_port *port = route->port;
+	struct apple_dcp *dcp;
+	int ret;
+
+	guard(mutex)(&dcp_typec_fabric_lock);
+	if (state->mode != TYPEC_STATE_SAFE)
+		return port->safe_pending ? -EBUSY : 0;
+	if (!port->owner || port->owner->tunnel)
+		return 0;
+	dcp = port->owner->dcp;
+	/* Stop new admission, but retain the owner until the set phase succeeds. */
+	if (!port->safe_pending)
+		port->safe_finish_ready = false;
+	port->safe_pending = true;
+	port->applied_valid = false;
+	port->dp_wanted = false;
+	port->dp_hpd = false;
+	/* HPD absence alone is not proof of a completed firmware shutdown. */
+	if (dcp_is_external_h17p(dcp)) {
+		scoped_guard(mutex, &dcp->external_lock) {
+			if (dcp->external_error)
+				return dcp->external_error;
+			if (!dcp->external_cable && dcp->external_stopped &&
+			    !READ_ONCE(dcp->dptxport[0].connected)) {
+				port->hpd = false;
+				return 0;
+			}
+		}
+	}
+	ret = dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0);
+	if (ret)
+		return ret;
+	port->hpd = false;
+	return 0;
+}
+
+static int dcp_typec_route_finish(struct typec_mux_dev *mux,
+				  struct typec_mux_state *state)
+{
+	struct apple_dcp_typec_port *port =
+		((struct apple_dcp_typec_route *)typec_mux_get_drvdata(mux))->port;
+	int ret;
+
+	guard(mutex)(&dcp_typec_fabric_lock);
+	if (state->mode != TYPEC_STATE_SAFE || !port->safe_pending ||
+	    port->safe_finish_ready)
+		return 0;
+	ret = port->owner ? dcp_typec_route_deactivate(port->owner) : 0;
+	if (ret)
+		return ret;
+	port->safe_finish_ready = true;
+	return 0;
+}
+
+static void dcp_typec_route_commit(struct typec_mux_dev *mux,
+				   struct typec_mux_state *state)
+{
+	struct apple_dcp_typec_port *port =
+		((struct apple_dcp_typec_route *)typec_mux_get_drvdata(mux))->port;
+
+	guard(mutex)(&dcp_typec_fabric_lock);
+	if (state->mode != TYPEC_STATE_SAFE || !port->safe_pending)
+		return;
+	if (port->owner)
+		port->preferred_route = port->owner;
+	port->owner = NULL;
+	port->safe_pending = false;
+	port->safe_finish_ready = false;
+	port->applied_alt = state->alt;
+	port->applied_mode = state->mode;
+	port->applied_status = 0;
+	port->applied_conf = 0;
+	port->applied_valid = true;
+	dcp_typec_pipeline_freed();
+}
+
+static int dcp_typec_route_set(struct typec_mux_dev *mux,
+			       struct typec_mux_state *state)
 {
 	struct apple_dcp_typec_route *route;
 	int ret;
+	struct apple_dcp_typec_route *route = typec_mux_get_drvdata(mux);
+	struct apple_dcp_typec_port *port = route->port;
+	struct apple_dcp_typec_route *best = NULL;
+	bool is_dp = dcp_typec_route_is_dp(state);
+	struct typec_displayport_data *dp_data = is_dp ? state->data : NULL;
+	u32 dp_status = dp_data ? dp_data->status : 0;
+	u32 dp_conf = dp_data ? dp_data->conf : 0;
+	bool hpd, was_counted;
+	int ret = 0;
+
+	guard(mutex)(&dcp_typec_fabric_lock);
+
+	if (state->mode == TYPEC_STATE_SAFE && port->safe_pending)
+		return 0;
+	if (port->safe_pending)
+		return -EBUSY;
+
+	/*
+	 * Every candidate route for this port is notified with the same state,
+	 * so only the first to arrive does the work; the others return early.
+	 *
+	 * Deliberately not a nominated coordinator: fwnode_typec_mux_get()
+	 * caps the providers one connector may have and drops the remainder
+	 * without a word, so a nominated route might never be called at all --
+	 * and the port would then never be routed.
+	 */
+	if (port->applied_valid && port->applied_alt == state->alt &&
+	    port->applied_mode == state->mode &&
+	    port->applied_status == dp_status && port->applied_conf == dp_conf)
+		return 0;
+
+	port->applied_alt = state->alt;
+	port->applied_mode = state->mode;
+	port->applied_status = dp_status;
+	port->applied_conf = dp_conf;
+	/* Failed route acquisition must remain retryable on the next update. */
+	port->applied_valid = false;
+
+	/* did the pairing pass count this port's direct stream so far? */
+	was_counted = port->dp_wanted && port->dp_hpd;
+
+	if (!is_dp) {
+		port->dp_wanted = false;
+		port->dp_hpd = false;
+
+		/* a Thunderbolt/USB4 DP tunnel is torn down by its own path */
+		if (port->owner && port->owner->tunnel) {
+			port->applied_valid = true;
+			return 0;
+		}
+		if (port->owner) {
+			struct apple_dcp *dcp = port->owner->dcp;
+
+			port->preferred_route = port->owner;
+			if (port->hpd || dcp->typec_cable_connected ||
+			    (dcp->typec_connector &&
+			     dcp->typec_connector->connected))
+				dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0);
+			port->hpd = false;
+			ret = dcp_typec_route_deactivate(port->owner);
+			if (ret)
+				return ret;
+			port->owner = NULL;
+
+			if (dcp->hdmi_hpd && dcp->active &&
+			    gpiod_get_value_cansleep(dcp->hdmi_hpd))
+				dcp_dptx_connect(dcp, 0);
+			dcp_typec_pipeline_freed();
+		} else if (was_counted && dcp_typec_keep_order()) {
+			/* a stream the plan left dark is gone: plan the rest */
+			dcp_typec_rebalance_locked(NULL, 0);
+		}
+
+		/* Data-only USB4 changes do not invalidate other display routes. */
+		port->applied_valid = true;
+		return 0;
+	}
+
+	/*
+	 * A Thunderbolt DP tunnel still owns the port (its teardown is on the
+	 * way): don't act on or remember this state; the tunnel teardown drops
+	 * what was recorded so the next update is applied.
+	 */
+	if (port->owner && port->owner->tunnel) {
+		port->applied_valid = false;
+		return 0;
+	}
+
+	hpd = dp_data && (dp_data->status & DP_STATUS_HPD_STATE);
+	port->dp_wanted = true;
+	port->dp_hpd = hpd;
+
+	/*
+	 * Until a compositor owns the display, a direct DP-alt stream has a
+	 * pipeline only while its sink asserts HPD, and the pairing pass
+	 * places it: HPD coming or going is the stream connecting or
+	 * disconnecting as far as a compositor can tell.  Otherwise the port
+	 * takes the lowest free pipeline on DP entry, as a compositor does.
+	 */
+	if (dcp_typec_keep_order()) {
+		struct apple_dcp_typec_route *owner = port->owner;
 
 	guard(mutex)(&dcp->tb_lock);
 	route = dcp->active_typec_route;
@@ -1037,7 +1221,8 @@ int dcp_tunnel_crossbar_up(struct apple_dcp *dcp)
 
 	guard(mutex)(&dcp->tb_lock);
 	route = dcp->active_typec_route;
-	if (!route || !route->tunnel || !route->active_xbar)
+	if (!route || !route->tunnel || !route->active_xbar ||
+	    route->deactivate_xbar_done)
 		return -ENODEV;
 	if (!dcp->tb_clock_ok) {
 		dev_warn(dcp->dev, "no DP tunnel pixel clock, crossbar left down\n");

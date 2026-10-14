@@ -86,6 +86,9 @@ struct typec_mux_state {
 	void *data;
 };
 
+typedef void (*typec_mux_notify_fn_t)(struct typec_mux_dev *mux,
+				     struct typec_mux_state *state);
+
 typedef int (*typec_mux_set_fn_t)(struct typec_mux_dev *mux,
 				  struct typec_mux_state *state);
 
@@ -94,6 +97,12 @@ struct typec_mux_desc {
 	typec_mux_set_fn_t set;
 	const char *name;
 	void *drvdata;
+	/* Quiesce consumers before any provider changes the shared route. */
+	typec_mux_set_fn_t prepare;
+	/* Fallible finalization retains ownership; commit cannot fail. */
+	typec_mux_set_fn_t finish;
+	typec_mux_notify_fn_t commit;
+	typec_mux_notify_fn_t abort;
 };
 
 #if IS_ENABLED(CONFIG_TYPEC)

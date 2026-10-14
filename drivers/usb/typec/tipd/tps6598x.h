@@ -320,6 +320,9 @@ struct tipd_data {
 };
 
 struct tps6598x {
+	struct typec_mux *mux;
+	/* CD remove leaves one open SAFE transaction for generic completion. */
+	bool remove_safe_prepared;
 	struct device *dev;
 	struct regmap *regmap;
 	struct mutex lock; /* device lock */
