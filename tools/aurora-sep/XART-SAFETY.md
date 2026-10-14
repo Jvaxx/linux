@@ -1,5 +1,16 @@
 # Shared xART gigalocker safety gate
 
+## Current default
+
+`xart_writes=1` is the driver default. The APFS extent-ownership checks,
+record validation and write-ordering checks remain mandatory; unsupported
+layouts fail closed. `xart_writes=0` explicitly selects read-only operation.
+Identity-keybag creation remains a separate `provision_keybag=1` opt-in.
+The historical evidence below records the earlier opt-in deployments and
+does not establish qualification on every supported Mac or APFS layout.
+
+## Earlier deployment policy
+
 The XART `.gl` file occupies APFS-managed storage. Writes require the explicit
 `xart_writes=1` opt-in and an APFS-resolved extent with a single owner, no
 snapshots or clones, and valid existing records. `xart_start_sector` is only

@@ -2337,8 +2337,12 @@ impl WorkItem<VERIFY_WORK_ID> for SepData {
 
 struct SepDriver(Arc<SepData>);
 
-const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, (), 1> =
-    kernel::device_id::IdArray::new([(of::DeviceId::new(c"apple,sep"), ())]);
+kernel::of_device_table!(
+    OF_TABLE,
+    MODULE_OF_TABLE,
+    (),
+    [(of::DeviceId::new(c"apple,sep"), ())]
+);
 
 impl platform::Driver for SepDriver {
     type IdInfo = ();

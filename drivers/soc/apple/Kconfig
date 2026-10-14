@@ -25,6 +25,18 @@ config APPLE_MAILBOX
 
 	  Say Y here if you have an Apple SoC.
 
+config APPLE_MCC
+	tristate "Apple T8140 system level cache"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on OF
+	default ARCH_APPLE
+	help
+	  The boot firmware of the Apple T8140 SoC enables the system level
+	  cache without letting it allocate. This driver allows allocation
+	  once the devices that took over DMA from the bootloader are bound.
+
+	  Say 'y' or 'm' here if you have an Apple T8140 SoC.
+
 config APPLE_PMGR_MISC
 	bool "Apple SoC PMGR miscellaneous support"
 	depends on PM
@@ -104,6 +116,7 @@ config APPLE_SEP_FV_INTERFACE
 
 config APPLE_SEP
 	tristate "Apple SEP (Secure Enclave Processor)"
+	default m if ARCH_APPLE
 	depends on ARCH_APPLE
 	depends on PM
 	depends on RUST
@@ -129,9 +142,10 @@ config APPLE_SEP
 	  the iBoot system container, locating its .gl extent through read-only,
 	  checksum-validated APFS metadata. It validates the complete store and
 	  both root records before registering with SEP.
-	  Shared xART writes and identity-keybag creation default on. A write
-	  still runs only when APFS proves a single unsnapshotted .gl extent.
-	  The first boot creates the Linux identity keybag when it is absent.
+	  xART writes are enabled by default, but accepted only when the driver
+	  validates the physical extent ownership invariants. Unsupported APFS
+	  layouts fail closed. Set xart_writes=0 for read-only operation.
+	  Identity-keybag provisioning remains a separate opt-in.
 	  With writes off the driver still attaches, but refuses Touch ID enrol
 	  and verify: the enclave saves anti-replay state after every match.
 
@@ -199,23 +213,6 @@ config APPLE_DISPLAY_GATE_KUNIT_TEST
 	  nothing changed when a check fails. On T6030: on by default, as
 	  before, whatever the T6031 option says.
 
-endmenu
-
-endif
-
-config APPLE_MCC
-	tristate "Apple T8140 system level cache"
-	depends on ARCH_APPLE || COMPILE_TEST
-	depends on OF
-	default ARCH_APPLE
-	help
-	  The boot firmware of the Apple T8140 SoC enables the system level
-	  cache without letting it allocate. This driver allows allocation
-	  once the devices that took over DMA from the bootloader are bound.
-
-	  Say 'y' or 'm' here if you have an Apple T8140 SoC.
-
-
 config APPLE_CLPC
 	tristate "Apple host performance controller floors"
 	depends on ARCH_APPLE || COMPILE_TEST
@@ -228,3 +225,7 @@ config APPLE_CLPC
 	  are busy, and releases them at idle.
 
 	  Say 'y' or 'm' here if you have an Apple SoC with a PMC.
+
+endmenu
+
+endif
