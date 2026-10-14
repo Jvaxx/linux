@@ -13,6 +13,8 @@
 #include <linux/mutex.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
+#include <linux/pm_wakeirq.h>
+#include <linux/pm_wakeup.h>
 #include <linux/reset.h>
 #include <linux/usb/phy.h>
 
@@ -78,7 +80,7 @@
  * Type-C mux for the SuperSpeed lanes, and the PHY follows those mode changes on its own.
  *
  * Whenever the core is up, for either kind of port, it is kept running across system sleep, see
- * dwc3_apple_init().
+ * dwc3_apple_init(). In host mode its interrupt is then also armed as the wake interrupt.
  *
  * enum dwc3_apple_state is defined in dwc3-apple-state.h.
  */
@@ -87,6 +89,7 @@
  * struct dwc3_apple - Apple-specific DWC3 USB controller
  * @dwc: Core DWC3 structure
  * @dev: Pointer to the device structure
+ * @irq: Core interrupt, shared with xHCI in host mode and used as its wake interrupt
  * @mmio_resource: Resource to be passed to dwc3_core_probe
  * @apple_regs: Apple-specific DWC3 registers
  * @reset: Reset control
@@ -107,6 +110,7 @@ struct dwc3_apple {
 	struct dwc3 dwc;
 
 	struct device *dev;
+	int irq;
 	struct resource *mmio_resource;
 	void __iomem *apple_regs;
 
@@ -438,6 +442,18 @@ static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state st
 		goto core_exit;
 	}
 
+	/*
+	 * xHCI shares the core interrupt and is suspended with its root port wake bits set when
+	 * this device may wake the system (dwc3_host_init() passes that on). Arm the interrupt
+	 * for wakeup while in host mode, so that a port event during suspend-to-idle ends it.
+	 * Device mode has no wake source: a gadget is woken by its host.
+	 */
+	if (state == DWC3_APPLE_HOST) {
+		ret = dev_pm_set_wake_irq(appledwc->dev, appledwc->irq);
+		if (ret)
+			dev_warn(appledwc->dev, "Failed to set up the wake IRQ, err=%d\n", ret);
+	}
+
 	appledwc->state = state;
 	/*
 	 * A connected cable leaves the Apple DWC3 core and its PHY as one live,
@@ -474,6 +490,7 @@ static int dwc3_apple_exit(struct dwc3_apple *appledwc)
 		appledwc->state = DWC3_APPLE_NO_CABLE;
 		break;
 	case DWC3_APPLE_HOST:
+		dev_pm_clear_wake_irq(appledwc->dev);
 		dwc3_host_exit(&appledwc->dwc);
 		appledwc->state = DWC3_APPLE_NO_CABLE;
 		break;
@@ -621,6 +638,18 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	if (IS_ERR(appledwc->apple_regs))
 		return dev_err_probe(dev, PTR_ERR(appledwc->apple_regs),
 				     "Failed to map Apple-specific MMIO\n");
+
+	appledwc->irq = platform_get_irq(pdev, 0);
+	if (appledwc->irq < 0)
+		return appledwc->irq;
+
+	/*
+	 * Like a PCI xHCI controller, allow USB devices to wake the system by default. This has
+	 * to be set before dwc3_core_probe(), which hands it on to the xHCI device.
+	 */
+	ret = devm_device_init_wakeup(dev);
+	if (ret)
+		return dev_err_probe(dev, ret, "Failed to set up wakeup\n");
 
 	/*
 	 * On this platform, DWC3 can only be brought up after parts of the PHY have been
