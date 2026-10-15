@@ -6,8 +6,6 @@
  * Author: Heikki Krogerus <heikki.krogerus@linux.intel.com>
  */
 
-#include <drm/drm_connector.h>
-
 #include <linux/i2c.h>
 #include <linux/acpi.h>
 #include <linux/gpio/consumer.h>
@@ -22,6 +20,7 @@
 #include <linux/usb/role.h>
 #include <linux/workqueue.h>
 #include <linux/firmware.h>
+#include <drm/drm_connector.h>
 
 #include "tps6598x.h"
 #include "trace.h"
@@ -213,7 +212,7 @@ static int tps6598x_read_partner_identity(struct tps6598x *tps)
 }
 
 static int tps6598x_set_data_role(struct tps6598x *tps,
-				   enum typec_data_role role, bool connected)
+				  enum typec_data_role role, bool connected)
 {
 	enum usb_role role_val;
 	int ret;
@@ -810,21 +809,19 @@ static void cd321x_update_work(struct work_struct *work)
 	was_disconnected |= partner_changed;
 
 	/*
-	 * Report sink absence before any fallible hardware transition. A failed
-	 * shutdown retains the route/PHY owner, but cannot keep the sink present.
-	 * Every Type-C port references the same external DCP connector.  Only the
-	 * port which successfully acquired the shared display route may report a
-	 * disconnect.  A second DP sink can negotiate Alt Mode even though its mux
-	 * request is rejected with -EBUSY; treating that sink as the connector
-	 * owner would tear down the display carried by the first port.
+	 * Report the sink as gone before any hardware transition that can fail:
+	 * a failed teardown keeps the route, but the sink must not stay present.
+	 * All ports reference the same external display connector, so only the
+	 * port that owns the display route may report a disconnect. A second DP
+	 * sink can enter Alt Mode while its mux request fails with -EBUSY, and
+	 * must not tear down the display carried by the other port.
 	 */
 	if (IS_REACHABLE(CONFIG_DRM) && cd321x->connector_fwnode &&
 	    dp_route_was_active &&
 	    (!new_connected || was_disconnected || !dp_connected || !dp_hpd ||
-	     dp_hpd_changed || dp_mode_changed)) {
+	     dp_hpd_changed || dp_mode_changed))
 		drm_connector_oob_hotplug_event(cd321x->connector_fwnode,
-					      connector_status_disconnected);
-	}
+						connector_status_disconnected);
 
 	/*
 	 * ACIO carries the tunneled PCIe reset handshake over the still-live
@@ -871,9 +868,8 @@ static void cd321x_update_work(struct work_struct *work)
 				 ret);
 			cd321x->state = old_state;
 			goto retry;
-		} else {
-			cd321x->display_route_active = false;
 		}
+		cd321x->display_route_active = false;
 	}
 
 	/* Update Type-C properties */
@@ -934,7 +930,8 @@ static void cd321x_update_work(struct work_struct *work)
 
 	if (IS_REACHABLE(CONFIG_DRM) && cd321x->connector_fwnode &&
 	    cd321x->display_route_active && dp_hpd)
-		drm_connector_oob_hotplug_event(cd321x->connector_fwnode, connector_status_connected);
+		drm_connector_oob_hotplug_event(cd321x->connector_fwnode,
+						connector_status_connected);
 
 	power_supply_changed(tps->psy);
 	cd321x_pm_complete(&cd321x->pm);
@@ -948,7 +945,8 @@ retry:
 static void cd321x_queue_status(struct cd321x *cd321x)
 {
 	cd321x->update_status.status_changed |= cd321x->update_status.status ^ cd321x->tps.status;
-	cd321x->update_status.data_status_changed |= cd321x->update_status.data_status ^ cd321x->tps.data_status;
+	cd321x->update_status.data_status_changed |=
+		cd321x->update_status.data_status ^ cd321x->tps.data_status;
 
 	cd321x->update_status.status = cd321x->tps.status;
 	cd321x->update_status.pwr_status = cd321x->tps.pwr_status;
@@ -2052,11 +2050,10 @@ static int cd321x_remove(struct tps6598x *tps)
 		typec_mux_abort(tps->mux);
 		return ret;
 	}
-	/* Same task/handle completes without another post-shutdown set callback. */
+	/* Leave the SAFE transaction open for tps6598x_disconnect() to end. */
 	tps->remove_safe_prepared = true;
 	return 0;
 }
-
 
 int tipd_init(struct tps6598x *tps)
 {
