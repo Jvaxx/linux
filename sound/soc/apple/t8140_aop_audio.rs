@@ -664,7 +664,7 @@ impl SndSocT8140AopData {
     }
 
     fn set_power(&self, state: u32) -> Result<()> {
-        let sequence = self.sequence.fetch_add(1, Relaxed) + 1;
+        let sequence = self.sequence.fetch_add(1, Relaxed).wrapping_add(1);
         let req = PowerRequest::new(0, sequence, state, 1)?;
         let ret = self.epic_wrapped_call(&AudioSetDeviceProp::new(
             AUDIO_DEV_LPAI,
@@ -732,7 +732,7 @@ impl SndSocT8140AopData {
     /// Property 202 with the service's sequence and a 24 MHz timestamp;
     /// `pw0 ` is confirmed through property 200 like the native host does.
     fn service_set_power(&self, svc: &Service, state: u32) -> Result<()> {
-        let sequence = svc.sequence.fetch_add(1, Relaxed) + 1;
+        let sequence = svc.sequence.fetch_add(1, Relaxed).wrapping_add(1);
         let req = PowerRequest::new(svc.dev_id, sequence, state, 0)?;
         let ret = self.epic_wrapped_call(&AudioSetDeviceProp::new(
             svc.dev_id,
