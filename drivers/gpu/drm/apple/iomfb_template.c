@@ -1394,7 +1394,7 @@ static void release_swap_cookie(struct kref *ref)
  * format two bytes late and its surface check rejects the swap as an
  * unsupported format.
  *
- * H17G retains this public packing path. The measured H17P profile uses
+ * H17G retains this public packing path. The H17P profile uses
  * a separate wire record with the SPEC's 0x588 swap boundary.
  */
 static void dcp_h17p_prepare_swap(struct apple_dcp *dcp)
@@ -1417,7 +1417,7 @@ static void dcp_h17p_prepare_swap(struct apple_dcp *dcp)
 	req->swap.h17p_pre_swap_id[0x00] = 2;
 	req->swap.h17p_pre_swap_id[0x28] = 3;
 
-	/* The measured H17P layout is serialized without shifting its surfaces. */
+	/* The H17P layout is serialized without shifting its surfaces. */
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
 		return;
 
@@ -1699,7 +1699,7 @@ static void complete_set_powerstate(struct apple_dcp *dcp, void *out,
 
 static bool dcp_power_stop_confirmed(struct dcp_wait_cookie *cookie)
 {
-	/* H17P stop semantics still require hardware qualification. */
+	/* H17P does not confirm that scanout has stopped. */
 #if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
 	return false;
 #else
@@ -1737,7 +1737,7 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	struct DCP_FW_NAME(dcp_swap_submit_req) *swap = &DCP_FW_UNION(dcp->swap);
 
 #if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
-	/* The measured profile has no safe pipe-off or surface-free transition. */
+	/* H17P has no known safe pipe-off or surface-free transition. */
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
 		return;
 #endif

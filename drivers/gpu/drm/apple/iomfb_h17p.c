@@ -311,7 +311,7 @@ static bool trampoline_analytics_h17p(struct apple_dcp *dcp, int tag,
 		return trampoline_zero(dcp, tag, out, in);
 
 	trace_iomfb_callback(dcp, tag, __func__);
-	/* The dispatcher has validated the measured D114 reply size. */
+	/* The dispatcher has validated the D114 reply size. */
 	memset(out, 0, 0x1004);
 	*(u8 *)out = 'd';
 	return true;
@@ -390,7 +390,7 @@ static const u8 j700_provider_data_4[] = {
 	0xa2, 0x19, 0x00, 0x00
 };
 
-/* Only these provider transfers have been measured against the disp0 ADT. */
+/* Only these provider transfers are known to match the disp0 ADT. */
 static const struct dcp_h17p_provider_property provider_properties[] = {
 	{ "power-lut-data-x", "apple,power-lut-data-x", 4, j700_provider_data_0 },
 	{ "power-lut-data-y", "apple,power-lut-data-y", 4, j700_provider_data_1 },
@@ -434,13 +434,13 @@ static bool trampoline_provider_property_h17p(struct apple_dcp *dcp, int tag,
 	trace_iomfb_callback(dcp, tag, __func__);
 	property = dcp_provider_property_h17p(in);
 	if (!property) {
-		dev_err(dcp->dev, "unqualified D400 provider property request\n");
+		dev_err(dcp->dev, "unsupported D400 provider property request\n");
 		goto fail;
 	}
 
 	length = of_property_count_u8_elems(node, property->dt_name);
 	if (!property->length) {
-		/* Only this absent property has a measured empty reply. */
+		/* Only this absent property has a known empty reply. */
 		if (of_property_present(node, property->dt_name))
 			goto fail;
 	} else if (!of_property_present(node, property->dt_name) &&
@@ -448,12 +448,12 @@ static bool trampoline_provider_property_h17p(struct apple_dcp *dcp, int tag,
 		   (of_device_is_compatible(node, "apple,t8140-dcp") ||
 		    (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL &&
 		     of_device_is_compatible(node, "apple,t8140-dcpext")))) {
-		/* Qualified older loaders lack the newly described table properties. */
+		/* Older loaders lack the newly described table properties. */
 		memset(reply, 0, sizeof(*reply));
 		memcpy(reply->data, property->legacy_data, property->length);
 		reply->length = cpu_to_le32(property->length);
 		dev_warn_once(dcp->dev,
-			      "missing provider property %s (%u bytes); using qualified J700 compatibility data\n",
+			      "missing provider property %s (%u bytes); using the J700 defaults\n",
 			      property->dt_name, property->length);
 		return true;
 	} else if (length != (int)property->length) {
@@ -486,7 +486,7 @@ static bool trampoline_luma_span_h17p(struct apple_dcp *dcp, int tag,
 
 	trace_iomfb_callback(dcp, tag, __func__);
 	if (get_unaligned_le32(in)) {
-		dev_err(dcp->dev, "unqualified D574 range selector\n");
+		dev_err(dcp->dev, "unsupported D574 range selector\n");
 		WRITE_ONCE(dcp->crashed, true);
 		return false;
 	}
@@ -510,7 +510,7 @@ static bool trampoline_get_uint_prop_h17p(struct apple_dcp *dcp, int tag,
 	    strnlen(request->key, sizeof(request->key)) == sizeof(request->key) ||
 	    strcmp(request->key, "Temperature") || request->value_null ||
 	    memchr_inv(request->padding, 0, sizeof(request->padding))) {
-		dev_err(dcp->dev, "unqualified D401 integer property query\n");
+		dev_err(dcp->dev, "unsupported D401 integer property query\n");
 		WRITE_ONCE(dcp->crashed, true);
 		return false;
 	}

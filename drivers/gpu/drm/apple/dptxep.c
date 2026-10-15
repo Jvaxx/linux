@@ -759,8 +759,8 @@ dptxport_call_deactivate(struct apple_epic_service *service,
 	return 0;
 }
 
-static int dptxport_call_qualified_config(struct apple_epic_service *service, bool lanes,
-					const void *data, size_t size, void *reply, size_t room)
+static int dptxport_call_link_config(struct apple_epic_service *service, bool lanes,
+				     const void *data, size_t size, void *reply, size_t room)
 {
 	struct dcp_180hz_token token = dcp_180hz_config_begin(service, lanes);
 	struct dptx_port *port = service->cookie;
@@ -836,7 +836,8 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 	case DPTX_APCALL_GET_LINK_RATE:
 		return dptxport_call_get_link_rate(service, reply, reply_size);
 	case DPTX_APCALL_SET_LINK_RATE:
-		return dptxport_call_qualified_config(service, false, data, data_size, reply, reply_size);
+		return dptxport_call_link_config(service, false, data, data_size,
+						 reply, reply_size);
 	case DPTX_APCALL_GET_MAX_LANE_COUNT:
 		return dptxport_call_get_max_lane_count(service, reply, reply_size);
 	case DPTX_APCALL_GET_ACTIVE_LANE_COUNT: {
@@ -849,7 +850,8 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 		return 0;
 	}
         case DPTX_APCALL_SET_ACTIVE_LANE_COUNT:
-		return dptxport_call_qualified_config(service, true, data, data_size, reply, reply_size);
+		return dptxport_call_link_config(service, true, data, data_size,
+						 reply, reply_size);
 	case DPTX_APCALL_GET_SUPPORTS_HPD:
 		return dptxport_call_get_supports_hpd(service, reply,
 						      reply_size);
@@ -1080,7 +1082,7 @@ static int dptxport_group_call(struct apple_epic_service *service, u16 group,
 	return 0;
 }
 
-static void dptxport_qualified_teardown(struct apple_epic_service *service)
+static void dptxport_teardown(struct apple_epic_service *service)
 {
 	dcp_180hz_invalidate(service->ep->dcp);
 	dptx_service_unbind(service);
@@ -1090,7 +1092,7 @@ static const struct apple_epic_service_ops dptxep_ops[] = {
 	{
 		.name = "AppleDCPDPTXRemotePort",
 		.prepare = dptxport_prepare,
-		.teardown = dptxport_qualified_teardown,
+		.teardown = dptxport_teardown,
 		.init = dptxport_init,
 		.call = dptxport_call,
 		.call_v2 = dptxport_group_call,
