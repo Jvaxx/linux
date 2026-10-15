@@ -60,7 +60,7 @@ config PCIE_APPLE
 config PCIE_APPLE_PIODMA_DIAG
 	bool "J700 PIODMA diagnostic (requires full reset after use)"
 	depends on PCIE_APPLE=y && ARCH_APPLE && IOMMU_DMA
-	depends on !KEXEC_CORE
+	depends on PCIEASPM
 	help
 	  Build the experimental SID17 retained bootstrap provider. It submits
 	  one fixed request, validates typed ECAM and then enumerates the two

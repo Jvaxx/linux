@@ -21,6 +21,7 @@
 #include <linux/of.h>
 #include <linux/overflow.h>
 #include <linux/pci.h>
+#include <linux/soc/apple/pci-apple-piodma.h>
 #include <linux/pm.h>
 #include <linux/pm_runtime.h>
 #include <linux/skbuff.h>
@@ -1135,6 +1136,9 @@ static int bt7932_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	    !of_machine_is_compatible("apple,t8140") ||
 	    pci_domain_nr(pdev->bus) || pdev->bus->number != 1 || pdev->devfn != PCI_DEVFN(0, 1))
 		return -ENODEV;
+	ret = apple_piodma_radio_check(pdev);
+	if (ret)
+		return ret;
 	ret = bt7932_wait_for_wifi(pdev);
 	if (ret)
 		return ret;

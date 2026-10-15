@@ -66,6 +66,14 @@ fail:
 	return ret;
 }
 
+/* D7 band 1 (5 GHz) requests three logical procedures; 2 GHz needs four.
+ * Both startup draining and runtime servicing use the same reply contract.
+ */
+static inline unsigned int mt7932_cal_request_replies(const u8 request[16])
+{
+	return get_unaligned_le32(request + 8) == 1 ? 3 : 4;
+}
+
 struct mt7932_cal_segment {
 	const u8 *data;
 	size_t length;
@@ -111,11 +119,15 @@ static inline int mt7932_cal_validate(const u8 *data, size_t size)
 	return 0;
 }
 
-/* Only call after full validation; borrowed storage remains owned by caller. */
+/* Only call after full validation; borrowed storage remains owned by caller.
+ * Record the requested section for missing/invalid-section diagnostics.
+ */
 static inline int mt7932_cal_segment(const u8 *data, unsigned int tag,
-				     struct mt7932_cal_segment *segment)
+				     struct mt7932_cal_segment *segment, unsigned int *input_tag)
 {
 	unsigned int i, count = get_unaligned_be16(data + 10);
+
+	*input_tag = tag;
 
 	for (i = 0; i < count; i++) {
 		const u8 *entry = data + 16 + 20 * i;
@@ -139,12 +151,13 @@ struct mt7932_cal_piece {
 /* Type1 group0/1, taking the validated operating center, not always primary.
  */
 static inline int mt7932_cal_association(const u8 *data, size_t size, u8 channel,
-					struct mt7932_cal_piece pieces[2])
+					struct mt7932_cal_piece pieces[2], unsigned int *input_tag)
 {
 	struct mt7932_cal_segment segment;
 	unsigned int group, part;
 	int ret;
 
+	*input_tag = 0;
 	if (channel >= 1 && channel <= 13)
 		group = 0;
 	else if (mt7932_channel_5g_cal(channel))
@@ -154,7 +167,7 @@ static inline int mt7932_cal_association(const u8 *data, size_t size, u8 channel
 	ret = mt7932_cal_validate(data, size);
 	if (ret)
 		return ret;
-	ret = mt7932_cal_segment(data, 0x2000 | group, &segment);
+	ret = mt7932_cal_segment(data, 0x2000 | group, &segment, input_tag);
 	if (ret)
 		return ret;
 	if (!segment.length || segment.length % 2 || segment.length / 2 > 1080)
@@ -171,7 +184,7 @@ static inline int mt7932_cal_association(const u8 *data, size_t size, u8 channel
 
 /* Plan all conditional power-on fragments before the first command is sent. */
 static inline int mt7932_cal_power_on(const u8 *data, size_t size, bool six_ghz,
-				      struct mt7932_cal_piece pieces[14])
+				      struct mt7932_cal_piece pieces[14], unsigned int *input_tag)
 {
 	static const unsigned int tags[] = {0x1001, 0x1002, 0x1003, 0x1011, 0x1012, 0x1021, 0x1022};
 	static const u8 groups[] = {0, 0, 0, 1, 1, 2, 2};
@@ -179,12 +192,15 @@ static inline int mt7932_cal_power_on(const u8 *data, size_t size, bool six_ghz,
 	static const u32 params[] = {0, 0x10000, 8, 0x10};
 	struct mt7932_cal_segment segment;
 	unsigned int i, part, count, at = 0;
-	int ret = mt7932_cal_validate(data, size);
+	int ret;
+
+	*input_tag = 0;
+	ret = mt7932_cal_validate(data, size);
 
 	if (ret)
 		return ret;
 	for (i = 0; i < (six_ghz ? 7 : 5); i++) {
-		ret = mt7932_cal_segment(data, tags[i], &segment);
+		ret = mt7932_cal_segment(data, tags[i], &segment, input_tag);
 		if (ret)
 			return ret;
 		if (!segment.length || segment.length > 1080)
@@ -198,7 +214,7 @@ static inline int mt7932_cal_power_on(const u8 *data, size_t size, bool six_ghz,
 		u32 param = params[i];
 		unsigned int tag = 0x2000 | (param & 0x7f) | ((param & 0x10000) ? 0x80 : 0);
 
-		ret = mt7932_cal_segment(data, tag, &segment);
+		ret = mt7932_cal_segment(data, tag, &segment, input_tag);
 		if (ret)
 			return ret;
 		count = tag & 0x80 ? 1 : 2;
@@ -219,7 +235,7 @@ static inline int mt7932_cal_power_on(const u8 *data, size_t size, bool six_ghz,
  */
 static inline int mt7932_cal_requested_5g(const u8 *data, size_t size,
 					 u32 upper, u32 channel, u8 version,
-					 u8 module, struct mt7932_cal_piece pieces[7])
+					 u8 module, struct mt7932_cal_piece pieces[7], unsigned int *input_tag)
 {
 	struct mt7932_cal_segment segment;
 	unsigned int i, part, at = 0, selected;
@@ -228,13 +244,14 @@ static inline int mt7932_cal_requested_5g(const u8 *data, size_t size,
 	unsigned int tags[3];
 	int ret;
 
+	*input_tag = 0;
 	if (upper != 0x1000 || version != 12 || module != 0x89 ||
 	    !mt7932_channel_5g_cal(channel))
 		return -EOPNOTSUPP;
 	ret = mt7932_cal_validate(data, size);
 	if (ret)
 		return ret;
-	ret = mt7932_cal_segment(data, 0x501, &segment);
+	ret = mt7932_cal_segment(data, 0x501, &segment, input_tag);
 	if (ret)
 		return ret;
 	if (segment.length != 200)
@@ -256,7 +273,7 @@ static inline int mt7932_cal_requested_5g(const u8 *data, size_t size,
 		unsigned int stride = i == 0 ? 1080 : i == 1 ? 20 : 612;
 		unsigned int meta = i == 0 ? 0 : i == 1 ? 4 : 8;
 
-		ret = mt7932_cal_segment(data, tags[i], &segment);
+		ret = mt7932_cal_segment(data, tags[i], &segment, input_tag);
 		if (ret)
 			return ret;
 		if (segment.length != count * stride)
@@ -276,11 +293,11 @@ static inline int mt7932_cal_requested_5g(const u8 *data, size_t size,
 }
 
 /* A genuine D7 event, not a fabricated channel-based startup trigger.
- * Initial PL profile: reject unqualified upper bits and all non-2G requests.
+ * Reject unqualified upper bits and band-specific profile mismatches.
  */
 static inline int mt7932_cal_requested(const u8 *data, size_t size,
 				       const u8 *event, size_t length, u8 version,
-				       u8 module, struct mt7932_cal_piece pieces[7])
+				       u8 module, struct mt7932_cal_piece pieces[7], unsigned int *input_tag)
 {
 	static const u8 rules[13][3] = {
 		{0,15,3}, {0,15,3}, {0x31,7,3}, {0x21,7,3},
@@ -293,19 +310,20 @@ static inline int mt7932_cal_requested(const u8 *data, size_t size,
 	unsigned int width, at = 0, i, part;
 	int ret;
 
+	*input_tag = 0;
 	if (length != 16 || version > 12)
 		return -EINVAL;
 	upper = get_unaligned_le32(event + 4);
 	band = get_unaligned_le32(event + 8);
 	channel = get_unaligned_le32(event + 12);
 	if (band == 1)
-		return mt7932_cal_requested_5g(data, size, upper, channel, version, module, pieces);
+		return mt7932_cal_requested_5g(data, size, upper, channel, version, module, pieces, input_tag);
 	if (band || !channel || channel > 13 || (upper & ~0x1001U))
 		return -EOPNOTSUPP;
 	ret = mt7932_cal_validate(data, size);
 	if (ret)
 		return ret;
-	ret = mt7932_cal_segment(data, 0x501, &segment);
+	ret = mt7932_cal_segment(data, 0x501, &segment, input_tag);
 	if (ret)
 		return ret;
 	if (segment.length != 200)
@@ -351,7 +369,7 @@ static inline int mt7932_cal_requested(const u8 *data, size_t size,
 			count = module & 15 ? (tag & 0x80 ? 1 : 3) : raw_count;
 			meta = 8;
 		}
-		ret = mt7932_cal_segment(data, tag, &segment);
+		ret = mt7932_cal_segment(data, tag, &segment, input_tag);
 		if (ret)
 			return ret;
 		if (types[i] == 1) {
