@@ -6,8 +6,6 @@
  * Author: Heikki Krogerus <heikki.krogerus@linux.intel.com>
  */
 
-#include <drm/drm_connector.h>
-
 #include <linux/i2c.h>
 #include <linux/acpi.h>
 #include <linux/gpio/consumer.h>
@@ -22,6 +20,7 @@
 #include <linux/usb/role.h>
 #include <linux/workqueue.h>
 #include <linux/firmware.h>
+#include <drm/drm_connector.h>
 
 #include "tps6598x.h"
 #include "cd321x-setup.h"
@@ -934,21 +933,19 @@ static void cd321x_update_work(struct work_struct *work)
 	}
 
 	/*
-	 * Report sink absence before any fallible hardware transition. A failed
-	 * shutdown retains the route/PHY owner, but cannot keep the sink present.
-	 * Every Type-C port references the same external DCP connector.  Only the
-	 * port which successfully acquired the shared display route may report a
-	 * disconnect.  A second DP sink can negotiate Alt Mode even though its mux
-	 * request is rejected with -EBUSY; treating that sink as the connector
-	 * owner would tear down the display carried by the first port.
+	 * Report the sink as gone before any hardware transition that can fail:
+	 * a failed teardown keeps the route, but the sink must not stay present.
+	 * All ports reference the same external display connector, so only the
+	 * port that owns the display route may report a disconnect. A second DP
+	 * sink can enter Alt Mode while its mux request fails with -EBUSY, and
+	 * must not tear down the display carried by the other port.
 	 */
 	if (IS_REACHABLE(CONFIG_DRM) && cd321x->connector_fwnode &&
 	    dp_route_was_active &&
 	    (!new_connected || was_disconnected || !dp_connected || !dp_hpd ||
 	     dp_hpd_changed || dp_mode_changed)) {
 		drm_connector_oob_hotplug_event(cd321x->connector_fwnode,
-					      connector_status_disconnected);
-	}
+						connector_status_disconnected);
 
 	/*
 	 * ACIO carries the tunneled PCIe reset handshake over the still-live
@@ -2297,11 +2294,10 @@ static void cd321x_remove(struct tps6598x *tps)
 		typec_mux_abort(tps->mux);
 		return ret;
 	}
-	/* Same task/handle completes without another post-shutdown set callback. */
+	/* Leave the SAFE transaction open for tps6598x_disconnect() to end. */
 	tps->remove_safe_prepared = true;
 	return 0;
 }
-
 
 int tipd_init(struct tps6598x *tps)
 {
