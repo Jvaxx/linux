@@ -2610,20 +2610,20 @@ apple_dart_platform_ioremap_np_resource(struct platform_device *pdev,
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, index);
 	if (!res)
-		return ERR_PTR(-EINVAL);
+		return IOMEM_ERR_PTR(-EINVAL);
 
 	if (!devm_request_mem_region(dev, res->start, resource_size(res),
 				     dev_name(dev)))
-		return ERR_PTR(-EBUSY);
+		return IOMEM_ERR_PTR(-EBUSY);
 
 	regs = ioremap_np(res->start, resource_size(res));
 	if (!regs)
-		return ERR_PTR(-ENOMEM);
+		return IOMEM_ERR_PTR(-ENOMEM);
 
 	ret = devm_add_action_or_reset(dev, apple_dart_iounmap_np,
 				       (__force void *)regs);
 	if (ret)
-		return ERR_PTR(ret);
+		return IOMEM_ERR_PTR(ret);
 
 	*res_out = res;
 	return regs;
