@@ -14,6 +14,7 @@
 enum cd321x_dp_event {
 	CD321X_DP_EVENT_NONE,
 	CD321X_DP_EVENT_CONNECTED,
+	CD321X_DP_EVENT_RETRAIN,
 };
 
 /**
@@ -23,17 +24,36 @@ enum cd321x_dp_event {
  * @link_reset: the Type-C session is torn down: unplug, flip, partner
  *	change, Thunderbolt/USB4 entry or exit, or a forced reconnect
  * @route_active: the previous update left a display route up
+ * @sink_reported: the connector was last told that a sink is present
  */
 struct cd321x_dp_update {
 	u32 data_status;
 	u32 changed;
 	bool link_reset;
 	bool route_active;
+	bool sink_reported;
 };
 
 static inline bool cd321x_dp_mode_changed(u32 changed)
 {
 	return changed & CD321X_DP_MODE_BITS;
+}
+
+/*
+ * HPD dropped for less than the debounce delay and came back high while the
+ * partner, the alternate mode and the pin assignment stayed the same.  The
+ * sink is still there, so check and retrain its link rather than report an
+ * unplug.  USB3_CONNECTION is part of the pin assignment (C/D, E/F), so a
+ * pulse that comes with a lane count change is not one of these.
+ */
+static inline bool cd321x_dp_hpd_pulse(const struct cd321x_dp_update *u)
+{
+	return u->route_active && !u->link_reset && u->sink_reported &&
+	       (u->data_status & TPS_DATA_STATUS_DP_CONNECTION) &&
+	       (u->data_status & CD321X_DATA_STATUS_HPD_LEVEL) &&
+	       (u->changed & CD321X_DATA_STATUS_HPD_LEVEL) &&
+	       !cd321x_dp_mode_changed(u->changed) &&
+	       !(u->changed & TPS_DATA_STATUS_USB3_CONNECTION);
 }
 
 /* Does the display connector lose its sink before this update is applied? */
@@ -42,11 +62,14 @@ static inline bool cd321x_dp_teardown(const struct cd321x_dp_update *u)
 	if (!u->route_active)
 		return false;
 
-	return u->link_reset ||
-	       !(u->data_status & TPS_DATA_STATUS_DP_CONNECTION) ||
-	       !(u->data_status & CD321X_DATA_STATUS_HPD_LEVEL) ||
-	       (u->changed & CD321X_DATA_STATUS_HPD_LEVEL) ||
-	       cd321x_dp_mode_changed(u->changed);
+	if (u->link_reset ||
+	    !(u->data_status & TPS_DATA_STATUS_DP_CONNECTION) ||
+	    !(u->data_status & CD321X_DATA_STATUS_HPD_LEVEL) ||
+	    cd321x_dp_mode_changed(u->changed))
+		return true;
+
+	return (u->changed & CD321X_DATA_STATUS_HPD_LEVEL) &&
+	       !cd321x_dp_hpd_pulse(u);
 }
 
 /* @route_up: the update left this port's display route up. */
@@ -55,6 +78,13 @@ cd321x_dp_event(const struct cd321x_dp_update *u, bool route_up)
 {
 	if (!route_up || !(u->data_status & CD321X_DATA_STATUS_HPD_LEVEL))
 		return CD321X_DP_EVENT_NONE;
+
+	/* The sink stays connected: have its link checked, not re-announced. */
+	if (cd321x_dp_hpd_pulse(u))
+		return CD321X_DP_EVENT_RETRAIN;
+	if (u->route_active && u->sink_reported && !cd321x_dp_teardown(u) &&
+	    (u->data_status & u->changed & CD321X_DATA_STATUS_HPD_IRQ))
+		return CD321X_DP_EVENT_RETRAIN;
 
 	return CD321X_DP_EVENT_CONNECTED;
 }
