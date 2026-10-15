@@ -138,6 +138,9 @@ static void dcpavserv_init(struct apple_epic_service *service, const char *name,
 		dev_dbg(dcp->dev, "DCPAVSERV: AFKV2 EDID service ready on channel %u\n",
 			service->channel);
 		dcpavserv_notify_edid(service);
+	} else {
+		/* Also report announcements arriving after the discovery window. */
+		dev_dbg(dcp->dev, "DCPAVSERV: legacy EDID service published\n");
 	}
 }
 
@@ -488,12 +491,15 @@ int dpavservep_init(struct apple_dcp *dcp)
 	if (ep->wire_v2)
 		return 0;
 
-	ret = wait_for_completion_timeout(&dcp->dcpavserv.enable_completion,
-					  msecs_to_jiffies(1000));
-	if (!ret) {
-		dev_warn(dcp->dev, "DCPAVSERV: timed out waiting for EDID service announcement\n");
-		return -ETIMEDOUT;
-	}
+	/*
+	 * Legacy firmware need not announce an EDID service. Give it the same
+	 * discovery window so an early announcement can precede get_modes,
+	 * but absence is not an endpoint failure.
+	 * Only dcpavserv_init() may publish a service that actually arrived.
+	 */
+	if (!wait_for_completion_timeout(&dcp->dcpavserv.enable_completion,
+					 msecs_to_jiffies(1000)))
+		dev_dbg(dcp->dev, "DCPAVSERV: no legacy EDID service within 1 s\n");
 
 	return 0;
 }
