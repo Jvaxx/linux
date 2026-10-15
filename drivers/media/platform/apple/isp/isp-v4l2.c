@@ -885,7 +885,6 @@ static int isp_vidioc_get_param(struct file *file, void *fh,
 		return -EINVAL;
 
 	a->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
-	a->parm.capture.readbuffers = ISP_MIN_FRAMES;
 	a->parm.capture.timeperframe.numerator = 1;
 	a->parm.capture.timeperframe.denominator = isp->frame_rate;
 
@@ -914,7 +913,7 @@ static int isp_vidioc_set_param(struct file *file, void *fh,
 		isp->frame_rate = isp_closest_frame_rate(tpf);
 
 	a->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
-	a->parm.capture.readbuffers = ISP_MIN_FRAMES;
+	a->parm.capture.readbuffers = 0;
 	tpf->numerator = 1;
 	tpf->denominator = isp->frame_rate;
 
