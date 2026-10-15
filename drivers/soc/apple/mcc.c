@@ -102,6 +102,12 @@ static int apple_mcc_enable(struct apple_mcc *mcc)
 		writel(0, mcc->planes[i] + MCC_ALLOC_DISABLE);
 		if (readl(mcc->planes[i] + MCC_ALLOC_DISABLE)) {
 			dev_err(mcc->dev, "plane %u did not enable allocation\n", i);
+			/*
+			 * The driver will not bind, so nothing disables these
+			 * planes on shutdown: disable the ones enabled so far,
+			 * and this one, whose state is unknown, now.
+			 */
+			apple_mcc_disable_planes(mcc, i + 1);
 			return -EIO;
 		}
 	}
