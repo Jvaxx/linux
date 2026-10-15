@@ -2587,6 +2587,11 @@ impl SepData {
         name: &'static CStr,
         payload: &[u8],
     ) -> Result<transfer::Completed> {
+        // The capture work item and the ioctl path both reach this endpoint.
+        // Without this, the second caller is refused with EBUSY, or clears a
+        // reply the first has not collected yet and takes the next one. Taken
+        // before the shutdown check, so a waiter never starts after remove().
+        let _exchange = self.sbio_exchange_lock.lock();
         if self.shutting_down.load(Relaxed) || !self.sbio_ready.load(Relaxed) {
             return Err(ENODEV);
         }
