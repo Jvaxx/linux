@@ -3,8 +3,10 @@
 #include <linux/array_size.h>
 #include <linux/bitfield.h>
 #include <linux/module.h>
+#include <linux/string.h>
 
 #include "cd321x-dp.h"
+#include "cd321x-pm.h"
 
 /* A dock in pin assignment D: DisplayPort plus USB 3. */
 #define DP_D	(TPS_DATA_STATUS_DATA_CONNECTION | TPS_DATA_STATUS_USB2_CONNECTION | \
@@ -370,6 +372,276 @@ static struct kunit_suite cd321x_dp_suite = {
 	.test_cases = cd321x_dp_cases,
 };
 
-kunit_test_suite(cd321x_dp_suite);
+/*
+ * One port as cd321x_queue_status() and cd321x_update_work() drive it:
+ * every interrupt adds a sample, and a debounced update reports the display
+ * around a mux update that can fail.  @log records the connector events in
+ * order: D(isconnected), C(onnected) and U(nknown, i.e. retrain).
+ */
+struct cd321x_dp_port {
+	struct cd321x_pm_state pm;
+	u32 status, data_status, rx;
+	u32 status_changed, data_changed;
+	bool irq_hpd, route_active, sink_reported;
+	char log[16];
+};
+
+static void port_notify(struct cd321x_dp_port *p, char event)
+{
+	size_t n = strlen(p->log);
+
+	if (n + 1 < sizeof(p->log))
+		p->log[n] = event;
+	p->sink_reported = event != 'D';
+}
+
+/* An interrupt that reads @status, @data_status and the DP status @rx. */
+static void port_irq(struct cd321x_dp_port *p, u32 status, u32 data_status, u32 rx)
+{
+	p->irq_hpd = cd321x_dp_irq_hpd(p->irq_hpd, p->data_status, data_status, p->rx, rx);
+	p->status_changed |= p->status ^ status;
+	p->data_changed |= p->data_status ^ data_status;
+	p->status = status;
+	p->data_status = data_status;
+	p->rx = rx;
+}
+
+/* A debounced update whose mux update returns @ret. */
+static void port_update(struct cd321x_dp_port *p, int ret)
+{
+	bool connected = p->status & TPS_STATUS_PLUG_PRESENT;
+	struct cd321x_dp_update u = {
+		.data_status = p->data_status,
+		.changed = p->data_changed,
+		.irq_hpd = p->irq_hpd,
+		.route_active = p->route_active,
+		.sink_reported = p->sink_reported,
+	};
+
+	if (p->pm.force_reconnect)
+		u.link_reset |= CD321X_DP_RESET_FORCED;
+	if (p->status_changed & TPS_STATUS_PLUG_PRESENT)
+		u.link_reset |= CD321X_DP_RESET_PLUG;
+	if (!connected)
+		u.link_reset |= CD321X_DP_RESET_UNPLUG;
+	p->status_changed = 0;
+	p->data_changed = 0;
+
+	if (cd321x_dp_teardown(&u))
+		port_notify(p, 'D');
+	if (u.link_reset)
+		p->route_active = false;
+	if (!connected) {
+		p->irq_hpd = false;
+		cd321x_pm_complete(&p->pm);
+		return;
+	}
+	if (ret) {
+		cd321x_pm_retry(&p->pm, ret != -EAGAIN);
+		return;
+	}
+
+	p->route_active = u.data_status & TPS_DATA_STATUS_DP_CONNECTION;
+	p->irq_hpd = false;
+	switch (cd321x_dp_event(&u, p->route_active)) {
+	case CD321X_DP_EVENT_NONE:
+		break;
+	case CD321X_DP_EVENT_CONNECTED:
+		port_notify(p, 'C');
+		break;
+	case CD321X_DP_EVENT_RETRAIN:
+		port_notify(p, 'C');
+		port_notify(p, 'U');
+		break;
+	}
+	cd321x_pm_complete(&p->pm);
+}
+
+/* The fresh read that a retried update starts from. */
+static void port_reread(struct kunit *test, struct cd321x_dp_port *p)
+{
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&p->pm));
+	cd321x_pm_snapshot_ready(&p->pm);
+	port_irq(p, p->status, p->data_status, p->rx);
+}
+
+#define PLUG	TPS_STATUS_PLUG_PRESENT
+#define HPD_RX	DP_STATUS_HPD_STATE
+
+/* A dock in pin assignment D with its sink announced and nothing pending. */
+static void port_docked(struct kunit *test, struct cd321x_dp_port *p)
+{
+	*p = (struct cd321x_dp_port){ .pm.phase = CD321X_PM_RUNNING };
+	port_irq(p, PLUG, DP_D | HPD, HPD_RX);
+	port_update(p, 0);
+	KUNIT_ASSERT_STREQ(test, p->log, "C");
+	memset(p->log, 0, sizeof(p->log));
+}
+
+/*
+ * The cases below are the nine sequence invariants of the tipd HPD pulse
+ * review, in its order, run through the helpers the driver uses.
+ */
+
+/* 1, 2: a Type-C unplug and replug within the debounce. */
+static void cd321x_dp_seq_typec_replug_test(struct kunit *test)
+{
+	struct cd321x_dp_port p;
+
+	port_docked(test, &p);
+	port_irq(&p, 0, 0, HPD_RX);
+	port_irq(&p, PLUG, DP_D | HPD, HPD_RX);
+	port_update(&p, 0);
+	KUNIT_EXPECT_STREQ(test, p.log, "DC");
+}
+
+/* 3: the monitor behind the dock is replaced; the dock stays. */
+static void cd321x_dp_seq_downstream_replug_test(struct kunit *test)
+{
+	struct cd321x_dp_port p;
+
+	port_docked(test, &p);
+	port_irq(&p, PLUG, DP_D, 0);
+	port_irq(&p, PLUG, DP_D | HPD, HPD_RX);
+	port_update(&p, 0);
+	KUNIT_EXPECT_STREQ(test, p.log, "DC");
+}
+
+/* 4: the sink's IRQ_HPD retrains the link and keeps the sink. */
+static void cd321x_dp_seq_irq_hpd_retrains_test(struct kunit *test)
+{
+	struct cd321x_dp_port p;
+
+	port_docked(test, &p);
+	port_irq(&p, PLUG, DP_D | HPD | CD321X_DATA_STATUS_HPD_IRQ, HPD_RX);
+	port_update(&p, 0);
+	KUNIT_EXPECT_STREQ(test, p.log, "CU");
+
+	/* Reported by the partner's DP status alone, set and cleared again. */
+	memset(p.log, 0, sizeof(p.log));
+	port_irq(&p, PLUG, DP_D | HPD | CD321X_DATA_STATUS_HPD_IRQ, HPD_RX | DP_STATUS_IRQ_HPD);
+	port_irq(&p, PLUG, DP_D | HPD | CD321X_DATA_STATUS_HPD_IRQ, HPD_RX);
+	port_update(&p, 0);
+	KUNIT_EXPECT_STREQ(test, p.log, "CU");
+}
+
+/* 5: -EAGAIN retries from a fresh read and keeps the session. */
+static void cd321x_dp_seq_eagain_keeps_session_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = { .phase = CD321X_PM_RUNNING };
+
+	KUNIT_EXPECT_TRUE(test, cd321x_pm_retry(&pm, false));
+	KUNIT_EXPECT_FALSE(test, pm.force_reconnect);
+	KUNIT_EXPECT_TRUE(test, cd321x_pm_begin_read(&pm));
+}
+
+/* 6: an IRQ_HPD whose update is deferred is still delivered, once. */
+static void cd321x_dp_seq_irq_hpd_after_eagain_test(struct kunit *test)
+{
+	struct cd321x_dp_port p;
+
+	port_docked(test, &p);
+	port_irq(&p, PLUG, DP_D | HPD | CD321X_DATA_STATUS_HPD_IRQ, HPD_RX);
+	port_update(&p, -EAGAIN);
+	KUNIT_EXPECT_STREQ(test, p.log, "");
+	port_reread(test, &p);
+	port_update(&p, 0);
+	KUNIT_EXPECT_STREQ(test, p.log, "CU");
+
+	/* Delivered: the sticky bit seen again is not another request. */
+	port_irq(&p, PLUG, DP_D | HPD | CD321X_DATA_STATUS_HPD_IRQ |
+		 TPS_DATA_STATUS_USB_DATA_ROLE, HPD_RX);
+	port_update(&p, 0);
+	KUNIT_EXPECT_STREQ(test, p.log, "CUC");
+}
+
+/* 7: HPD low at the end of the debounce. */
+static void cd321x_dp_seq_hpd_low_test(struct kunit *test)
+{
+	struct cd321x_dp_port p;
+
+	port_docked(test, &p);
+	port_irq(&p, PLUG, DP_D, 0);
+	port_update(&p, 0);
+	KUNIT_EXPECT_STREQ(test, p.log, "D");
+}
+
+/* 8: D to C with HPD held high: the lane count changes. */
+static void cd321x_dp_seq_usb3_pin_change_test(struct kunit *test)
+{
+	struct cd321x_dp_port p;
+
+	port_docked(test, &p);
+	port_irq(&p, PLUG, DP_C | HPD, HPD_RX);
+	port_update(&p, 0);
+	KUNIT_EXPECT_STREQ(test, p.log, "DC");
+}
+
+/* 9: D to C with an HPD bounce. */
+static void cd321x_dp_seq_pin_change_with_bounce_test(struct kunit *test)
+{
+	struct cd321x_dp_port p;
+
+	port_docked(test, &p);
+	port_irq(&p, PLUG, DP_D, 0);
+	port_irq(&p, PLUG, DP_C | HPD, HPD_RX);
+	port_update(&p, 0);
+	KUNIT_EXPECT_STREQ(test, p.log, "DC");
+}
+
+/* A bounce whose reconnect is deferred announces the sink on the retry. */
+static void cd321x_dp_seq_bounce_after_eagain_test(struct kunit *test)
+{
+	struct cd321x_dp_port p;
+
+	port_docked(test, &p);
+	port_irq(&p, PLUG, DP_D, 0);
+	port_irq(&p, PLUG, DP_D | HPD | CD321X_DATA_STATUS_HPD_IRQ, HPD_RX);
+	port_update(&p, -EAGAIN);
+	KUNIT_EXPECT_STREQ(test, p.log, "D");
+	port_reread(test, &p);
+	port_update(&p, 0);
+	KUNIT_EXPECT_STREQ(test, p.log, "DC");
+}
+
+/* An IRQ_HPD still pending when the dock leaves is dropped with it. */
+static void cd321x_dp_seq_irq_hpd_then_unplug_test(struct kunit *test)
+{
+	struct cd321x_dp_port p;
+
+	port_docked(test, &p);
+	port_irq(&p, PLUG, DP_D | HPD | CD321X_DATA_STATUS_HPD_IRQ, HPD_RX);
+	port_update(&p, -EAGAIN);
+	port_irq(&p, 0, 0, HPD_RX);
+	port_reread(test, &p);
+	port_update(&p, 0);
+	KUNIT_EXPECT_STREQ(test, p.log, "D");
+	KUNIT_EXPECT_FALSE(test, p.irq_hpd);
+
+	port_irq(&p, PLUG, DP_D | HPD, HPD_RX);
+	port_update(&p, 0);
+	KUNIT_EXPECT_STREQ(test, p.log, "DC");
+}
+
+static struct kunit_case cd321x_dp_seq_cases[] = {
+	KUNIT_CASE(cd321x_dp_seq_typec_replug_test),
+	KUNIT_CASE(cd321x_dp_seq_downstream_replug_test),
+	KUNIT_CASE(cd321x_dp_seq_irq_hpd_retrains_test),
+	KUNIT_CASE(cd321x_dp_seq_eagain_keeps_session_test),
+	KUNIT_CASE(cd321x_dp_seq_irq_hpd_after_eagain_test),
+	KUNIT_CASE(cd321x_dp_seq_hpd_low_test),
+	KUNIT_CASE(cd321x_dp_seq_usb3_pin_change_test),
+	KUNIT_CASE(cd321x_dp_seq_pin_change_with_bounce_test),
+	KUNIT_CASE(cd321x_dp_seq_bounce_after_eagain_test),
+	KUNIT_CASE(cd321x_dp_seq_irq_hpd_then_unplug_test),
+	{}
+};
+
+static struct kunit_suite cd321x_dp_seq_suite = {
+	.name = "cd321x-dp-sequence",
+	.test_cases = cd321x_dp_seq_cases,
+};
+
+kunit_test_suites(&cd321x_dp_suite, &cd321x_dp_seq_suite);
 MODULE_DESCRIPTION("KUnit tests for the CD321x DisplayPort hotplug decisions");
 MODULE_LICENSE("GPL");
