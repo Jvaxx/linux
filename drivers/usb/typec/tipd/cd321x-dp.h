@@ -3,6 +3,7 @@
 #define __CD321X_DP_H__
 
 #include <linux/types.h>
+#include <linux/usb/typec_dp.h>
 
 #include "tps6598x.h"
 
@@ -27,6 +28,7 @@ enum cd321x_dp_event {
  * @changed: DATA_STATUS bits that changed since the previous update
  * @link_reset: the Type-C session is torn down: unplug, flip, partner
  *	change, Thunderbolt/USB4 entry or exit, or a forced reconnect
+ * @irq_hpd: the sink signalled IRQ_HPD and that has not been delivered
  * @route_active: the previous update left a display route up
  * @sink_reported: the connector was last told that a sink is present
  */
@@ -34,6 +36,7 @@ struct cd321x_dp_update {
 	u32 data_status;
 	u32 changed;
 	bool link_reset;
+	bool irq_hpd;
 	bool route_active;
 	bool sink_reported;
 };
@@ -51,6 +54,34 @@ static inline bool cd321x_dp_mode_changed(u32 data_status, u32 changed)
 		bits |= TPS_DATA_STATUS_USB3_CONNECTION;
 
 	return changed & bits;
+}
+
+/**
+ * cd321x_dp_irq_hpd() - Track the sink's IRQ_HPD across interrupts
+ * @pending: an IRQ_HPD is waiting to be delivered
+ * @old: DATA_STATUS read at the previous interrupt
+ * @new: DATA_STATUS read at this interrupt
+ * @old_rx: DisplayPort status last received from the partner, as of @old
+ * @new_rx: the same, as of @new
+ *
+ * TI documents the HPD IRQ bit of DATA_STATUS as sticky, and the partner's
+ * DisplayPort status keeps IRQ_HPD until its next status message, so either
+ * bit becoming set is a new attention.  It is looked at on every interrupt,
+ * not across the debounced update, so an attention that comes and goes
+ * within the debounce is not lost.  It stays pending until it has been
+ * delivered, including through updates that have to be retried.  HPD going
+ * low drops it: the sink is then reported gone and connected again anyway.
+ *
+ * Return: whether an IRQ_HPD is pending after this interrupt.
+ */
+static inline bool cd321x_dp_irq_hpd(bool pending, u32 old, u32 new,
+				     u32 old_rx, u32 new_rx)
+{
+	if (!(new & CD321X_DATA_STATUS_HPD_LEVEL))
+		return false;
+
+	return pending || (~old & new & CD321X_DATA_STATUS_HPD_IRQ) ||
+	       (~old_rx & new_rx & DP_STATUS_IRQ_HPD);
 }
 
 /*
@@ -81,8 +112,8 @@ cd321x_dp_event(const struct cd321x_dp_update *u, bool route_up)
 		return CD321X_DP_EVENT_NONE;
 
 	/* IRQ_HPD on a sink that stays connected: have its link checked. */
-	if (u->route_active && u->sink_reported && !cd321x_dp_teardown(u) &&
-	    (u->data_status & u->changed & CD321X_DATA_STATUS_HPD_IRQ))
+	if (u->irq_hpd && u->route_active && u->sink_reported &&
+	    !cd321x_dp_teardown(u))
 		return CD321X_DP_EVENT_RETRAIN;
 
 	return CD321X_DP_EVENT_CONNECTED;

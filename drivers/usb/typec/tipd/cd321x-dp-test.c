@@ -192,6 +192,7 @@ static void cd321x_dp_hpd_bounce_reconnects_test(struct kunit *test)
 	/* An IRQ_HPD in the same window does not make the bounce harmless. */
 	u.data_status |= CD321X_DATA_STATUS_HPD_IRQ;
 	u.changed |= CD321X_DATA_STATUS_HPD_IRQ;
+	u.irq_hpd = true;
 	KUNIT_EXPECT_TRUE(test, cd321x_dp_teardown(&u));
 	KUNIT_EXPECT_EQ(test, cd321x_dp_event(&u, true), CD321X_DP_EVENT_CONNECTED);
 }
@@ -202,6 +203,7 @@ static void cd321x_dp_irq_hpd_retrains_test(struct kunit *test)
 	struct cd321x_dp_update u = {
 		.data_status = DP_D | HPD | CD321X_DATA_STATUS_HPD_IRQ,
 		.changed = CD321X_DATA_STATUS_HPD_IRQ,
+		.irq_hpd = true,
 		.route_active = true,
 		.sink_reported = true,
 	};
@@ -209,9 +211,46 @@ static void cd321x_dp_irq_hpd_retrains_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, cd321x_dp_teardown(&u));
 	KUNIT_EXPECT_EQ(test, cd321x_dp_event(&u, true), CD321X_DP_EVENT_RETRAIN);
 
-	/* The attention bit clearing again is not a new request. */
-	u.data_status &= ~CD321X_DATA_STATUS_HPD_IRQ;
+	/* The sticky bit seen again, with nothing pending, is no new request. */
+	u.irq_hpd = false;
 	KUNIT_EXPECT_EQ(test, cd321x_dp_event(&u, true), CD321X_DP_EVENT_CONNECTED);
+}
+
+/* Either IRQ_HPD indication becoming set is an attention. */
+static void cd321x_dp_irq_hpd_sources_test(struct kunit *test)
+{
+	u32 hpd = DP_D | HPD, irq = hpd | CD321X_DATA_STATUS_HPD_IRQ;
+
+	KUNIT_EXPECT_TRUE(test, cd321x_dp_irq_hpd(false, hpd, irq, 0, 0));
+	KUNIT_EXPECT_TRUE(test, cd321x_dp_irq_hpd(false, hpd, hpd, DP_STATUS_HPD_STATE,
+						  DP_STATUS_HPD_STATE | DP_STATUS_IRQ_HPD));
+	/* Still set from an earlier attention, or clearing: nothing new. */
+	KUNIT_EXPECT_FALSE(test, cd321x_dp_irq_hpd(false, irq, irq, DP_STATUS_IRQ_HPD,
+						   DP_STATUS_IRQ_HPD));
+	KUNIT_EXPECT_FALSE(test, cd321x_dp_irq_hpd(false, irq, hpd, DP_STATUS_IRQ_HPD, 0));
+	/* IRQ_HPD is only valid with HPD high. */
+	KUNIT_EXPECT_FALSE(test, cd321x_dp_irq_hpd(false, DP_D, DP_D | CD321X_DATA_STATUS_HPD_IRQ,
+						   0, DP_STATUS_IRQ_HPD));
+}
+
+/* A pending attention survives later interrupts until HPD drops. */
+static void cd321x_dp_irq_hpd_pending_test(struct kunit *test)
+{
+	u32 hpd = DP_D | HPD, irq = hpd | CD321X_DATA_STATUS_HPD_IRQ;
+	bool pending;
+
+	/* Set and cleared again within one debounce window. */
+	pending = cd321x_dp_irq_hpd(false, hpd, irq, 0, 0);
+	pending = cd321x_dp_irq_hpd(pending, irq, hpd, 0, 0);
+	KUNIT_EXPECT_TRUE(test, pending);
+	/* An unrelated interrupt rereads the same status. */
+	pending = cd321x_dp_irq_hpd(pending, hpd, hpd, 0, 0);
+	KUNIT_EXPECT_TRUE(test, pending);
+	/* HPD low: the sink is reconnected, nothing is left to retrain. */
+	pending = cd321x_dp_irq_hpd(pending, hpd, DP_D, 0, 0);
+	KUNIT_EXPECT_FALSE(test, pending);
+	pending = cd321x_dp_irq_hpd(pending, DP_D, hpd, 0, 0);
+	KUNIT_EXPECT_FALSE(test, pending);
 }
 
 /* HPD rising after a reported low is a connect, as before. */
@@ -227,6 +266,7 @@ static void cd321x_dp_hpd_rise_connects_test(struct kunit *test)
 	/* Attention is no reason to skip announcing a sink that just came up. */
 	u.data_status |= CD321X_DATA_STATUS_HPD_IRQ;
 	u.changed |= CD321X_DATA_STATUS_HPD_IRQ;
+	u.irq_hpd = true;
 	KUNIT_EXPECT_EQ(test, cd321x_dp_event(&u, true), CD321X_DP_EVENT_CONNECTED);
 }
 
@@ -255,6 +295,7 @@ static void cd321x_dp_irq_hpd_with_link_reset_test(struct kunit *test)
 		.data_status = DP_D | HPD | CD321X_DATA_STATUS_HPD_IRQ,
 		.changed = CD321X_DATA_STATUS_HPD_IRQ,
 		.link_reset = true,
+		.irq_hpd = true,
 		.route_active = true,
 		.sink_reported = true,
 	};
@@ -269,6 +310,7 @@ static void cd321x_dp_retrain_needs_live_sink_test(struct kunit *test)
 	struct cd321x_dp_update u = {
 		.data_status = DP_D | HPD | CD321X_DATA_STATUS_HPD_IRQ,
 		.changed = CD321X_DATA_STATUS_HPD_IRQ,
+		.irq_hpd = true,
 		.route_active = true,
 	};
 
@@ -313,6 +355,8 @@ static struct kunit_case cd321x_dp_cases[] = {
 	KUNIT_CASE(cd321x_dp_display_taken_test),
 	KUNIT_CASE(cd321x_dp_hpd_bounce_reconnects_test),
 	KUNIT_CASE(cd321x_dp_irq_hpd_retrains_test),
+	KUNIT_CASE(cd321x_dp_irq_hpd_sources_test),
+	KUNIT_CASE(cd321x_dp_irq_hpd_pending_test),
 	KUNIT_CASE(cd321x_dp_hpd_rise_connects_test),
 	KUNIT_CASE(cd321x_dp_bounce_with_lane_change_test),
 	KUNIT_CASE(cd321x_dp_irq_hpd_with_link_reset_test),
