@@ -4654,7 +4654,9 @@ static void dcp_drain_for_sleep(struct apple_dcp *dcp)
  */
 static void dcp_hold_for_sleep(struct apple_dcp *dcp)
 {
-	if (!dcp_uses_soft_dpms(dcp) || dcp->fw_compat != DCP_FIRMWARE_H17P ||
+	/* A failed component bind leaves no coprocessor session to hold. */
+	if (IS_ERR_OR_NULL(dcp->rtk) ||
+	    !dcp_uses_soft_dpms(dcp) || dcp->fw_compat != DCP_FIRMWARE_H17P ||
 	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G ||
 	    READ_ONCE(dcp->crashed))
 		return;
