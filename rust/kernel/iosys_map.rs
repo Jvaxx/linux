@@ -536,7 +536,7 @@ pub mod tests {
     use super::*;
 
     /// A helper struct for managed IoSysMapRef structs which point to a [`Vec`].
-    pub struct VecIoSysMap<T: AsBytes + FromBytes + Clone + PartialEq> {
+    pub struct VecIoSysMap<T: AsBytes + FromBytes + Clone + PartialEq + core::fmt::Debug> {
         map: RawIoSysMap<T>,
         vec: KVec<T>,
     }
