@@ -20,6 +20,9 @@ description: |
   The remaining audio data moves over the named ADMAC channels while its AOP
   service is active. The parent AOP binding describes the firmware transport.
 
+allOf:
+  - $ref: dai-common.yaml#
+
 properties:
   compatible:
     const: apple,t8140-aop-audio
@@ -96,7 +99,7 @@ required:
   - apple,chassis-name
   - apple,machine-kind
 
-additionalProperties: false
+unevaluatedProperties: false
 
 examples:
   - |
