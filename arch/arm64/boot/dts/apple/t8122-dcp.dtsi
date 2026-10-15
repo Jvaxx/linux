@@ -130,10 +130,11 @@
 	/*
 	 * The external display processor (ADT dispext0, dcpext, dart-dispext0
 	 * and dart-dcpext). Unlike the internal one it is not handed over by
-	 * the boot loader: the boot loader only reserves its firmware and then
-	 * enables the dcpext node, and the driver starts it. The board adds the
-	 * Type-C routes; the display gate enables the DARTs, the mailbox and
-	 * the display crossbars of those routes together with the dcpext.
+	 * the boot loader: the boot loader only reserves its firmware and marks
+	 * this node apple,t8122-dcpext-firmware-ready, leaving it disabled, and
+	 * the driver starts it. The board adds the Type-C routes; the display
+	 * gate enables the dcpext, its DARTs, its mailbox and the display
+	 * crossbars of those routes together.
 	 *
 	 * The DMA windows are the ones the working asahi-based kernel uses per
 	 * stream: dcpext stream 5 at 0x8_0000_0000 and PIODMA stream 4 from 0
