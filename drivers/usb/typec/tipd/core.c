@@ -882,7 +882,8 @@ static void cd321x_update_work(struct work_struct *work)
 
 	bool usb_connection = st.data_status &
 			      (TPS_DATA_STATUS_USB2_CONNECTION | TPS_DATA_STATUS_USB3_CONNECTION);
-	bool dp_mode_changed = cd321x_dp_mode_changed(st.data_status_changed);
+	bool dp_mode_changed = cd321x_dp_mode_changed(st.data_status,
+						       st.data_status_changed);
 	bool dp_connected = st.data_status & TPS_DATA_STATUS_DP_CONNECTION;
 	struct cd321x_dp_update dp = {
 		.data_status = st.data_status,
