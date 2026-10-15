@@ -306,6 +306,13 @@ static u32 dchid_checksum(void *p, size_t length)
 	return sum;
 }
 
+static bool dchid_verify_checksum(struct dchid_hdr *hdr, void *data, u32 *checksum)
+{
+	*checksum = dchid_checksum(hdr, sizeof(*hdr));
+	*checksum += dchid_checksum(data, hdr->length + sizeof(u32));
+	return *checksum == U32_MAX;
+}
+
 static int dchid_send(struct dchid_iface *iface, u32 flags, void *msg, size_t size)
 {
 	u32 checksum = 0xffffffff;
@@ -1202,10 +1209,7 @@ static void dchid_handle_packet(void *cookie, size_t avail)
 		goto done;
 	}
 
-	checksum = dchid_checksum(&hdr, sizeof(hdr));
-	checksum += dchid_checksum(dchid->pkt_buf, hdr.length + 4);
-
-	if (checksum != 0xffffffff) {
+	if (!dchid_verify_checksum(&hdr, dchid->pkt_buf, &checksum)) {
 		dev_err(dchid->dev, "Checksum mismatch (iface %d): 0x%08x != 0xffffffff\n",
 			hdr.iface, checksum);
 		goto done;
@@ -1459,3 +1463,7 @@ module_platform_driver(dockchannel_hid_driver);
 MODULE_DESCRIPTION("Apple DockChannel HID transport driver");
 MODULE_AUTHOR("Hector Martin <marcan@marcan.st>");
 MODULE_LICENSE("Dual MIT/GPL");
+
+#if IS_ENABLED(CONFIG_HID_DOCKCHANNEL_PARSER_KUNIT_TEST)
+#include "dockchannel-hid-parser-test.c"
+#endif
