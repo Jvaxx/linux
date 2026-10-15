@@ -736,7 +736,7 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 		if (ret)
 			goto out;
 		ret = typec_mux_set(cd321x->mux, &cd321x->state);
-		*display_busy = ret == -EBUSY;
+		*display_busy = cd321x_display_taken(ret);
 		if (!ret) {
 			cd321x->dp_status = dp_data.status;
 			cd321x->dp_conf = dp_data.conf;
@@ -937,7 +937,7 @@ static void cd321x_update_work(struct work_struct *work)
 	 * a failed teardown keeps the route, but the sink must not stay present.
 	 * All ports reference the same external display connector, so only the
 	 * port that owns the display route may report a disconnect. A second DP
-	 * sink can enter Alt Mode while its mux request fails with -EBUSY, and
+	 * sink can enter Alt Mode while its mux request fails with -ENOSPC, and
 	 * must not tear down the display carried by the other port.
 	 */
 	if (IS_REACHABLE(CONFIG_DRM) && cd321x->connector_fwnode &&

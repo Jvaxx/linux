@@ -419,7 +419,7 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 	guard(mutex)(&dcp->external_lock);
 	if (dcp_is_external_h17p(dcp) &&
 	    (dcp->external_error || (dcp->external_power_attempted && !dcp->external_stopped)))
-		return dcp->external_error ?: -EBUSY;
+		return dcp->external_error ?: -EAGAIN;
 
 	/*
 	 * Under tb_lock so a DCP link (re)configuration can neither select the
@@ -935,7 +935,7 @@ static int dcp_typec_route_prepare(struct typec_mux_dev *mux,
 
 	guard(mutex)(&dcp_typec_fabric_lock);
 	if (state->mode != TYPEC_STATE_SAFE)
-		return port->safe_pending ? -EBUSY : 0;
+		return port->safe_pending ? -EAGAIN : 0;
 	if (!port->owner || port->owner->tunnel)
 		return 0;
 	dcp = port->owner->dcp;
@@ -1025,7 +1025,7 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 	if (state->mode == TYPEC_STATE_SAFE && port->safe_pending)
 		return 0;
 	if (port->safe_pending)
-		return -EBUSY;
+		return -EAGAIN;
 
 	/*
 	 * Every candidate route for this port is notified with the same state,

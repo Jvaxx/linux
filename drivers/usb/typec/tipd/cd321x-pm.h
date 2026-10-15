@@ -2,6 +2,8 @@
 #ifndef __CD321X_PM_H__
 #define __CD321X_PM_H__
 
+#include <linux/errno.h>
+
 #include <linux/types.h>
 
 #define CD321X_RESUME_ATTEMPTS 3
