@@ -154,6 +154,18 @@ config APPLE_SEP
 
 	  Say Y here if you have an Apple silicon Mac.
 
+config APPLE_SEP_KUNIT_TEST
+	bool "KUnit tests for the Apple SEP driver" if !KUNIT_ALL_TESTS
+	depends on APPLE_SEP && KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Build KUnit tests for the pure logic of the Apple SEP driver: the
+	  mailbox message encoding and decoding, the shared-memory registration
+	  limits and the rules that keep a keybag's lookup identity apart from
+	  the identity the enclave reports. The tests touch no hardware.
+
+	  If unsure, say N.
+
 config APPLE_PMP
 	tristate "Apple Power Management Processor"
 	depends on ARCH_APPLE || COMPILE_TEST
