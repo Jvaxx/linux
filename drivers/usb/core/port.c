@@ -151,6 +151,21 @@ static ssize_t disable_store(struct device *dev, struct device_attribute *attr,
 		goto out_hdev_lock;
 	}
 
+	/*
+	 * A driver holds the port off while it moves the lanes behind it, see
+	 * usb_hub_port_power_off(). Powering it on would run its link on lanes
+	 * in transition. Keeping it off takes the port over from the driver,
+	 * which then leaves it off.
+	 */
+	if (port_dev->held_off) {
+		if (!disabled) {
+			rc = -EBUSY;
+			goto out_hdev_lock;
+		}
+		port_dev->held_off = false;
+		pm_runtime_put(&port_dev->dev);
+	}
+
 	if (disabled && port_dev->child)
 		usb_disconnect(&port_dev->child);
 
@@ -163,8 +178,10 @@ static ssize_t disable_store(struct device *dev, struct device_attribute *attr,
 			usb_clear_port_feature(hdev, port1, USB_PORT_FEAT_C_ENABLE);
 	}
 
-	if (!rc)
+	if (!rc) {
+		port_dev->disabled = disabled;
 		rc = count;
+	}
 
  out_hdev_lock:
 	usb_unlock_device(hdev);
@@ -860,6 +877,8 @@ void usb_hub_remove_port_device(struct usb_hub *hub, int port1)
 	peer = port_dev->peer;
 	if (peer)
 		unlink_peers(port_dev, peer);
+	if (port_dev->held_off)
+		pm_runtime_put_noidle(&port_dev->dev);
 	component_del(&port_dev->dev, &connector_ops);
 	sysfs_put(port_dev->state_kn);
 	device_unregister(&port_dev->dev);
