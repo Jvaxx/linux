@@ -218,6 +218,37 @@ static void dptx_service_duplicate_close_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, port.enabled);
 }
 
+static void afk_service_retired_channel_test(struct kunit *test)
+{
+	struct apple_epic_service *service = test->priv;
+
+	/* A slot that never served the channel does not know it. */
+	KUNIT_EXPECT_FALSE(test, afk_service_retired(service, 1));
+	KUNIT_ASSERT_TRUE(test, afk_service_reinit(service, NULL, &reusable_ops, 1));
+	/* A live service is found by afk_service_matches(), not here. */
+	KUNIT_EXPECT_FALSE(test, afk_service_retired(service, 1));
+	/* Retired locally (display unplugged) before the co-processor closes it. */
+	afk_test_retire(service);
+	KUNIT_EXPECT_FALSE(test, afk_service_matches(service, 1));
+	KUNIT_EXPECT_TRUE(test, afk_service_retired(service, 1));
+	KUNIT_EXPECT_FALSE(test, afk_service_retired(service, 2));
+	/* Reusing the slot forgets the old channel. */
+	KUNIT_ASSERT_TRUE(test, afk_service_reinit(service, NULL, &reusable_ops, 2));
+	KUNIT_EXPECT_FALSE(test, afk_service_retired(service, 1));
+	KUNIT_EXPECT_FALSE(test, afk_service_retired(service, 2));
+}
+
+static void afk_service_declined_channel_test(struct kunit *test)
+{
+	struct apple_epic_service *service = test->priv;
+
+	/* An announcement whose preparation we declined is closed later too. */
+	KUNIT_ASSERT_TRUE(test, afk_service_reinit(service, NULL, &prepared_ops, 3));
+	afk_service_discard(service);
+	KUNIT_EXPECT_FALSE(test, afk_service_matches(service, 3));
+	KUNIT_EXPECT_TRUE(test, afk_service_retired(service, 3));
+}
+
 static struct kunit_case afk_service_cases[] = {
 	KUNIT_CASE(afk_service_admission_test),
 	KUNIT_CASE(dptx_service_identity_test),
@@ -228,6 +259,8 @@ static struct kunit_case afk_service_cases[] = {
 	KUNIT_CASE(afk_service_completed_reader_test),
 	KUNIT_CASE(afk_service_tag_sequence_test),
 	KUNIT_CASE(afk_service_unconverted_owner_test),
+	KUNIT_CASE(afk_service_retired_channel_test),
+	KUNIT_CASE(afk_service_declined_channel_test),
 	{ }
 };
 
