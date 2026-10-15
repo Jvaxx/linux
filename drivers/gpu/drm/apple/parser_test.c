@@ -184,6 +184,37 @@ static void parser_bad_header_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, parse(b.data, b.len, &ctx), -EINVAL);
 }
 
+static void parser_mode_count_test(struct kunit *test)
+{
+	struct dcp_display_mode *modes;
+	struct dcp_parse_ctx ctx;
+	unsigned int count = 1;
+	struct blob b;
+
+	/* An element count that cannot be backed by the bytes present. */
+	blob_init(&b);
+	blob_tag(&b, T_ARRAY, 0xffffff);
+	blob_tag(&b, T_DICT, 0);
+
+	KUNIT_ASSERT_EQ(test, parse(b.data, b.len, &ctx), 0);
+	modes = enumerate_modes(&ctx, &count, 0, 0, 0, false, false);
+	KUNIT_EXPECT_PTR_EQ(test, modes, ERR_PTR(-EINVAL));
+
+	/* Entries that are present but invalid are skipped, not fatal. */
+	blob_init(&b);
+	blob_tag(&b, T_ARRAY, 2);
+	blob_tag(&b, T_DICT, 0);
+	blob_tag(&b, T_DICT, 1);
+	blob_string(&b, "ID");
+	blob_int(&b, 1);
+
+	KUNIT_ASSERT_EQ(test, parse(b.data, b.len, &ctx), 0);
+	modes = enumerate_modes(&ctx, &count, 0, 0, 0, false, false);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(modes));
+	KUNIT_EXPECT_EQ(test, count, 0);
+	kfree(modes);
+}
+
 static void parser_property_complete_test(struct kunit *test)
 {
 	struct blob b;
@@ -208,6 +239,7 @@ static struct kunit_case parser_cases[] = {
 	KUNIT_CASE(parser_service_init_truncated_test),
 	KUNIT_CASE(parser_nesting_test),
 	KUNIT_CASE(parser_bad_header_test),
+	KUNIT_CASE(parser_mode_count_test),
 	KUNIT_CASE(parser_property_complete_test),
 	{}
 };
