@@ -19,13 +19,17 @@
  * sleep releases that link.  Restoring such a CRTC as it was fails the whole
  * resume commit in its mode fixup, which leaves every output dark until
  * userspace reacts to the next hotplug.  Restore that CRTC disabled instead.
- * The DCP reports the display again once its link is back, and userspace
- * re-enables it on that hotplug, as it does after a cable is replugged.
+ * Userspace still believes the CRTC is on, and the DCP need not report the
+ * same display again when its link comes back, so mark the link of each of
+ * its connectors bad: userspace then sets the mode again, on the hotplug
+ * event the caller sends, as after a failed link retraining.
  *
  * The suspend state holds every CRTC, plane and connector already, so it is
  * edited directly rather than through helpers that need the modeset locks.
+ *
+ * Returns true if a CRTC is to be resumed disabled.
  */
-void apple_drm_drop_stale_crtcs(struct drm_atomic_state *state)
+bool apple_drm_drop_stale_crtcs(struct drm_atomic_state *state)
 {
 	const struct drm_crtc_helper_funcs *funcs;
 	struct drm_connector_state *conn_state;
@@ -34,6 +38,7 @@ void apple_drm_drop_stale_crtcs(struct drm_atomic_state *state)
 	struct drm_connector *connector;
 	struct drm_plane *plane;
 	struct drm_crtc *crtc;
+	bool dropped = false;
 	int i, j;
 
 	for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
@@ -59,7 +64,7 @@ void apple_drm_drop_stale_crtcs(struct drm_atomic_state *state)
 				continue;
 			/* Detaching from a CRTC already in the state cannot fail. */
 			if (WARN_ON(drm_atomic_set_crtc_for_connector(conn_state, NULL)))
-				return;
+				return true;
 			/*
 			 * Nor does a connector without a CRTC keep an encoder:
 			 * the resume check warns about one left routed.
@@ -68,9 +73,13 @@ void apple_drm_drop_stale_crtcs(struct drm_atomic_state *state)
 				crtc_state->encoder_mask &=
 					~drm_encoder_mask(conn_state->best_encoder);
 			conn_state->best_encoder = NULL;
+			conn_state->link_status = DRM_LINK_STATUS_BAD;
 		}
 		crtc_state->active = false;
+		dropped = true;
 		if (WARN_ON(drm_atomic_set_mode_for_crtc(crtc_state, NULL)))
-			return;
+			break;
 	}
+
+	return dropped;
 }

@@ -186,7 +186,8 @@ static void resume_stale_crtc_disabled_test(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, drm_mode_config_helper_suspend(&priv->drm), 0);
 	priv->admissible = false;
 	state = priv->drm.mode_config.suspend_state;
-	apple_drm_drop_stale_crtcs(state);
+	/* The caller tells userspace about the CRTC it had and lost. */
+	KUNIT_EXPECT_TRUE(test, apple_drm_drop_stale_crtcs(state));
 
 	/* The resume check warns about an encoder routed without a CRTC. */
 	conn_state = drm_atomic_get_new_connector_state(state, &priv->connector);
@@ -205,6 +206,9 @@ static void resume_stale_crtc_disabled_test(struct kunit *test)
 	KUNIT_EXPECT_NULL(test, priv->plane->state->crtc);
 	KUNIT_EXPECT_NULL(test, priv->plane->state->fb);
 	KUNIT_EXPECT_NULL(test, priv->connector.state->crtc);
+	/* Userspace must modeset again rather than flip onto a dead CRTC. */
+	KUNIT_EXPECT_EQ(test, priv->connector.state->link_status,
+			DRM_LINK_STATUS_BAD);
 	/* Only the creator's reference is left: the saved scanout was dropped. */
 	KUNIT_EXPECT_EQ(test, drm_framebuffer_read_refcount(&priv->fb), 1U);
 }
@@ -214,7 +218,8 @@ static void resume_admissible_crtc_restored_test(struct kunit *test)
 	struct resume_test *priv = resume_test_init(test);
 
 	KUNIT_ASSERT_EQ(test, drm_mode_config_helper_suspend(&priv->drm), 0);
-	apple_drm_drop_stale_crtcs(priv->drm.mode_config.suspend_state);
+	KUNIT_EXPECT_FALSE(test,
+			   apple_drm_drop_stale_crtcs(priv->drm.mode_config.suspend_state));
 	KUNIT_EXPECT_EQ(test, drm_mode_config_helper_resume(&priv->drm), 0);
 
 	KUNIT_EXPECT_TRUE(test, priv->crtc->state->enable);
@@ -251,10 +256,13 @@ static void resume_stale_dpms_off_crtc_disabled_test(struct kunit *test)
 
 	KUNIT_ASSERT_EQ(test, drm_mode_config_helper_suspend(&priv->drm), 0);
 	priv->admissible = false;
-	apple_drm_drop_stale_crtcs(priv->drm.mode_config.suspend_state);
+	KUNIT_EXPECT_TRUE(test,
+			  apple_drm_drop_stale_crtcs(priv->drm.mode_config.suspend_state));
 	KUNIT_EXPECT_EQ(test, drm_mode_config_helper_resume(&priv->drm), 0);
 	KUNIT_EXPECT_FALSE(test, priv->crtc->state->enable);
 	KUNIT_EXPECT_NULL(test, priv->connector.state->crtc);
+	KUNIT_EXPECT_EQ(test, priv->connector.state->link_status,
+			DRM_LINK_STATUS_BAD);
 	KUNIT_EXPECT_EQ(test, drm_framebuffer_read_refcount(&priv->fb), 1U);
 }
 
