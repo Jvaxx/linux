@@ -916,7 +916,7 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	 * brightness.
 	 */
 	if (dcp_has_panel(dcp)) {
-#if DCP_FW_VER < DCP_FW_VERSION(14, 7, 0)
+#if !DCP_FW_LAYOUT_14_7(DCP_FW_VER)
 		swap->swap.bl_unk = 1;
 #else
 		swap->swap.bl_update = 1;
@@ -1437,13 +1437,18 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		req->swap.src_rect[l] = apple_state->src_rect;
 		req->swap.dst_rect[l] = apple_state->dst_rect;
 
+#if DCP_FW_VER < DCP_FW_VERSION(26, 0, 0)
 		req->swap.surf_ids[apl_plane->iomfb_surf] = plane->base.id;
+#endif
 
 		if (dcp->notch_height > 0)
 			req->swap.dst_rect[l].y += dcp->notch_height;
 
 		req->surf_iova[l] = apple_state->iova;
 		req->surf[l].base = apple_state->surf;
+#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+		req->surf[l].base.surface_id = 0;
+#endif
 
 		/* Use sRGB colorspace only for internal panels. External
 		 * displays are expected to have EDID and user space can use
@@ -1495,7 +1500,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 
 	/* update brightness if changed */
 	if (dcp_has_panel(dcp) && dcp->brightness.update) {
-#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+#if DCP_FW_LAYOUT_14_7(DCP_FW_VER)
 		req->swap.bl_update = 1;
 #else
 		req->swap.bl_unk = 1;
