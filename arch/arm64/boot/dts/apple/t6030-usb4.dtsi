@@ -1,0 +1,245 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+
+#define T6030_ACIO_DART_SIDS(dart)					\
+	<&dart 0>, <&dart 1>, <&dart 2>, <&dart 3>, <&dart 4>,		\
+	<&dart 5>, <&dart 6>, <&dart 7>, <&dart 8>, <&dart 9>,		\
+	<&dart 10>, <&dart 11>, <&dart 16>, <&dart 17>, <&dart 18>,	\
+	<&dart 19>, <&dart 20>, <&dart 21>, <&dart 22>, <&dart 23>,	\
+	<&dart 24>, <&dart 25>, <&dart 26>, <&dart 27>
+
+#define T6030_NHI_IRQS(tx, rx)						\
+	<AIC_IRQ (tx + 0) IRQ_TYPE_LEVEL_HIGH>,				\
+	<AIC_IRQ (tx + 1) IRQ_TYPE_LEVEL_HIGH>,				\
+	<AIC_IRQ (tx + 2) IRQ_TYPE_LEVEL_HIGH>,				\
+	<AIC_IRQ (tx + 3) IRQ_TYPE_LEVEL_HIGH>,				\
+	<AIC_IRQ (tx + 4) IRQ_TYPE_LEVEL_HIGH>,				\
+	<AIC_IRQ (tx + 5) IRQ_TYPE_LEVEL_HIGH>,				\
+	<AIC_IRQ (tx + 6) IRQ_TYPE_LEVEL_HIGH>,				\
+	<AIC_IRQ (tx + 7) IRQ_TYPE_LEVEL_HIGH>,				\
+	<AIC_IRQ (tx + 8) IRQ_TYPE_LEVEL_HIGH>,				\
+	<AIC_IRQ (tx + 9) IRQ_TYPE_LEVEL_HIGH>,				\
+	<AIC_IRQ (tx + 10) IRQ_TYPE_LEVEL_HIGH>,			\
+	<AIC_IRQ (tx + 11) IRQ_TYPE_LEVEL_HIGH>,			\
+	<AIC_IRQ (rx + 0) IRQ_TYPE_LEVEL_HIGH>,				\
+	<AIC_IRQ (rx + 1) IRQ_TYPE_LEVEL_HIGH>,				\
+	<AIC_IRQ (rx + 2) IRQ_TYPE_LEVEL_HIGH>,				\
+	<AIC_IRQ (rx + 3) IRQ_TYPE_LEVEL_HIGH>,				\
+	<AIC_IRQ (rx + 4) IRQ_TYPE_LEVEL_HIGH>,				\
+	<AIC_IRQ (rx + 5) IRQ_TYPE_LEVEL_HIGH>,				\
+	<AIC_IRQ (rx + 6) IRQ_TYPE_LEVEL_HIGH>,				\
+	<AIC_IRQ (rx + 7) IRQ_TYPE_LEVEL_HIGH>,				\
+	<AIC_IRQ (rx + 8) IRQ_TYPE_LEVEL_HIGH>,				\
+	<AIC_IRQ (rx + 9) IRQ_TYPE_LEVEL_HIGH>,				\
+	<AIC_IRQ (rx + 10) IRQ_TYPE_LEVEL_HIGH>,			\
+	<AIC_IRQ (rx + 11) IRQ_TYPE_LEVEL_HIGH>
+
+#define T6030_NHI_IRQ_NAMES						\
+	"txring0", "txring1", "txring2", "txring3",			\
+	"txring4", "txring5", "txring6", "txring7",			\
+	"txring8", "txring9", "txring10", "txring11",			\
+	"rxring0", "rxring1", "rxring2", "rxring3",			\
+	"rxring4", "rxring5", "rxring6", "rxring7",			\
+	"rxring8", "rxring9", "rxring10", "rxring11"
+
+/*
+ * T6030_USB4(n, unit, hi, irq): ACIO n at <hi 0x01000000>, unit is hi without the 0x prefix. irq is
+ * the first AIC interrupt of the block (1076 for ATC0), the blocks are 58 interrupts apart.
+ */
+#define T6030_USB4(n, unit, hi, irq)						\
+	usb4_##n##_mbox: mailbox@unit##01108000 {			\
+		compatible = "apple,t6030-asc-mailbox",			\
+			     "apple,asc-mailbox-v4";			\
+		reg = <hi 0x01108000 0x0 0x4000>;			\
+		interrupt-parent = <&aic>;				\
+		interrupts = <AIC_IRQ (irq + 52) IRQ_TYPE_LEVEL_HIGH>,	\
+			     <AIC_IRQ (irq + 53) IRQ_TYPE_LEVEL_HIGH>,	\
+			     <AIC_IRQ (irq + 54) IRQ_TYPE_LEVEL_HIGH>,	\
+			     <AIC_IRQ (irq + 55) IRQ_TYPE_LEVEL_HIGH>;	\
+		interrupt-names = "send-empty", "send-not-empty",	\
+				  "recv-empty", "recv-not-empty";	\
+		#mbox-cells = <0>;					\
+	};								\
+									\
+	usb4_##n##_acio: cio@unit##01ac0000 {				\
+		compatible = "apple,t6030-usb4-acio",			\
+			     "apple,t8103-usb4-acio";			\
+		reg = <hi 0x01ac0000 0x0 0xc000>,			\
+		      <hi 0x01080000 0x0 0x20000>,			\
+		      <hi 0x01e44000 0x0 0x4000>,			\
+		      <hi 0x01100000 0x0 0x4000>;			\
+		reg-names = "rc", "sram", "pcie-adapter", "cpu";	\
+									\
+		mboxes = <&usb4_##n##_mbox>;				\
+		resets = <&cio_reset n>;				\
+									\
+		power-domains = <&ps_atc##n##_cio>,			\
+				<&ps_atc##n##_cio_pcie>,		\
+				<&ps_atc##n##_cio_usb>,			\
+				<&ps_atc##n##_pcie>;			\
+		post-init-providers = <&ps_atc##n##_cio>,		\
+				<&ps_atc##n##_cio_pcie>,		\
+				<&ps_atc##n##_cio_usb>,			\
+				<&ps_atc##n##_pcie>;			\
+									\
+		thunderbolt-switch;					\
+									\
+		pinctrl-0 = <&acio##n##_pins>;				\
+		pinctrl-names = "default";				\
+									\
+		#address-cells = <1>;					\
+		#size-cells = <1>;					\
+		ranges = <0x0 hi 0x01000000 0x1000000>;			\
+		nonposted-mmio;						\
+									\
+		usb4_##n##_dart: iommu@a80000 {				\
+			compatible = "apple,t6030-dart",		\
+				     "apple,t8110-dart";		\
+			reg = <0xa80000 0x4000>;			\
+			interrupt-parent = <&aic>;			\
+			interrupts = <AIC_IRQ (irq + 50) IRQ_TYPE_LEVEL_HIGH>; \
+			#iommu-cells = <1>;				\
+		};							\
+									\
+		usb4_##n##_nhi: nhi@f00000 {				\
+			compatible = "apple,t6030-usb4-nhi",		\
+				     "apple,t8103-usb4-nhi";		\
+			reg = <0xf00000 0x100000>,			\
+			      <0xdb0000 0x30004>;			\
+			reg-names = "nhi", "pdf";			\
+			interrupt-parent = <&aic>;			\
+			interrupts = T6030_NHI_IRQS((irq + 23), (irq + 35)); \
+			interrupt-names = T6030_NHI_IRQ_NAMES;		\
+			iommus = T6030_ACIO_DART_SIDS(usb4_##n##_dart);	\
+			/* To be filled by the loader */		\
+			apple,thunderbolt-drom = [00];			\
+		};							\
+	}
+
+&soc {
+	pmgr_cio: power-management@350780000 {
+		compatible = "apple,t6030-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		reg = <0x3 0x50780000 0x0 0x4000>;
+
+		cio_reset: reset-controller@8 {
+			compatible = "apple,t6030-cio-reset", "apple,t6000-cio-reset";
+			reg = <0x8 0x4>;
+			#reset-cells = <1>;
+		};
+	};
+
+	T6030_USB4(0, 7, 0x7, 1076);
+	T6030_USB4(1, b, 0xb, 1134);
+	T6030_USB4(2, f, 0xf, 1192);
+
+	usb4_0_pcie_tunnel: usb4-pcie-tunnel-0 {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		usb4_0_pcie_dart: iommu@721008000 {
+			compatible = "apple,t6030-dart", "apple,t8110-dart";
+			reg = <0x7 0x21008000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1077 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			/* No bootloader fills this one; the tunnel's cold init needs it. */
+			apple,tunable =
+				<0x20c 0x800001b7 0x800001b7>,
+				<0x220 0xf0f0f 0xf0f0f>,
+				<0x224 0xffffff 0x80808>,
+				<0x300 0x1f31 0x1>,
+				<0x308 0x3ffffffc 0x10000000>,
+				<0x310 0x3ffffffc 0x3ffffffc>,
+				<0x318 0x1f31 0x1>,
+				<0x320 0x3ffffffc 0x1f00000>,
+				<0x328 0x3ffffffc 0x1f0bffc>;
+		};
+
+		usb4_0_pcie: pcie@730000000 {
+			compatible = "apple,t8122-pciec", "apple,t8103-pciec";
+			device_type = "pci";
+			reg = <0x7 0x30000000 0x0 0x10000000>,
+			      <0x7 0x20000000 0x0 0x4000>,
+			      <0x7 0x21000000 0x0 0x8000>,
+			      <0x7 0x20004000 0x0 0x4000>,
+			      <0x7 0x20200000 0x0 0x4000>,
+			      <0x7 0x21010000 0x0 0x4000>,
+			      <0x7 0x20008000 0x0 0x4000>,
+			      <0x7 0x2100c000 0x0 0x4000>;
+			reg-names = "config", "rc", "port0", "fabric",
+				    "debug", "ltssm", "oe-fabric", "intr2axi";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1076 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_atc0_cio_pcie>;
+			apple,pciec-kernel-init;
+			/*
+			 * m1n1 fills the rc, fabric and debug tunables through the
+			 * usb4_0_pcie alias, but not this one.
+			 */
+			apple,tunable-oe-fabric =
+				<0x4 0x70007 0x40004>,
+				<0x8 0x1 0x1>,
+				<0xc 0x1 0x1>,
+				<0x10 0x801f 0x4>,
+				<0x18 0x801f 0x4>,
+				<0x20 0x801f 0x4>;
+			msi-controller;
+			msi-parent = <&usb4_0_pcie>;
+			msi-ranges = <&aic AIC_IRQ 1342 IRQ_TYPE_EDGE_RISING 0x200>;
+			iommu-map = <0x0 &usb4_0_pcie_dart 0x0 0x40>;
+			iommu-map-mask = <0x3f>;
+			bus-range = <0x0 0x7f>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges = <0x43000000 0x8 0x0
+				  0x8 0x0 0x2 0x0>,
+				 <0x02000000 0x0 0x100000
+				  0xa 0x100000 0x0 0x3ff00000>,
+				 <0x42000000 0x0 0x40000000
+				  0xa 0x40000000 0x0 0x40000000>;
+
+			usb4_0_pcie_port: pci@0,0 {
+				device_type = "pci";
+				reg = <0x0 0x0 0x0 0x0 0x0>;
+				external-facing;
+				/* apple,tunable is filled by the bootloader */
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges;
+				interrupt-controller;
+				#interrupt-cells = <1>;
+				interrupt-map-mask = <0 0 0 7>;
+				interrupt-map = <0 0 0 1 &usb4_0_pcie_port 0 0 0 0>,
+						<0 0 0 2 &usb4_0_pcie_port 0 0 0 1>,
+						<0 0 0 3 &usb4_0_pcie_port 0 0 0 2>,
+						<0 0 0 4 &usb4_0_pcie_port 0 0 0 3>;
+			};
+		};
+	};
+};
+
+&usb4_0_acio {
+	apple,pcie-tunnel = <&usb4_0_pcie_tunnel>;
+};
+
+/* LSTX (USB4 sideband TX) pins, ADT acioN gpio-lstx */
+&pinctrl_aop {
+	acio0_pins: acio0-pins {
+		pinmux = <APPLE_PINMUX(25, 1)>;
+	};
+
+	acio1_pins: acio1-pins {
+		pinmux = <APPLE_PINMUX(27, 1)>;
+	};
+
+	acio2_pins: acio2-pins {
+		pinmux = <APPLE_PINMUX(29, 1)>;
+	};
+};
+
+#undef T6030_USB4
+#undef T6030_NHI_IRQ_NAMES
+#undef T6030_NHI_IRQS
+#undef T6030_ACIO_DART_SIDS

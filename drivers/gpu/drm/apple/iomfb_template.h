@@ -18,18 +18,15 @@
 #include "version_utils.h"
 
 struct DCP_FW_NAME(dcp_swap) {
-	u64 ts1;
-	u64 ts2;
-
-	u64 unk_10;
-	u64 unk_18;
-	u64 ts64_unk;
-	u64 unk_28;
-	u64 ts3;
+	/* IOMobileFramebuffer timestamp types 1 through 7, in wire order. */
+	u64 timestamp[7];
 	u64 unk_38;
 
 	u64 flags1;
 	u64 flags2;
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+	u8 unk_v14_7[0x48];
+#endif
 
 	u32 swap_id;
 
@@ -44,19 +41,36 @@ struct DCP_FW_NAME(dcp_swap) {
 	u32 bg_color;
 	u8 unk_110[0x1b8];
 	u32 unk_2c8;
+#if DCP_FW_VER < DCP_FW_VERSION(14, 7, 0)
 	u8 unk_2cc[0x14];
 	u32 unk_2e0;
+#else
+	u8 unk_2cc[0x40];
+	/*
+	 * 14.7 moved the backlight update flag here (Asahi: bl_update). It
+	 * keeps the name bl_unk so that the shared code sets the flag the
+	 * same way for every firmware.
+	 */
+	u32 bl_unk;
+#endif
 #if DCP_FW_VER < DCP_FW_VERSION(13, 2, 0)
 	u16 unk_2e2;
 #else
 	u8 unk_2e2[3];
 #endif
+#if DCP_FW_VER < DCP_FW_VERSION(14, 7, 0)
 	u64 bl_unk;
+#else
+	u32 bl_unk_v14_7; /* the 13.x bl_unk position; not written */
+#endif
 	u32 bl_value; // min value is 0x10000000
 	u8  bl_power; // constant 0x40 for on
 	u8 unk_2f3[0x2d];
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
 	u8 unk_320[0x13f];
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+	u8 unk_14_7_2[0x30];
+#endif
 	u64 unk_1;
 #endif
 } __packed;
@@ -91,6 +105,9 @@ struct DCP_FW_NAME(dcp_swap_submit_req) {
 	u32 clear; // or maybe switch to default fb?
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
 	u32 unkU32Ptr;
+#endif
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+	u8 padding_14_7[0x234];
 #endif
 	u8 swap_null;
 	u8 surf_null[SWAP_SURFACES];

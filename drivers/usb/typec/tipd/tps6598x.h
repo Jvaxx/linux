@@ -6,15 +6,19 @@
  * Author: Heikki Krogerus <heikki.krogerus@linux.intel.com>
  */
 
+#include <linux/atomic.h>
 #include <linux/bits.h>
 #include <linux/bitfield.h>
 #include <linux/interrupt.h>
+#include <linux/notifier.h>
 #include <linux/power_supply.h>
 #include <linux/usb/typec.h>
 #include <linux/usb/typec_mux.h>
 
 #ifndef __TPS6598X_H__
 #define __TPS6598X_H__
+
+#include "cd321x-pm.h"
 
 #define TPS_FIELD_GET(_mask, _reg) ((typeof(_mask))(((_reg) & (_mask)) >> __bf_shf(_mask)))
 
@@ -140,6 +144,12 @@
 #define APPLE_CD_REG_INT_STATUS_UPDATE			BIT(8)
 #define APPLE_CD_REG_INT_PLUG_EVENT			BIT(1)
 
+/*
+ * SN201202x: the DP SID status register changed, that is the DisplayPort
+ * status the partner sent last (DP Status Update or Attention).
+ */
+#define SN201202X_INT_DP_SID_UPDATE			BIT_ULL(37)
+
 /* TPS_REG_SYSTEM_POWER_STATE states */
 #define TPS_SYSTEM_POWER_STATE_S0	0x00
 #define TPS_SYSTEM_POWER_STATE_S3	0x03
@@ -204,16 +214,17 @@
 /* modified TPS_REG_DATA_STATUS bits for CD321x (and likely also TPS65987DDK) */
 #define CD321X_DATA_STATUS_HPD_IRQ	     BIT(14)
 #define CD321X_DATA_STATUS_HPD_LEVEL	     BIT(15)
+#define CD321X_DATA_STATUS_ACTIVE_CABLE	     BIT(22)
 #define CD321X_DATA_STATUS_USB4_CONNECTION   BIT(23)
 
 #define TPS_DATA_STATUS_DP_PIN_ASSIGNMENT_MASK GENMASK(11, 10)
 #define TPS_DATA_STATUS_DP_PIN_ASSIGNMENT(x) \
 	TPS_FIELD_GET(TPS_DATA_STATUS_DP_PIN_ASSIGNMENT_MASK, (x))
 #define TPS_DATA_STATUS_TBT_CABLE_SPEED_MASK   GENMASK(27, 25)
-#define TPS_DATA_STATUS_TBT_CABLE_SPEED \
+#define TPS_DATA_STATUS_TBT_CABLE_SPEED(x) \
 	TPS_FIELD_GET(TPS_DATA_STATUS_TBT_CABLE_SPEED_MASK, (x))
 #define TPS_DATA_STATUS_TBT_CABLE_GEN_MASK     GENMASK(29, 28)
-#define TPS_DATA_STATUS_TBT_CABLE_GEN \
+#define TPS_DATA_STATUS_TBT_CABLE_GEN(x) \
 	TPS_FIELD_GET(TPS_DATA_STATUS_TBT_CABLE_GEN_MASK, (x))
 
 /* Map data status to DP spec assignments */
@@ -282,6 +293,7 @@ struct tipd_data {
 	void (*remove)(struct tps6598x *tps);
 	int (*register_port)(struct tps6598x *tps, struct fwnode_handle *node);
 	void (*unregister_port)(struct tps6598x *tps);
+	void (*ready)(struct tps6598x *tps);
 	void (*trace_data_status)(u32 status);
 	void (*trace_power_status)(u16 status);
 	void (*trace_status)(u32 status);
@@ -291,6 +303,8 @@ struct tipd_data {
 	bool (*read_data_status)(struct tps6598x *tps);
 	int (*reset)(struct tps6598x *tps);
 	int (*connect)(struct tps6598x *tps, u32 status);
+	void (*suspend_prepare)(struct tps6598x *tps);
+	void (*resume_reverify)(struct tps6598x *tps);
 };
 
 struct tps6598x {
@@ -342,7 +356,6 @@ struct tps6598x_intel_vid_status_reg {
 	__le32 attention_vdo;
 	__le16 enter_vdo;
 	__le16 device_mode;
-	__le16 cable_mode;
 } __packed;
 
 struct cd321x_status {
@@ -350,10 +363,15 @@ struct cd321x_status {
 	u32 pwr_status;
 	u32 data_status;
 	u32 status_changed;
+	u32 data_status_changed;
 	struct usb_pd_identity partner_identity;
 	struct tps6598x_dp_sid_status_reg dp_sid_status;
 	struct tps6598x_intel_vid_status_reg intel_vid_status;
 	struct tps6598x_usb4_status_reg usb4_status;
+	/* SN201202x: what the DP status showed since the last update */
+	bool dp_sid_event;
+	bool dp_sid_hpd_low;
+	bool dp_sid_irq;
 };
 
 struct cd321x {
@@ -368,10 +386,27 @@ struct cd321x {
 
 	struct typec_mux *mux;
 	struct typec_mux_state state;
+	bool state_valid;
+	u32 dp_status;
+	u32 dp_conf;
+	/* SN201202x: the partner's DP status is current for this DP connection */
+	bool dp_sid_valid;
+	struct typec_thunderbolt_switch *tbt_switch;
+	struct notifier_block tbt_notifier;
+	bool tbt_notifier_registered;
+	atomic_t link_event;
+	atomic_t ready_event;
+	atomic_t restore_event;
+	bool display_route_active;
 
 	struct cd321x_status update_status;
 	struct delayed_work update_work;
+	struct delayed_work resume_work;
+	struct cd321x_pm_state pm;
 	struct usb_pd_identity cur_partner_identity;
+	bool cur_partner_is_pd;
+
+	struct fwnode_handle *connector_fwnode;
 };
 
 struct sn201202x {
@@ -390,6 +425,8 @@ extern const struct regmap_config tps6598x_regmap_config;
 
 int tipd_init(struct tps6598x *tps);
 void tipd_remove(struct tps6598x *tps);
+int tipd_prepare(struct device *dev);
+void tipd_complete(struct device *dev);
 int tipd_suspend(struct tps6598x *tps);
 int tipd_resume(struct tps6598x *tps);
 

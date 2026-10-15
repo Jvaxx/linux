@@ -30,7 +30,6 @@ const NOTE_AGX_DUMP_INFO: u32 = 1;
 
 const NOTE_NAME_RTKIT: &str = "RTKIT";
 const NOTE_RTKIT_CRASHLOG: u32 = 1;
-
 #[repr(C)]
 pub(crate) struct AGXDumpInfo {
     initdata_address: u64,

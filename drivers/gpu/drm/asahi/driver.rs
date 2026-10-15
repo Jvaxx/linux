@@ -13,20 +13,25 @@ use kernel::{
     drm::ioctl,
     of,
     platform,
+    workqueue::{self, impl_has_work, new_work, Work, WorkItem},
     prelude::*,
     sync::{
         aref::ARef,
-        Arc, //
-    }, //
+        Arc, SetOnce, //
+    },
 };
 
 use crate::{
     debug,
+    drm_gpu,
     file,
+    g15_boot,
     gem::AsahiObject,
     gpu,
     hw,
+    identity,
     regs, //
+    t8122_admission,
 };
 
 use kernel::macros::vtable;
@@ -34,18 +39,70 @@ use kernel::macros::vtable;
 /// Holds a reference to the top-level `GpuManager` object.
 #[pin_data]
 pub(crate) struct AsahiData {
-    #[pin]
-    pub(crate) gpu: Arc<dyn gpu::GpuManager>,
+    pub(crate) gpu: SetOnce<drm_gpu::Backend>,
+    pub(crate) is_m3: bool,
+    pub(crate) completion: SetOnce<Arc<crate::m3_completion::Completion>>,
     pub(crate) pdev: ARef<platform::Device>,
-    pub(crate) resources: regs::Resources,
+    pub(crate) resources: Option<regs::Resources>,
+    #[pin]
+    g16_completion_work: Work<AsahiDevice, 3>,
+
+}
+
+impl AsahiData {
+    pub(crate) fn new(pdev: &platform::Device<Core>, resources: Option<regs::Resources>, is_m3: bool) -> impl PinInit<Self, Error> {
+        let pdev: ARef<platform::Device> = pdev.into();
+        try_pin_init!(Self {
+            gpu: SetOnce::new(),
+            is_m3,
+            completion: SetOnce::new(),
+            pdev,
+            resources,
+            g16_completion_work <- new_work!("AsahiData::g16_completion_work"),
+        })
+    }
+
+    /// Runtime construction can use GEM before the GPU backend exists. All
+    /// DRM operations fail with ENODEV until probe publishes the backend once.
+    pub(crate) fn gpu(&self) -> Result<&dyn drm_gpu::DrmGpu> {
+        self.gpu.as_ref().map(|backend| backend.gpu()).ok_or(ENODEV)
+    }
 }
 
 unsafe impl Send for AsahiData {}
 unsafe impl Sync for AsahiData {}
 
+impl_has_work! { impl HasWork<AsahiDevice, 3> for AsahiData { self.g16_completion_work } }
+impl WorkItem<3> for AsahiData {
+    type Pointer = ARef<AsahiDevice>;
+    fn run(dev: ARef<AsahiDevice>) {
+        if let Ok(gpu) = dev.gpu() { gpu.service_g16_jobs(); }
+    }
+}
+pub(crate) fn queue_g16_completion_worker(dev: ARef<AsahiDevice>) {
+    let _ = workqueue::system_highpri().enqueue::<ARef<AsahiDevice>, 3>(dev);
+}
+
+#[allow(dead_code)]
+enum AsahiRuntime {
+    Legacy(ARef<drm::Device<AsahiDriver>>),
+    M3(crate::m3_drm::Registered),
+    G16(crate::g16_drm::Registered),
+    G15(crate::g15_probe::G15Manager),
+}
+
 pub(crate) struct AsahiDriver {
-    #[expect(unused)]
-    drm: ARef<drm::Device<Self>>,
+    runtime: AsahiRuntime,
+}
+
+/// A matched device either has a complete legacy hardware configuration or is
+/// an exact AGX3 identification target whose firmware boundary remains closed.
+pub(crate) enum ProbeConfig {
+    Supported(&'static hw::HwConfig),
+    /// AGX3 (G15) target: chip identification and the read-only
+    /// topology decode run at probe time, then the probe fails closed before
+    /// DMA setup, ASC start, or any MMIO write.
+    Agx3Diagnostic(&'static hw::agx3::SocConfig),
 }
 
 unsafe impl Send for AsahiDriver {}
@@ -58,7 +115,7 @@ pub(crate) type AsahiDevRef = ARef<AsahiDevice>;
 /// DRM Driver metadata
 const INFO: drm::driver::DriverInfo = drm::driver::DriverInfo {
     major: 0,
-    minor: 0,
+    minor: 2,
     patchlevel: 0,
     name: c_str!("asahi"),
     desc: c_str!("Apple AGX Graphics"),
@@ -115,43 +172,254 @@ kernel::of_device_table!(
     [
         (
             of::DeviceId::new(c_str!("apple,agx-t8103")),
-            &hw::t8103::HWCONFIG
+            ProbeConfig::Supported(&hw::t8103::HWCONFIG)
         ),
         (
             of::DeviceId::new(c_str!("apple,agx-t8112")),
-            &hw::t8112::HWCONFIG
+            ProbeConfig::Supported(&hw::t8112::HWCONFIG)
         ),
         (
             of::DeviceId::new(c_str!("apple,agx-t6000")),
-            &hw::t600x::HWCONFIG_T6000
+            ProbeConfig::Supported(&hw::t600x::HWCONFIG_T6000)
         ),
         (
             of::DeviceId::new(c_str!("apple,agx-t6001")),
-            &hw::t600x::HWCONFIG_T6001
+            ProbeConfig::Supported(&hw::t600x::HWCONFIG_T6001)
         ),
         (
             of::DeviceId::new(c_str!("apple,agx-t6002")),
-            &hw::t600x::HWCONFIG_T6002
+            ProbeConfig::Supported(&hw::t600x::HWCONFIG_T6002)
         ),
         (
             of::DeviceId::new(c_str!("apple,agx-t6020")),
-            &hw::t602x::HWCONFIG_T6020
+            ProbeConfig::Supported(&hw::t602x::HWCONFIG_T6020)
         ),
         (
             of::DeviceId::new(c_str!("apple,agx-t6021")),
-            &hw::t602x::HWCONFIG_T6021
+            ProbeConfig::Supported(&hw::t602x::HWCONFIG_T6021)
         ),
         (
             of::DeviceId::new(c_str!("apple,agx-t6022")),
-            &hw::t602x::HWCONFIG_T6022
+            ProbeConfig::Supported(&hw::t602x::HWCONFIG_T6022)
+        ),
+        // AGX3 (G15) identification targets. These intentionally select no
+        // HwConfig: unproved power/MMIO/firmware-tuning fields must never be
+        // represented by copied or zero-filled legacy values. T6030 starts
+        // the M3 runtime; a handed-over T8122 is admitted by it and refused
+        // while its table is incomplete; T6031 starts that runtime only with
+        // asahi.t6031_start=1 and otherwise fails closed the same way; the
+        // others fail closed before any firmware handoff.
+        // The M4 (G16) and M5/A18 Pro (G17) bring-up runtimes are not bound
+        // in this kernel.
+        (
+            of::DeviceId::new(c_str!("apple,agx-t8122")),
+            ProbeConfig::Agx3Diagnostic(&hw::agx3::T8122)
+        ),
+        (
+            of::DeviceId::new(c_str!("apple,agx-t6030")),
+            ProbeConfig::Agx3Diagnostic(&hw::agx3::T6030)
+        ),
+        (
+            of::DeviceId::new(c_str!("apple,agx-t6031")),
+            ProbeConfig::Agx3Diagnostic(&hw::agx3::T6031)
+        ),
+        (
+            of::DeviceId::new(c_str!("apple,agx-t6032")),
+            ProbeConfig::Agx3Diagnostic(&hw::agx3::T6032)
         ),
     ]
 );
 
+/// Start the M3 runtime on a T8122 (M3, G15G) whose GPU the boot loader handed over: only after
+/// its identity gate passes, and only on a board the T8122 table allows. The runtime then admits
+/// the boot loader's description and refuses the SoC while its table is incomplete
+/// (`m3_soc::T8122`).
+fn start_t8122(pdev: &platform::Device<Core>) -> Result<crate::m3_drm::Registered> {
+    // This gate reads only DT properties.
+    let identity = t8122_admission::read_identity(pdev).map_err(|error| {
+        dev_info!(
+            pdev.as_ref(),
+            "G15G: T8122 identity or ABI rejected ({:?}); startup refused\n",
+            error
+        );
+        ENODEV
+    })?;
+    dev_info!(
+        pdev.as_ref(),
+        "G15G: T8122 revision 2.0 identity admitted ({} active / {} slots)\n",
+        identity.active_cores,
+        identity.core_slots
+    );
+    if !crate::m3_params::t8122_backend(pdev) {
+        return Err(ENODEV);
+    }
+    crate::m3_drm::Registered::start(pdev, &crate::m3_soc::T8122)
+}
+
+/// Start the M3 runtime on a T6031 (M3 Max, G15C) when `asahi.t6031_start=1`. The caller has
+/// already accepted that parameter. Resource admission still requires the boot loader's handoff.
+fn start_t6031(pdev: &platform::Device<Core>) -> Result<crate::m3_drm::Registered> {
+    crate::m3_drm::Registered::start(pdev, &crate::m3_soc::T6031)
+}
+
+fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocConfig) -> Error {
+
+    let Some(expected) =
+        identity::decode_gpu_identity(soc.hw_family, soc.hw_variant, soc.num_dies as u8)
+    else {
+        dev_err!(
+            pdev.as_ref(),
+            "AGX3: static identity for chip {:#x} does not decode\n",
+            soc.chip_id
+        );
+        return EINVAL;
+    };
+
+    if soc.uat_ias != 42 {
+        dev_err!(
+            pdev.as_ref(),
+            "AGX3: static UAT width for chip {:#x} disagrees with the identity decode\n",
+            soc.chip_id
+        );
+        return EINVAL;
+    }
+
+    dev_info!(
+        pdev.as_ref(),
+        "AGX3: matched {:?}{:?} (chip {:#x}, USC gen {}, HAL {:?}, {}-bit UAT roots, {}-bit OAS)\n",
+        expected.gpu_gen,
+        expected.gpu_variant,
+        soc.chip_id,
+        expected.usc_generation,
+        expected.gpu_hal_generation,
+        soc.uat_ias,
+        soc.uat_oas
+    );
+
+    match regs::Resources::new(pdev) {
+        Ok(res) => match res.get_gpu_id() {
+            Ok(id) => {
+                dev_info!(
+                    pdev.as_ref(),
+                    "AGX3: hardware reports {:?}{:?} rev {:?}, {} dies, {} clusters, {} cores/cluster, {} active cores\n",
+                    id.gpu_gen,
+                    id.gpu_variant,
+                    id.gpu_rev,
+                    id.num_dies,
+                    id.num_clusters,
+                    id.num_cores,
+                    id.total_active_cores
+                );
+                if id.gpu_gen != soc.gpu_gen || id.gpu_variant != soc.gpu_variant {
+                    dev_warn!(
+                        pdev.as_ref(),
+                        "AGX3: hardware identity {:?}{:?} does not match the matched compatible ({:?}{:?})\n",
+                        id.gpu_gen,
+                        id.gpu_variant,
+                        soc.gpu_gen,
+                        soc.gpu_variant
+                    );
+                }
+            }
+            Err(e) => dev_warn!(pdev.as_ref(), "AGX3: GPU ID decode failed: {:?}\n", e),
+        },
+        Err(e) => {
+            dev_warn!(
+                pdev.as_ref(),
+                "AGX3: SGX MMIO region unavailable: {:?}\n",
+                e
+            );
+        }
+    }
+
+    match expected.gpu_gen {
+        hw::GpuGen::G15 => refuse_g15_probe(pdev),
+        gen => {
+            dev_err!(
+                pdev.as_ref(),
+                "AGX3 setup unavailable for {:?}: firmware tuning, initdata, and handoff are incomplete; no DMA or processor state changed\n",
+                gen
+            );
+            ENODEV
+        }
+    }
+}
+
+/// Report the grounded-vs-UNKNOWN state of the single-role G15 (M3) boot, then
+/// stop the probe. G15 is the easiest AGX3 target — one `GFX` role, classic
+/// device-control-ring submission — but the firmware image is not on disk and
+/// the init-data/RTKit graph is not boot-complete offline.
+fn refuse_g15_probe(pdev: &platform::Device<Core>) -> Error {
+    let Err(missing) = g15_boot::pre_handoff_gate(hw::GpuGen::G15 as u32) else {
+        dev_err!(
+            pdev.as_ref(),
+            "G15 diagnostic target remained selected after its preflight opened\n"
+        );
+        return EINVAL;
+    };
+
+    dev_info!(
+        pdev.as_ref(),
+        "G15 identity decoded (single-role GFX, classic submission); grounded init-data root and shared RTKit codec are diagnostic-only\n"
+    );
+    dev_err!(
+        pdev.as_ref(),
+        "G15 setup incomplete: evidence mask {:#x}; no DMA, MMIO, UAT, or processor state changed\n",
+        missing.bits()
+    );
+    if missing.contains(g15_boot::missing::FIRMWARE_IMAGE) {
+        dev_err!(
+            pdev.as_ref(),
+            "G15 preflight: the G15 GFX RTKit firmware image and its nested identity are not available offline\n"
+        );
+    }
+    if missing.contains(g15_boot::missing::UAT_HANDOFF) {
+        dev_err!(
+            pdev.as_ref(),
+            "G15 preflight: the dual-TTBR 42-bit UAT/Handoff firmware-shared state is not validated\n"
+        );
+    }
+    if missing.contains(g15_boot::missing::INITDATA_GRAPH) {
+        dev_err!(
+            pdev.as_ref(),
+            "G15 preflight: init-data root and runtime-pointer graph are grounded, but hw_globals and struct sizes are not boot-complete\n"
+        );
+    }
+    if missing.contains(g15_boot::missing::RTKIT_TRANSPORT) {
+        dev_err!(
+            pdev.as_ref(),
+            "G15 preflight: the GPU RTKit codec is grounded but HELLO/EPMAP transmit is unproved\n"
+        );
+    }
+    if missing.contains(g15_boot::missing::INTERFACE_VERSION) {
+        dev_err!(
+            pdev.as_ref(),
+            "G15 preflight: the EP0 RTKit interface version for this firmware/OS build is unknown\n"
+        );
+    }
+    if missing.contains(g15_boot::missing::SUBMISSION_TRANSPORT) {
+        dev_err!(
+            pdev.as_ref(),
+            "G15 preflight: classic register-list submission is not implemented\n"
+        );
+    }
+
+    ENODEV
+}
+
 /// Platform Driver implementation for `AsahiDriver`.
 impl platform::Driver for AsahiDriver {
-    type IdInfo = &'static hw::HwConfig;
+    type IdInfo = ProbeConfig;
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
+
+    fn unbind(_pdev: &platform::Device<Core>, this: Pin<&Self>) {
+
+        match &this.runtime {
+            AsahiRuntime::M3(runtime) => runtime.stop(),
+            AsahiRuntime::G16(runtime) => runtime.stop(),
+            _ => {},
+        }
+    }
 
     /// Device probe function.
     fn probe(
@@ -162,7 +430,60 @@ impl platform::Driver for AsahiDriver {
 
         dev_info!(pdev.as_ref(), "Probing...\n");
 
-        let cfg = info.ok_or(ENODEV)?;
+        let cfg = match info.ok_or(ENODEV)? {
+            ProbeConfig::Supported(cfg) => *cfg,
+            ProbeConfig::Agx3Diagnostic(soc) if soc.chip_id == 0x6030 => {
+                match crate::m3_params::t6030_backend(pdev) {
+                    crate::m3_params::T6030Backend::Manager => {
+                        let manager = crate::g15_probe::probe(pdev)?;
+                        return Ok(Self { runtime: AsahiRuntime::G15(manager) });
+                    }
+                    crate::m3_params::T6030Backend::Off => return Err(ENODEV),
+                    crate::m3_params::T6030Backend::Runtime => {}
+                }
+                let runtime = crate::m3_drm::Registered::start(pdev, &crate::m3_soc::T6030)?;
+                return Ok(Self { runtime: AsahiRuntime::M3(runtime) });
+            }
+            ProbeConfig::Agx3Diagnostic(soc) if soc.chip_id == 0x8122 => {
+                if crate::g16_profile::selected(pdev).inspect_err(|error| {
+                    dev_err!(pdev.as_ref(), "G16G: firmware/profile admission failed: {:?}\n", error);
+                })? {
+                    if crate::m3_params::t8122_params().start != 1 { return Err(ENODEV); }
+                    crate::g16_board::initialize(pdev).inspect_err(|error| {
+                        dev_err!(pdev.as_ref(), "G16G: per-Mac calibration admission failed: {:?}\n", error);
+                    })?;
+                    let runtime = crate::g16_drm::Registered::start(pdev)?;
+                    return Ok(Self { runtime: AsahiRuntime::G16(runtime) });
+                }
+                let runtime = start_t8122(pdev)?;
+                return Ok(Self { runtime: AsahiRuntime::M3(runtime) });
+            }
+            ProbeConfig::Agx3Diagnostic(soc) if soc.chip_id == 0x6031 => {
+                match crate::t6031_knobs::start(&crate::m3_params::t6031_params()) {
+                    crate::t6031_knobs::Start::Off => {
+                        if crate::m3_params::t6031_params().values_given() {
+                            dev_info!(
+                                pdev.as_ref(),
+                                "M3 G15C start: asahi.t6031_* values given without asahi.t6031_start=1; ignored\n"
+                            );
+                        }
+                        return Err(refuse_agx3_probe(pdev, soc));
+                    }
+                    crate::t6031_knobs::Start::Invalid => {
+                        dev_err!(
+                            pdev.as_ref(),
+                            "M3 G15C start: refused: asahi.t6031_start has a value it does not accept (0 or 1); GPU startup disabled\n"
+                        );
+                        return Err(ENODEV);
+                    }
+                    crate::t6031_knobs::Start::On => {
+                        let runtime = start_t6031(pdev)?;
+                        return Ok(Self { runtime: AsahiRuntime::M3(runtime) });
+                    }
+                }
+            }
+            ProbeConfig::Agx3Diagnostic(soc) => return Err(refuse_agx3_probe(pdev, soc)),
+        };
 
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(cfg.uat_oas)?)? };
 
@@ -179,17 +500,11 @@ impl platform::Driver for AsahiDriver {
             .property_read_array_vec(c_str!("apple,firmware-compat"), 3)?
             .required_by(pdev.as_ref())?;
 
-        // TODO: This is very temporary
-        // SAFETY: This should be safe as data is not touched by the driver
-        // untill it gets fully initialised.
-        // Additionally drm::device::Device::release() will not drop data and
-        // leaks instead.
-        let uninit = unsafe {
-            pin_init::pin_init_from_closure::<AsahiData, kernel::error::Error>(|_slot| Ok(()))
-        };
-        let drm: ARef<AsahiDevice> = drm::device::Device::new(pdev.as_ref(), uninit)?;
+        let drm: ARef<AsahiDevice> = drm::device::Device::new(
+            pdev.as_ref(), AsahiData::new(pdev, Some(res), false))?;
+        let res = drm.resources.as_ref().ok_or(ENODEV)?;
 
-        let gpu = match (cfg.gpu_gen, cfg.gpu_variant, compat.as_slice()) {
+        let legacy_gpu = match (cfg.gpu_gen, cfg.gpu_variant, compat.as_slice()) {
             (hw::GpuGen::G13, _, &[12, 3, 0]) => {
                 gpu::GpuManagerG13V12_3::new(&drm.clone(), &res, cfg)? as Arc<dyn gpu::GpuManager>
             }
@@ -216,22 +531,16 @@ impl platform::Driver for AsahiDriver {
                 return Err(ENODEV);
             }
         };
+        let gpu = drm_gpu::Backend::Legacy(drm_gpu::LegacyDrmGpu::new(legacy_gpu));
 
-        let data = try_pin_init!(AsahiData {
-            gpu,
-            pdev: pdev.into(),
-            resources: res,
-        });
+        if !drm.gpu.populate(gpu) { return Err(EBUSY); }
 
-        let ptr: *const AsahiData = &raw const **drm;
-        unsafe {
-            data.__pinned_init(ptr as *mut AsahiData)?;
-        }
-
-        (*drm).gpu.init()?;
+        (*drm).gpu()?.init()?;
 
         drm::driver::Registration::new_foreign_owned(&drm, pdev.as_ref(), 0)?;
 
-        Ok(Self { drm })
+        Ok(Self {
+            runtime: AsahiRuntime::Legacy(drm),
+        })
     }
 }

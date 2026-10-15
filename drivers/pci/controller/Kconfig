@@ -43,9 +43,11 @@ config PCIE_APPLE_MSI_DOORBELL_ADDR
 config PCIE_APPLE
 	tristate "Apple PCIe controller"
 	depends on ARCH_APPLE || COMPILE_TEST
+	depends on APPLE_DART || !APPLE_DART
 	depends on OF
 	depends on PCI_MSI
 	depends on PAGE_SIZE_16KB || COMPILE_TEST
+	select APPLE_TUNABLE
 	select PCI_HOST_COMMON
 	select IRQ_MSI_LIB
 	help
@@ -54,6 +56,20 @@ config PCIE_APPLE
 	  type-A ports, Ethernet, Wi-Fi, and Bluetooth.
 
 	  If unsure, say Y if you have an Apple Silicon system.
+
+config PCIE_APPLE_PIODMA_DIAG
+	bool "J700 PIODMA diagnostic (requires full reset after use)"
+	depends on PCIE_APPLE != n && ARCH_APPLE && IOMMU_DMA
+	depends on PCIEASPM
+	help
+	  Build the experimental SID17 retained bootstrap provider. It submits
+	  one fixed request, validates typed ECAM and permits enumeration of
+	  the two Neo functions by default on J700/T8140 only. The parameter
+	  pcie_apple_piodma_diag.enumerate=0 disables the bootstrap.
+	  Its arena remains owned until a full reset. While that memory is
+	  retained, suspend, hibernate and kexec are refused at runtime on
+	  the Neo; other machines retain their normal lifecycle support.
+	  The provider is built-in even when the Apple PCIe host is a module.
 
 config PCI_VERSATILE
 	bool "ARM Versatile PB PCI controller"

@@ -35,11 +35,12 @@ struct dcp_parse_tag {
 
 static const void *parse_bytes(struct dcp_parse_ctx *ctx, size_t count)
 {
-	const void *ptr = ctx->blob + ctx->pos;
+	const void *ptr;
 
-	if (ctx->pos + count > ctx->len)
+	if (ctx->pos > ctx->len || count > ctx->len - ctx->pos)
 		return ERR_PTR(-EINVAL);
 
+	ptr = ctx->blob + ctx->pos;
 	ctx->pos += count;
 	return ptr;
 }
@@ -53,7 +54,9 @@ static const struct dcp_parse_tag *parse_tag(struct dcp_parse_ctx *ctx)
 {
 	const struct dcp_parse_tag *tag;
 
-	/* Align to 32-bits */
+	/* Align to 32-bits without wrapping the cursor. */
+	if ((u64)ctx->pos + 3 > U32_MAX)
+		return ERR_PTR(-EINVAL);
 	ctx->pos = round_up(ctx->pos, 4);
 
 	tag = parse_bytes(ctx, sizeof(struct dcp_parse_tag));
@@ -81,11 +84,16 @@ static const struct dcp_parse_tag *parse_tag_of_type(struct dcp_parse_ctx *ctx,
 	return tag;
 }
 
-static int skip(struct dcp_parse_ctx *handle)
+static int skip_depth(struct dcp_parse_ctx *handle, unsigned int depth)
 {
-	const struct dcp_parse_tag *tag = parse_tag(handle);
+	const struct dcp_parse_tag *tag;
 	int ret = 0;
 	int i;
+
+	if (depth > 64)
+		return -E2BIG;
+
+	tag = parse_tag(handle);
 
 	if (IS_ERR(tag))
 		return PTR_ERR(tag);
@@ -93,26 +101,31 @@ static int skip(struct dcp_parse_ctx *handle)
 	switch (tag->type) {
 	case DCP_TYPE_DICTIONARY:
 		for (i = 0; i < tag->size; ++i) {
-			ret |= skip(handle); /* key */
-			ret |= skip(handle); /* value */
+			ret = skip_depth(handle, depth + 1); /* key */
+			if (ret)
+				return ret;
+			ret = skip_depth(handle, depth + 1); /* value */
+			if (ret)
+				return ret;
 		}
 
 		return ret;
 
 	case DCP_TYPE_ARRAY:
-		for (i = 0; i < tag->size; ++i)
-			ret |= skip(handle);
+		for (i = 0; i < tag->size; ++i) {
+			ret = skip_depth(handle, depth + 1);
+			if (ret)
+				return ret;
+		}
 
 		return ret;
 
 	case DCP_TYPE_INT64:
-		handle->pos += sizeof(s64);
-		return 0;
+		return PTR_ERR_OR_ZERO(parse_bytes(handle, sizeof(s64)));
 
 	case DCP_TYPE_STRING:
 	case DCP_TYPE_BLOB:
-		handle->pos += tag->size;
-		return 0;
+		return PTR_ERR_OR_ZERO(parse_bytes(handle, tag->size));
 
 	case DCP_TYPE_BOOL:
 		return 0;
@@ -120,6 +133,11 @@ static int skip(struct dcp_parse_ctx *handle)
 	default:
 		return -EINVAL;
 	}
+}
+
+static int skip(struct dcp_parse_ctx *handle)
+{
+	return skip_depth(handle, 0);
 }
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
@@ -172,6 +190,8 @@ static char *parse_string(struct dcp_parse_ctx *handle)
 		return (void *)in;
 
 	out = kmalloc(tag->size + 1, GFP_KERNEL);
+	if (!out)
+		return ERR_PTR(-ENOMEM);
 
 	memcpy(out, in, tag->size);
 	out[tag->size] = '\0';
@@ -213,6 +233,22 @@ static int parse_bool(struct dcp_parse_ctx *handle, bool *b)
 
 	*b = !!tag->size;
 	return 0;
+}
+
+/*
+ * For an optional flag: a value of another type reads as false instead of
+ * failing the whole dictionary, which the key did not do before it was read.
+ */
+static int parse_bool_or_skip(struct dcp_parse_ctx *handle, bool *b)
+{
+	struct dcp_parse_ctx at = *handle;
+
+	if (!parse_bool(handle, b))
+		return 0;
+
+	*handle = at;
+	*b = false;
+	return skip(handle);
 }
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_AUDIO)
@@ -270,6 +306,9 @@ int parse(const void *blob, size_t size, struct dcp_parse_ctx *ctx)
 {
 	const u32 *header;
 
+	if (size > U32_MAX)
+		return -E2BIG;
+
 	*ctx = (struct dcp_parse_ctx) {
 		.blob = blob,
 		.len = size,
@@ -286,28 +325,37 @@ int parse(const void *blob, size_t size, struct dcp_parse_ctx *ctx)
 	return 0;
 }
 
-static int parse_dimension(struct dcp_parse_ctx *handle, struct dimension *dim)
+static int parse_dimension(struct dcp_parse_ctx *handle, struct dimension *dim,
+			   bool require_rate)
 {
 	struct iterator it;
+	unsigned int fields = 0;
 	int ret = 0;
 
 	dcp_parse_foreach_in_dict(handle, it) {
 		char *key = parse_string(it.handle);
 
-		if (IS_ERR(key))
+		if (IS_ERR(key)) {
 			ret = PTR_ERR(key);
-		else if (!strcmp(key, "Active"))
-			ret = parse_int(it.handle, &dim->active);
-		else if (!strcmp(key, "Total"))
-			ret = parse_int(it.handle, &dim->total);
-		else if (!strcmp(key, "FrontPorch"))
-			ret = parse_int(it.handle, &dim->front_porch);
-		else if (!strcmp(key, "SyncWidth"))
-			ret = parse_int(it.handle, &dim->sync_width);
-		else if (!strcmp(key, "PreciseSyncRate"))
-			ret = parse_int(it.handle, &dim->precise_sync_rate);
-		else
-			skip(it.handle);
+		} else if (!strcmp(key, "Active")) {
+			ret = parse_int_bound(it.handle, &dim->active, 1, U16_MAX);
+			fields |= BIT(0);
+		} else if (!strcmp(key, "Total")) {
+			ret = parse_int_bound(it.handle, &dim->total, 1, U16_MAX);
+			fields |= BIT(1);
+		} else if (!strcmp(key, "FrontPorch")) {
+			ret = parse_int_bound(it.handle, &dim->front_porch, 0, U16_MAX);
+			fields |= BIT(2);
+		} else if (!strcmp(key, "SyncWidth")) {
+			ret = parse_int_bound(it.handle, &dim->sync_width, 0, U16_MAX);
+			fields |= BIT(3);
+		} else if (!strcmp(key, "PreciseSyncRate")) {
+			ret = parse_int_bound(it.handle, &dim->precise_sync_rate,
+					      require_rate ? 1 : 0, U32_MAX);
+			fields |= BIT(4);
+		} else {
+			ret = skip(it.handle);
+		}
 
 		if (!IS_ERR_OR_NULL(key))
 			kfree(key);
@@ -315,6 +363,11 @@ static int parse_dimension(struct dcp_parse_ctx *handle, struct dimension *dim)
 		if (ret)
 			return ret;
 	}
+
+	if ((fields & GENMASK(3, 0)) != GENMASK(3, 0) ||
+	    (require_rate && !(fields & BIT(4))) ||
+	    dim->active + dim->front_porch + dim->sync_width > dim->total)
+		return -EINVAL;
 
 	return 0;
 }
@@ -370,7 +423,10 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 	dcp_parse_foreach_in_array(handle, outer_it) {
 		struct iterator it;
 		bool is_virtual = true;
-		struct color_mode cmode;
+		struct color_mode cmode = {
+			.colorimetry = -1, .depth = -1, .dynamic_range = -1,
+			.eotf = -1, .id = -1, .pixel_encoding = -1, .score = -1,
+		};
 
 		dcp_parse_foreach_in_dict(handle, it) {
 			char *key = parse_string(it.handle);
@@ -404,7 +460,8 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 		}
 
 		/* Skip virtual or partial entries */
-		if (is_virtual || cmode.score < 0 || cmode.id < 0)
+		if (is_virtual || cmode.score < 0 || cmode.id < 0 ||
+		    cmode.id > U32_MAX)
 			continue;
 
 		trace_iomfb_color_mode(handle->dcp, cmode.id, cmode.score,
@@ -433,26 +490,34 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
  * specifies the clock in kHz. The intermediate result may overflow a u32, so
  * use a u64 where required.
  */
-static u32 calculate_clock(struct dimension *horiz, struct dimension *vert)
+static u64 calculate_clock(struct dimension *horiz, struct dimension *vert)
 {
-	u32 pixels = horiz->total * vert->total;
-	u64 clock = mul_u32_u32(pixels, vert->precise_sync_rate);
+	u64 pixels = (u64)horiz->total * vert->total;
+	u64 clock = pixels * vert->precise_sync_rate;
 
 	return DIV_ROUND_CLOSEST_ULL(clock >> 16, 1000);
 }
 
 static int parse_mode(struct dcp_parse_ctx *handle,
 		      struct dcp_display_mode *out, s64 *score, int width_mm,
-		      int height_mm, unsigned notch_height)
+		      int height_mm, unsigned notch_height, bool internal)
 {
 	int ret = 0;
 	struct iterator it;
-	struct dimension horiz, vert;
+	struct dimension horiz = {}, vert = {};
+	u64 clock;
 	s64 min_vrr = 0, max_vrr = 0;
 	s64 id = -1;
 	s64 best_color_mode = -1;
 	bool is_virtual = false;
 	struct drm_display_mode *mode = &out->mode;
+
+	*out = (struct dcp_display_mode) {};
+	out->sdr_rgb.score = -1;
+	out->sdr_444.score = -1;
+	out->sdr.score = -1;
+	out->best.score = -1;
+	*score = -1;
 
 	dcp_parse_foreach_in_dict(handle, it) {
 		char *key = parse_string(it.handle);
@@ -462,9 +527,9 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		else if (is_virtual)
 			skip(it.handle);
 		else if (!strcmp(key, "HorizontalAttributes"))
-			ret = parse_dimension(it.handle, &horiz);
+			ret = parse_dimension(it.handle, &horiz, false);
 		else if (!strcmp(key, "VerticalAttributes"))
-			ret = parse_dimension(it.handle, &vert);
+			ret = parse_dimension(it.handle, &vert, true);
 		else if (!strcmp(key, "MinimumVariableRefreshRate"))
 			ret = parse_int_bound(it.handle, &min_vrr, 0, U32_MAX);
 		else if (!strcmp(key, "MaximumVariableRefreshRate"))
@@ -500,9 +565,16 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 	trace_iomfb_parse_mode_success(id, &horiz, &vert, best_color_mode,
 				       is_virtual, *score);
 
-	/*
-	 * Reject modes without valid color mode.
-	 */
+	/* Reject incomplete records before deriving DRM timings. */
+	if (*score < 0 || id < 0 || id > U32_MAX ||
+	    horiz.active <= 0 || vert.active <= 0 ||
+	    vert.precise_sync_rate <= 0 || vert.active <= notch_height)
+		return -EINVAL;
+
+	clock = calculate_clock(&horiz, &vert);
+	if (!clock || clock > INT_MAX)
+		return -EINVAL;
+
 	if (best_color_mode < 0)
 		return -EINVAL;
 
@@ -515,20 +587,21 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		return -EINVAL;
 
 	/*
-	* HACK:
-	* Mark the 120 Hz mode on j314/j316 (identified by resolution) as vrr.
-	* We still do not know how to drive VRR but at least seetinng timestamps
-	* in the the swap_surface message to non-zero values drives the display
-	* at 120 fps.
-	*/
-	if (vert.precise_sync_rate >> 16 == 120 &&
-	    ((horiz.active == 3024 && vert.active == 1964) ||
-	     (horiz.active == 3456 && vert.active == 2234)))
+	 * An internal ProMotion panel carries no EDID or DisplayID, so DCP
+	 * reports no adaptive-sync range for it. Assume the ProMotion floor of
+	 * 24 Hz up to whatever rate the mode itself advertises.
+	 */
+	if (internal && vert.precise_sync_rate >> 16 == 120) {
+		out->min_vrr = 24 << 16;
+		out->max_vrr = vert.precise_sync_rate;
 		out->vrr = true;
+	}
 
-	if (min_vrr && max_vrr) {
+	/* Refresh rates are reported by DCP as 16.16 fixed-point Hz. */
+	if (min_vrr && max_vrr > min_vrr) {
 		out->min_vrr = min_vrr;
 		out->max_vrr = max_vrr;
+		out->vrr = true;
 	}
 
 	vert.active -= notch_height;
@@ -537,7 +610,7 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 	/* From here we must succeed. Start filling out the mode. */
 	*mode = (struct drm_display_mode) {
 		.type = DRM_MODE_TYPE_DRIVER,
-		.clock = calculate_clock(&horiz, &vert),
+		.clock = clock,
 
 		.vdisplay = vert.active,
 		.vsync_start = vert.active + vert.front_porch,
@@ -568,7 +641,8 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 
 struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 					 unsigned int *count, int width_mm,
-					 int height_mm, unsigned notch_height)
+					 int height_mm, unsigned notch_height,
+					 bool internal)
 {
 	struct iterator it;
 	int ret;
@@ -581,6 +655,9 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 	if (ret)
 		return ERR_PTR(ret);
 
+	if (it.len > 4096 || it.len > (handle->len - handle->pos) / sizeof(u32))
+		return ERR_PTR(-E2BIG);
+
 	/* Start with a worst case allocation */
 	modes = kmalloc_array(it.len, sizeof(*modes), GFP_KERNEL);
 	*count = 0;
@@ -589,8 +666,19 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 		return ERR_PTR(-ENOMEM);
 
 	for (; it.idx < it.len; ++it.idx) {
+		struct dcp_parse_ctx next = *handle;
+
+		ret = skip(&next);
+		if (ret) {
+			kfree(modes);
+			*count = 0;
+			return ERR_PTR(ret);
+		}
+
 		mode = &modes[*count];
-		ret = parse_mode(it.handle, mode, &score, width_mm, height_mm, notch_height);
+		ret = parse_mode(it.handle, mode, &score, width_mm, height_mm,
+				 notch_height, internal);
+		*handle = next;
 
 		/* Errors for a single mode are recoverable -- just skip it. */
 		if (ret)
@@ -611,24 +699,61 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 	return modes;
 }
 
+int replace_modes(struct dcp_parse_ctx *handle,
+		  struct dcp_display_mode **modes, unsigned int *count,
+		  int width_mm, int height_mm, unsigned int notch_height,
+		  bool internal)
+{
+	struct dcp_display_mode *next;
+	struct dcp_parse_ctx extent = *handle;
+	struct iterator it;
+	unsigned int next_count;
+	int ret;
+
+	ret = iterator_begin(&extent, &it, false);
+	if (ret)
+		return ret;
+
+	next = enumerate_modes(handle, &next_count, width_mm, height_mm,
+			       notch_height, internal);
+	if (IS_ERR(next))
+		return PTR_ERR(next);
+	if (it.len && !next_count) {
+		kfree(next);
+		return -EINVAL;
+	}
+
+	kfree(*modes);
+	*modes = next;
+	*count = next_count;
+	return 0;
+}
+
 int parse_display_attributes(struct dcp_parse_ctx *handle, int *width_mm,
-			     int *height_mm)
+			     int *height_mm, bool *backlight_control)
 {
 	int ret = 0;
 	struct iterator it;
 	s64 width_cm = 0, height_cm = 0;
 
-	dcp_parse_foreach_in_dict(handle, it) {
+	*backlight_control = false;
+
+	ret = iterator_begin(handle, &it, true);
+	if (ret)
+		return ret;
+	for (; it.idx < it.len; ++it.idx) {
 		char *key = parse_string(it.handle);
 
 		if (IS_ERR(key))
 			ret = PTR_ERR(key);
 		else if (!strcmp(key, "MaxHorizontalImageSize"))
-			ret = parse_int(it.handle, &width_cm);
+			ret = parse_int_bound(it.handle, &width_cm, 0, INT_MAX / 10);
 		else if (!strcmp(key, "MaxVerticalImageSize"))
-			ret = parse_int(it.handle, &height_cm);
+			ret = parse_int_bound(it.handle, &height_cm, 0, INT_MAX / 10);
+		else if (!strcmp(key, "SupportsBacklightControl"))
+			ret = parse_bool_or_skip(it.handle, backlight_control);
 		else
-			skip(it.handle);
+			ret = skip(it.handle);
 
 		if (!IS_ERR_OR_NULL(key))
 			kfree(key);

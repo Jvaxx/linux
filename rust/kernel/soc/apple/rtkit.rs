@@ -48,6 +48,9 @@ pub trait Operations {
     /// Type representing an allocated buffer for RTKit.
     type Buffer: Buffer;
 
+    /// Firmware chooses and announces shared-buffer addresses.
+    const COPROC_PLACES_BUFFERS: bool = false;
+
     /// Called when RTKit crashes.
     fn crashed(_data: <Self::Data as ForeignOwnable>::Borrowed<'_>, _crashlog: Option<&[u8]>) {}
 
@@ -98,7 +101,30 @@ pub trait Operations {
 pub struct RtKit<T: Operations> {
     rtk: *mut bindings::apple_rtkit,
     data: *mut core::ffi::c_void,
+    retain_shared_buffers: bool,
     _p: PhantomData<T>,
+}
+
+// The wrapper owns opaque pointers. Neither the C allocation nor the foreign
+// callback context points back to this Rust wrapper, so moving it is safe.
+impl<T: Operations> Unpin for RtKit<T> {}
+/// Discovery result type retained for compile compatibility with optional backends.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct EpmapSnapshot {
+    /// Raw HELLO message.
+    pub raw_hello: u64,
+    /// Minimum protocol version.
+    pub hello_min_version: u16,
+    /// Maximum protocol version.
+    pub hello_max_version: u16,
+    /// Endpoint bitmap.
+    pub endpoints: [u64; 4],
+}
+impl EpmapSnapshot {
+    /// Test an advertised endpoint.
+    pub fn has_endpoint(&self, endpoint: u8) -> bool {
+        self.endpoints[endpoint as usize / 64] & (1u64 << (endpoint % 64)) != 0
+    }
 }
 
 unsafe extern "C" fn crashed_callback<T: Operations>(
@@ -159,6 +185,10 @@ unsafe extern "C" fn shmem_setup_callback<T: Operations>(
         let iova = buf.iova()?;
         let iosys_map = buf.buf()?;
 
+        // The C transport accesses this pointer as normal system memory.
+        if iosys_map.is_iomem() {
+            return Err(EINVAL);
+        }
         if iosys_map.size() < bfr_mut.size {
             return Err(ENOMEM);
         }
@@ -191,6 +221,7 @@ unsafe extern "C" fn shmem_destroy_callback<T: Operations>(
 
 impl<T: Operations> RtKit<T> {
     const VTABLE: bindings::apple_rtkit_ops = bindings::apple_rtkit_ops {
+        flags: if T::COPROC_PLACES_BUFFERS { bindings::APPLE_RTKIT_COPROC_PLACES_BUFFERS } else { 0 },
         crashed: Some(crashed_callback::<T>),
         recv_message: Some(recv_message_callback::<T>),
         recv_message_early: Some(recv_message_early_callback::<T>),
@@ -238,8 +269,27 @@ impl<T: Operations> RtKit<T> {
         Ok(Self {
             rtk,
             data: ptr,
+            retain_shared_buffers: false,
             _p: PhantomData,
         })
+    }
+
+    /// Requests acknowledged RTKit shutdown using the C core's bounded waits.
+    ///
+    /// The caller must not hold a lock needed by its receive callbacks: the
+    /// shutdown path also drains the RTKit workqueue.
+    pub fn shutdown(self: Pin<&mut Self>) -> Result {
+        // SAFETY: `rtk` is valid and the mutable borrow excludes other callers.
+        to_result(unsafe { bindings::apple_rtkit_shutdown(self.rtk) })
+    }
+
+    /// Retains firmware-visible buffers when a shutdown cannot be confirmed.
+    ///
+    /// Drop will still close callbacks and drain the private RTKit queue, but
+    /// shared mappings/allocation contexts remain retained until reboot. The
+    /// owner must retain its own DMA buffers too. This does not permit reprobe.
+    pub fn retain_shared_buffers_on_drop(&mut self) {
+        self.retain_shared_buffers = true;
     }
 
     /// Boots (wakes up) the RTKit coprocessor.
@@ -252,6 +302,23 @@ impl<T: Operations> RtKit<T> {
     pub fn boot(self: Pin<&mut Self>) -> Result {
         // SAFETY: `rtk` is valid per the type invariant.
         to_result(unsafe { bindings::apple_rtkit_boot(self.rtk) })
+    }
+
+
+
+    /// Passive endpoint discovery is not supported in the M3 runtime path.
+    pub fn new_epmap_only(
+        _dev: &device::Device,
+        _mbox_name: Option<&'static CStr>,
+        _mbox_idx: usize,
+        _data: T::Data,
+    ) -> Result<Self> {
+        Err(crate::error::Error::from_errno(-(bindings::EOPNOTSUPP as i32)))
+    }
+
+    /// Refuse unsupported discovery instead of changing normal RTKit boot.
+    pub fn discover_epmap(self: Pin<&mut Self>) -> Result<EpmapSnapshot> {
+        Err(crate::error::Error::from_errno(-(bindings::EOPNOTSUPP as i32)))
     }
 
     /// Starts a non-system endpoint.
@@ -272,6 +339,18 @@ impl<T: Operations> RtKit<T> {
     pub fn has_endpoint(self: Pin<&mut Self>, endpoint: u8) -> bool {
         unsafe { bindings::apple_rtkit_has_endpoint(self.rtk, endpoint) }
     }
+
+    /// Returns whether the coprocessor is running (not crashed, IOP and AP power states on).
+    pub fn is_running(&self) -> bool {
+        // SAFETY: `rtk` is valid per the type invariant. The call only reads state.
+        unsafe { bindings::apple_rtkit_is_running(self.rtk) }
+    }
+
+    /// Returns whether the coprocessor has reported a crash.
+    pub fn is_crashed(&self) -> bool {
+        // SAFETY: `rtk` is valid per the type invariant. The call only reads state.
+        unsafe { bindings::apple_rtkit_is_crashed(self.rtk) }
+    }
 }
 
 // SAFETY: `RtKit` operations require a mutable reference
@@ -283,7 +362,13 @@ unsafe impl<T: Operations> Send for RtKit<T> {}
 impl<T: Operations> Drop for RtKit<T> {
     fn drop(&mut self) {
         // SAFETY: The pointer is valid by the type invariant.
-        unsafe { bindings::apple_rtkit_free(self.rtk) };
+        unsafe {
+            if self.retain_shared_buffers {
+                bindings::apple_rtkit_free_retaining_buffers(self.rtk);
+            } else {
+                bindings::apple_rtkit_free(self.rtk);
+            }
+        }
 
         // Free context data.
         //

@@ -6,15 +6,20 @@ config DRM_APPLE
 	depends on APPLE_RTKIT
 	depends on OF_ADDRESS
 	select APPLE_PMP_REPORT
+	select APPLE_J613_DISPLAY_GATE if ARCH_APPLE
+	select OF_DYNAMIC
 	select DRM_CLIENT_SELECTION
 	select DRM_KMS_HELPER
 	select DRM_KMS_DMA_HELPER
+	select DRM_GEM_SHMEM_HELPER
 	select DRM_GEM_DMA_HELPER
 	select VIDEOMODE_HELPERS
 	depends on BACKLIGHT_CLASS_DEVICE
 	select MULTIPLEXER
+	select DRM_APPLE_FABRIC_CORE
 	help
-	  Say Y if you have an Apple Silicon chipset.
+	  Say Y if you have an Apple Silicon chipset. This includes the
+	  Type-C display fabric and Thunderbolt display routing.
 
 config DRM_APPLE_AUDIO
 	bool "DisplayPort/HDMI Audio support"
@@ -28,3 +33,29 @@ config DRM_APPLE_DEBUG
 	bool "Enable additional driver debugging"
 	depends on DRM_APPLE
 	depends on EXPERT # only for developers
+
+config DRM_APPLE_KUNIT_TEST
+	tristate "KUnit tests for Apple display state" if !KUNIT_ALL_TESTS
+	depends on KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Test modeset and hotplug state transitions without display hardware,
+	  including link changes that race with a modeset and recovery after
+	  failed modesets. These tests can run on other architectures and do
+	  not require the Apple display driver to be enabled. Also test service
+	  ownership and pending commands across disconnect and reannouncement.
+
+config DRM_APPLE_DISPLAY_KUNIT_TEST
+	bool "KUnit tests for Apple display mode probing" if !KUNIT_ALL_TESTS
+	depends on KUNIT && DRM_APPLE
+	select DRM_KUNIT_TEST_HELPERS
+	select DRM_CLIENT
+	default KUNIT_ALL_TESTS
+	help
+	  Test the production timing parser and display reply bounds without
+	  Apple display hardware, including incomplete records and stable
+	  preferred mode selection. Exercise mode list replacement and EDID
+	  invalidation when a sink or display route changes. Check connector
+	  status updates before hotplug notifications and same-state retrains.
+	  Check which 14.x board record an internal display gets on which
+	  machine, and which DCP firmware image each record admits.

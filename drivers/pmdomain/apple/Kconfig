@@ -21,3 +21,35 @@ config APPLE_PMP_REPORT
 	select PM_GENERIC_DOMAINS
 
 endif
+
+config APPLE_PMP_REPORT_KUNIT_TEST
+	tristate "Apple PMP report validation tests" if !KUNIT_ALL_TESTS
+	depends on KUNIT && PM
+	select PM_GENERIC_DOMAINS
+	default KUNIT_ALL_TESTS
+	help
+	  Tests the PMP report layout, request acknowledgment flags and boot
+	  argument validation without accessing hardware.
+	  Includes malformed tables, address arithmetic and device ordering.
+	  The PMP report driver does not need to be enabled to run this suite.
+
+config APPLE_PMC
+	bool "Apple PMC voter interface"
+	depends on OF
+	depends on PM
+	select PM_GENERIC_DOMAINS
+	default ARCH_APPLE
+	help
+	  The PMC in some Apple SoCs arbitrates the performance states of
+	  shared rails, such as the DRAM controller and the SoC fabric,
+	  between voter agents. This driver enables the static agents and
+	  provides power domains that enable a dynamic agent, such as the
+	  GPU, while its device is powered on. It can also limit the DRAM
+	  controller rail as a thermal cooling device.
+
+
+config APPLE_PMP_REPORT_NEO
+	bool "Apple T8140 PMP report and fast die-temperature limits"
+	depends on ARCH_APPLE && OF && PM
+	select PM_GENERIC_DOMAINS
+	default ARCH_APPLE

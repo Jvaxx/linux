@@ -28,6 +28,7 @@
  */
 #include <linux/hrtimer_types.h>
 
+#include <crypto/sha2.h>
 #include <linux/acpi.h>
 #include <linux/gpu_buddy.h>
 #include <drm/drm_device.h>
@@ -62,6 +63,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/dma-resv.h>
 #include <linux/errname.h>
+#include <linux/soc/apple/pmp.h>
 #include <linux/ethtool.h>
 #include <linux/fdtable.h>
 #include <linux/file.h>
@@ -102,6 +104,7 @@
 #include <linux/soc/apple/rtkit.h>
 #include <linux/sys_soc.h>
 #include <linux/task_work.h>
+#include <linux/thermal.h>
 #include <linux/tracepoint.h>
 #include <linux/usb.h>
 #include <linux/wait.h>
@@ -109,7 +112,12 @@
 #include <linux/xarray.h>
 #include <sound/core.h>
 #include <sound/dmaengine_pcm.h>
+#include <linux/pm_domain.h>
+#include <linux/pm_runtime.h>
 #include <sound/pcm.h>
+#include <sound/soc.h>
+#include <sound/soc-dpcm.h>
+#include <sound/tlv.h>
 #include <trace/events/rust_sample.h>
 
 /*
@@ -136,9 +144,15 @@ const gfp_t RUST_CONST_HELPER___GFP_HIGHMEM = ___GFP_HIGHMEM;
 const gfp_t RUST_CONST_HELPER___GFP_NOWARN = ___GFP_NOWARN;
 const blk_features_t RUST_CONST_HELPER_BLK_FEAT_ROTATIONAL = BLK_FEAT_ROTATIONAL;
 const uint32_t RUST_CONST_HELPER_DRM_EXEC_INTERRUPTIBLE_WAIT = DRM_EXEC_INTERRUPTIBLE_WAIT;
+const uint32_t RUST_CONST_HELPER_DRM_EXEC_IGNORE_DUPLICATES = DRM_EXEC_IGNORE_DUPLICATES;
+const u32 RUST_CONST_HELPER_APPLE_RTKIT_COPROC_PLACES_BUFFERS = APPLE_RTKIT_COPROC_PLACES_BUFFERS;
 const fop_flags_t RUST_CONST_HELPER_FOP_UNSIGNED_OFFSET = FOP_UNSIGNED_OFFSET;
 
 const u64 BINDINGS_SNDRV_PCM_FMTBIT_FLOAT_LE = SNDRV_PCM_FMTBIT_FLOAT_LE;
+const u64 BINDINGS_SNDRV_PCM_FMTBIT_S32_LE = SNDRV_PCM_FMTBIT_S32_LE;
+const u64 BINDINGS_SNDRV_PCM_FMTBIT_S24_LE = SNDRV_PCM_FMTBIT_S24_LE;
+const u32 BINDINGS_SNDRV_PCM_SUBFMTBIT_STD = SNDRV_PCM_SUBFMTBIT_STD;
+const snd_ctl_elem_iface_t BINDINGS_SNDRV_CTL_ELEM_IFACE_MIXER = SNDRV_CTL_ELEM_IFACE_MIXER;
 
 const u32 BINDINGS_IIO_CHAN_INFO_RAW = IIO_CHAN_INFO_RAW;
 const u32 BINDINGS_IIO_CHAN_INFO_PROCESSED = IIO_CHAN_INFO_PROCESSED;

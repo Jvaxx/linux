@@ -83,6 +83,7 @@ config RUST_APPLE_RTKIT
 	depends on PM
 	depends on RUST
 	select APPLE_RTKIT
+	select RUST_APPLE_MAILBOX
 
 config APPLE_AOP
 	tristate "Apple \"Always-on\" Processor"
@@ -90,24 +91,51 @@ config APPLE_AOP
 	depends on PM
 	depends on RUST
 	select RUST_APPLE_RTKIT
+	select RUST_APPLE_MAILBOX
+	select RUST_FW_LOADER_ABSTRACTIONS
 	help
 	  A co-processor persent on certain Apple SoCs controlling accelerometers,
 	  gyros, ambient light sensors and microphones. Is not actually always on.
 
 	  Say 'y' here if you have an Apple laptop.
 
+config APPLE_SEP_FV_INTERFACE
+	bool
+
 config APPLE_SEP
-	tristate "Apple Secure Element Processor"
-	depends on ARCH_APPLE || COMPILE_TEST
+	tristate "Apple SEP (Secure Enclave Processor)"
+	depends on ARCH_APPLE
 	depends on PM
 	depends on RUST
-	select RUST_APPLE_RTKIT
-	select RUST_APPLE_MAILBOX
+	depends on RUST_APPLE_MAILBOX
+	depends on HW_RANDOM
+	depends on TRUSTED_KEYS
+	depends on CRYPTO
+	depends on MFD_MACSMC || !MFD_MACSMC
+	select CRYPTO_HMAC
+	select CRYPTO_SHA256
+	select CRYPTO_AES
+	select CRYPTO_GCM
+	select CRYPTO_ECDH
+	select APPLE_SEP_FV_INTERFACE
+	select RUST_FW_LOADER_ABSTRACTIONS
 	help
-	  A security co-processor persent on Apple SoCs, controlling transparent
-	  disk encryption, secure boot, HDCP, biometric auth and probably more.
+	  Driver for the Apple SEP (Secure Enclave Processor) on Apple silicon.
+	  It drives the Touch ID fingerprint sensor over a /dev/sep-bio character
+	  device (enrol and match), exposes the SEP hardware RNG, and registers a
+	  SEP-backed trusted key source so keyctl can seal keys to the enclave.
 
-	  Say 'y' here if you have an Apple SoC.
+	  The driver reads the existing machine-wide xART gigalocker directly from
+	  the iBoot system container, locating its .gl extent through read-only,
+	  checksum-validated APFS metadata. It validates the complete store and
+	  both root records before registering with SEP.
+	  Shared xART writes and identity-keybag creation default on. A write
+	  still runs only when APFS proves a single unsnapshotted .gl extent.
+	  The first boot creates the Linux identity keybag when it is absent.
+	  With writes off the driver still attaches, but refuses Touch ID enrol
+	  and verify: the enclave saves anti-replay state after every match.
+
+	  Say Y here if you have an Apple silicon Mac.
 
 config APPLE_PMP
 	tristate "Apple Power Management Processor"
@@ -122,6 +150,81 @@ config APPLE_PMP
 
 	  Say 'y' here if you have an Apple SoC.
 
+config APPLE_J613_DISPLAY_GATE
+	bool "Apple J613 25G83 display boot gate"
+	depends on ARCH_APPLE && OF_DYNAMIC && OF_ADDRESS
+	select VIDEO
+	default ARCH_APPLE
+	help
+	  Enable the exact J613 26.6.2 display and PMP nodes before platform
+	  population after validating the boot loader's handoff and this Mac's
+	  clock and PMP values. This built-in gate also supports modular DRM.
+	  Missing or invalid handoffs keep the boot framebuffer available.
+
+config APPLE_T6030_DISPLAY_GATE
+	bool "Apple T6030 internal display enable gate"
+	depends on ARCH_APPLE && OF_DYNAMIC && OF_OVERLAY
+	default ARCH_APPLE
+	help
+	  The T6030 device tree keeps the internal display nodes disabled so
+	  the display stays on the boot framebuffer until the boot loader has
+	  validated the display handoff. This option enables those nodes
+	  before devices are created once the boot loader has marked the
+	  handoff as validated, and adds the power management processor
+	  from a built-in overlay, with the values the boot loader passes
+	  for this Mac (or, on a J516S whose boot loader passes none,
+	  built-in ones). Without them it does nothing.
+	  apple_t6030_display.enable=0 keeps the boot framebuffer.
+
+	  The same gate serves T8122 (M3) device trees with
+	  apple,t8122-handoff and the T8122 PMP overlay. It enables the T8122
+	  external display processor only when the boot loader has marked it
+	  apple,t8122-dcpext-firmware-ready, and not with nomodeset.
+
+	  It also serves T6031 (M3 Max) device trees with apple,t6031-handoff,
+	  but only for a boot with apple_t6031_display.enable=1 on the kernel
+	  command line, and only with the PMP values the boot loader passes.
+
+	  Say 'y' if you want the native display on M3 Pro MacBook Pros.
+
+config APPLE_DISPLAY_GATE_KUNIT_TEST
+	bool "KUnit tests for the Apple display gate" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && APPLE_T6030_DISPLAY_GATE
+	default KUNIT_ALL_TESTS
+	help
+	  Runs the display gate on test device trees with the T6031 and the
+	  T6030 display nodes, without Apple hardware. On T6031: off by
+	  default, enabled only by apple_t6031_display.enable=1, only with the
+	  boot loader's handoff marker and this Mac's PMP values, and with
+	  nothing changed when a check fails. On T6030: on by default, as
+	  before, whatever the T6031 option says.
+
 endmenu
 
 endif
+
+config APPLE_MCC
+	tristate "Apple T8140 system level cache"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on OF
+	default ARCH_APPLE
+	help
+	  The boot firmware of the Apple T8140 SoC enables the system level
+	  cache without letting it allocate. This driver allows allocation
+	  once the devices that took over DMA from the bootloader are bound.
+
+	  Say 'y' or 'm' here if you have an Apple T8140 SoC.
+
+
+config APPLE_CLPC
+	tristate "Apple host performance controller floors"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on APPLE_PMC && CPU_FREQ
+	select MFD_SYSCON
+	default ARCH_APPLE
+	help
+	  Raises the DRAM controller and SoC fabric performance floors of the
+	  host's PMC voter agent while CPU clusters, and optionally the GPU,
+	  are busy, and releases them at idle.
+
+	  Say 'y' or 'm' here if you have an Apple SoC with a PMC.
