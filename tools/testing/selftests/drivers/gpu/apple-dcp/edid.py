@@ -45,9 +45,10 @@ static void bitmap_release_region(unsigned long *p,unsigned int bit,int order) {
 #define cpu_to_le32(x) (x)
 #define dev_warn(...) ((void)0)
 #define dev_err(...) do { diagnostic_errors++; } while (0)
+#define dev_dbg(dev,fmt,...) do { if(!strcmp(fmt,"DCPAVSERV: legacy EDID service published\n")) legacy_publishes++; } while (0)
 #define dev_info(...) do { diagnostic_information++; } while (0)
 
-static unsigned diagnostic_errors,diagnostic_information;
+static unsigned diagnostic_errors,diagnostic_information,legacy_publishes;
 #define DCP_FIRMWARE_H17P 17
 #define EPIC_TYPE_NOTIFY 0
 #define EPIC_CAT_REPORT 0
@@ -339,7 +340,8 @@ static void repeated_announcements(void)
     dpavservep_detach(&d);afk_service_publish(legacy);dcpavserv_init(legacy,name,native_class,0);
     assert(!d.dcpavserv.service && legacy->torndown);
     legacy=prepare(13,0,name,native_class);assert(legacy);
-    d.typec_generation++;afk_service_publish(legacy);dcpavserv_init(legacy,name,native_class,0);
+    legacy_publishes=0;d.typec_generation++;afk_service_publish(legacy);dcpavserv_init(legacy,name,native_class,0);
+    assert(legacy_publishes==1);
     assert(d.dcpavserv.service==legacy && legacy->users==1);dpavservep_detach(&d);
     assert(dcpdpserv_prepare(legacy,"dcpdp-service-epic",native_class,0)==0);
     ep.wire_v2=true;ep.endpoint=0x2a;d.external_physically_absent=false;
@@ -573,6 +575,7 @@ static bool *once(bool *p) { assert(*p); *p=false; return NULL; }
 #define scoped_guard(k,p) for(bool *_lock __attribute__((cleanup(release)))=acquire(p); _lock; _lock=once(_lock))
 static void mutex_lock(bool *p) { (void)acquire(p); }
 static void mutex_unlock(bool *p) { (void)once(p); }
+#define dev_dbg(...) ((void)0)
 #define dev_info(...) ((void)0)
 #define dev_err(...) ((void)0)
 #define trace_dcpavserv_init(...) ((void)0)
@@ -932,3 +935,95 @@ int main(void)
 }
 '''
     return prefix + '\n'.join(parts) + suffix
+
+
+def startup(root):
+    source = (root / 'drivers/gpu/drm/apple/epic/dpavservep.c').read_text()
+    return r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <errno.h>
+#define DCP_IOMFB_METHODS_H17P_EXTERNAL 2
+#define DPAVSERV_ENDPOINT 0x28
+#define DPAVSERV_ENDPOINT_V2 0x2a
+#define IS_ERR(p) ((uintptr_t)(p) > (uintptr_t)-4096)
+#define PTR_ERR(p) ((int)(intptr_t)(p))
+#define ERR_PTR(e) ((void *)(intptr_t)(e))
+#define dev_warn(...) do { warnings++; } while (0)
+#define dev_dbg(...) do { debug++; } while (0)
+struct apple_dcp;
+struct apple_dcp_afkep {
+    struct apple_dcp *dcp;
+    unsigned endpoint;
+    bool wire_v2,inline_v2,match_epic_name;
+};
+struct apple_dcp {
+    void *dev;
+    struct { int iomfb_method_profile; } hw;
+    struct { unsigned enable_completion; bool enabled; } dcpavserv;
+    struct apple_dcp_afkep *dcpavservep;
+};
+static const unsigned dpavservep_ops[] = {0};
+static struct apple_dcp_afkep endpoint;
+static int init_error,start_error;
+static unsigned warnings,waits,starts,shutdowns,detaches,debug;
+static bool announce;
+static void init_completion(unsigned *c) { *c=0; }
+static unsigned msecs_to_jiffies(unsigned ms) { return ms; }
+static unsigned wait_for_completion_timeout(unsigned *c,unsigned timeout)
+{ assert(timeout==1000);waits++;return *c; }
+static struct apple_dcp_afkep *afk_init(struct apple_dcp *d,unsigned ep,const void *ops)
+{
+    assert(ops==dpavservep_ops);
+    endpoint=(struct apple_dcp_afkep){.dcp=d,.endpoint=ep};
+    return init_error ? ERR_PTR(init_error) : &endpoint;
+}
+static int afk_start(struct apple_dcp_afkep *ep)
+{
+    starts++;
+    assert(ep==&endpoint&&ep->match_epic_name);
+    if(announce&&!start_error) {
+        ep->dcp->dcpavserv.enabled=true;
+        ep->dcp->dcpavserv.enable_completion=1;
+    }
+    return start_error;
+}
+static void afk_shutdown(struct apple_dcp_afkep *ep)
+{ assert(ep==&endpoint);shutdowns++; }
+static void dpavservep_detach(struct apple_dcp *d)
+{ detaches++;d->dcpavserv.enabled=false; }
+''' + block(source, 'int dpavservep_init(') + r'''
+int main(void)
+{
+    for(unsigned v2=0;v2<2;v2++) {
+        for(unsigned early=0;early<2;early++) {
+            struct apple_dcp d={.hw={.iomfb_method_profile=v2?2:0}};
+            announce=early;waits=warnings=starts=shutdowns=detaches=debug=0;
+            assert(dpavservep_init(&d)==0);
+            assert(starts==1&&waits==!v2&&!warnings&&!shutdowns&&!detaches);
+            assert(d.dcpavservep==&endpoint&&endpoint.wire_v2==v2&&!endpoint.inline_v2);
+            assert(endpoint.endpoint==(v2?DPAVSERV_ENDPOINT_V2:DPAVSERV_ENDPOINT));
+            /* A missing optional service must not be fabricated as enabled. */
+            assert(d.dcpavserv.enabled==early);
+            assert(debug==(!v2&&!early));
+            const int errors[]={-ENOMEM,-ETIMEDOUT};
+            for(unsigned i=0;i<sizeof(errors)/sizeof(errors[0]);i++) {
+                d=(struct apple_dcp){.hw={.iomfb_method_profile=v2?2:0}};
+                start_error=errors[i];waits=warnings=starts=shutdowns=detaches=0;
+                assert(dpavservep_init(&d)==errors[i]);
+                assert(starts==1&&!waits&&shutdowns==1&&detaches==1);
+                assert(!d.dcpavservep&&!d.dcpavserv.enabled);
+                start_error=0;
+            }
+            init_error=-ENOMEM;starts=shutdowns=detaches=0;
+            assert(dpavservep_init(&d)==-ENOMEM);
+            assert(!starts&&!shutdowns&&!detaches);
+            init_error=0;
+        }
+    }
+    puts("PASS optional legacy discovery, AFKV2 early/absent service, endpoint failures");
+    return 0;
+}
+'''
