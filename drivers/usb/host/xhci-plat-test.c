@@ -8,6 +8,7 @@
 #include <kunit/visibility.h>
 #include <linux/device.h>
 #include <linux/module.h>
+#include <linux/pm_runtime.h>
 #include <linux/property.h>
 
 #include "xhci.h"
@@ -91,6 +92,54 @@ static void xhci_plat_quiesce_dying_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, xhci->xhc_state & XHCI_STATE_HALTED);
 }
 
+#ifdef CONFIG_PM
+static int xhci_plat_test_rpm_ret;
+
+static int xhci_plat_test_runtime_resume(struct device *dev)
+{
+	return xhci_plat_test_rpm_ret;
+}
+
+static struct dev_pm_domain xhci_plat_test_pm_domain = {
+	.ops = { .runtime_resume = xhci_plat_test_runtime_resume },
+};
+
+static struct device *xhci_plat_test_rpm_device(struct kunit *test, int rpm_ret)
+{
+	struct device *dev = kunit_device_register(test, "xhci-plat-rpm-test");
+
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dev);
+	xhci_plat_test_rpm_ret = rpm_ret;
+	dev->pm_domain = &xhci_plat_test_pm_domain;
+	pm_runtime_set_suspended(dev);
+	pm_runtime_enable(dev);
+	return dev;
+}
+
+/* A runtime resume that fails before system sleep fails the system suspend. */
+static void xhci_plat_resume_from_runtime_error_test(struct kunit *test)
+{
+	struct device *dev = xhci_plat_test_rpm_device(test, -ETIMEDOUT);
+
+	KUNIT_EXPECT_EQ(test, xhci_plat_resume_from_runtime(dev), -ETIMEDOUT);
+	KUNIT_EXPECT_TRUE(test, pm_runtime_suspended(dev));
+	pm_runtime_disable(dev);
+	dev->pm_domain = NULL;
+}
+
+/* A successful one, and an active controller, let it go ahead. */
+static void xhci_plat_resume_from_runtime_ok_test(struct kunit *test)
+{
+	struct device *dev = xhci_plat_test_rpm_device(test, 0);
+
+	KUNIT_EXPECT_EQ(test, xhci_plat_resume_from_runtime(dev), 0);
+	KUNIT_EXPECT_TRUE(test, pm_runtime_active(dev));
+	KUNIT_EXPECT_EQ(test, xhci_plat_resume_from_runtime(dev), 0);
+	pm_runtime_disable(dev);
+	dev->pm_domain = NULL;
+}
+#endif /* CONFIG_PM */
+
 static u64 xhci_plat_test_quirks(struct kunit *test, const struct property_entry *props)
 {
 	struct device *dev;
@@ -147,6 +196,10 @@ static struct kunit_case xhci_plat_test_cases[] = {
 	KUNIT_CASE(xhci_plat_keep_running_other_quirks_test),
 	KUNIT_CASE(xhci_plat_stopped_test),
 	KUNIT_CASE(xhci_plat_quiesce_dying_test),
+#ifdef CONFIG_PM
+	KUNIT_CASE(xhci_plat_resume_from_runtime_error_test),
+	KUNIT_CASE(xhci_plat_resume_from_runtime_ok_test),
+#endif
 	KUNIT_CASE(xhci_plat_no_property_quirks_test),
 	KUNIT_CASE(xhci_plat_run_in_s2idle_property_test),
 	KUNIT_CASE(xhci_plat_all_property_quirks_test),

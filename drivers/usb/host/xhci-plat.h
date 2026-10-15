@@ -41,6 +41,7 @@ u64 xhci_plat_property_quirks(struct device *dev);
 bool xhci_plat_keep_running(u64 quirks, suspend_state_t target, bool may_wakeup,
 			    bool wakeup_path);
 bool xhci_plat_stopped(u32 usbsts);
+int xhci_plat_resume_from_runtime(struct device *dev);
 #endif
 
 #endif	/* _XHCI_PLAT_H */
