@@ -12,6 +12,7 @@ def make_unit(source, parent=False, reference=None):
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <string.h>
 #include <errno.h>
 #include <pthread.h>
 typedef unsigned u32;
@@ -25,6 +26,7 @@ typedef unsigned u32;
 #define container_of(p,t,m) ((t *)((char *)(p)-offsetof(t,m)))
 #define to_platform_device(p) (p)
 #define typec_mux_get_drvdata(m) ((m)->data)
+#define dev_dbg(...) ((void)0)
 #define dev_warn(...) ((void)0)
 #define dev_info(...) ((void)0)
 #define dev_name(p) "device"
@@ -38,7 +40,7 @@ enum typec_data_role {TYPEC_HOST,TYPEC_DEVICE};
 #define TPS_STATUS_TO_TYPEC_VCONN(s) (s)
 #define TPS_STATUS_TO_TYPEC_DATAROLE(s) (s)
 struct typec_mux_state { void *alt; unsigned long mode; void *data; };
-struct typec_mux_dev { bool removed; void (*commit)(struct typec_mux_dev *,struct typec_mux_state *); void (*abort)(struct typec_mux_dev *,struct typec_mux_state *); int (*finish)(struct typec_mux_dev *,struct typec_mux_state *); void *data; int (*set)(struct typec_mux_dev *,struct typec_mux_state *); int (*prepare)(struct typec_mux_dev *,struct typec_mux_state *); };
+struct typec_mux_dev { bool removed, safe_after_role; void (*commit)(struct typec_mux_dev *,struct typec_mux_state *); void (*abort)(struct typec_mux_dev *,struct typec_mux_state *); int (*finish)(struct typec_mux_dev *,struct typec_mux_state *); void *data; int (*set)(struct typec_mux_dev *,struct typec_mux_state *); int (*prepare)(struct typec_mux_dev *,struct typec_mux_state *); };
 struct task_struct { int unused; };
 static _Thread_local struct task_struct this_task;
 #define current (&this_task)
@@ -65,6 +67,8 @@ static struct apple_dcp_typec_route route;
 static struct apple_dcp_typec_port *sole_port(void) { return &port; }
 static char events[100];static unsigned count;
 static int power_error,phy_error,tbt_error,role_error,last_error,phy_calls,reset_calls,gpio_calls,role_calls,stops,unregisters;
+static bool ordinary_port,controller_active,phy_off,safe_noop;
+
 static void event(char c) { assert(count+1<sizeof(events));events[count++]=c;events[count]=0; }
 static bool dcp_is_external_h17p(struct apple_dcp *d) { return d->external; }
 static int dcp_dptx_disconnect_oob(void *dev,u32 index) { (void)dev;assert(index==0);event('Q');stops++;if(power_error){display.external_error=power_error;return power_error;}display.external_cable=false;display.external_stopped=true;display.dptxport[0].connected=false;display.typec_cable_connected=false;connector.connected=false;return 0; }
@@ -85,7 +89,8 @@ struct cd321x { struct tps6598x tps; struct typec_mux *mux; void *tbt_switch; };
 struct typec_thunderbolt_switch_data { int state; };
 static void cd321x_stop_work(struct cd321x *c) { (void)c;event('W'); }
 static int typec_thunderbolt_switch_set(void *p,void *s) { (void)p;(void)s;event('B');return tbt_error; }
-static int usb_role_switch_set_role(void *p,int r) { (void)p;assert(r==USB_ROLE_NONE);event('R');role_calls++;return role_error; }
+static int usb_role_switch_set_role(void *p,int r) { (void)p;assert(r==USB_ROLE_NONE);if(ordinary_port&&!role_error){controller_active=false;phy_off=true;}event('R');role_calls++;return role_error; }
+static enum usb_role __attribute__((unused)) usb_role_switch_get_role(void *p) { (void)p;return controller_active?USB_ROLE_HOST:USB_ROLE_NONE; }
 static void typec_unregister_partner(void *p) { (void)p;event('P'); }
 #define typec_set_pwr_opmode(...) ((void)0)
 #define typec_set_pwr_role(...) ((void)0)
@@ -102,9 +107,12 @@ static void usb_role_switch_put(void *p) { (void)p;event('V'); }
 static void gpiod_set_value_cansleep(void *p,int v) { (void)p;assert(v==1);gpio_calls++;event('G'); }
 
 '''.replace('REMOVE_RETURN','void' if parent else 'int')
- functions='\n'.join(block(mux, marker) for marker in ('static void typec_mux_unlock(', 'void typec_mux_abort(', 'int typec_mux_begin(', 'int typec_mux_apply(', 'int typec_mux_end(', 'int typec_mux_prepare(')) if not parent else block((reference/'drivers/usb/typec/mux.c').read_text(),'int typec_mux_prepare(')+'\n'
+ policy=block(mux,'bool typec_mux_safe_after_role(')+'\n' if 'bool typec_mux_safe_after_role(' in mux else ''
+ functions=policy+'\n'.join(block(mux, marker) for marker in ('static void typec_mux_unlock(', 'void typec_mux_abort(', 'int typec_mux_begin(', 'int typec_mux_apply(', 'int typec_mux_end(', 'int typec_mux_prepare(')) if not parent else block((reference/'drivers/usb/typec/mux.c').read_text(),'int typec_mux_prepare(')+'\n'
  functions+=block(mux,'int typec_mux_set(')+'\n'+block(dcp,'static int dcp_typec_route_prepare(')+'\n'+block(dcp,'static int dcp_typec_route_finish(')+'\n'+block(dcp,'static void dcp_typec_route_commit(')+'\n'
  functions+=block(dcp,'static struct apple_dcp_typec_route *\ndcp_typec_rebalance_locked(')+'\n'
+ if 'static bool tps6598x_safe_after_role(' in core:
+  functions+=block(core,'static bool tps6598x_safe_after_role(')+'\n'
  if not parent:functions+=block(core,'static void tps6598x_drop_partner(')+'\n'+block(core,'static int tps6598x_set_data_role(')+'\n'
  functions+=block(core,'static '+('void' if parent else 'int')+' tps6598x_disconnect(')+'\n'+block(core,'static '+('void' if parent else 'int')+' cd321x_remove(')+'\n'+block(core,'void tipd_remove(')+'\n'
  controls=r'''
@@ -113,12 +121,13 @@ static struct typec_mux mux;
 static struct typec_port class_port;
 static struct tipd_data data;
 
-static int phy_set(struct typec_mux_dev *m,struct typec_mux_state *s) { (void)m;assert(s->mode==TYPEC_STATE_SAFE);event('L');phy_calls++;return phy_error; }
+static int phy_set(struct typec_mux_dev *m,struct typec_mux_state *s) { (void)m;assert(s->mode==TYPEC_STATE_SAFE);event('L');phy_calls++;if(ordinary_port&&controller_active)return -EBUSY;if(ordinary_port){assert(phy_off);safe_noop=true;}return phy_error; }
 static int display_set(struct typec_mux_dev *m,struct typec_mux_state *s) { (void)m;(void)s;event('S');if(port.owner&&display.external&&connector.connected) {int r=dcp_dptx_disconnect_oob(display.dev,0);if(r)return r;}if(port.safe_pending)return 0;port.owner=NULL;return 0; }
 static void unregister_port(struct tps6598x *t) { (void)t;unregisters++;event('U'); }
 static int reset(struct tps6598x *t) { (void)t;reset_calls++;event('X');return 0; }
 static void initial(struct cd321x *c) {
  count=0;events[0]=0;power_error=phy_error=tbt_error=role_error=last_error=phy_calls=reset_calls=gpio_calls=role_calls=stops=unregisters=deactivate_calls=0;
+ ordinary_port=false;controller_active=true;phy_off=safe_noop=false;
  connector=(struct connector){.connected=true};display=(struct apple_dcp){.external=true,.external_cable=true,.dptxport={{.connected=true}},.typec_cable_connected=true,.typec_connector=&connector};
  port=(struct apple_dcp_typec_port){.owner=&route,.applied_valid=true,.dp_wanted=true,.dp_hpd=true,.hpd=true};route=(struct apple_dcp_typec_route){.port=&port,.dcp=&display,.selected=true};
  phy_provider=(struct typec_mux_dev){.set=phy_set};display_provider=(struct typec_mux_dev){.data=&route,.set=display_set,.prepare=dcp_typec_route_prepare,.finish=dcp_typec_route_finish,.commit=dcp_typec_route_commit};
@@ -130,7 +139,62 @@ static int position(char c) { for(unsigned i=0;i<count;i++)if(events[i]==c)retur
 int main(int argc,char **argv) {
  (void)argc;struct cd321x c;struct typec_mux_state safe={.mode=TYPEC_STATE_SAFE};
  initial(&c);
- if(argv[1][0]=='o') {tipd_remove(&c.tps);fprintf(stderr,"ordered remove: %s\n",events);assert(position('Q')>=0&&position('Q')<position('R')&&position('Q')<position('L'));assert(!last_error&&reset_calls==1&&gpio_calls==1&&unregisters==1);}
+ if(!strcmp(argv[1],"ordered")) {tipd_remove(&c.tps);fprintf(stderr,"ordered remove: %s\n",events);assert(position('Q')>=0&&position('Q')<position('L')&&position('L')<position('R'));assert(!last_error&&reset_calls==1&&gpio_calls==1&&unregisters==1&&phy_calls==1);}
+ if(!strcmp(argv[1],"generic-disconnect")) {
+  c.tps.role_sw=&c;
+  assert(tps6598x_disconnect(&c.tps,0)==0);
+  assert(position('Q')<position('L')&&position('L')<position('R'));
+  assert(phy_calls==1&&!port.owner&&!mux.owner);
+ }
+ if(!strncmp(argv[1],"ordinary-",9)) {
+  ordinary_port=true;c.tps.role_sw=&c;phy_provider.safe_after_role=true;
+  if(!strcmp(argv[1],"ordinary-role-error"))role_error=-EBUSY;
+  if(!strcmp(argv[1],"ordinary-phy-error"))phy_error=-ETIMEDOUT;
+  if(!strcmp(argv[1],"ordinary-role-reprobe"))role_error=-EBUSY;
+  if(!strncmp(argv[1],"ordinary-unsupported-",21))role_error=-EOPNOTSUPP;
+  if(!strncmp(argv[1],"ordinary-unregistered-",22)) {
+   role_error=-EOPNOTSUPP;controller_active=false;phy_off=true;
+  }
+  if(!strcmp(argv[1],"ordinary-disconnect")||!strcmp(argv[1],"ordinary-unregistered-disconnect")||!strcmp(argv[1],"ordinary-unsupported-disconnect")) {
+   int ret=tps6598x_disconnect(&c.tps,0);
+   if(controller_active) {
+    assert(ret==-EOPNOTSUPP&&phy_calls==0&&role_calls==1);
+    assert(port.owner==&route&&port.safe_pending&&!mux.owner);
+   } else {
+    assert(ret==0);
+    assert(position('Q')>=0&&position('Q')<position('R')&&position('R')<position('L'));
+    assert(phy_calls==1&&safe_noop&&!port.owner&&!mux.owner);
+   }
+  } else {
+   tipd_remove(&c.tps);
+   if(role_error&&(role_error!=-EOPNOTSUPP||controller_active)) {
+    assert(last_error==role_error&&phy_calls==0&&role_calls==1);
+    assert(port.owner==&route&&port.safe_pending&&!reset_calls&&!gpio_calls);
+    if(!strcmp(argv[1],"ordinary-role-reprobe")) {
+     /* Probe submits SAFE through this same mux while the PIPE is live. */
+     assert(typec_mux_set(&mux,&safe)==-EBUSY);
+     assert(controller_active&&!phy_off&&!safe_noop&&phy_calls==1);
+     assert(port.owner==&route&&port.safe_pending&&!mux.owner);
+     /* A later successful shutdown allows probe's SAFE retry to commit. */
+     role_error=0;assert(usb_role_switch_set_role(c.tps.role_sw,USB_ROLE_NONE)==0);
+     assert(typec_mux_set(&mux,&safe)==0&&safe_noop&&!port.owner&&!mux.owner);
+    }
+   } else {
+    assert(position('Q')>=0&&position('Q')<position('R')&&position('R')<position('L'));
+    assert(phy_calls==1&&!controller_active&&safe_noop);
+    if(phy_error)assert(last_error==-ETIMEDOUT&&port.owner==&route&&port.safe_pending&&!reset_calls&&!gpio_calls);
+    else {assert(!last_error&&reset_calls==1&&gpio_calls==1&&!port.owner);}
+   }
+   assert(unregisters==1&&!mux.owner);
+  }
+ }
+ if(!strncmp(argv[1],"noop-fixed-",11)) {
+  c.tps.role_sw=&c;
+  if(!strcmp(argv[1],"noop-fixed-disconnect"))assert(tps6598x_disconnect(&c.tps,0)==0);
+  else tipd_remove(&c.tps);
+  assert(position('Q')<position('L')&&position('L')<position('R'));
+  assert(controller_active&&!phy_off&&!safe_noop&&phy_calls==1&&!port.owner&&!mux.owner);
+ }
  if(argv[1][0]=='p') {power_error=-EIO;tipd_remove(&c.tps);assert(port.safe_pending&&last_error==-EIO&&phy_calls==0&&role_calls==0&&reset_calls==0&&gpio_calls==0&&port.owner==&route&&unregisters==1);}
  if(argv[1][0]=='a') {phy_error=-ETIMEDOUT;tipd_remove(&c.tps);fprintf(stderr,"failed SAFE: error=%d reset=%d events=%s\n",last_error,reset_calls,events);assert(port.safe_pending&&last_error==-ETIMEDOUT&&phy_calls==1&&reset_calls==0&&gpio_calls==0&&port.owner==&route&&unregisters==1);}
  if(argv[1][0]=='r') {role_error=-EBUSY;tipd_remove(&c.tps);assert(last_error==-EBUSY&&phy_calls==1&&reset_calls==0&&gpio_calls==0&&port.safe_pending&&port.owner==&route);}
@@ -144,4 +208,8 @@ int main(int argc,char **argv) {
  puts("PASS actual ordered prepare/set/remove control");return 0;
 }
 '''
+ if 'role_switch_controls_phy' in core:
+  prefix=prefix.replace('struct tipd_data {','struct tipd_data { bool role_switch_controls_phy;')
+  controls=controls.replace('data=(struct tipd_data){','data=(struct tipd_data){.role_switch_controls_phy=true,')
+  controls=controls.replace('c.tps.role_sw=&c;\n  assert(tps6598x_disconnect', 'c.tps.role_sw=&c;data.role_switch_controls_phy=false;\n  assert(tps6598x_disconnect')
  return prefix+functions+controls

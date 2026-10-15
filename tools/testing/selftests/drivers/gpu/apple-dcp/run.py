@@ -51,6 +51,7 @@ def main():
                                        'failed-flip-return', 'live-park'))
     tests = [
         ('boot', 'oslog-events', boot.oslog, ((),), ()),
+        ('edid', 'dpavserv-start', edid.startup, ((),), ()),
         ('edid', 'service-rebind', edid.rebind, ((),), ()),
         ('edid', 'provider-admission', edid.admission, ((),), ()),
         ('edid', 'ordered-rx', edid.rx_progress, ((),), ('-pthread',)),
@@ -65,7 +66,7 @@ def main():
         ('phy', 'usb-unreachable', lambda r: pm.ownership(r, True), ((),), ()),
         ('lifecycle', 'cpuidle-s2idle', idle.s2idle, ((),), ('-Wno-unused-parameter', '-Wno-unused-variable')),
         ('lifecycle', 'typec-probe', pm.probe, ((),), ()),
-        ('lifecycle', 'quiesce-before-safe', quiesce.make_unit, tuple((c,) for c in ('ordered','power','ack','role','bolt','mux','duplicate','error-latched','legacy','fabric','tunnel')), ()),
+        ('lifecycle', 'quiesce-before-safe', quiesce.make_unit, tuple((c,) for c in ('ordered','power','ack','role','bolt','mux','duplicate','error-latched','legacy','fabric','tunnel','generic-disconnect','ordinary-remove','ordinary-disconnect','ordinary-role-error','ordinary-phy-error','ordinary-role-reprobe','ordinary-unsupported-remove','ordinary-unsupported-disconnect','ordinary-unregistered-remove','ordinary-unregistered-disconnect','noop-fixed-remove','noop-fixed-disconnect')), ()),
         ('lifecycle', 'probe-mux-pm-dispatch', pm.probe_dispatch, ((),), ()),
         ('phy', 'parking', lambda r: parking_unit(r), parking_cases, ()),
         ('phy', 'adverse-retry', phy.adverse, tuple((c,) for c in ('bist', 'init', 'mux', 'gate', 'dp-cache', 'off', 'success')), ()),

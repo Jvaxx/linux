@@ -182,6 +182,44 @@ static void atcphy_test_update_takes_usb(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_D), -ENODEV);
 }
 
+struct atcphy_test_configure {
+	unsigned int calls;
+	unsigned int lane_requests;
+};
+
+/* Count lane requests instead of touching MMIO, including stale USB3 requests. */
+static int atcphy_test_configure_stub(struct apple_atcphy *atcphy, enum atcphy_mode mode)
+{
+	struct kunit *test = kunit_get_current_test();
+	struct atcphy_test_configure *config = test->priv;
+
+	lockdep_assert_held(&atcphy->lock);
+	config->calls++;
+	if (mode != APPLE_ATCPHY_MODE_OFF) {
+		config->lane_requests++;
+		return -EINVAL;
+	}
+	return 0;
+}
+
+/* Rebinding after a failed role shutdown must not touch a live PIPE. */
+static void atcphy_test_safe_live_pipe(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_dev(test, false);
+	struct atcphy_test_configure config = {};
+
+	test->priv = &config;
+	kunit_activate_static_stub(test, atcphy_configure, atcphy_test_configure_stub);
+	atcphy->hw = &atcphy_hw_t8103;
+	atcphy->typec_mode = APPLE_ATCPHY_MODE_USB3;
+	mutex_init(&atcphy->lock);
+	KUNIT_EXPECT_EQ(test, atcphy_mux_set_locked(atcphy, APPLE_ATCPHY_MODE_OFF), -EBUSY);
+	KUNIT_EXPECT_EQ(test, config.calls, 0U);
+	KUNIT_EXPECT_EQ(test, atcphy->mode, APPLE_ATCPHY_MODE_USB3_DP);
+	KUNIT_EXPECT_EQ(test, atcphy->typec_mode, APPLE_ATCPHY_MODE_USB3);
+	KUNIT_EXPECT_EQ(test, atcphy->pipe_state, ATCPHY_PIPEHANDLER_STATE_USB3);
+}
+
 static struct kunit_case atcphy_mux_test_cases[] = {
 	KUNIT_CASE(atcphy_test_target_mode),
 	KUNIT_CASE(atcphy_test_target_mode_fixed_hub),
@@ -189,6 +227,7 @@ static struct kunit_case atcphy_mux_test_cases[] = {
 	KUNIT_CASE(atcphy_test_noop_needs_work),
 	KUNIT_CASE(atcphy_test_update_skips_usb),
 	KUNIT_CASE(atcphy_test_update_takes_usb),
+	KUNIT_CASE(atcphy_test_safe_live_pipe),
 	{}
 };
 

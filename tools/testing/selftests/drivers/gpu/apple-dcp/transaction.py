@@ -329,7 +329,7 @@ static int connect(struct tps6598x *t,u32 status) { (void)t;(void)status;return 
 """
     unit += helpers + block(core, 'int tipd_init(') + r"""
 static void probe_initial(struct cd321x *c) {
- initial(c);c->tps.irq=1;data.register_port=register_port;data.read_data_status=read_data_status;data.connect=connect;
+ initial(c);ordinary_port=true;phy_provider.safe_after_role=true;c->tps.irq=1;data.register_port=register_port;data.read_data_status=read_data_status;data.connect=connect;
  connect_error=irq_error=register_error=node_puts=mux_get_error=0;
 }
 int main(void) {
@@ -337,7 +337,7 @@ int main(void) {
  probe_initial(&c);irq_error=-ENOSPC;phy_error=-ETIMEDOUT;
  assert(tipd_init(&c.tps)==-ENOSPC&&reset_calls==0&&gpio_calls==0&&port.owner==&route&&port.safe_pending&&unregisters==1&&node_puts==1);
  probe_initial(&c);connect_error=-EAGAIN;role_error=-EBUSY;
- assert(tipd_init(&c.tps)==-EAGAIN&&reset_calls==0&&gpio_calls==0&&phy_calls==1&&port.owner==&route&&port.safe_pending);
+ assert(tipd_init(&c.tps)==-EAGAIN&&reset_calls==0&&gpio_calls==0&&phy_calls==0&&port.owner==&route&&port.safe_pending);
  probe_initial(&c);irq_error=-ENOSPC;
  assert(tipd_init(&c.tps)==-ENOSPC&&reset_calls==1&&!port.owner&&!port.safe_pending&&unregisters==1);
  probe_initial(&c);mux_get_error=-ENODEV;
@@ -392,7 +392,7 @@ def clock_order(root):
     unit = unit.replace(block(unit, 'int main('), block(unit, 'int main(').replace('int main(', 'int __attribute__((unused)) prior_main(', 1), 1)
     unit = unit.replace('static int power_error,', 'static bool backend_clock=true,parked;\nstatic int power_error,')
     unit = unit.replace("event('R');role_calls++;return role_error;", "event('R');role_calls++;if(!role_error)backend_clock=false;return role_error;", 1)
-    unit = unit.replace("event('L');phy_calls++;return phy_error;", "event('L');phy_calls++;if(parked)return 0;if(!backend_clock)return -ENODEV;if(!phy_error)parked=true;return phy_error;", 1)
+    unit = unit.replace("event('L');phy_calls++;", "event('L');phy_calls++;if(parked)return 0;if(!backend_clock)return -ENODEV;if(!phy_error)parked=true;", 1)
     unit += r"""
 int main(void) {
  (void)current;struct cd321x c;initial(&c);
