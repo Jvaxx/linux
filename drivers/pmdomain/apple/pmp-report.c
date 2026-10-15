@@ -158,7 +158,7 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 	if (IS_ERR(rep->base))
 		return PTR_ERR(rep->base);
 	rep->offsets = of_device_get_match_data(dev);
-	dev_set_drvdata(dev, rep);
+
 	INIT_LIST_HEAD(&rep->list);
 	ret = devm_add_action_or_reset(dev, apple_pmp_report_release, rep);
 	if (ret)
