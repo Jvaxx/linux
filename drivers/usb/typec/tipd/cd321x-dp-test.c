@@ -44,7 +44,7 @@ static void cd321x_dp_unplug_tears_down_test(struct kunit *test)
 {
 	struct cd321x_dp_update u = {
 		.changed = DP_D | HPD,
-		.link_reset = true,
+		.link_reset = CD321X_DP_RESET_UNPLUG | CD321X_DP_RESET_PLUG,
 		.route_active = true,
 	};
 
@@ -57,7 +57,7 @@ static void cd321x_dp_link_reset_reconnects_test(struct kunit *test)
 {
 	struct cd321x_dp_update u = {
 		.data_status = DP_D | HPD,
-		.link_reset = true,
+		.link_reset = CD321X_DP_RESET_FLIP,
 		.route_active = true,
 	};
 
@@ -294,7 +294,7 @@ static void cd321x_dp_irq_hpd_with_link_reset_test(struct kunit *test)
 	struct cd321x_dp_update u = {
 		.data_status = DP_D | HPD | CD321X_DATA_STATUS_HPD_IRQ,
 		.changed = CD321X_DATA_STATUS_HPD_IRQ,
-		.link_reset = true,
+		.link_reset = CD321X_DP_RESET_PARTNER,
 		.irq_hpd = true,
 		.route_active = true,
 		.sink_reported = true,
