@@ -123,18 +123,6 @@ void mt_abort_scan(struct wiphy *wiphy, struct wireless_dev *wdev)
 	spin_unlock_irqrestore(&m->response_lock, flags);
 }
 
-/* No command/response lock held. The caller closes new scan admission first.
- * Natural EID0d completion fences the scan; a local cancel alone does not.
- */
-int mt_scan_quiesce(struct mt7932 *m)
-{
-	if (READ_ONCE(m->scan_request) || READ_ONCE(m->retired_scan_seq))
-		wait_for_completion_timeout(&m->scan_done, msecs_to_jiffies(5000));
-	mt_abort_scan(m->wiphy, &m->wdev);
-	flush_work(&m->scan_finish_work);
-	return READ_ONCE(m->retired_scan_seq) ? -EBUSY : 0;
-}
-
 /* Wait at most @timeout in total for a cancelled scan to retire. Callers
  * may hold RTNL, so this never waits longer than asked. A stopping driver
  * completes scan_done for good, which would turn the wait into a spin.
@@ -151,6 +139,20 @@ static void mt_scan_retire_wait(struct mt7932 *m, unsigned long timeout)
 		if (left <= 0 || !wait_for_completion_timeout(&m->scan_done, left))
 			break;
 	}
+}
+
+/* No command/response lock held. The caller closes new scan admission first.
+ * Natural EID0d completion fences the scan; a local cancel alone does not.
+ * The batch awaited here may already have been followed by the next one,
+ * which the abort then cancels: give the firmware time to end that one too,
+ * rather than declaring the link unrecoverable while its cancel is in flight.
+ */
+int mt_scan_quiesce(struct mt7932 *m)
+{
+	if (READ_ONCE(m->scan_request) || READ_ONCE(m->retired_scan_seq))
+		wait_for_completion_timeout(&m->scan_done, msecs_to_jiffies(5000));
+	mt_scan_retire_wait(m, msecs_to_jiffies(2000));
+	return READ_ONCE(m->retired_scan_seq) ? -EBUSY : 0;
 }
 
 /* command_mutex held: one RF-band/type batch at a time, with matching EID0d
