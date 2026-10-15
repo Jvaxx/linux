@@ -122,8 +122,8 @@ apple_connector_detect(struct drm_connector *connector, bool force)
 {
 	struct apple_connector *apple_connector = to_apple_connector(connector);
 
-	return apple_connector->connected ? connector_status_connected :
-						  connector_status_disconnected;
+	return dcp_connector_connected(apple_connector) ?
+		connector_status_connected : connector_status_disconnected;
 }
 
 static void apple_connector_oob_hotplug(struct drm_connector *connector,
