@@ -24,11 +24,12 @@ static int mt_stock_config(struct mt7932 *m)
 	};
 	struct mt_config_record *records;
 	const struct firmware *file;
+	const char *phase = "file-format";
 	u8 body[284];
 	unsigned int count, i, j, batch;
 	int ret;
 
-	ret = request_firmware_direct(&file, "mediatek/mt7932/config-original.bin", &m->pdev->dev);
+	ret = mt_request_input(m, &file, "mediatek/mt7932/config-original.bin");
 	if (ret)
 		return ret;
 	ret = -EINVAL;
@@ -43,6 +44,7 @@ static int mt_stock_config(struct mt7932 *m)
 	 */
 	records = kcalloc(count + ARRAY_SIZE(updates), sizeof(*records), GFP_KERNEL);
 	if (!records) {
+		phase = "host allocation";
 		ret = -ENOMEM;
 		goto out;
 	}
@@ -61,6 +63,8 @@ static int mt_stock_config(struct mt7932 *m)
 	 * the separately specified conditional DbdcMode insertion, not a default.
 	 */
 	if (!m->phy_cap[5]) {
+		phase = "capability profile";
+		dev_err(&m->pdev->dev, "STOCK_CONFIG_CAPABILITY_MISMATCH: DBDC expected=1 observed=0\n");
 		ret = -EOPNOTSUPP;
 		goto free;
 	}
@@ -107,6 +111,7 @@ static int mt_stock_config(struct mt7932 *m)
 		records[j].value[0] = '1';
 		records[j].value_len = 1;
 	}
+	phase = "native SET submission";
 	for (i = 0; i < count; i += batch) {
 		batch = min(4U, count - i);
 		memset(body, 0, sizeof(body));
@@ -122,6 +127,12 @@ static int mt_stock_config(struct mt7932 *m)
 free:
 	kfree(records);
 out:
+	if (ret) {
+		if (!strcmp(phase, "file-format"))
+			dev_err(&m->pdev->dev, "local input mediatek/mt7932/config-original.bin has invalid format: %d\n", ret);
+		else
+			dev_err(&m->pdev->dev, "STOCK_CONFIG_FAILED: phase=%s error=%d\n", phase, ret);
+	}
 	release_firmware(file);
 	return ret;
 }
@@ -264,6 +275,24 @@ static void mt_policy_disable(struct mt7932 *m, const struct mt7932_policy *poli
 	rtnl_unlock();
 }
 
+/* Retry only a completed file lookup that failed before any policy SET.
+ * Consume the flag under the same lock as the worker publication, so repeated
+ * userspace requests cannot continually invalidate an in-flight attempt.
+ */
+void mt_retry_missing_policy(struct mt7932 *m)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&m->response_lock, flags);
+	if (m->reg_retryable && m->reg_pending && m->interface_registered &&
+	    !m->stopping && !m->policy_failed && !m->link_failed && !m->cal_state.error) {
+		m->reg_retryable = false;
+		m->reg_generation++;
+		schedule_work(&m->startup_work);
+	}
+	spin_unlock_irqrestore(&m->response_lock, flags);
+}
+
 static void mt_startup_work(struct work_struct *work)
 {
 	struct mt7932 *m = container_of(work, struct mt7932, startup_work);
@@ -273,6 +302,7 @@ static void mt_startup_work(struct work_struct *work)
 	unsigned long flags;
 	u32 generation;
 	char path[64];
+	bool submitted;
 	int ret;
 
 	for (;;) {
@@ -284,6 +314,7 @@ static void mt_startup_work(struct work_struct *work)
 			return;
 		}
 		m->reg_attempted = generation;
+		m->reg_retryable = false;
 		spin_unlock_irqrestore(&m->response_lock, flags);
 
 		/* No command/wiphy lock while joining lifecycle workers. RX, D7
@@ -304,6 +335,7 @@ static void mt_startup_work(struct work_struct *work)
 		if (READ_ONCE(m->retired_scan_seq))
 			ret = -EBUSY;
 		file = NULL;
+		submitted = false;
 		if (READ_ONCE(m->policy_failed) || READ_ONCE(m->link_failed) ||
 		    (m->startup_started && !READ_ONCE(m->rf_ready)))
 			ret = -EIO;
@@ -314,39 +346,49 @@ static void mt_startup_work(struct work_struct *work)
 			else
 				scnprintf(path, sizeof(path), "mediatek/mt7932/policy/%c%c.bin",
 					  reg.alpha2[0], reg.alpha2[1]);
-			ret = request_firmware_direct(&file, path, &m->pdev->dev);
+			ret = mt_request_input(m, &file, path);
 		}
-		if (!ret)
-			ret = mt7932_policy_parse(&policy, file->data, file->size, reg.domain);
 		if (!ret) {
-			mt7932_policy_filter(&reg, &policy);
-			mt_policy_disable(m, &policy, generation);
+			ret = mt7932_policy_parse(&policy, file->data, file->size, reg.domain);
+			if (!ret) {
+				mt7932_policy_filter(&reg, &policy);
+				mt_policy_disable(m, &policy, generation);
+			} else {
+				dev_err_ratelimited(&m->pdev->dev, "local input %s has invalid policy: %d\n", path, ret);
+			}
 		}
 		mutex_lock(&m->command_mutex);
 		if (READ_ONCE(m->stopping) || generation != READ_ONCE(m->reg_generation))
 			goto next;
 		if (!ret) {
+			submitted = true;
 			ret = mt_publish_policy(m, &reg, &policy);
 			if (!ret && !m->startup_started)
 				ret = mt_startup_once(m);
 			/* A partial SET sequence is not a rollback. Only missing or
 			 * invalid files BEFORE submission are recoverable by a hint.
 			 */
-			if (ret)
-				WRITE_ONCE(m->policy_failed, true);
 		}
 		spin_lock_irqsave(&m->response_lock, flags);
+		if (!ret && (m->stopping || m->link_failed || m->cal_state.error))
+			ret = m->cal_state.error ?: -EIO;
+		if (ret && submitted)
+			WRITE_ONCE(m->policy_failed, true);
+		if (generation == m->reg_generation)
+			m->reg_retryable = ret == -ENOENT && !submitted &&
+				!m->stopping && !m->policy_failed && !m->link_failed &&
+				!m->cal_state.error;
 		if (!ret && generation == m->reg_generation)
 			WRITE_ONCE(m->reg_pending, false);
-		spin_unlock_irqrestore(&m->response_lock, flags);
 		if (ret)
-			dev_warn(&m->pdev->dev, "REGULATORY_BLOCKED: %c%c generation=%u error=%d recovery-required=%u\n",
+			dev_warn_ratelimited(&m->pdev->dev, "REGULATORY_BLOCKED: %c%c generation=%u error=%d recovery-required=%u\n",
 				 reg.alpha2[0], reg.alpha2[1], generation, ret,
 				 m->policy_failed || m->link_failed);
 		else
 			dev_info(&m->pdev->dev, "REGULATORY_READY: %c%c firmware=%c%c generation=%u current=%u\n",
 				 reg.alpha2[0], reg.alpha2[1], reg.domain[0], reg.domain[1],
 				 generation, !m->reg_pending);
+		spin_unlock_irqrestore(&m->response_lock, flags);
 next:
 		mutex_unlock(&m->command_mutex);
 		if (file)
@@ -454,7 +496,7 @@ static void mt_regulatory_notify(struct wiphy *wiphy, struct regulatory_request 
 	if (READ_ONCE(m->interface_registered))
 		schedule_work(&m->startup_work);
 	spin_unlock_irqrestore(&m->response_lock, irqflags);
-	dev_info(&m->pdev->dev, "REGULATORY_REQUEST: %c%c initiator=%u generation=%u\n",
+	dev_info_ratelimited(&m->pdev->dev, "REGULATORY_REQUEST: %c%c initiator=%u generation=%u\n",
 		 reg.alpha2[0], reg.alpha2[1], request->initiator, m->reg_generation);
 }
 

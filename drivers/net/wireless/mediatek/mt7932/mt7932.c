@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /* J700 firmware-owned Wi-Fi: native transport and cfg80211 station support.
- * Clean-room contract: NEO_MT7932_DOWNLOAD_AND_NIC_CAP_CONTRACT.md.
+ * Covers firmware download and the NIC capability exchange.
  * All addresses here are BAR0 offsets, never chip/CPU physical addresses.
  */
 #include <linux/mt7932.h>
+#include <linux/soc/apple/pci-apple-piodma.h>
+
 #include "mt7932.h"
 
 #include <linux/pm_wakeup.h>
@@ -58,7 +60,16 @@ bool mt_transport_polled(void)
 bool mt_rf_allowed(struct mt7932 *m)
 {
 	return !READ_ONCE(m->stopping) && READ_ONCE(m->rf_ready) && !READ_ONCE(m->reg_pending) &&
-	       !READ_ONCE(m->policy_failed);
+	       !READ_ONCE(m->policy_failed) && !READ_ONCE(m->link_failed);
+}
+
+int mt_request_input(struct mt7932 *m, const struct firmware **fw, const char *name)
+{
+	int ret = request_firmware_direct(fw, name, &m->pdev->dev);
+
+	if (ret)
+		dev_err_ratelimited(&m->pdev->dev, "local input %s unavailable: %d\n", name, ret);
+	return ret;
 }
 
 u32 mt_read(struct mt7932 *m, u32 reg)
@@ -176,6 +187,8 @@ static void mt_receive(struct mt7932 *m, const u8 *packet, size_t length)
 				     m->smart_version);
 		dev_info(&m->pdev->dev, "CAL_EVENT: seq=%u length=%zu result=%d credits=%u/%u\n",
 			 event.seq, event.length, ret, m->cal_state.received, m->cal_state.expected);
+		if (ret < 0)
+			mt_rf_fail_locked(m, ret);
 		if (ret)
 			complete(&m->cal_response);
 		goto unlock;
@@ -188,14 +201,11 @@ static void mt_receive(struct mt7932 *m, const u8 *packet, size_t length)
 		 * for checked reset, rather than silently declaring retirement safe.
 		 */
 		if (m->disconnecting || m->link_failed) {
-			m->cal_state.error = -EPROTO;
-			m->link_failed = true;
-			complete(&m->cal_response);
+			mt_rf_fail_locked(m, -EPROTO);
 			goto unlock;
 		}
 		if (event.length < 52 || m->cal_request_count == ARRAY_SIZE(m->cal_requests)) {
-			m->cal_state.error = -EPROTO;
-			complete(&m->cal_response);
+			mt_rf_fail_locked(m, -EPROTO);
 		} else {
 			unsigned int at = (m->cal_request_head + m->cal_request_count) % ARRAY_SIZE(m->cal_requests);
 
@@ -540,6 +550,14 @@ static int mt_dma_setup(struct mt7932 *m)
 	m->aux = mt_alloc(m, 0x320, &m->aux_dma);
 	if (!m->ipc || !m->aux)
 		return -ENOMEM;
+	/* Pin before the first endpoint-visible DMA pointer. A live Bluetooth
+	 * sibling forbids FLR, so normal module unload must never enter remove
+	 * and hold a device lock while waiting for an impossible reset.
+	 */
+	if (!try_module_get(THIS_MODULE))
+		return -ENODEV;
+	m->module_pinned = true;
+	WRITE_ONCE(m->dma_owned, true);
 	for (i = 0; i < ARRAY_SIZE(m->tx); i++) {
 		struct mt7932_ring *q = &m->tx[i];
 
@@ -572,7 +590,6 @@ static int mt_dma_setup(struct mt7932 *m)
 	mt_rmw(m, W + 0x2b0, 0, BIT(6));
 	/* All endpoint-visible storage and interrupt state now have an owner. */
 	dma_wmb();
-	WRITE_ONCE(m->dma_owned, true);
 	pci_set_master(m->pdev);
 	WRITE_ONCE(m->running, true);
 	mt_rmw(m, W + 0x208, 0, BIT(0) | BIT(2));
@@ -754,8 +771,10 @@ static int mt_capability_gate(struct mt7932 *m)
 			dev_info(&m->pdev->dev, "firmware MAC %pM\n", value);
 			mac = true;
 		} else if (type == 8) {
-			if (!value[4] || value[4] > 4)
+			if (!value[4] || value[4] > 4) {
+				dev_err(&m->pdev->dev, "PHY_CAPABILITY_MISMATCH: NSS=%u\n", value[4]);
 				return -EOPNOTSUPP;
+			}
 			memcpy(m->phy_cap, value, 12);
 			m->antenna_mask = (1U << value[4]) - 1;
 			dev_info(&m->pdev->dev, "firmware PHY NSS=%u paths=%02x HT=%u VHT=%u HE=%u\n",
@@ -773,8 +792,10 @@ static int mt_capability_gate(struct mt7932 *m)
 		}
 		offset += 8 + length;
 	}
-	if (!mac || !phy)
+	if (!mac || !phy) {
+		dev_err(&m->pdev->dev, "CAPABILITY_MISSING: MAC=%u PHY=%u\n", mac, phy);
 		return -ENODATA;
+	}
 	print_hex_dump(KERN_INFO, "NIC_CAP: ", DUMP_PREFIX_OFFSET, 16, 1,
 		       m->reply, m->reply_length, false);
 	dev_info(&m->pdev->dev, "MCU_CAPABILITY_OK eid=%02x seq=%u (no calibration or RF yet)\n",
@@ -854,25 +875,33 @@ static int mt_precal_gate(struct mt7932 *m)
 	u32 status;
 	int ret;
 
-	if (!m->runtime_epoch || m->board_type != 3 || !m->runtime_cal_valid)
-		return -EINVAL;
+	if (!m->runtime_epoch || m->board_type != 3 || !m->runtime_cal_valid) {
+		dev_err(&m->pdev->dev, "PRECAL_CAPABILITY_MISMATCH: runtime-epoch=%u board-type=%u runtime-cal-valid=%u\n",
+			m->runtime_epoch, m->board_type, m->runtime_cal_valid);
+		return -EOPNOTSUPP;
+	}
 	/* Stock EfuseBufferModeCal=3, own eFuse board3: original PPR source2.
 	 * This is not the external EEPROM/source0 or own-WCAL/source3 path.
 	 */
-	ret = request_firmware_direct(&ppr, "mediatek/mt7932/ppr.bin", &m->pdev->dev);
+	ret = mt_request_input(m, &ppr, "mediatek/mt7932/ppr.bin");
 	if (ret)
 		return ret;
 	if (ppr->size != sizeof(request) - 4) {
+		dev_err(&m->pdev->dev, "local input mediatek/mt7932/ppr.bin has invalid size %zu\n", ppr->size);
 		release_firmware(ppr);
 		return -EINVAL;
 	}
 	memcpy(request + 4, ppr->data, ppr->size);
 	release_firmware(ppr);
 	ret = mt_request_ext(m, 0xed, 0x21, true, false, true, request, sizeof(request));
-	if (ret)
+	if (ret) {
+		dev_err(&m->pdev->dev, "PPR_SOURCE2_COMMAND_FAILED: %d\n", ret);
 		return ret;
-	if (m->reply_length < 44 || m->reply[28] != 0xed || m->reply[32])
+	}
+	if (m->reply_length < 44 || m->reply[28] != 0xed || m->reply[32]) {
+		dev_err(&m->pdev->dev, "PPR_SOURCE2_REPLY_REJECTED: length=%zu\n", m->reply_length);
 		return -EPROTO;
+	}
 	status = get_unaligned_le32(m->reply + 40);
 	dev_info(&m->pdev->dev, "PPR_SOURCE2_RESULT: status=%08x\n", status);
 	if (status)
@@ -927,30 +956,40 @@ static int mt_firmware_gate(struct mt7932 *m)
 {
 	const struct firmware *patch, *ram;
 	struct mt7932_region region;
+	const char *phase = "file-format";
 	u8 request[8] = {}, value;
 	u32 entry = 0;
 	int ret, patches, regions, i;
 
-	ret = request_firmware_direct(&patch, "mediatek/mt7932/IZUBA_WIFI_MT7932_patch_mcu_1_2_hdr.bin", &m->pdev->dev);
+	ret = mt_request_input(m, &patch, "mediatek/mt7932/IZUBA_WIFI_MT7932_patch_mcu_1_2_hdr.bin");
 	if (ret)
 		return ret;
-	ret = request_firmware_direct(&ram, "mediatek/mt7932/IZUBA_W7932_2.bin", &m->pdev->dev);
+	ret = mt_request_input(m, &ram, "mediatek/mt7932/IZUBA_W7932_2.bin");
 	if (ret)
 		goto out_patch;
 	/* Validate all regions before emitting the first download command. */
 	patches = mt7932_patch_region(patch->data, patch->size, 0, &region);
 	regions = mt7932_ram_region(ram->data, ram->size, 0, &region);
 	ret = -EINVAL;
-	if (patches < 0 || regions < 0)
+	if (patches < 0 || regions < 0) {
+		dev_err(&m->pdev->dev, "local input %s has invalid region table\n",
+			patches < 0 ? "mediatek/mt7932/IZUBA_WIFI_MT7932_patch_mcu_1_2_hdr.bin" :
+				      "mediatek/mt7932/IZUBA_W7932_2.bin");
 		goto out;
+	}
 	for (i = 0; i < patches; i++)
-		if (mt7932_patch_region(patch->data, patch->size, i, &region) < 0)
+		if (mt7932_patch_region(patch->data, patch->size, i, &region) < 0) {
+			dev_err(&m->pdev->dev, "local input mediatek/mt7932/IZUBA_WIFI_MT7932_patch_mcu_1_2_hdr.bin has invalid region %d\n", i);
 			goto out;
+		}
 	for (i = 0; i < regions; i++)
-		if (mt7932_ram_region(ram->data, ram->size, i, &region) < 0)
+		if (mt7932_ram_region(ram->data, ram->size, i, &region) < 0) {
+			dev_err(&m->pdev->dev, "local input mediatek/mt7932/IZUBA_W7932_2.bin has invalid region %d\n", i);
 			goto out;
+		}
 	dev_info(&m->pdev->dev, "stock containers patch=%zu/%d regions RAM=%zu/%d regions\n",
 		 patch->size, patches, ram->size, regions);
+	phase = "patch semaphore command/reply";
 	put_unaligned_le32(2, request);
 	ret = mt_command(m, 0x10, request, 4);
 	if (ret)
@@ -960,6 +999,7 @@ static int mt_firmware_gate(struct mt7932 *m)
 		goto out;
 	}
 	if (m->reply[32] != 1) {
+		phase = "patch download/start";
 		for (i = 0; i < patches; i++) {
 			mt7932_patch_region(patch->data, patch->size, i, &region);
 			ret = mt_download(m, patch->data, &region, false);
@@ -976,6 +1016,7 @@ static int mt_firmware_gate(struct mt7932 *m)
 		mt_secure_release(m);
 	}
 	dev_info(&m->pdev->dev, "PATCH_READY\n");
+	phase = "OTP command/profile";
 	ret = mt_otp_byte(m, 0x7a, &value);
 	if (!ret)
 		ret = mt_otp_byte(m, 0x164, &value);
@@ -984,7 +1025,7 @@ static int mt_firmware_gate(struct mt7932 *m)
 	if (ret)
 		goto out;
 	if (value != 0x15) {
-		dev_err(&m->pdev->dev, "OTP selector mismatch: %02x\n", value);
+		dev_err(&m->pdev->dev, "OTP_PROFILE_MISMATCH: selector=%02x\n", value);
 		ret = -EPROTO;
 		goto out;
 	}
@@ -993,6 +1034,7 @@ static int mt_firmware_gate(struct mt7932 *m)
 		if (ret)
 			goto out;
 	}
+	phase = "RAM download";
 	for (i = 0; i < regions; i++) {
 		mt7932_ram_region(ram->data, ram->size, i, &region);
 		if (region.features & BIT(5))
@@ -1003,6 +1045,7 @@ static int mt_firmware_gate(struct mt7932 *m)
 		if (ret)
 			goto out;
 	}
+	phase = "RAM TX retirement";
 	for (i = 0; i < 1000; i++) {
 		mt_tx_clean(&m->tx[16]);
 		if (!m->tx[16].queued)
@@ -1013,6 +1056,7 @@ static int mt_firmware_gate(struct mt7932 *m)
 		ret = -ETIMEDOUT;
 		goto out;
 	}
+	phase = "firmware start command/readback";
 	usleep_range(20000, 21000);
 	ret = mt_secure_acquire(m);
 	if (ret)
@@ -1027,8 +1071,11 @@ static int mt_firmware_gate(struct mt7932 *m)
 	if (ret)
 		goto out;
 	dev_info(&m->pdev->dev, "FIRMWARE_READY entry=%08x\n", entry);
+	phase = "runtime capability/transport gates";
 	ret = mt_runtime_start(m);
 out:
+	if (ret)
+		dev_err(&m->pdev->dev, "FIRMWARE_GATE_FAILED: phase=%s error=%d\n", phase, ret);
 	release_firmware(ram);
 out_patch:
 	release_firmware(patch);
@@ -1085,6 +1132,10 @@ static int mt_reset_retained(struct mt7932 **epoch)
 	if (ret)
 		return ret;
 	old->dma_owned = false;
+	if (old->module_pinned) {
+		old->module_pinned = false;
+		module_put(THIS_MODULE);
+	}
 	dev_info(&pdev->dev, "RESET_TEST: function reset complete; retaining old DMA\n");
 	fresh = devm_kzalloc(&pdev->dev, sizeof(*fresh), GFP_KERNEL);
 	if (!fresh)
@@ -1151,8 +1202,14 @@ static int mt_retire_dma(struct mt7932 *m)
 		ret = mt_dma_stop(m);
 	if (!ret)
 		ret = mt_function_reset(m);
-	if (!ret)
+	if (!ret) {
 		m->dma_owned = false;
+		/* Probe/remove's framework reference still owns this callback. */
+		if (m->module_pinned) {
+			m->module_pinned = false;
+			module_put(THIS_MODULE);
+		}
+	}
 	return ret;
 }
 
@@ -1192,12 +1249,26 @@ static void mt_remove(struct pci_dev *pdev)
 
 static int mt_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
+	struct pci_host_bridge *bridge = pci_find_host_bridge(pdev->bus);
 	struct mt7932 *m;
 	struct iommu_domain *domain;
 	int ret;
 
-	if (!of_machine_is_compatible("apple,j700") || pdev->devfn != 0)
+	if (!of_machine_is_compatible("apple,j700") ||
+	    !of_machine_is_compatible("apple,t8140") || pdev->devfn != 0 ||
+	    !of_device_is_compatible(pdev->dev.of_node, "pci14c3,7932") ||
+	    !bridge->dev.parent ||
+	    !of_device_is_compatible(bridge->dev.parent->of_node,
+				     "apple,t8140-pcie"))
 		return -ENODEV;
+	/* Supplier admission and link policy must precede PCI/MMIO/DMA setup. */
+	ret = apple_piodma_radio_check(pdev);
+	if (ret)
+		return ret;
+	/* A remove/rescan may have recreated link state under the global policy. */
+	ret = pci_disable_link_state(pdev, PCIE_LINK_STATE_ALL);
+	if (ret)
+		return ret;
 	domain = iommu_get_domain_for_dev(&pdev->dev);
 	if (!domain || (domain->type != IOMMU_DOMAIN_DMA && domain->type != IOMMU_DOMAIN_DMA_FQ))
 		return dev_err_probe(&pdev->dev, -EINVAL, "translated DMA domain required\n");
@@ -1295,8 +1366,8 @@ static void mt_shutdown(struct pci_dev *pdev)
 {
 	struct mt7932 *m = pci_get_drvdata(pdev);
 
-	WRITE_ONCE(m->running, false);
-	mt_write(m, W + 0x204, 0);
+	/* Close admission and join software users before disabling bus mastering. */
+	mt_stop_host(m);
 	pci_clear_master(pdev);
 	/* Storage remains allocated through reset, even if the engine is stuck. */
 }
@@ -1359,3 +1430,16 @@ EXPORT_SYMBOL_GPL(mt7932_fullmac_ready);
 module_pci_driver(mt_driver);
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("J700 MT7932 firmware-owned cfg80211 station driver");
+
+MODULE_FIRMWARE("mediatek/mt7932/IZUBA_WIFI_MT7932_patch_mcu_1_2_hdr.bin");
+MODULE_FIRMWARE("mediatek/mt7932/IZUBA_W7932_2.bin");
+MODULE_FIRMWARE("mediatek/mt7932/ppr.bin");
+MODULE_FIRMWARE("mediatek/mt7932/wcal.bin");
+MODULE_FIRMWARE("mediatek/mt7932/oca2.bin");
+MODULE_FIRMWARE("mediatek/mt7932/config-original.bin");
+MODULE_FIRMWARE("mediatek/mt7932/policy/world-XZ.bin");
+/* Country selection is runtime-dependent; this pattern is packaging metadata.
+ * Globs do not guarantee complete inclusion by every initramfs builder.
+ * Explicitly package world-XZ and every intended current/later country policy.
+ */
+MODULE_FIRMWARE("mediatek/mt7932/policy/[A-Z][A-Z].bin");

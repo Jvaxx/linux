@@ -24,7 +24,8 @@ The tested configuration includes ``CONFIG_MT7932_FULLMAC=m``,
 ``CONFIG_BT_LE=y``, ``CONFIG_CRYPTO_AES=y`` and ``CONFIG_CRYPTO_CMAC=y``.
 The Bluetooth transport can be built with modular Bluetooth and system
 sleep. The separately selected bootstrap provider has its own lifecycle
-restrictions. Kexec is excluded while either retained experiment is enabled.
+restrictions. A runtime guard refuses kexec while radio admission or retained
+bootstrap DMA ownership is active. Kernels may still support kexec elsewhere.
 The station uses 2.4 GHz channels 1-13 and the 5 GHz channels 36-64,
 100-144 and 149-165 that the cfg80211 regulatory domain permits. Radar (DFS)
 channels stay passive: the firmware listens on them while the station is not
@@ -54,41 +55,38 @@ as in the tested sequence, however the drivers are loaded. Bluetooth therefore
 stays unbound while the Wi-Fi driver is missing or has failed, including when
 a failed Wi-Fi function stays bound to keep DMA it could not stop. A device link
 makes the driver core unbind Bluetooth before Wi-Fi; unloading
-``mt7932_bt_pcie`` does not affect Wi-Fi. The probe rejects a function that is
+``mt7932_bt_pcie`` does not affect Wi-Fi. Wi-Fi pins its module before publishing
+DMA pointers, and refuses function reset while its Bluetooth sibling is live.
+The probe rejects a function that is
 not cold, which is what now prevents a reprobe after a failed or uncertain
 admission; ``enable=0`` leaves the function unbound. The transport also
 disables ASPM on the shared link. Like the Wi-Fi driver, it reads its firmware
 while probing, so build it as a module. The tested Wi-Fi driver owns function
 0 and Bluetooth owns function 1.
 
-NetworkManager supplies the existing saved WPA2 profile. Use a unique profile
-name or UUID and the current interface name; an older ``neo-wifi0`` profile
-will not match an interface named ``wlan0``. KDE audio requires BlueZ,
-PipeWire, its PulseAudio compatibility service, WirePlumber and the Bluetooth
-audio plugins in the logged-in user's session.
+Use a saved NetworkManager WPA2 profile matching the current interface.
+KDE audio requires BlueZ, PipeWire, its PulseAudio compatibility service,
+WirePlumber and Bluetooth audio plugins in the logged-in user's session.
 
 Local firmware inputs
 ---------------------
 
-No firmware, calibration, unit address, credentials or captured command
-payloads are distributed in this contribution. Install lawfully obtained
-local inputs for the target unit under ``/lib/firmware``. Do not substitute
-another unit's calibration or address. A missing or invalid input must remain
-a startup failure rather than an excuse to invent calibration or power data.
+Firmware and calibration are not included. Install local inputs for the
+target unit under ``/lib/firmware``; another unit's calibration or address
+cannot be substituted. Missing or invalid inputs prevent startup.
 
 Wi-Fi requests the following files under ``mediatek/mt7932/``:
 
 * ``IZUBA_WIFI_MT7932_patch_mcu_1_2_hdr.bin`` and ``IZUBA_W7932_2.bin``:
-  the original firmware containers accepted by the driver's parser.
+  original firmware containers.
 * ``ppr.bin``: the original power-on calibration request payload.
-* ``wcal.bin`` and ``oca2.bin``: the unit's factory calibration; OCA2 retains
-  its original BLOB container, rather than an older replay-stream wrapper.
+* ``wcal.bin`` and ``oca2.bin``: the unit's factory calibration; OCA2 uses
+  its original BLOB container.
 * ``config-original.bin``: the bounded J7CF package with the original 64 or
-  65 configuration records. Required keys and record shapes are validated.
+  65 configuration records, including all required keys.
 * ``policy/world-XZ.bin`` and, when available, the matching country package
   under ``policy/``: J7RP containers with original-derived modes and power
-  tables. The parser checks the country and table shapes. Relabeling a
-  different country's payload is not a supported conversion.
+  tables. Relabeling a different country's payload is unsupported.
 
 Bluetooth requests these files under ``mediatek/``:
 
@@ -98,35 +96,30 @@ Bluetooth requests these files under ``mediatek/``:
 * ``MT7932_PTB_IzubaA_0.1.0.0_20251021141303.ptx`` (198 bytes);
 * ``j700-mt7932-bdaddr.bin`` (the unit's six-byte Bluetooth address).
 
-Extraction and packaging require the original local assets. The Linux loader
-does not grant redistribution rights to them. Do not include those assets or
-their unit-specific digests in bug reports, commits or test artifacts.
+Extraction and packaging require the original local assets. Keep these
+assets and unit identities out of commits and public test reports.
 
 Repeatable physical network test
 --------------------------------
 
-The manual test is installed as a selftest data file rather than an automatic
-test: activating a real saved network requires an explicit profile selection.
-It selects the profile's requested band and checks an actual scan result,
-WPA2 activation, DHCP route, gateway replies, DNS, verified HTTPS response,
-KDE processes and fatal kernel/driver diagnostics. It never asks for or prints
-the saved password. Run as root, with a fresh attempt name::
+The manual test activates a saved profile and checks scan, WPA2, DHCP,
+gateway replies, DNS, HTTPS, KDE and kernel diagnostics. It is not run
+automatically. Run as root, with a fresh attempt name::
 
   python3 tools/testing/selftests/drivers/net/mt7932_e2e.py \
     --expected-release "$(uname -r)" --profile "YOUR SAVED PROFILE" \
     --connect --band a --attempt five-ghz
 
-Use ``--band bg`` for 2.4 GHz. The JSON artifact path is printed on completion;
-each of three traffic samples includes the downloaded response's size and
-SHA256. Connection names, SSIDs, unit addresses and credentials are omitted
-from the result. A successful host serial command is not a test pass: require
-``WIFI_PHYSICAL_NETWORK_E2E_PASS`` in the target artifact.
+Use ``--band bg`` for 2.4 GHz. Require ``WIFI_PHYSICAL_NETWORK_E2E_PASS`` in
+the JSON artifact printed on completion. The artifact records three traffic
+samples and response hashes, omitting network names, addresses and credentials.
 
-Qualification and remaining work
---------------------------------
+Limitations
+-----------
 
 * PCI bootstrap memory remains retained until external reset. Controller
-  removal, memory reuse, suspend and kexec are unqualified.
+  removal and memory reuse are unqualified. Runtime guards refuse reset and
+  kexec; suspend-to-idle retains the successfully admitted arena.
 * Bluetooth system sleep uses a bounded firmware quiesce/restore handshake
   around HCI suspend/resume, preserving its DMA arena. Hibernation is rejected.
   Removal first quiesces firmware, then stops work and interrupts, disables

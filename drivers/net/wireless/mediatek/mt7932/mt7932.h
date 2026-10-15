@@ -68,6 +68,11 @@ struct mt7932 {
 	struct completion response;
 	struct completion cal_response;
 	struct mt7932_cal_completion cal_state;
+#if IS_ENABLED(CONFIG_MT7932_RF_KUNIT_TEST)
+	/* Hardware-free calibration transport seam; production builds omit it. */
+	int (*cal_test_send)(struct mt7932 *m, const void *body, size_t length);
+	void *cal_test_context;
+#endif
 	u8 cal_requests[32][16];
 	u8 cal_request_seq[32];
 	unsigned int cal_request_head, cal_request_count;
@@ -82,7 +87,7 @@ struct mt7932 {
 	/* Probe finished initialization; the Bluetooth function may start. */
 	bool ready;
 	bool irq_requested, vectors_allocated, wiphy_registered;
-	bool dma_owned;
+	bool dma_owned, module_pinned;
 	struct completion reset_retry;
 	int removal_error;
 	bool ram_config;
@@ -106,7 +111,7 @@ struct mt7932 {
 	struct ieee80211_rate rates[12];
 	struct work_struct startup_work;
 	struct mutex command_mutex;
-	bool startup_started, rf_ready, reg_pending, policy_failed;
+	bool startup_started, rf_ready, reg_pending, policy_failed, reg_retryable;
 	bool interface_registered, interface_up;
 	u32 reg_generation, reg_attempted;
 	struct mt7932_reg_snapshot reg_desired;
@@ -181,6 +186,11 @@ struct mt7932 {
 };
 
 bool mt_rf_allowed(struct mt7932 *m);
+void mt_retry_missing_policy(struct mt7932 *m);
+int mt_net_open(struct net_device *netdev);
+int mt_request_input(struct mt7932 *m, const struct firmware **fw, const char *name);
+/* response_lock held; closes RF admission and reports terminal host state. */
+void mt_rf_fail_locked(struct mt7932 *m, int error);
 u32 mt_read(struct mt7932 *m, u32 reg);
 void mt_write(struct mt7932 *m, u32 reg, u32 value);
 void mt_rmw(struct mt7932 *m, u32 reg, u32 mask, u32 value);
@@ -196,6 +206,8 @@ int mt_recovery_gate(struct mt7932 *m);
 int mt_cal_procedure(struct mt7932 *m, struct mt7932_cal_piece *pieces,
 				    unsigned int count, unsigned int logical, u8 context_version);
 int mt_calibration_gate(struct mt7932 *m);
+int mt_cal_drain_requests(struct mt7932 *m, const struct firmware *oca);
+void mt_cal_input_error(struct mt7932 *m, int error, unsigned int tag, const char *stage);
 void mt_data_clean_locked(struct mt7932 *m);
 void mt_data_kick_locked(struct mt7932 *m);
 void mt_data_clean(struct mt7932 *m);

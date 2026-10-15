@@ -6,7 +6,6 @@ static void mt_scan_timeout_work(struct work_struct *work);
 static int mt_scan_submit_next(struct mt7932 *m);
 static int mt_scan_admit(struct mt7932 *m);
 static int mt_set_bss(struct mt7932 *m, bool active);
-static int mt_net_open(struct net_device *netdev);
 static int mt_net_stop(struct net_device *netdev);
 static void mt_cal_work(struct work_struct *work);
 
@@ -47,6 +46,8 @@ static void mt_scan_finish_work(struct work_struct *work)
 	}
 	cancel_delayed_work(&m->scan_timeout_work);
 	spin_lock_irqsave(&m->response_lock, flags);
+	/* A terminal failure may have followed the worker's earlier snapshot. */
+	info.aborted |= m->scan_aborted || !mt_rf_allowed(m);
 	cancel[0] = m->scan_seq;
 	if (request && info.aborted && !m->scan_finished)
 		m->retired_scan_seq = m->scan_seq;
@@ -348,7 +349,8 @@ int mt_scan(struct wiphy *wiphy, struct cfg80211_scan_request *request)
 
 	if (request->wdev != &m->wdev)
 		return -ENODEV;
-	dev_info(&m->pdev->dev, "SCAN_REQUEST: channels=%u ssids=%d ies=%zu flags=%08x duration=%u/%u\n",
+	mt_retry_missing_policy(m);
+	dev_info_ratelimited(&m->pdev->dev, "SCAN_REQUEST: channels=%u ssids=%d ies=%zu flags=%08x duration=%u/%u\n",
 		 request->n_channels, request->n_ssids, request->ie_len, request->flags,
 		 request->duration, request->duration_mandatory);
 	/* cfg80211 lists each advertised channel at most once. */
@@ -413,20 +415,32 @@ static int mt_set_bss(struct mt7932 *m, bool active)
 	return ret;
 }
 
-static int mt_net_open(struct net_device *netdev)
+int mt_net_open(struct net_device *netdev)
 {
 	struct mt7932 *m = *(struct mt7932 **)netdev_priv(netdev);
+	unsigned long flags;
 	int ret = 0;
 
 	mutex_lock(&m->command_mutex);
-	if (READ_ONCE(m->stopping)) {
+	mt_retry_missing_policy(m);
+	spin_lock_irqsave(&m->response_lock, flags);
+	if (m->stopping)
+		ret = -ESHUTDOWN;
+	else if (m->link_failed || m->cal_state.error)
+		ret = m->cal_state.error ?: -EIO;
+	spin_unlock_irqrestore(&m->response_lock, flags);
+	if (ret) {
 		mutex_unlock(&m->command_mutex);
-		return -ESHUTDOWN;
+		return ret;
 	}
 	if (READ_ONCE(m->rf_ready))
 		ret = mt_set_bss(m, true);
+	spin_lock_irqsave(&m->response_lock, flags);
+	if (!ret && (m->stopping || m->link_failed || m->cal_state.error))
+		ret = m->cal_state.error ?: (m->stopping ? -ESHUTDOWN : -EIO);
 	if (!ret)
 		WRITE_ONCE(m->interface_up, true);
+	spin_unlock_irqrestore(&m->response_lock, flags);
 	mutex_unlock(&m->command_mutex);
 	netif_carrier_off(netdev);
 	netif_stop_queue(netdev);
@@ -502,13 +516,13 @@ static void mt_cal_work(struct work_struct *work)
 	struct mt7932_cal_piece pieces[7];
 	u8 request[16];
 	unsigned long flags;
-	unsigned int count;
+	unsigned int count, input_tag;
 	int ret;
 
 	mutex_lock(&m->command_mutex);
 	if (!READ_ONCE(m->rf_ready))
 		goto unlock;
-	ret = request_firmware_direct(&oca, "mediatek/mt7932/oca2.bin", &m->pdev->dev);
+	ret = mt_request_input(m, &oca, "mediatek/mt7932/oca2.bin");
 	if (ret)
 		goto fail;
 	for (;;) {
@@ -523,11 +537,13 @@ static void mt_cal_work(struct work_struct *work)
 		if (!count)
 			break;
 		ret = mt7932_cal_requested(oca->data, oca->size, request, sizeof(request),
-					  m->smart_version, m->module_byte, pieces);
-		if (ret < 0)
+					  m->smart_version, m->module_byte, pieces, &input_tag);
+		if (ret < 0) {
+			mt_cal_input_error(m, ret, input_tag, "runtime D7 plan");
 			break;
+		}
 		ret = mt_cal_procedure(m, pieces, ret,
-				       get_unaligned_le32(request + 8) == 1 ? 3 : 4,
+				       mt7932_cal_request_replies(request),
 				       m->preload_version);
 		if (ret)
 			break;
@@ -537,9 +553,10 @@ static void mt_cal_work(struct work_struct *work)
 	if (!ret)
 		goto unlock;
 fail:
-	WRITE_ONCE(m->rf_ready, false);
-	mt_abort_scan(m->wiphy, &m->wdev);
-	dev_err(&m->pdev->dev, "D7_CALIBRATION_FAILED: %d; RF operations stopped\n", ret);
+	spin_lock_irqsave(&m->response_lock, flags);
+	mt_rf_fail_locked(m, ret);
+	spin_unlock_irqrestore(&m->response_lock, flags);
+	dev_err(&m->pdev->dev, "D7_CALIBRATION_FAILED: %d; mediatek/mt7932/oca2.bin RF operations stopped\n", ret);
 unlock:
 	mutex_unlock(&m->command_mutex);
 }
@@ -590,8 +607,21 @@ int mt_register_interface(struct mt7932 *m)
 
 int mt_enable_scan(struct mt7932 *m)
 {
-	int ret = mt_data_prepare(m);
+	unsigned long flags;
+	int ret;
 
+	spin_lock_irqsave(&m->response_lock, flags);
+	ret = m->cal_state.error ?: ((m->stopping || m->link_failed) ? -EIO : 0);
+	spin_unlock_irqrestore(&m->response_lock, flags);
+	if (ret)
+		return ret;
+	ret = mt_data_prepare(m);
+
+	if (ret)
+		return ret;
+	spin_lock_irqsave(&m->response_lock, flags);
+	ret = m->cal_state.error ?: ((m->stopping || m->link_failed) ? -EIO : 0);
+	spin_unlock_irqrestore(&m->response_lock, flags);
 	if (ret)
 		return ret;
 	if (READ_ONCE(m->interface_up)) {
@@ -599,9 +629,17 @@ int mt_enable_scan(struct mt7932 *m)
 		if (ret)
 			return ret;
 	}
+	/* An RX calibration failure must win over late startup publication. */
+	spin_lock_irqsave(&m->response_lock, flags);
+	if (m->stopping || m->link_failed || m->cal_state.error) {
+		ret = m->cal_state.error ?: -EIO;
+		spin_unlock_irqrestore(&m->response_lock, flags);
+		return ret;
+	}
 	WRITE_ONCE(m->rf_ready, true);
 	dev_info(&m->pdev->dev, "CFG80211_SCAN_READY: %s, carrier off until WPA2 authorization\n", m->netdev->name);
 	schedule_work(&m->cal_work);
+	spin_unlock_irqrestore(&m->response_lock, flags);
 	return 0;
 }
 
