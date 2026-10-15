@@ -4096,9 +4096,6 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 		of_node_put(panel_np);
 		dcp->fixed_connector_type = DRM_MODE_CONNECTOR_eDP;
 		dcp->connector_type = DRM_MODE_CONNECTOR_eDP;
-		INIT_WORK(&dcp->bl_register_wq, dcp_work_register_backlight);
-		mutex_init(&dcp->bl_register_mutex);
-		INIT_WORK(&dcp->bl_update_wq, dcp_work_update_backlight);
 	}
 
 	ret = dcp_create_piodma_iommu_dev(dcp);
@@ -4142,9 +4139,6 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	bitmap_zero(dcp->memdesc_map, DCP_MAX_MAPPINGS);
 	// TDOD: mem_desc IDs start at 1, for simplicity just skip '0' entry
 	set_bit(0, dcp->memdesc_map);
-
-	INIT_WORK(&dcp->vblank_wq, dcp_delayed_vblank);
-	INIT_DELAYED_WORK(&dcp->swap_watchdog_wq, dcp_swap_watchdog);
 
 	if (dcp->hw.iomfb_method_profile ==
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL) {
@@ -4406,6 +4400,12 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	INIT_DELAYED_WORK(&dcp->placeholder_edid_wq,
 			  dcp_placeholder_edid_work);
 	INIT_DELAYED_WORK(&dcp->bl_fallback_wq, dcp_work_backlight_fallback);
+	/* System sleep and shutdown cancel these even if no bind succeeded. */
+	INIT_WORK(&dcp->vblank_wq, dcp_delayed_vblank);
+	INIT_DELAYED_WORK(&dcp->swap_watchdog_wq, dcp_swap_watchdog);
+	INIT_WORK(&dcp->bl_register_wq, dcp_work_register_backlight);
+	INIT_WORK(&dcp->bl_update_wq, dcp_work_update_backlight);
+	mutex_init(&dcp->bl_register_mutex);
 	/* Balanced by enable at successful component bind. */
 	disable_delayed_work(&dcp->typec_reconnect_wq);
 	disable_delayed_work(&dcp->placeholder_edid_wq);
