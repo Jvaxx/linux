@@ -1906,3 +1906,7 @@ void iomfb_shutdown(struct apple_dcp *dcp)
 		break;
 	}
 }
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_PARSER_KUNIT_TEST)
+#include "iomfb-parser-test.c"
+#endif

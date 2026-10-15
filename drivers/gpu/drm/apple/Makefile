@@ -26,3 +26,5 @@ obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += afk_test.o
 obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_backlight_test.o
 
 obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += afk-service-test.o
+
+obj-$(CONFIG_DRM_APPLE_PARSER_KUNIT_TEST) += afkv2-test.o

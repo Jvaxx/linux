@@ -2086,3 +2086,7 @@ static void afk_remove_service_debugfs(struct apple_epic_service *srv)
 }
 
 #endif
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_PARSER_KUNIT_TEST)
+#include "afk-parser-test.c"
+#endif
