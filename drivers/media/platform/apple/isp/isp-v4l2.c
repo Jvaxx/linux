@@ -757,6 +757,10 @@ static int isp_vidioc_set_format(struct file *file, void *fh,
 	struct isp_preset *preset;
 	int err;
 
+	/* The buffers and the queue type depend on the format. */
+	if (vb2_is_busy(&isp->vbq))
+		return -EBUSY;
+
 	preset = isp_select_preset(isp, f->fmt.pix.width, f->fmt.pix.height);
 	err = isp_set_preset(isp, fmt, preset);
 	if (err)
@@ -811,6 +815,9 @@ static int isp_vidioc_set_format_mplane(struct file *file, void *fh,
 
 	if (!isp->multiplanar)
 		return -ENOTTY;
+
+	if (vb2_is_busy(&isp->vbq))
+		return -EBUSY;
 
 	preset = isp_select_preset(isp, f->fmt.pix_mp.width,
 				   f->fmt.pix_mp.height);
