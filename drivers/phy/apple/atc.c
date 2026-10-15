@@ -4194,3 +4194,7 @@ module_platform_driver(atcphy_driver);
 MODULE_AUTHOR("Sven Peter <sven@kernel.org>");
 MODULE_DESCRIPTION("Apple Type-C PHY driver");
 MODULE_LICENSE("GPL");
+
+#if IS_ENABLED(CONFIG_PHY_APPLE_ATC_KUNIT_TEST)
+#include "atc-test.c"
+#endif
