@@ -47,6 +47,8 @@ config TYPEC_TIPD_KUNIT_TEST
 	  about two minutes, also next to a display route that declares
 	  nothing, and that other providers and errors keep the bounded
 	  retries.
+	  They also cover which DisplayPort hotplug event a cable update sends
+	  to the display connector.
 	  These tests run without accessing a physical Type-C controller.
 
 config TYPEC_SN201202X_KUNIT_TEST
