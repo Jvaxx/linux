@@ -3971,6 +3971,23 @@ static int dcp_connector_type_from_dt(struct device_node *np)
 	return DRM_MODE_CONNECTOR_Unknown;
 }
 
+/*
+ * The fixed route's crossbar selection and Type-C mux are taken at probe and
+ * must be released with the device: a crossbar left selected blocks the next
+ * probe's mux_control_select() for good.
+ */
+static void dcp_release_fixed_route(void *data)
+{
+	struct apple_dcp *dcp = data;
+
+	if (dcp->fixed_route_selected) {
+		mux_control_deselect(dcp->xbar);
+		dcp->fixed_route_selected = false;
+	}
+	typec_mux_put(dcp->typec_mux);
+	dcp->typec_mux = NULL;
+}
+
 static void dcp_disable_typec_work(struct apple_dcp *dcp, bool release_cable)
 {
 	scoped_guard(mutex, &dcp->hpd_mutex) {
@@ -4248,7 +4265,6 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 		disable_irq(dcp->hdmi_hpd_irq);
 
 	dcp_disable_typec_work(dcp, true);
-	typec_mux_put(dcp->typec_mux);
 
 	if (dcp->avep) {
 		av_service_disconnect(dcp);
@@ -4510,6 +4526,9 @@ static int dcp_platform_probe(struct platform_device *pdev)
 				dev_err(dev, "Failed to get dp-xbar: %ld\n", PTR_ERR(dcp->xbar));
 				return PTR_ERR(dcp->xbar);
 			}
+			ret = devm_add_action_or_reset(dev, dcp_release_fixed_route, dcp);
+			if (ret)
+				return ret;
 			ret = mux_control_select(dcp->xbar, mux_index);
 			if (ret)
 				dev_warn(dev, "mux_control_select failed: %d\n", ret);
