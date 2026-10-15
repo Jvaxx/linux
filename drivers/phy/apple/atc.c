@@ -3705,6 +3705,7 @@ static int atcphy_mux_set_locked(struct apple_atcphy *atcphy, enum atcphy_mode t
 		atcphy->mode, atcphy->mode_dirty);
 
 	if (atcphy->mode == target_mode && !atcphy->mode_dirty) {
+		atcphy->typec_mode = target_mode;
 		/* Retry a failed PIPE setup without disturbing the configured lanes. */
 		if (atcphy->fixed_usb2 && atcphy->host_active &&
 		    (atcphy->pipe_state != atcphy_modes[target_mode].pipehandler_state ||
@@ -3805,8 +3806,11 @@ static int atcphy_mux_update(struct apple_atcphy *atcphy, const struct typec_mux
 		 * includes a whole enumeration with its timeouts, and would
 		 * hold up a DisplayPort update that changes neither.
 		 */
-		if (atcphy_mux_is_noop(atcphy, target_mode))
+		if (atcphy_mux_is_noop(atcphy, target_mode)) {
+			/* Record matching requests for the next PHY init to restore. */
+			atcphy->typec_mode = target_mode;
 			return 0;
+		}
 	}
 
 	ret = atcphy_usb3_pm_get(atcphy, &pm);
