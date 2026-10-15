@@ -136,8 +136,8 @@ struct apple_rtkit *apple_rtkit_init_adopted(struct device *dev, void *cookie,
 void apple_rtkit_free(struct apple_rtkit *rtk);
 
 /*
- * Detach a co-processor that could not be quiesced without releasing its
- * shared buffers.
+ * Detach a co-processor that is still running, or that could not be
+ * quiesced, without releasing its shared buffers.
  *
  * Stops mailbox callbacks and drains the private RTKit workqueue before
  * freeing the transport state. Firmware-visible mappings and their allocation
