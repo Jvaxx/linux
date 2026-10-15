@@ -21,6 +21,7 @@
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
+#include <drm/drm_atomic_uapi.h>
 #include <drm/drm_blend.h>
 #include <drm/clients/drm_client_setup.h>
 #include <drm/drm_crtc.h>
@@ -927,12 +928,66 @@ static int apple_platform_suspend(struct device *dev)
 	return 0;
 }
 
+/*
+ * A mode can be admissible only while the link it was proven on is up: the
+ * external H17P 180 Hz mode needs the current DPTX link training, and system
+ * sleep releases that link.  Restoring such a CRTC as it was fails the whole
+ * resume commit in its mode fixup, which leaves every output dark until
+ * userspace reacts to the next hotplug.  Restore that CRTC disabled instead.
+ * The DCP reports the display again once its link is back, and userspace
+ * re-enables it on that hotplug, as it does after a cable is replugged.
+ *
+ * The suspend state holds every CRTC, plane and connector already, so it is
+ * edited directly rather than through helpers that need the modeset locks.
+ */
+static void apple_drm_drop_stale_crtcs(struct drm_atomic_state *state)
+{
+	struct drm_connector_state *conn_state;
+	struct drm_plane_state *plane_state;
+	struct drm_crtc_state *crtc_state;
+	struct drm_connector *connector;
+	struct drm_plane *plane;
+	struct drm_crtc *crtc;
+	int i, j;
+
+	for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
+		if (!crtc_state->enable ||
+		    dcp_crtc_mode_fixup(crtc, &crtc_state->mode,
+					&crtc_state->adjusted_mode))
+			continue;
+
+		drm_dbg_kms(crtc->dev,
+			    "[CRTC:%d:%s] " DRM_MODE_FMT " needs a new link, resuming disabled\n",
+			    crtc->base.id, crtc->name, DRM_MODE_ARG(&crtc_state->mode));
+
+		for_each_new_plane_in_state(state, plane, plane_state, j) {
+			if (plane_state->crtc != crtc)
+				continue;
+			crtc_state->plane_mask &= ~drm_plane_mask(plane);
+			plane_state->crtc = NULL;
+			drm_atomic_set_fb_for_plane(plane_state, NULL);
+		}
+		for_each_new_connector_in_state(state, connector, conn_state, j) {
+			/* Detaching from a CRTC already in the state cannot fail. */
+			if (conn_state->crtc == crtc &&
+			    WARN_ON(drm_atomic_set_crtc_for_connector(conn_state, NULL)))
+				return;
+		}
+		crtc_state->active = false;
+		if (WARN_ON(drm_atomic_set_mode_for_crtc(crtc_state, NULL)))
+			return;
+	}
+}
+
 static int apple_platform_resume(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
 
-	if (apple)
+	if (apple) {
+		if (apple->drm.mode_config.suspend_state)
+			apple_drm_drop_stale_crtcs(apple->drm.mode_config.suspend_state);
 		drm_mode_config_helper_resume(&apple->drm);
+	}
 
 	return 0;
 }
