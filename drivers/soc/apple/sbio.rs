@@ -1761,9 +1761,24 @@ impl SepData {
 
     fn register_sensor(&self, id: &sensor::Identifier) -> bool {
         let stage = self.bringup.load(Relaxed);
-        dev_info!(self.dev, "sbio: registering sensor at bring-up stage {}\n", stage);
+        let plan = registration::plan(
+            stage,
+            self.sensor_held.load(Relaxed),
+            self.profile.nonce_session,
+            matches!(self.profile.key_store, profile::KeyStore::Sepos13 { .. }),
+        );
+        dev_info!(
+            self.dev,
+            "sbio: registering sensor at bring-up stage {}{}\n",
+            stage,
+            if plan.clear_state && stage < BRINGUP_ESTABLISHED {
+                c", clearing the enclave's partial registration first"
+            } else {
+                c""
+            }
+        );
 
-        if self.profile.nonce_session {
+        if plan.identify_first {
             // J700 needs identification before CLEAR_STATE on every reset.
             let platform = match Self::sensor_platform_identity() {
                 Ok(platform) => platform,
@@ -1777,12 +1792,15 @@ impl SepData {
                 return false;
             }
             self.sensor_trace(c"PLATFORM_IDENTITY");
+            // Counted as held from submission on: a reply that is lost or
+            // late does not mean the enclave did not act on the request.
+            self.sensor_held.store(true, Relaxed);
             if self.sensor_enclave_step(&crate::sbio::sbio_register_sensor(id)).is_none() {
                 return false;
             }
         }
 
-        if stage >= BRINGUP_ESTABLISHED {
+        if plan.clear_state {
             let _ = self.log_identity_count(c"before CLEAR_STATE for sensor re-registration");
             if self
                 .sensor_enclave_step(&crate::sbio::sbio_clear_state())
@@ -1799,7 +1817,7 @@ impl SepData {
             // The 13.5 J313 flow begins with REGISTER_SENSOR_SERIAL (0x17).
             // The newer REGISTER_SENSOR (0x80) returned 0x16 on this firmware.
             self.bringup.store(BRINGUP_IDENTIFIED, Relaxed);
-        } else if stage == BRINGUP_FRESH && !self.profile.nonce_session {
+        } else if plan.register_sensor {
             let op = crate::sbio::sbio_register_sensor(id);
             match self.sbio_call(&op) {
                 SbioOutcome::Ok(_payload) => {
