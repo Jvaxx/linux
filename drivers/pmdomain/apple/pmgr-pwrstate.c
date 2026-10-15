@@ -366,7 +366,13 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	} else if (of_property_read_bool(node, "apple,always-on")) {
 		ps->genpd.flags |= GENPD_FLAG_ALWAYS_ON;
 		if (!active) {
-			dev_warn(dev, "always-on domain %s is not on at boot\n", name);
+			/*
+			 * The boot loader need not leave an always-on domain on,
+			 * so this is not an error: apple_pmgr_ps_set() reports a
+			 * domain that cannot be turned on.
+			 */
+			dev_info(dev, "always-on domain %s is off at boot, turning it on\n",
+				 name);
 			/*
 			 * Turn it on so pm_genpd_init does not fail. genpd never
 			 * powers an always-on domain, so keep requesting it on
