@@ -175,6 +175,8 @@ static const struct apple_cio_hw apple_cio_t6030_hw = {
 #define APPLE_CIO_RESUME_LINK_WAIT_MS 90000
 #define APPLE_CIO_RESUME_LINK_CHECK_MS 5000
 #define APPLE_CIO_SLEEP_RESTART_FALLBACK_MS 10000
+/* How long a forced cable cycle may take before it no longer counts. */
+#define APPLE_CIO_RESUME_RECOVERY_WINDOW_MS 30000
 
 static bool resume_recovery;
 module_param(resume_recovery, bool, 0644);
@@ -191,7 +193,7 @@ static atomic_t resume_recovery_used = ATOMIC_INIT(0);
 static bool s2idle_teardown;
 module_param(s2idle_teardown, bool, 0644);
 MODULE_PARM_DESC(s2idle_teardown,
-		 "Power off connected ports for system sleep and restart them on resume (default N; drops tunnels)");
+		 "Power off connected ports for system sleep and restart them on resume (default N; drops tunnels, including USB devices tunnelled through a USB4 dock: unmount their storage first; ports with PCIe tunnels are skipped)");
 
 #define APPLE_CIO_START_RETRIES 5
 #define APPLE_CIO_START_RETRY_DELAY_MS 100
@@ -274,6 +276,7 @@ struct apple_cio {
 	u64 resume_activity; /* snapshot before the stock resume path */
 	bool resume_had_peer; /* peer present before suspend */
 	bool resume_recovery_active; /* forced cable cycle is in progress */
+	unsigned long resume_recovery_until; /* jiffies: the cycle is over after */
 	bool resume_recovery_failed; /* terminal recovery failure */
 	bool resume_link_failed; /* protected by lock */
 	bool resume_link_pending; /* set by NHI resume, consumed by ACIO complete */
@@ -2257,6 +2260,9 @@ static int apple_nhi_prepare(struct device *dev)
 	struct apple_cio *acio = anhi->acio;
 
 	acio->resume_had_peer = false;
+	/* Only resume recovery reads it: don't take the domain lock otherwise. */
+	if (!READ_ONCE(resume_recovery))
+		return 0;
 	scoped_guard(mutex, &anhi->tb->lock) {
 		struct tb_port *port;
 
@@ -2506,6 +2512,20 @@ static void apple_cio_log_state(struct apple_cio *acio, const char *when)
 			 readl(acio->rc_base + APPLE_CIO_M3_STAT));
 }
 
+/*
+ * Whether a forced cable cycle for resume recovery is under way. One that
+ * CD321x did not take up within the window (it refused, or a suspend came
+ * first) no longer counts, so a later unrelated start gets every attempt.
+ * Called with acio->lock held.
+ */
+static bool apple_cio_recovering(struct apple_cio *acio)
+{
+	if (acio->resume_recovery_active &&
+	    time_after(jiffies, acio->resume_recovery_until))
+		acio->resume_recovery_active = false;
+	return acio->resume_recovery_active;
+}
+
 /**
  * apple_cio_start - Power up and start the ACIO complex
  * @acio: ACIO complex to start
@@ -2569,7 +2589,7 @@ static int apple_cio_start(struct apple_cio *acio)
 	 * After the power domains are on we need to signal and wait for the ACIO block
 	 * to actually start before we can bring up the co-processor.
 	 */
-	attempts = acio->resume_recovery_active ? 1 : APPLE_CIO_START_RETRIES;
+	attempts = apple_cio_recovering(acio) ? 1 : APPLE_CIO_START_RETRIES;
 	for (i = 0; i < attempts; i++) {
 		ret = reset_control_deassert(acio->reset);
 		if (!ret)
@@ -2686,7 +2706,6 @@ err_shutdown_rtkit:
 	apple_rtkit_poweroff(acio->rtk);
 err_free_rtkit:
 	apple_rtkit_free(acio->rtk);
-	acio->rtk = NULL;
 remove_links:
 	acio->rtk = NULL;
 	/* Cut power to reset the entire block  */
@@ -2754,8 +2773,8 @@ static int apple_cio_link_connected(struct apple_cio *acio)
 			if (!tb_port_is_null(port))
 				continue;
 			dev_dbg(acio->dev,
-				"resume lane %u link %u: state/error %d, xdomain registered %d unplugged %d\n",
-				port->port, port->link_nr, tb_port_state(port),
+				"resume lane %u link %u: xdomain registered %d unplugged %d\n",
+				port->port, port->link_nr,
 				port->xdomain && device_is_registered(&port->xdomain->dev),
 				port->xdomain && port->xdomain->is_unplugged);
 		}
@@ -2797,6 +2816,8 @@ static void apple_cio_resume_link_work(struct work_struct *work)
 		}
 		acio->resume_link_failed = true;
 		acio->resume_recovery_active = true;
+		acio->resume_recovery_until = jiffies +
+			msecs_to_jiffies(APPLE_CIO_RESUME_RECOVERY_WINDOW_MS);
 		dev_info(acio->dev, "no fresh remote discovery after resume, revalidating cable once\n");
 		notify = true;
 	}
@@ -2815,6 +2836,8 @@ static int apple_cio_prepare(struct device *dev)
 	scoped_guard(mutex, &acio->lock) {
 		WRITE_ONCE(acio->resume_link_pending, false);
 		acio->resume_link_failed = false;
+		/* A cycle CD321x did not take up is not carried into this sleep. */
+		acio->resume_recovery_active = false;
 	}
 	return 0;
 }
@@ -2943,17 +2966,18 @@ static int apple_cio_tbt_switch_set(struct typec_thunderbolt_switch_dev *sw,
 	if (acio->target_cable_info) {
 		int ret;
 
+		/* -EHOSTDOWN: CD321x stops retrying a port disabled for good. */
 		if (acio->resume_recovery_failed)
-			return -ESHUTDOWN;
+			return -EHOSTDOWN;
 		ret = apple_cio_start(acio);
 		if (!ret)
-			acio->sleep_restart_owed = false;
-		if (ret && acio->resume_recovery_active) {
+			WRITE_ONCE(acio->sleep_restart_owed, false);
+		if (ret && apple_cio_recovering(acio)) {
 			acio->resume_recovery_failed = true;
 			acio->target_cable_info = 0;
 			dev_err(acio->dev,
 				"resume recovery start failed: %d; port disabled\n", ret);
-			ret = -ESHUTDOWN;
+			ret = -EHOSTDOWN;
 		}
 		acio->resume_recovery_active = false;
 		return ret;
@@ -2988,7 +3012,7 @@ static void apple_cio_sleep_teardown(struct apple_cio *acio)
 		 acio->current_cable_info);
 	apple_cio_stop(acio);
 	acio->sleep_phase = APPLE_CIO_SLEEP_CLOSED;
-	acio->sleep_restart_owed = true;
+	WRITE_ONCE(acio->sleep_restart_owed, true);
 }
 
 /* A restart still owed from the last sleep must not race this suspend. */
@@ -3016,7 +3040,7 @@ static void apple_cio_sleep_restart_work(struct work_struct *work)
 			return;
 		acio->sleep_phase = APPLE_CIO_SLEEP_OPEN;
 		if (acio->removing || acio->resume_recovery_failed || acio->current_cable_info) {
-			acio->sleep_restart_owed = false;
+			WRITE_ONCE(acio->sleep_restart_owed, false);
 			return;
 		}
 		dev_info(acio->dev, "requesting cable restore after system sleep\n");
@@ -3031,6 +3055,10 @@ static int apple_cio_pm_notify(struct notifier_block *nb, unsigned long event,
 {
 	struct apple_cio *acio = container_of(nb, struct apple_cio, pm_notifier);
 	bool owed, early;
+
+	/* Teardown off and no restart owed from an earlier sleep: nothing to do. */
+	if (!READ_ONCE(s2idle_teardown) && !READ_ONCE(acio->sleep_restart_owed))
+		return NOTIFY_DONE;
 
 	switch (event) {
 	case PM_SUSPEND_PREPARE:

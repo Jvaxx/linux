@@ -477,7 +477,6 @@ int tb_port_state(struct tb_port *port)
 		return res;
 	return phy.state;
 }
-EXPORT_SYMBOL_NS_GPL(tb_port_state, "USB4");
 
 /**
  * tb_wait_for_port() - wait for a port to become ready

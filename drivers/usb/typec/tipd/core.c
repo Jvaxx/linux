@@ -1256,7 +1256,12 @@ static void cd321x_update_work(struct work_struct *work)
 	return;
 
 retry:
-	if (ret == -ESHUTDOWN) {
+	/*
+	 * The Thunderbolt provider disabled the port for good after a failed
+	 * resume recovery (see apple_cio_tbt_switch_set()). Other errors,
+	 * including -ESHUTDOWN while the provider unbinds, are retried as before.
+	 */
+	if (ret == -EHOSTDOWN) {
 		struct typec_mux_state safe = { .mode = TYPEC_STATE_SAFE };
 		int cleanup;
 
