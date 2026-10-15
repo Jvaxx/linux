@@ -2906,25 +2906,24 @@ static int atc_tunnel_start_t602x(struct apple_atcphy *atcphy)
 	core_clear32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_COMMON_CLAMP);
 	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_COMMON_CLAMP_OV);
 	udelay(2);
-	core_set32(atcphy, ACIOPHY_SLEEP_CTRL, 0x30);
-	core_set32(atcphy, ACIOPHY_SLEEP_CTRL, 0xc0);
+	/* same for the TX lanes */
+	core_set32(atcphy, ACIOPHY_SLEEP_CTRL, ACIOPHY_SLEEP_CTRL_TX_SMALL);
+	core_set32(atcphy, ACIOPHY_SLEEP_CTRL, ACIOPHY_SLEEP_CTRL_TX_SMALL_OV);
 	udelay(2);
-	core_set32(atcphy, ACIOPHY_SLEEP_CTRL, 0x03);
-	core_set32(atcphy, ACIOPHY_SLEEP_CTRL, 0x0c);
+	core_set32(atcphy, ACIOPHY_SLEEP_CTRL, ACIOPHY_SLEEP_CTRL_TX_BIG);
+	core_set32(atcphy, ACIOPHY_SLEEP_CTRL, ACIOPHY_SLEEP_CTRL_TX_BIG_OV);
 	udelay(2);
-	core_clear32(atcphy, ACIOPHY_SLEEP_CTRL, 0x300);
-	core_set32(atcphy, ACIOPHY_SLEEP_CTRL, 0xc00);
+	core_clear32(atcphy, ACIOPHY_SLEEP_CTRL, ACIOPHY_SLEEP_CTRL_TX_CLAMP);
+	core_set32(atcphy, ACIOPHY_SLEEP_CTRL, ACIOPHY_SLEEP_CTRL_TX_CLAMP_OV);
 	udelay(2);
-	/* Additional override bit alongside RX_BIG_OV; exact meaning not independently confirmed. */
-	core_set32(atcphy, ACIOPHY_CFG0, 0xc00);
+	/* and for the RX lanes */
+	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_RX_BIG);
 	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_RX_BIG_OV);
 	udelay(2);
-	/* Additional override bit alongside RX_SMALL_OV; exact meaning not independently confirmed. */
-	core_set32(atcphy, ACIOPHY_CFG0, 0xc0);
+	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_RX_SMALL);
 	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_RX_SMALL_OV);
 	udelay(2);
-	/* Additional override bit alongside RX_CLAMP_OV; exact meaning not independently confirmed. */
-	core_clear32(atcphy, ACIOPHY_CFG0, 0xc000);
+	core_clear32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_RX_CLAMP);
 	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_RX_CLAMP_OV);
 	udelay(2);
 	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, BIT(2));
