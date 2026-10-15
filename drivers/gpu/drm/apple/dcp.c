@@ -762,6 +762,15 @@ static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_
 	if (READ_ONCE(dcp->quiescing))
 		return;
 
+	/*
+	 * A failed T8122 dcpext: its start never ran (start_done is not set
+	 * up) and it has no connector. Its firmware may still report a crash.
+	 */
+	if (READ_ONCE(dcp->ext_dead)) {
+		dcp->crashed = true;
+		dev_err(dcp->dev, "unusable external display processor has crashed\n");
+		return;
+	}
 	dcp->crashed = true;
 	dev_err(dcp->dev, "DCP has crashed\n");
 	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
@@ -4160,6 +4169,44 @@ static void dcp_ext_give_up(struct apple_dcp *dcp, int err, const char *when)
 }
 
 /*
+ * Whether the DP PHY and display crossbar of every Type-C route are there.
+ * Routes register one at a time, and one registered cannot be taken back,
+ * since a port controller may hold it: a later route waiting for its
+ * supplier would leave the dcpext unusable for the boot. Returns
+ * -EPROBE_DEFER until all of them are; other errors are left to the route
+ * probe, which reports them.
+ */
+static int dcp_ext_route_suppliers(struct device *dev)
+{
+	struct device_node *routes __free(device_node) =
+		of_get_child_by_name(dev->of_node, "typec-routes");
+	char name[16];
+	u32 index;
+
+	if (!routes)
+		return 0;
+	for_each_available_child_of_node_scoped(routes, route_np) {
+		struct mux_control *xbar;
+		struct phy *phy;
+
+		if (of_property_read_u32(route_np, "reg", &index))
+			continue;
+		snprintf(name, sizeof(name), "typec%u", index);
+		phy = of_phy_get(dev->of_node, name);
+		if (PTR_ERR_OR_ZERO(phy) == -EPROBE_DEFER)
+			return -EPROBE_DEFER;
+		if (!IS_ERR(phy))
+			of_phy_put(phy);
+		xbar = mux_control_get(dev, name);
+		if (PTR_ERR_OR_ZERO(xbar) == -EPROBE_DEFER)
+			return -EPROBE_DEFER;
+		if (!IS_ERR(xbar))
+			mux_control_put(xbar);
+	}
+	return 0;
+}
+
+/*
  * The T8122 dcpext is a component of the panel's DRM device, so it must
  * always register one, or the panel stays on the boot framebuffer. Keep
  * deferring while its suppliers may still appear (bounded by the deferred
@@ -4174,6 +4221,10 @@ static int dcp_platform_probe(struct platform_device *pdev)
 
 	if (!of_device_is_compatible(dev->of_node, "apple,t8122-dcpext"))
 		return dcp_platform_probe_pipe(pdev);
+
+	ret = dcp_ext_route_suppliers(dev);
+	if (ret)
+		goto unusable;
 
 	group = devres_open_group(dev, NULL, GFP_KERNEL);
 	if (!group)
@@ -4194,6 +4245,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 
 	devres_release_group(dev, group);
 	platform_set_drvdata(pdev, NULL);
+unusable:
 	if (ret == -EPROBE_DEFER) {
 		ret = driver_deferred_probe_check_state(dev);
 		if (ret == -EPROBE_DEFER)

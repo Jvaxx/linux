@@ -197,6 +197,9 @@ static int afk_start_polled(struct apple_dcp_afkep *ep)
 			return 0;
 	} while (time_before(jiffies, timeout));
 
+	/* Completed after the last wait, before the deadline check. */
+	if (try_wait_for_completion(&ep->started))
+		return 0;
 	dev_err(ep->dcp->dev,
 		"RTKit AFK endpoint %02x did not acknowledge init\n",
 		ep->endpoint);
