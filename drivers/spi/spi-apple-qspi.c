@@ -587,9 +587,9 @@ static int apple_qspi_probe(struct platform_device *pdev)
 				     "failed to register SPI controller\n");
 
 	version = apple_qspi_p_read(qspi, APPLE_QSPI_P_VERSION);
-	dev_info(dev, "QSPIMC version %#x, %lu Hz clock, txq=%u rxq=%u\n",
-		 version, clk_get_rate(qspi->clk), qspi->tx_depth,
-		 qspi->rx_depth);
+	dev_dbg(dev, "QSPIMC version %#x, %lu Hz clock, txq=%u rxq=%u\n",
+		version, clk_get_rate(qspi->clk), qspi->tx_depth,
+		qspi->rx_depth);
 	return 0;
 }
 
