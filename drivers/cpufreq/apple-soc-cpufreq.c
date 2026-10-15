@@ -843,6 +843,8 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 		dev_pm_opp_put(opp);
 		if (freq_table[i].driver_data < info->min_pstate ||
 		    freq_table[i].driver_data > info->max_pstate) {
+			dev_err(cpu_dev, "OPP level %u is not a valid P-state\n",
+				freq_table[i].driver_data);
 			ret = -EINVAL;
 			goto out_free_cpufreq_table;
 		}
@@ -856,13 +858,16 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 		ret = readq_poll_timeout_atomic(reg_base + APPLE_DVFS_CMD, cmd,
 						!(cmd & APPLE_DVFS_CMD_BUSY), 2,
 						apple_soc_cpufreq_timeout(info));
-		if (ret)
+		if (ret) {
+			dev_err(cpu_dev, "DVFS busy at init, command=%#llx\n", cmd);
 			goto out_free_cpufreq_table;
+		}
 		state = FIELD_GET(APPLE_DVFS_CMD_PS1, cmd);
 		for (i = 0; freq_table[i].frequency != CPUFREQ_TABLE_END; i++)
 			if (freq_table[i].driver_data == state)
 				break;
 		if (freq_table[i].frequency == CPUFREQ_TABLE_END) {
+			dev_err(cpu_dev, "current P-state %u has no OPP\n", state);
 			ret = -ERANGE;
 			goto out_free_cpufreq_table;
 		}
