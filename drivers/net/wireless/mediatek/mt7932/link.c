@@ -113,11 +113,11 @@ void mt_link_event(struct mt7932 *m, const struct mt7932_event *event)
 	selector = get_unaligned_le32(event->packet + 40);
 	body = event->packet + 48;
 	length = event->length - 48;
-	dev_info(&m->pdev->dev, "LINK_EVENT: selector=%02x length=%zu\n", selector, length);
+	dev_dbg(&m->pdev->dev, "LINK_EVENT: selector=%02x length=%zu\n", selector, length);
 	if (selector == 0x44) {
 		if (length < 5 || (!m->connecting && !m->connected && !m->disconnecting))
 			return;
-		dev_info(&m->pdev->dev, "DISCONNECT_EVENT: metadata=%u deferred=%u reason-index=%u\n",
+		dev_dbg(&m->pdev->dev, "DISCONNECT_EVENT: metadata=%u deferred=%u reason-index=%u\n",
 			body[0], body[3], body[4]);
 		if (m->disconnect_seen)
 			return;
@@ -179,18 +179,18 @@ void mt_link_event(struct mt7932 *m, const struct mt7932_event *event)
 			 * rate-control setting. Bounds were checked by the exporter.
 			 */
 			if (he)
-				dev_info(&m->pdev->dev,
-					 "ASSOC_HE_CAPABILITIES: epoch=%u rx-map=%04x tx-map=%04x\n",
-					 m->connection_generation,
-					 get_unaligned_le16(he->data + 18),
-					 get_unaligned_le16(he->data + 20));
+				dev_dbg(&m->pdev->dev,
+					"ASSOC_HE_CAPABILITIES: epoch=%u rx-map=%04x tx-map=%04x\n",
+					m->connection_generation,
+					get_unaligned_le16(he->data + 18),
+					get_unaligned_le16(he->data + 20));
 		}
 		break;
 	}
 	case 0x4d:
 		if (length >= 20)
-			dev_info(&m->pdev->dev, "ASSOC_START: band=%u width=%u channel=%u extension=%u\n",
-				 get_unaligned_le32(body + 12), body[16], body[17], body[19]);
+			dev_dbg(&m->pdev->dev, "ASSOC_START: band=%u width=%u channel=%u extension=%u\n",
+				get_unaligned_le32(body + 12), body[16], body[17], body[19]);
 		if (!mt_channel_event(m, body, length)) {
 			m->connect_error = -EPROTO;
 			complete(&m->assoc_done);
@@ -199,9 +199,10 @@ void mt_link_event(struct mt7932 *m, const struct mt7932_event *event)
 		break;
 	case 0x40:
 		if (length >= 52)
-			dev_info(&m->pdev->dev, "ASSOC_REPORT: status=%u band=%u channel=%u bss=%u bmc=%u station=%u peer=%u cipher=%08x\n",
-				 get_unaligned_le16(body), body[11], body[12], body[16], body[17], body[20], body[21],
-				 get_unaligned_le32(body + 48));
+			dev_dbg(&m->pdev->dev,
+				"ASSOC_REPORT: status=%u band=%u channel=%u bss=%u bmc=%u station=%u peer=%u cipher=%08x\n",
+				get_unaligned_le16(body), body[11], body[12], body[16], body[17],
+				body[20], body[21], get_unaligned_le32(body + 48));
 		/* OPEN reports retain cipher as numeric metadata only; it neither
 		 * installs a key nor changes the immutable requested security mode.
 		 */
@@ -215,12 +216,13 @@ void mt_link_event(struct mt7932 *m, const struct mt7932_event *event)
 		m->peer_valid = true;
 		/* HOST decoder confirms the RSN suite namespace, not request enum10. */
 		m->event_cipher = get_unaligned_le32(body + 48);
-		dev_info(&m->pdev->dev, "ASSOCIATED: peer=%u station=%u cipher-raw=%u\n",
-			 m->peer_wtbl, body[20], m->event_cipher);
+		dev_dbg(&m->pdev->dev, "ASSOCIATED: peer=%u station=%u cipher-raw=%u\n",
+			m->peer_wtbl, body[20], m->event_cipher);
 		break;
 	case 0x42:
 		if (length >= 2)
-			dev_info(&m->pdev->dev, "CONNECT_REPORT: status=%u peer-owned=%u\n", get_unaligned_le16(body), m->peer_valid);
+			dev_dbg(&m->pdev->dev, "CONNECT_REPORT: status=%u peer-owned=%u\n",
+				get_unaligned_le16(body), m->peer_valid);
 		if (length < 2 || get_unaligned_le16(body) || !m->peer_valid)
 			m->connect_error = -ECONNREFUSED;
 		complete(&m->assoc_done);
@@ -354,8 +356,9 @@ static int mt_retire_connection(struct mt7932 *m)
 		m->link_failed = true; /* uncertain ownership: recovery required */
 	spin_unlock_irqrestore(&m->response_lock, flags);
 	mutex_unlock(&m->command_mutex);
-	dev_info(&m->pdev->dev, "CONNECTION_RETIRED: status=%d%s\n", ret,
-		 ret ? "; recovery required, DMA ownership retained" : "; old TX drained, six IDs released");
+	dev_dbg(&m->pdev->dev, "CONNECTION_RETIRED: status=%d%s\n", ret,
+		ret ? "; recovery required, DMA ownership retained" :
+		      "; old TX drained, six IDs released");
 	return ret;
 }
 
@@ -400,7 +403,7 @@ void mt_connect_work(struct work_struct *work)
 		goto free;
 	}
 	if (!m->connect_bss) {
-		dev_info(&m->pdev->dev, "CONNECT_DISCOVERY: refreshing missing scan candidate\n");
+		dev_dbg(&m->pdev->dev, "CONNECT_DISCOVERY: refreshing missing scan candidate\n");
 		ret = mt_connect_discover(m);
 		if (ret)
 			goto free;
@@ -446,7 +449,8 @@ free:
 	memzero_explicit(m->connect_pmk, sizeof(m->connect_pmk));
 	if (ret)
 		goto report;
-	dev_info(&m->pdev->dev, "CONNECT_SUBMITTED: BSSID=%pM channel=%u\n", m->connect_bssid, m->connect_channel);
+	dev_dbg(&m->pdev->dev, "CONNECT_SUBMITTED: BSSID=%pM channel=%u\n",
+		m->connect_bssid, m->connect_channel);
 	/* Genuine D7 requests must remain serviceable during asynchronous waits. */
 	mutex_unlock(&m->command_mutex);
 	ret = wait_for_completion_timeout(&m->assoc_start, msecs_to_jiffies(5000)) ? 0 : -ETIMEDOUT;
@@ -462,8 +466,8 @@ free:
 	ret = ret ?: READ_ONCE(m->connect_error);
 	if (ret)
 		goto report;
-	dev_info(&m->pdev->dev, "ASSOCIATION_CALIBRATED: primary=%u center=%u\n",
-		 m->connect_channel, m->connect_center);
+	dev_dbg(&m->pdev->dev, "ASSOCIATION_CALIBRATED: primary=%u center=%u\n",
+		m->connect_channel, m->connect_center);
 	mt7932_peer_queue(queue, m->peer_ids.station[0], true);
 	ret = mt_request(m, 0x6b, true, true, false, queue, sizeof(queue));
 	if (ret)
@@ -556,10 +560,14 @@ report:
 			netif_wake_queue(m->netdev);
 		}
 		if (m->connect_open) {
-			dev_info(&m->pdev->dev, "OPEN_CONNECTED: owned peer, firmware completion; Ethernet=%u\n", m->data_ready);
+			dev_dbg(&m->pdev->dev,
+				"OPEN_CONNECTED: owned peer, firmware completion; Ethernet=%u\n",
+				m->data_ready);
 		} else {
 			cfg80211_port_authorized(m->netdev, m->connect_bssid, NULL, 0, GFP_ATOMIC);
-			dev_info(&m->pdev->dev, "WPA2_AUTHORIZED: firmware handshake complete; Ethernet=%u\n", m->data_ready);
+			dev_dbg(&m->pdev->dev,
+				"WPA2_AUTHORIZED: firmware handshake complete; Ethernet=%u\n",
+				m->data_ready);
 		}
 	} else {
 		dev_err(&m->pdev->dev, "CONNECT_FAILED: %d; recovery-required=%u\n", ret, m->link_failed);
@@ -601,9 +609,11 @@ int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 		mt_retry_missing_policy(m);
 	if (!mt_rf_allowed(m) || !m->bss_active || netdev != m->netdev)
 		return -EAGAIN;
-	dev_info_ratelimited(&m->pdev->dev, "CONNECT_REQUEST: WPA=%u pairwise-count=%d group=%08x AKM-count=%d PMK-present=%u MFP=%u IE-bytes=%zu\n",
-		 params->crypto.wpa_versions, params->crypto.n_ciphers_pairwise, params->crypto.cipher_group,
-		 params->crypto.n_akm_suites, !!params->crypto.psk, params->mfp, params->ie_len);
+	dev_dbg(&m->pdev->dev,
+		"CONNECT_REQUEST: WPA=%u pairwise-count=%d group=%08x AKM-count=%d PMK-present=%u MFP=%u IE-bytes=%zu\n",
+		params->crypto.wpa_versions, params->crypto.n_ciphers_pairwise,
+		params->crypto.cipher_group, params->crypto.n_akm_suites,
+		!!params->crypto.psk, params->mfp, params->ie_len);
 	if (!params->ssid_len || params->ssid_len > 32)
 		return -EINVAL;
 	if (!open && (params->crypto.wpa_versions != NL80211_WPA_VERSION_2 ||
@@ -680,7 +690,7 @@ void mt_disconnect_work(struct work_struct *work)
 	m->disconnecting = false;
 	cfg80211_disconnected(m->netdev, reason, NULL, 0, local, GFP_ATOMIC);
 	spin_unlock_irqrestore(&m->response_lock, flags);
-	dev_info(&m->pdev->dev, "DISCONNECTED: teardown=%d local=%u\n", ret, local);
+	dev_dbg(&m->pdev->dev, "DISCONNECTED: teardown=%d local=%u\n", ret, local);
 }
 
 int mt_disconnect(struct wiphy *wiphy, struct net_device *netdev, u16 reason)

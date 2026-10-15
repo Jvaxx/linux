@@ -169,8 +169,8 @@ static void mt_receive(struct mt7932 *m, const u8 *packet, size_t length)
 		ret = mt7932_cal_null(&m->cal_state, packet + 36,
 				     event.length >= 36 ? event.length - 36 : 0,
 				     m->smart_version);
-		dev_info(&m->pdev->dev, "CAL_EVENT: seq=%u length=%zu result=%d credits=%u/%u\n",
-			 event.seq, event.length, ret, m->cal_state.received, m->cal_state.expected);
+		dev_dbg(&m->pdev->dev, "CAL_EVENT: seq=%u length=%zu result=%d credits=%u/%u\n",
+			event.seq, event.length, ret, m->cal_state.received, m->cal_state.expected);
 		if (ret < 0)
 			mt_rf_fail_locked(m, ret);
 		if (ret)
@@ -196,9 +196,10 @@ static void mt_receive(struct mt7932 *m, const u8 *packet, size_t length)
 			memcpy(m->cal_requests[at], packet + 36, 16);
 			m->cal_request_seq[at] = event.seq;
 			m->cal_request_count++;
-			dev_info(&m->pdev->dev, "CAL_REQUEST: seq=%u words=%08x/%08x/%08x/%08x queued=%u\n",
-				 event.seq, get_unaligned_le32(packet + 36), get_unaligned_le32(packet + 40),
-				 get_unaligned_le32(packet + 44), get_unaligned_le32(packet + 48), m->cal_request_count);
+			dev_dbg(&m->pdev->dev, "CAL_REQUEST: seq=%u words=%08x/%08x/%08x/%08x queued=%u\n",
+				event.seq, get_unaligned_le32(packet + 36),
+				get_unaligned_le32(packet + 40), get_unaligned_le32(packet + 44),
+				get_unaligned_le32(packet + 48), m->cal_request_count);
 			if (READ_ONCE(m->rf_ready))
 				schedule_work(&m->cal_work);
 		}
@@ -385,38 +386,18 @@ int mt_request_ext(struct mt7932 *m, u8 cid, u8 ext, bool runtime, bool set, boo
 	if (READ_ONCE(m->stopping))
 		ret = -ESHUTDOWN;
 	if (ret == -ETIMEDOUT) {
-		/* Diagnostic only: never turn a polled late reply into IRQ success. */
 		unsigned int i;
-		u16 command;
-		u32 mask, pending;
-		unsigned int cap = pci_find_capability(m->pdev, PCI_CAP_ID_MSI);
 
-		pci_read_config_word(m->pdev, PCI_COMMAND, &command);
-		pci_read_config_dword(m->pdev, cap + PCI_MSI_MASK_64, &mask);
-		pci_read_config_dword(m->pdev, cap + PCI_MSI_PENDING_64, &pending);
-		dev_info(&m->pdev->dev, "timeout PCI command=%04x MSI mask=%08x pending=%08x\n",
-			 command, mask, pending);
-
-		dev_info(&m->pdev->dev, "timeout gates MAC=%08x WFDMA=%08x SW=%08x\n",
-			 mt_read(m, 0x10188), mt_read(m, W + 0x204), mt_read(m, W + 0x1f4));
+		/*
+		 * Collect a reply that arrived without its interrupt, so that the
+		 * error below reports it. It does not turn the timeout into success.
+		 */
 		disable_irq(pci_irq_vector(m->pdev, 0));
-		for (i = 0; i < ARRAY_SIZE(m->rx); i++) {
-			struct mt7932_ring *rx = &m->rx[i];
-
-			if (!rx->count)
-				continue;
-			dev_info(&m->pdev->dev, "timeout RX%u ctrl=%08x CPU=%u DMA=%u\n", i,
-				 le32_to_cpu(rx->desc[rx->tail].control),
-				 mt_read(m, rx->reg + 8), mt_read(m, rx->reg + 12));
-			if (le32_to_cpu(rx->desc[rx->tail].control) & DONE) {
-				dma_rmb();
-				print_hex_dump(KERN_INFO, "ROM RX prefix: ", DUMP_PREFIX_OFFSET,
-					       16, 1, rx->buffers + rx->tail * RX_STRIDE, 40, false);
-			}
-			mt_rx_drain(m, rx);
-		}
-		dev_info(&m->pdev->dev, "late polled reply length=%zu eid=%02x (not IRQ success)\n",
-			 m->reply_length, m->reply_length > 28 ? m->reply[28] : 0);
+		for (i = 0; i < ARRAY_SIZE(m->rx); i++)
+			if (m->rx[i].count)
+				mt_rx_drain(m, &m->rx[i]);
+		dev_dbg(&m->pdev->dev, "late reply length=%zu eid=%02x\n",
+			m->reply_length, m->reply_length > 28 ? m->reply[28] : 0);
 		enable_irq(pci_irq_vector(m->pdev, 0));
 	}
 	spin_lock_irqsave(&m->response_lock, flags);
@@ -459,7 +440,7 @@ static int mt_ownership(struct mt7932 *m)
 	udelay(2);
 	if ((mt_read(m, 0xfe250) >> 16) != 0x7000)
 		return -EIO;
-	dev_info(&m->pdev->dev, "DRIVER_OWN_OK power=%08x\n", mt_read(m, 0xe00f0));
+	dev_dbg(&m->pdev->dev, "DRIVER_OWN_OK power=%08x\n", mt_read(m, 0xe00f0));
 	return 0;
 }
 
@@ -570,8 +551,8 @@ static int mt_dma_setup(struct mt7932 *m)
 	mt_rmw(m, 0x2120, 0, BIT(1));
 	mt_write(m, W + 0x1f4, 0xffff);
 	mt_write(m, W + 0x204, IRQ_MASK);
-	dev_info(&m->pdev->dev, "DMA_PUBLISHED glo=%08x TX17=%pad RX0=%pad IPC=%pad\n",
-		 mt_read(m, W + 0x208), &m->tx[17].dma, &m->rx[0].dma, &m->ipc_dma);
+	dev_dbg(&m->pdev->dev, "DMA_PUBLISHED glo=%08x TX17=%pad RX0=%pad IPC=%pad\n",
+		mt_read(m, W + 0x208), &m->tx[17].dma, &m->rx[0].dma, &m->ipc_dma);
 	return 0;
 }
 
@@ -604,11 +585,11 @@ static int mt_rom_gate(struct mt7932 *m)
 		if (m->reply_length < 40 || m->reply[28] != 2 ||
 		    get_unaligned_le32(m->reply + 32) != addresses[i])
 			return -EPROTO;
-		dev_info(&m->pdev->dev, "ROM_READ_OK %08x=%08x seq=%u IRQ=%llu\n",
-			 addresses[i], get_unaligned_le32(m->reply + 36), m->seq, m->interrupts);
+		dev_dbg(&m->pdev->dev, "ROM_READ_OK %08x=%08x seq=%u IRQ=%llu\n",
+			addresses[i], get_unaligned_le32(m->reply + 36), m->seq, m->interrupts);
 	}
-	dev_info(&m->pdev->dev, "ROM_TRANSPORT_OK IRQ=%llu (no firmware download or RF yet)\n",
-		 m->interrupts);
+	dev_dbg(&m->pdev->dev, "ROM_TRANSPORT_OK IRQ=%llu (no firmware download or RF yet)\n",
+		m->interrupts);
 	return 0;
 }
 
@@ -663,8 +644,8 @@ static int mt_download(struct mt7932 *m, const u8 *data, struct mt7932_region *r
 	if (ret)
 		return ret;
 	ret = mt_scatter(m, data + r->offset, r->length);
-	dev_info(&m->pdev->dev, "%s region target=%08x length=%u scatter=%d\n",
-		 ram ? "RAM" : "PATCH", r->target, r->length, ret);
+	dev_dbg(&m->pdev->dev, "%s region target=%08x length=%u scatter=%d\n",
+		ram ? "RAM" : "PATCH", r->target, r->length, ret);
 	return ret;
 }
 
@@ -728,8 +709,8 @@ static int mt_capability_gate(struct mt7932 *m)
 	count = mt7932_capabilities(body, m->reply_length - 36);
 	if (count < 0) {
 		dev_err(&m->pdev->dev, "invalid capability reply len=%zu parse=%d\n", m->reply_length, count);
-		print_hex_dump(KERN_INFO, "NIC_CAP_REJECTED: ", DUMP_PREFIX_OFFSET,
-			       16, 1, m->reply, m->reply_length, false);
+		print_hex_dump_debug("NIC_CAP_REJECTED: ", DUMP_PREFIX_OFFSET,
+				     16, 1, m->reply, m->reply_length, false);
 		return count;
 	}
 	for (i = 0; i < count; i++) {
@@ -737,9 +718,9 @@ static int mt_capability_gate(struct mt7932 *m)
 		u32 length = get_unaligned_le32(body + offset + 4);
 		const u8 *value = body + offset + 8;
 
-		dev_info(&m->pdev->dev, "capability TLV type=%x bytes=%u\n", type, length);
+		dev_dbg(&m->pdev->dev, "capability TLV type=%x bytes=%u\n", type, length);
 		if (type == 7) {
-			dev_info(&m->pdev->dev, "firmware MAC %pM\n", value);
+			dev_dbg(&m->pdev->dev, "firmware MAC %pM\n", value);
 			mac = true;
 		} else if (type == 8) {
 			if (!value[4] || value[4] > 4) {
@@ -748,13 +729,13 @@ static int mt_capability_gate(struct mt7932 *m)
 			}
 			memcpy(m->phy_cap, value, 12);
 			m->antenna_mask = (1U << value[4]) - 1;
-			dev_info(&m->pdev->dev, "firmware PHY NSS=%u paths=%02x HT=%u VHT=%u HE=%u\n",
-				 value[4], value[10], value[0], value[1], value[11]);
+			dev_dbg(&m->pdev->dev, "firmware PHY NSS=%u paths=%02x HT=%u VHT=%u HE=%u\n",
+				value[4], value[10], value[0], value[1], value[11]);
 			phy = true;
 		} else if (type == 0x38 && length) {
 			m->runtime_cal = value[0];
 			m->runtime_cal_valid = true;
-			dev_info(&m->pdev->dev, "RUNTIME_CAL_CAPABILITY: %u\n", value[0]);
+			dev_dbg(&m->pdev->dev, "RUNTIME_CAL_CAPABILITY: %u\n", value[0]);
 		} else if (type == 0x18 && length >= 4) {
 			m->six_ghz = value[0];
 			m->six_ghz_valid = value[0] <= 1;
@@ -767,10 +748,10 @@ static int mt_capability_gate(struct mt7932 *m)
 		dev_err(&m->pdev->dev, "CAPABILITY_MISSING: MAC=%u PHY=%u\n", mac, phy);
 		return -ENODATA;
 	}
-	print_hex_dump(KERN_INFO, "NIC_CAP: ", DUMP_PREFIX_OFFSET, 16, 1,
-		       m->reply, m->reply_length, false);
-	dev_info(&m->pdev->dev, "MCU_CAPABILITY_OK eid=%02x seq=%u (no calibration or RF yet)\n",
-		 m->reply[28], m->seq);
+	print_hex_dump_debug("NIC_CAP: ", DUMP_PREFIX_OFFSET, 16, 1,
+			     m->reply, m->reply_length, false);
+	dev_dbg(&m->pdev->dev, "MCU_CAPABILITY_OK eid=%02x seq=%u (no calibration or RF yet)\n",
+		m->reply[28], m->seq);
 	return 0;
 }
 
@@ -792,7 +773,7 @@ static int mt_config_gate(struct mt7932 *m)
 	do {
 		mt_tx_clean(&m->tx[17]);
 		if (!m->tx[17].queued) {
-			dev_info(&m->pdev->dev, "BASIC_MLME_SUBMITTED: TX retired, no semantic ACK or RF startup\n");
+			dev_dbg(&m->pdev->dev, "BASIC_MLME_SUBMITTED: TX retired, no semantic ACK or RF startup\n");
 			return 0;
 		}
 		usleep_range(100, 200);
@@ -816,7 +797,7 @@ static int mt_board_gate(struct mt7932 *m)
 		return ret;
 	if (m->reply_length < 44 || m->reply[28] != 0xed || m->reply[32] != 0xc1)
 		return -EPROTO;
-	dev_info(&m->pdev->dev, "CHIP_UID_QUERY_OK: 8 opaque bytes received, not published\n");
+	dev_dbg(&m->pdev->dev, "CHIP_UID_QUERY_OK: 8 opaque bytes received, not published\n");
 	for (i = 0; i < ARRAY_SIZE(addresses); i++) {
 		put_unaligned_le32(addresses[i], request);
 		ret = mt_request_ext(m, 0xed, 1, true, false, true, request, sizeof(request));
@@ -834,8 +815,8 @@ static int mt_board_gate(struct mt7932 *m)
 	candidate = !(module & 15) ? 2 : !board_byte ? 3 : 1;
 	m->board_type = candidate;
 	m->module_byte = module;
-	dev_info(&m->pdev->dev, "BOARD_CLASSIFICATION_CAPTURED: candidate=%u module=%02x board-byte=%02x status=%08x/%08x; no buffer branch selected\n",
-		 candidate, module, board_byte, status[0], status[1]);
+	dev_dbg(&m->pdev->dev, "BOARD_CLASSIFICATION_CAPTURED: candidate=%u module=%02x board-byte=%02x status=%08x/%08x; no buffer branch selected\n",
+		candidate, module, board_byte, status[0], status[1]);
 	return 0;
 }
 
@@ -874,7 +855,7 @@ static int mt_precal_gate(struct mt7932 *m)
 		return -EPROTO;
 	}
 	status = get_unaligned_le32(m->reply + 40);
-	dev_info(&m->pdev->dev, "PPR_SOURCE2_RESULT: status=%08x\n", status);
+	dev_dbg(&m->pdev->dev, "PPR_SOURCE2_RESULT: status=%08x\n", status);
 	if (status)
 		return -EREMOTEIO;
 	memset(request, 0, sizeof(request));
@@ -884,17 +865,17 @@ static int mt_precal_gate(struct mt7932 *m)
 	if (m->reply_length < 40 || m->reply[28] != 0xed || m->reply[32] != 0xaa)
 		return -EPROTO;
 	m->smart_version = m->reply[38] & 15;
-	dev_info(&m->pdev->dev, "SMART_VERSION_REPLY: eid=%02x ext=%02x version=%u\n",
-		 m->reply[28], m->reply[32], m->smart_version);
+	dev_dbg(&m->pdev->dev, "SMART_VERSION_REPLY: eid=%02x ext=%02x version=%u\n",
+		m->reply[28], m->reply[32], m->smart_version);
 	request[3] = 9;
 	ret = mt_request(m, 0xbf, true, false, true, request, 20);
 	if (ret)
 		return ret;
 	if (m->reply_length < 56)
 		return -EPROTO;
-	dev_info(&m->pdev->dev, "CALTYPE_REPLY: eid=%02x ext=%02x H=%u P=%u O=%u V=%u marker=%08x\n",
-		 m->reply[28], m->reply[32], m->runtime_cal, m->reply[37],
-		 m->reply[44], m->reply[38], get_unaligned_le32(m->reply + 48));
+	dev_dbg(&m->pdev->dev, "CALTYPE_REPLY: eid=%02x ext=%02x H=%u P=%u O=%u V=%u marker=%08x\n",
+		m->reply[28], m->reply[32], m->runtime_cal, m->reply[37],
+		m->reply[44], m->reply[38], get_unaligned_le32(m->reply + 48));
 	/* M=0/T=3 exact host predicate. Stage metadata only after acceptance;
 	 * do not select the legacy absent-marker D6 compatibility fallback.
 	 */
@@ -902,7 +883,7 @@ static int mt_precal_gate(struct mt7932 *m)
 	    m->reply[37] != 1 || m->reply[44] != 1)
 		return -EPROTO;
 	m->preload_version = m->reply[38];
-	dev_info(&m->pdev->dev, "PRECAL_HANDSHAKE_OK: own calibration and RF policy still required\n");
+	dev_dbg(&m->pdev->dev, "PRECAL_HANDSHAKE_OK: own calibration and RF policy still required\n");
 	return 0;
 }
 
@@ -958,8 +939,8 @@ static int mt_firmware_gate(struct mt7932 *m)
 			dev_err(&m->pdev->dev, "local input mediatek/mt7932/IZUBA_W7932_2.bin has invalid region %d\n", i);
 			goto out;
 		}
-	dev_info(&m->pdev->dev, "stock containers patch=%zu/%d regions RAM=%zu/%d regions\n",
-		 patch->size, patches, ram->size, regions);
+	dev_dbg(&m->pdev->dev, "stock containers patch=%zu/%d regions RAM=%zu/%d regions\n",
+		patch->size, patches, ram->size, regions);
 	phase = "patch semaphore command/reply";
 	put_unaligned_le32(2, request);
 	ret = mt_command(m, 0x10, request, 4);
@@ -986,7 +967,7 @@ static int mt_firmware_gate(struct mt7932 *m)
 			goto out;
 		mt_secure_release(m);
 	}
-	dev_info(&m->pdev->dev, "PATCH_READY\n");
+	dev_dbg(&m->pdev->dev, "PATCH_READY\n");
 	phase = "OTP command/profile";
 	ret = mt_otp_byte(m, 0x7a, &value);
 	if (!ret)
@@ -1041,7 +1022,7 @@ static int mt_firmware_gate(struct mt7932 *m)
 	ret = mt_poll(m, 0xe00f0, 3, 3, 5000000);
 	if (ret)
 		goto out;
-	dev_info(&m->pdev->dev, "FIRMWARE_READY entry=%08x\n", entry);
+	dev_dbg(&m->pdev->dev, "FIRMWARE_READY entry=%08x\n", entry);
 	phase = "runtime capability/transport gates";
 	ret = mt_runtime_start(m);
 out:
@@ -1058,16 +1039,16 @@ void mt_transport_snapshot(struct mt7932 *m)
 	unsigned int i;
 	struct mt7932_ring *tx = &m->tx[17];
 
-	dev_info(&m->pdev->dev, "TRANSPORT: interrupts=%llu packets=%llu pending=%08x mask=%08x TX17 head=%u tail=%u queued=%u DMA=%u\n",
-		 m->interrupts, m->packets, mt_read(m, W + 0x200), mt_read(m, W + 0x204),
-		 tx->head, tx->tail, tx->queued, mt_read(m, tx->reg + 12));
+	dev_dbg(&m->pdev->dev, "TRANSPORT: interrupts=%llu packets=%llu pending=%08x mask=%08x TX17 head=%u tail=%u queued=%u DMA=%u\n",
+		m->interrupts, m->packets, mt_read(m, W + 0x200), mt_read(m, W + 0x204),
+		tx->head, tx->tail, tx->queued, mt_read(m, tx->reg + 12));
 	for (i = 0; i < ARRAY_SIZE(m->rx); i++) {
 		struct mt7932_ring *rx = &m->rx[i];
 
 		if (rx->count)
-			dev_info(&m->pdev->dev, "TRANSPORT_RX%u: tail=%u producer=%u DMA=%u control=%08x\n",
-				 i, rx->tail, mt_read(m, rx->reg + 8), mt_read(m, rx->reg + 12),
-				 le32_to_cpu(READ_ONCE(rx->desc[rx->tail].control)));
+			dev_dbg(&m->pdev->dev, "TRANSPORT_RX%u: tail=%u producer=%u DMA=%u control=%08x\n",
+				i, rx->tail, mt_read(m, rx->reg + 8), mt_read(m, rx->reg + 12),
+				le32_to_cpu(READ_ONCE(rx->desc[rx->tail].control)));
 	}
 }
 
@@ -1155,7 +1136,7 @@ static void mt_remove(struct pci_dev *pdev)
 		wiphy_free(m->wiphy);
 	if (m->vectors_allocated)
 		pci_free_irq_vectors(pdev);
-	dev_info(&pdev->dev, "REMOVE_COMPLETE: host users joined, PCI function reset, DMA retired\n");
+	dev_dbg(&pdev->dev, "REMOVE_COMPLETE: host users joined, PCI function reset, DMA retired\n");
 	/* All coherent allocations/BAR mappings are devres-owned and now safe
 	 * to release. No default-domain ownership manipulation is necessary.
 	 */
@@ -1230,27 +1211,6 @@ static int mt_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (ret)
 		goto retain;
 	m->irq_requested = true;
-	{
-		struct irq_data *irq = irq_get_irq_data(pci_irq_vector(pdev, 0));
-		unsigned int cap = pci_find_capability(pdev, PCI_CAP_ID_MSI);
-		u16 control, command;
-		u32 lo, hi, data, mask;
-
-		pci_read_config_word(pdev, PCI_COMMAND, &command);
-		pci_read_config_word(pdev, cap + PCI_MSI_FLAGS, &control);
-		pci_read_config_dword(pdev, cap + PCI_MSI_ADDRESS_LO, &lo);
-		pci_read_config_dword(pdev, cap + PCI_MSI_ADDRESS_HI, &hi);
-		pci_read_config_dword(pdev, cap + PCI_MSI_DATA_64, &data);
-		pci_read_config_dword(pdev, cap + PCI_MSI_MASK_64, &mask);
-		dev_dbg(&pdev->dev, "PCI command=%04x MSI cap=%x control=%04x addr=%08x:%08x data=%08x\n",
-			 command, cap, control, hi, lo, data);
-		dev_dbg(&pdev->dev, "MSI mask=%08x MSI-X cap=%x chosen=%s\n", mask,
-			 pci_find_capability(pdev, PCI_CAP_ID_MSIX),
-			 pdev->msix_enabled ? "MSI-X" : pdev->msi_enabled ? "MSI" : "INTx");
-		for (; irq; irq = irq->parent_data)
-			dev_dbg(&pdev->dev, "IRQ %u chip=%s hwirq=%lu\n", irq->irq,
-				 irq->chip->name, irq->hwirq);
-	}
 	ret = mt_initialize(m);
 	if (!ret)
 		ret = mt_register_regulatory_gate(m);

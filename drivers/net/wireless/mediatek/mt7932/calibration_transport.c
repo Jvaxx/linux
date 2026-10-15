@@ -124,12 +124,10 @@ int mt_calibration_gate(struct mt7932 *m)
 	    get_unaligned_le32(m->reply + 40)) {
 		dev_err(&m->pdev->dev, "WCAL_REPLY_REJECTED: length=%zu eid=%02x ext=%02x\n",
 			m->reply_length, m->reply[28], m->reply[32]);
-		print_hex_dump(KERN_INFO, "WCAL_RESULT: ", DUMP_PREFIX_OFFSET, 16, 1,
-			       m->reply, min_t(size_t, m->reply_length, 64), false);
 		ret = -EPROTO;
 		goto out;
 	}
-	dev_info(&m->pdev->dev, "OWN_WCAL_ACCEPTED: %zu bytes\n", wcal->size);
+	dev_dbg(&m->pdev->dev, "OWN_WCAL_ACCEPTED: %zu bytes\n", wcal->size);
 	phase = "power-on D6 command/completion";
 	for (at = 0, group = 0; at < planned; at += count, group++) {
 		count = pieces[at].fragment >> 4;
@@ -140,10 +138,10 @@ int mt_calibration_gate(struct mt7932 *m)
 		ret = mt_cal_procedure(m, pieces + at, count, 1, m->preload_version);
 		if (ret)
 			goto out;
-		dev_info(&m->pdev->dev, "POWER_ON_CAL_GROUP_OK: %u type=%u parameter=%08x fragments=%u\n",
-			 group, pieces[at].type, pieces[at].parameter, count);
+		dev_dbg(&m->pdev->dev, "POWER_ON_CAL_GROUP_OK: %u type=%u parameter=%08x fragments=%u\n",
+			group, pieces[at].type, pieces[at].parameter, count);
 	}
-	dev_info(&m->pdev->dev, "POWER_ON_CAL_COMPLETE: %u groups, %d fragments\n", group, planned);
+	dev_dbg(&m->pdev->dev, "POWER_ON_CAL_COMPLETE: %u groups, %d fragments\n", group, planned);
 	phase = "queued D7 planning/command/completion";
 	ret = mt_cal_drain_requests(m, oca);
 out:
@@ -187,7 +185,8 @@ int mt_cal_drain_requests(struct mt7932 *m, const struct firmware *oca)
 				       mt7932_cal_request_replies(request), m->preload_version);
 		if (ret)
 			return ret;
-		dev_info(&m->pdev->dev, "CAL_REQUEST_SERVICED: channel=%u\n", get_unaligned_le32(request + 12));
+		dev_dbg(&m->pdev->dev, "CAL_REQUEST_SERVICED: channel=%u\n",
+			get_unaligned_le32(request + 12));
 	}
 	return 0;
 }

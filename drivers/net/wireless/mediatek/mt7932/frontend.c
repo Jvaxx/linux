@@ -64,8 +64,8 @@ static void mt_scan_finish_work(struct work_struct *work)
 	}
 	mutex_unlock(&m->command_mutex);
 	if (request) {
-		dev_info(&m->pdev->dev, "SCAN_FINISHED: seq=%u aborted=%u received-BSS=%llu\n",
-			 cancel[0], info.aborted, m->beacons);
+		dev_dbg(&m->pdev->dev, "SCAN_FINISHED: seq=%u aborted=%u received-BSS=%llu\n",
+			cancel[0], info.aborted, m->beacons);
 		cfg80211_scan_done(request, &info);
 	}
 }
@@ -226,8 +226,8 @@ static int mt_scan_submit_next(struct mt7932 *m)
 		ret = mt_request(m, 3, true, true, false, body, sizeof(body));
 	}
 	if (!ret)
-		dev_info(&m->pdev->dev, "SCAN_SUBMITTED: seq=%u band=%u channels=%u passive=%u\n",
-			 m->scan_seq, m->scan_band, count, passive);
+		dev_dbg(&m->pdev->dev, "SCAN_SUBMITTED: seq=%u band=%u channels=%u passive=%u\n",
+			m->scan_seq, m->scan_band, count, passive);
 	return ret;
 }
 
@@ -350,9 +350,10 @@ int mt_scan(struct wiphy *wiphy, struct cfg80211_scan_request *request)
 	if (request->wdev != &m->wdev)
 		return -ENODEV;
 	mt_retry_missing_policy(m);
-	dev_info_ratelimited(&m->pdev->dev, "SCAN_REQUEST: channels=%u ssids=%d ies=%zu flags=%08x duration=%u/%u\n",
-		 request->n_channels, request->n_ssids, request->ie_len, request->flags,
-		 request->duration, request->duration_mandatory);
+	dev_dbg(&m->pdev->dev,
+		"SCAN_REQUEST: channels=%u ssids=%d ies=%zu flags=%08x duration=%u/%u\n",
+		request->n_channels, request->n_ssids, request->ie_len, request->flags,
+		request->duration, request->duration_mandatory);
 	/* cfg80211 lists each advertised channel at most once. */
 	if (request->n_channels > MT7932_CHANNELS)
 		return -EOPNOTSUPP;
@@ -547,7 +548,8 @@ static void mt_cal_work(struct work_struct *work)
 				       m->preload_version);
 		if (ret)
 			break;
-		dev_info(&m->pdev->dev, "D7_CALIBRATION_COMPLETE: channel=%u\n", get_unaligned_le32(request + 12));
+		dev_dbg(&m->pdev->dev, "D7_CALIBRATION_COMPLETE: channel=%u\n",
+			get_unaligned_le32(request + 12));
 	}
 	release_firmware(oca);
 	if (!ret)
@@ -601,7 +603,8 @@ int mt_register_interface(struct mt7932 *m)
 		free_netdev(netdev);
 		return ret;
 	}
-	dev_info(&m->pdev->dev, "CFG80211_INTERFACE_READY: %s, RF awaits country policy\n", netdev->name);
+	dev_dbg(&m->pdev->dev, "CFG80211_INTERFACE_READY: %s, RF awaits country policy\n",
+		netdev->name);
 	return 0;
 }
 
@@ -637,7 +640,8 @@ int mt_enable_scan(struct mt7932 *m)
 		return ret;
 	}
 	WRITE_ONCE(m->rf_ready, true);
-	dev_info(&m->pdev->dev, "CFG80211_SCAN_READY: %s, carrier off until WPA2 authorization\n", m->netdev->name);
+	dev_dbg(&m->pdev->dev, "CFG80211_SCAN_READY: %s, carrier off until WPA2 authorization\n",
+		m->netdev->name);
 	schedule_work(&m->cal_work);
 	spin_unlock_irqrestore(&m->response_lock, flags);
 	return 0;
