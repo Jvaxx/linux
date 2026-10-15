@@ -1514,10 +1514,10 @@ void apple_rtkit_free_retaining_buffers(struct apple_rtkit *rtk)
 	 * Retain shared buffers, including custom allocation contexts, rather
 	 * than returning their storage to an allocator while it may be live.
 	 */
-	dev_warn(rtk->dev,
-		 "RTKit: retaining the shared buffers of an unstopped co-processor (ioreport %zu, crashlog %zu, oslog %zu, syslog %zu bytes)\n",
-		 rtk->ioreport_buffer.size, rtk->crashlog_buffer.size,
-		 rtk->oslog_buffer.size, rtk->syslog_buffer.size);
+	dev_dbg(rtk->dev,
+		"RTKit: retaining the shared buffers of a running co-processor (ioreport %zu, crashlog %zu, oslog %zu, syslog %zu bytes)\n",
+		rtk->ioreport_buffer.size, rtk->crashlog_buffer.size,
+		rtk->oslog_buffer.size, rtk->syslog_buffer.size);
 	kfree(rtk->syslog_msg_buffer);
 	apple_rtkit_release_rx(rtk);
 	kfree(rtk);
