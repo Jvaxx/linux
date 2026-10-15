@@ -716,7 +716,11 @@ out:
 	if (ret) {
 		/* The mux may have changed before the switch failed. */
 		cd321x->state = old_state;
-		dev_warn(tps->dev, "failed to configure Type-C connection: %d\n", ret);
+		/* A provider that is not ready yet asks for a retry. */
+		if (ret == -EAGAIN)
+			dev_dbg(tps->dev, "Type-C connection deferred\n");
+		else
+			dev_warn(tps->dev, "failed to configure Type-C connection: %d\n", ret);
 	} else if (cd321x->state.alt != cd321x->port_altmode_dp) {
 		cd321x->dp_status = 0;
 		cd321x->dp_conf = 0;
@@ -1006,7 +1010,7 @@ static void cd321x_resume_work(struct work_struct *work)
 	if (atomic_xchg(&cd321x->link_event, 0)) {
 		if (cd321x_pm_link_event(&cd321x->pm)) {
 			cd321x->state_valid = false;
-			dev_info(tps->dev, "revalidating cable after tunnel state change\n");
+			dev_dbg(tps->dev, "revalidating cable after tunnel state change\n");
 		} else {
 			dev_warn_ratelimited(tps->dev,
 					     "tunnel link recovery budget exhausted\n");
