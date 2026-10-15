@@ -2618,9 +2618,9 @@ static void atc_tunnel_restore(struct apple_atcphy *atcphy)
 	 */
 	core_clear32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0,
 		     DPTX_PCLK1_ENABLE | DPTX_PCLK2_ENABLE);
-	core_clear32(atcphy, AUSPLL_CLKOUT_MASTER, BIT(2));
-	core_clear32(atcphy, AUSPLL_CLKOUT_MASTER, BIT(4));
-	core_clear32(atcphy, AUSPLL_CLKOUT_MASTER, BIT(6));
+	core_clear32(atcphy, AUSPLL_CLKOUT_MASTER, AUSPLL_CLKOUT_MASTER_PCLK_DRVR_EN);
+	core_clear32(atcphy, AUSPLL_CLKOUT_MASTER, AUSPLL_CLKOUT_MASTER_PCLK2_DRVR_EN);
+	core_clear32(atcphy, AUSPLL_CLKOUT_MASTER, AUSPLL_CLKOUT_MASTER_REFBUFCLK_DRVR_EN);
 	ret = atc_tunnel_command(atcphy, 3);
 	if (ret)
 		dev_warn(atcphy->dev, "USB4 tunnel clock: AUSPLL power-down was not acked\n");
@@ -2693,7 +2693,7 @@ static int atc_tunnel_start_t602x(struct apple_atcphy *atcphy)
 	 * state only with no enabled PLL output, no outstanding command and
 	 * no lock. Any other active gate state is refused.
 	 */
-	if (outputs & 0x54 || command & AUSPLL_APB_CMD_OVERRIDE_REQ ||
+	if (outputs & AUSPLL_CLKOUT_MASTER_DRVR_EN || command & AUSPLL_APB_CMD_OVERRIDE_REQ ||
 	    status & ACIOPHY_AUSPLL_LOCK)
 		return -EBUSY;
 	if ((gates & (DPTX_PCLK1_ENABLE | DPTX_PCLK2_ENABLE | DPRX_PCLK_ENABLE)) &&
@@ -2719,25 +2719,24 @@ static int atc_tunnel_start_t602x(struct apple_atcphy *atcphy)
 	core_clear32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_COMMON_CLAMP);
 	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_COMMON_CLAMP_OV);
 	udelay(2);
-	core_set32(atcphy, ACIOPHY_SLEEP_CTRL, 0x30);
-	core_set32(atcphy, ACIOPHY_SLEEP_CTRL, 0xc0);
+	/* same for the TX lanes */
+	core_set32(atcphy, ACIOPHY_SLEEP_CTRL, ACIOPHY_SLEEP_CTRL_TX_SMALL);
+	core_set32(atcphy, ACIOPHY_SLEEP_CTRL, ACIOPHY_SLEEP_CTRL_TX_SMALL_OV);
 	udelay(2);
-	core_set32(atcphy, ACIOPHY_SLEEP_CTRL, 0x03);
-	core_set32(atcphy, ACIOPHY_SLEEP_CTRL, 0x0c);
+	core_set32(atcphy, ACIOPHY_SLEEP_CTRL, ACIOPHY_SLEEP_CTRL_TX_BIG);
+	core_set32(atcphy, ACIOPHY_SLEEP_CTRL, ACIOPHY_SLEEP_CTRL_TX_BIG_OV);
 	udelay(2);
-	core_clear32(atcphy, ACIOPHY_SLEEP_CTRL, 0x300);
-	core_set32(atcphy, ACIOPHY_SLEEP_CTRL, 0xc00);
+	core_clear32(atcphy, ACIOPHY_SLEEP_CTRL, ACIOPHY_SLEEP_CTRL_TX_CLAMP);
+	core_set32(atcphy, ACIOPHY_SLEEP_CTRL, ACIOPHY_SLEEP_CTRL_TX_CLAMP_OV);
 	udelay(2);
-	/* Additional override bit alongside RX_BIG_OV; exact meaning not independently confirmed. */
-	core_set32(atcphy, ACIOPHY_CFG0, 0xc00);
+	/* and for the RX lanes */
+	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_RX_BIG);
 	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_RX_BIG_OV);
 	udelay(2);
-	/* Additional override bit alongside RX_SMALL_OV; exact meaning not independently confirmed. */
-	core_set32(atcphy, ACIOPHY_CFG0, 0xc0);
+	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_RX_SMALL);
 	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_RX_SMALL_OV);
 	udelay(2);
-	/* Additional override bit alongside RX_CLAMP_OV; exact meaning not independently confirmed. */
-	core_clear32(atcphy, ACIOPHY_CFG0, 0xc000);
+	core_clear32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_RX_CLAMP);
 	core_set32(atcphy, ACIOPHY_CFG0, ACIOPHY_CFG0_RX_CLAMP_OV);
 	udelay(2);
 	core_set32(atcphy, ACIOPHY_LANE_DP_CFG_BLK_TX_DP_CTRL0, BIT(2));
@@ -2805,7 +2804,7 @@ static void atc_tunnel_stop_t602x(struct apple_atcphy *atcphy, unsigned int dpin
 	 * them. A mode change still powers it down in atc_tunnel_restore().
 	 */
 	if (!atcphy->tunnel_users && atcphy->tunnel_saved)
-		core_clear32(atcphy, AUSPLL_CLKOUT_MASTER, 0x54);
+		core_clear32(atcphy, AUSPLL_CLKOUT_MASTER, AUSPLL_CLKOUT_MASTER_DRVR_EN);
 }
 
 /* Run one T602X DP IN adapter's pixel clock at @rate; atcphy->lock held. */
@@ -2830,12 +2829,13 @@ static int atc_tunnel_set_t602x(struct apple_atcphy *atcphy, unsigned int dpin,
 			 * its descriptor until the USB4 PHY changes mode instead of
 			 * reprogramming a still-locked PLL on every DPMS wake.
 			 */
-			core_set32(atcphy, AUSPLL_CLKOUT_MASTER, 0x54);
+			core_set32(atcphy, AUSPLL_CLKOUT_MASTER, AUSPLL_CLKOUT_MASTER_DRVR_EN);
 			ret = readl_poll_timeout(atcphy->regs.core + ACIOPHY_DP_PCLK_STAT,
 						 value, value & ACIOPHY_AUSPLL_LOCK,
 						 10, 10000);
 			if (ret)
-				core_clear32(atcphy, AUSPLL_CLKOUT_MASTER, 0x54);
+				core_clear32(atcphy, AUSPLL_CLKOUT_MASTER,
+					     AUSPLL_CLKOUT_MASTER_DRVR_EN);
 		}
 		if (ret)
 			return ret;
