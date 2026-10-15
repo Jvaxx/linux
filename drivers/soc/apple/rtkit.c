@@ -1233,14 +1233,15 @@ void apple_rtkit_free_retaining_buffers(struct apple_rtkit *rtk)
 	apple_rtkit_stop_rx(rtk);
 
 	/*
-	 * A failed shutdown provides no guarantee that firmware stopped DMA.
-	 * Retain shared buffers, including custom allocation contexts, rather
-	 * than returning their storage to an allocator while it may be live.
+	 * The firmware may still be using the shared buffers, so keep them,
+	 * including custom allocation contexts, rather than returning their
+	 * storage to an allocator. Callers use this on purpose for firmware
+	 * that cannot be stopped, and report a failed shutdown themselves.
 	 */
-	dev_warn(rtk->dev,
-		 "RTKit: retaining the shared buffers of an unstopped co-processor (ioreport %zu, crashlog %zu, oslog %zu, syslog %zu bytes)\n",
-		 rtk->ioreport_buffer.size, rtk->crashlog_buffer.size,
-		 rtk->oslog_buffer.size, rtk->syslog_buffer.size);
+	dev_dbg(rtk->dev,
+		"RTKit: retaining the shared buffers of a running co-processor (ioreport %zu, crashlog %zu, oslog %zu, syslog %zu bytes)\n",
+		rtk->ioreport_buffer.size, rtk->crashlog_buffer.size,
+		rtk->oslog_buffer.size, rtk->syslog_buffer.size);
 	kfree(rtk->syslog_msg_buffer);
 	apple_rtkit_release_rx(rtk);
 	kfree(rtk);
