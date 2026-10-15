@@ -112,10 +112,9 @@
 #define APPLE_SPI_DELAY_CYCLES		GENMASK(31, 16)
 
 /*
- * These are the values used by AppleSPIMCController's hardware-delay path.
- * The pre-delay asserts active-low CS and the post-delay releases it. The
- * otherwise undocumented bit 11 is named for its observed role rather than
- * assigning it a speculative electrical meaning.
+ * Hardware CS delays: the pre-delay asserts the active-low CS and the
+ * post-delay releases it.  Bit 11 is undocumented and named for its observed
+ * role only.
  */
 #define APPLE_SPI_DELAY_PRE_FLAGS	(APPLE_SPI_DELAY_PRE_ARM | \
 					 APPLE_SPI_DELAY_SET_CS | \
