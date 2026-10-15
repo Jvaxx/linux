@@ -3450,10 +3450,58 @@ static int atcphy_probe_switch(struct apple_atcphy *atcphy)
  */
 struct atcphy_usb3_pm {
 	struct platform_device *controller;
+	struct device *host;
 	struct usb_device *root;
+	struct usb_device *link;
 };
 
 #if IS_REACHABLE(CONFIG_USB)
+/* The root's runtime state does not cover selective suspend of its port. */
+static int atcphy_usb3_link_get(struct atcphy_usb3_pm *pm)
+{
+	struct usb_device *link;
+	int ret;
+
+	/* The graph identifies the controller, not a port in a multiport root. */
+	if (pm->root->maxchild != 1)
+		return pm->root->maxchild ? -ENODEV : -EAGAIN;
+	link = usb_hub_find_child(pm->root, 1);
+	if (!link)
+		return 0;
+	pm->link = usb_get_dev(link);
+	usb_lock_device(pm->link);
+	if (READ_ONCE(pm->link->state) == USB_STATE_NOTATTACHED) {
+		ret = 0;
+		goto unlock_link;
+	}
+	ret = pm_runtime_resume_and_get(&pm->link->dev);
+	if (ret < 0)
+		goto unlock_link;
+	if (READ_ONCE(pm->link->state) == USB_STATE_NOTATTACHED) {
+		pm_runtime_put_noidle(&pm->link->dev);
+		ret = -ENODEV;
+		goto unlock_link;
+	}
+	return 0;
+
+unlock_link:
+	usb_unlock_device(pm->link);
+	usb_put_dev(pm->link);
+	pm->link = NULL;
+	return ret;
+}
+
+static void atcphy_usb3_link_put(struct atcphy_usb3_pm *pm)
+{
+	if (!pm->link)
+		return;
+	usb_mark_last_busy(pm->link);
+	pm_runtime_put_autosuspend(&pm->link->dev);
+	usb_unlock_device(pm->link);
+	usb_put_dev(pm->link);
+	pm->link = NULL;
+}
+
 static int atcphy_usb3_pm_find(struct usb_device *udev, void *data)
 {
 	struct atcphy_usb3_pm *pm = data;
@@ -3488,6 +3536,17 @@ static int atcphy_usb3_pm_get(struct apple_atcphy *atcphy, struct atcphy_usb3_pm
 	if (!pm->controller)
 		return -EAGAIN;
 
+	/* Driver core takes this lock before DWC3 removal touches SUSPHY. */
+	device_lock(&pm->controller->dev);
+	if (!pm->controller->dev.driver) {
+		ret = -EAGAIN;
+		goto put_controller;
+	}
+	if (strcmp(pm->controller->dev.driver->name, "dwc3-apple")) {
+		ret = -ENODEV;
+		goto put_controller;
+	}
+
 	/* Firmware identity, not a bus number, binds this PHY to its root hub. */
 	usb_for_each_dev(pm, atcphy_usb3_pm_find);
 	if (!pm->root) {
@@ -3495,7 +3554,20 @@ static int atcphy_usb3_pm_get(struct apple_atcphy *atcphy, struct atcphy_usb3_pm
 		goto put_controller;
 	}
 
-	/* Exclude root-hub teardown while its controller backs the handoff. */
+	/* Also serialize direct xHCI unbind, before it marks the HCD removing. */
+	pm->host = get_device(pm->root->bus->controller);
+	device_lock(pm->host);
+	if (!pm->host->driver) {
+		ret = -EAGAIN;
+		goto put_root;
+	}
+	if (pm->host->parent != &pm->controller->dev ||
+	    strcmp(pm->host->driver->name, "xhci-hcd")) {
+		ret = -ENODEV;
+		goto put_root;
+	}
+
+	/* USB destruction follows the platform lifecycle locks, not vice versa. */
 	usb_lock_device(pm->root);
 	hcd = bus_to_hcd(pm->root->bus);
 	if (READ_ONCE(pm->root->state) == USB_STATE_NOTATTACHED || HCD_DEAD(hcd)) {
@@ -3511,13 +3583,33 @@ static int atcphy_usb3_pm_get(struct apple_atcphy *atcphy, struct atcphy_usb3_pm
 		ret = -ENODEV;
 		goto unlock_root;
 	}
+	/* Resume the attached upstream link before taking the ATC mutex. */
+	ret = atcphy_usb3_link_get(pm);
+	if (ret) {
+		usb_mark_last_busy(pm->root);
+		pm_runtime_put_autosuspend(&pm->root->dev);
+		goto unlock_root;
+	}
+	if (READ_ONCE(pm->root->state) == USB_STATE_NOTATTACHED ||
+	    READ_ONCE(hcd->state) != HC_STATE_RUNNING ||
+	    HCD_DEAD(hcd) || !HCD_HW_ACCESSIBLE(hcd)) {
+		atcphy_usb3_link_put(pm);
+		pm_runtime_put_noidle(&pm->root->dev);
+		ret = -ENODEV;
+		goto unlock_root;
+	}
 	return 0;
 
 unlock_root:
 	usb_unlock_device(pm->root);
+put_root:
+	device_unlock(pm->host);
+	put_device(pm->host);
+	pm->host = NULL;
 	usb_put_dev(pm->root);
 	pm->root = NULL;
 put_controller:
+	device_unlock(&pm->controller->dev);
 	put_device(&pm->controller->dev);
 	pm->controller = NULL;
 	return ret;
@@ -3533,12 +3625,19 @@ static void atcphy_usb3_pm_put(struct atcphy_usb3_pm *pm)
 	if (!pm->root)
 		return;
 
+	/* Release child ownership before the root: keep the lock order hierarchical. */
+	atcphy_usb3_link_put(pm);
+
 	/* Restore normal runtime policy after both success and failed parking. */
 	usb_mark_last_busy(pm->root);
 	pm_runtime_put_autosuspend(&pm->root->dev);
 	usb_unlock_device(pm->root);
 	usb_put_dev(pm->root);
+	device_unlock(pm->host);
+	put_device(pm->host);
+	device_unlock(&pm->controller->dev);
 	put_device(&pm->controller->dev);
+	pm->host = NULL;
 	pm->root = NULL;
 	pm->controller = NULL;
 #endif
