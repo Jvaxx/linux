@@ -215,6 +215,41 @@ static void parser_mode_count_test(struct kunit *test)
 	kfree(modes);
 }
 
+/* Build an array of @count empty dictionaries in a test allocation. */
+static struct dcp_display_mode *parse_empty_modes(struct kunit *test,
+						  unsigned int count,
+						  unsigned int *found)
+{
+	size_t len = 8 + 4 * count;
+	struct dcp_parse_ctx ctx;
+	unsigned int i;
+	u8 *data;
+
+	data = kunit_kzalloc(test, len, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	put_unaligned_le32(0xd3, data);
+	put_unaligned_le32(count | T_ARRAY << 24, data + 4);
+	for (i = 0; i < count; i++)
+		put_unaligned_le32(T_DICT << 24, data + 8 + 4 * i);
+
+	KUNIT_ASSERT_EQ(test, parse(data, len, &ctx), 0);
+	return enumerate_modes(&ctx, found, 0, 0, 0, false, false);
+}
+
+static void parser_mode_cap_test(struct kunit *test)
+{
+	struct dcp_display_mode *modes;
+	unsigned int count = 1;
+
+	modes = parse_empty_modes(test, DCP_MAX_TIMING_MODES, &count);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(modes));
+	KUNIT_EXPECT_EQ(test, count, 0);
+	kfree(modes);
+
+	modes = parse_empty_modes(test, DCP_MAX_TIMING_MODES + 1, &count);
+	KUNIT_EXPECT_PTR_EQ(test, modes, ERR_PTR(-E2BIG));
+}
+
 static void parser_property_complete_test(struct kunit *test)
 {
 	struct blob b;
@@ -240,6 +275,7 @@ static struct kunit_case parser_cases[] = {
 	KUNIT_CASE(parser_nesting_test),
 	KUNIT_CASE(parser_bad_header_test),
 	KUNIT_CASE(parser_mode_count_test),
+	KUNIT_CASE(parser_mode_cap_test),
 	KUNIT_CASE(parser_property_complete_test),
 	{}
 };
