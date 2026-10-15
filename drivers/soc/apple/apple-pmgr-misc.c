@@ -15,6 +15,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/regmap.h>
 #include <linux/soc/apple/pmgr-misc.h>
@@ -70,7 +71,8 @@ struct apple_pmgr_misc {
 	unsigned int holds;			/* protected by lock */
 	bool sleeping;				/* protected by lock */
 	bool voters_ok;
-	bool pmp_owned; /* PMP firmware manages fabric and DCS p-states */
+	bool pmp_owned; /* PMP is described: no governor, holds don't raise */
+	bool pmp_sleep; /* PMP runs: this sleep leaves DCS to it (see prepare) */
 	u32 pmp_fabric; /* PMP's desired fabric p-state, saved across suspend */
 	struct {
 		struct regmap *regmap;
@@ -147,7 +149,8 @@ static int apple_pmgr_raise_fabric(struct apple_pmgr_misc *misc)
  */
 int apple_pmgr_fabric_hold(void)
 {
-	struct apple_pmgr_misc *misc = READ_ONCE(apple_pmgr_misc_inst);
+	/* Pairs with the release in probe: the instance is set up before it is seen. */
+	struct apple_pmgr_misc *misc = smp_load_acquire(&apple_pmgr_misc_inst);
 
 	if (!misc)
 		return 0;
@@ -159,7 +162,8 @@ EXPORT_SYMBOL_GPL(apple_pmgr_fabric_hold);
 
 void apple_pmgr_fabric_release(void)
 {
-	struct apple_pmgr_misc *misc = READ_ONCE(apple_pmgr_misc_inst);
+	/* Pairs with the release in probe: the instance is set up before it is seen. */
+	struct apple_pmgr_misc *misc = smp_load_acquire(&apple_pmgr_misc_inst);
 
 	if (!misc)
 		return;
@@ -216,9 +220,13 @@ static void apple_pmgr_find_voters(struct apple_pmgr_misc *misc)
 		}
 	}
 	misc->voters_ok = found == ARRAY_SIZE(apple_pmgr_fabric_voters);
-	if (!misc->voters_ok)
+	/* Desktops have no ISP: say so only where the governor is wanted. */
+	if (!misc->voters_ok && READ_ONCE(idle_fabric_pstate))
 		dev_warn(misc->dev, "idle fabric: found %u of %zu bandwidth voters, staying high\n",
 			 found, ARRAY_SIZE(apple_pmgr_fabric_voters));
+	else if (!misc->voters_ok)
+		dev_dbg(misc->dev, "idle fabric: found %u of %zu bandwidth voters\n",
+			found, ARRAY_SIZE(apple_pmgr_fabric_voters));
 }
 
 /* True while every cpufreq policy runs at its lowest frequency. */
@@ -293,7 +301,8 @@ static void apple_pmgr_idle_stop(struct apple_pmgr_misc *misc)
 
 static int idle_fabric_pstate_set(const char *val, const struct kernel_param *kp)
 {
-	struct apple_pmgr_misc *misc = READ_ONCE(apple_pmgr_misc_inst);
+	/* Pairs with the release in probe: the instance is set up before it is seen. */
+	struct apple_pmgr_misc *misc = smp_load_acquire(&apple_pmgr_misc_inst);
 	unsigned int ps;
 	int ret;
 
@@ -304,6 +313,8 @@ static int idle_fabric_pstate_set(const char *val, const struct kernel_param *kp
 		return -EINVAL;
 	if (ps && misc && misc->pmp_owned)
 		return -EBUSY;
+	if (ps && misc && !misc->voters_ok)
+		dev_warn(misc->dev, "idle fabric: not every bandwidth voter was found, staying high\n");
 	WRITE_ONCE(idle_fabric_pstate, ps);
 	if (!misc)
 		return 0;
@@ -327,11 +338,36 @@ module_param_cb(idle_fabric_pstate, &idle_fabric_pstate_ops, &idle_fabric_pstate
 MODULE_PARM_DESC(idle_fabric_pstate,
 		 "Fabric p-state while all CPUs run at their lowest frequency and no bandwidth user is active (0 = keep the boot state)");
 
+/*
+ * Whether PMP runs: its node is available and its driver is bound. With the
+ * node described but no driver (not loaded, or no values from the boot
+ * loader), nothing manages DCS, and sleep takes the path without PMP.
+ */
+static bool apple_pmgr_pmp_running(void)
+{
+	struct device_node *np __free(device_node) =
+		of_find_compatible_node(NULL, NULL, "apple,t6000-pmp-v2");
+	struct platform_device *pdev;
+	bool bound;
+
+	if (!np || !of_device_is_available(np))
+		return false;
+	pdev = of_find_device_by_node(np);
+	if (!pdev)
+		return false;
+	bound = device_is_bound(&pdev->dev);
+	put_device(&pdev->dev);
+	return bound;
+}
+
 /* Raise before any device suspends; noirq then applies the suspend p-state. */
 static int __maybe_unused apple_pmgr_misc_prepare(struct device *dev)
 {
 	struct apple_pmgr_misc *misc = dev_get_drvdata(dev);
 
+	misc->pmp_sleep = misc->pmp_owned && apple_pmgr_pmp_running();
+	if (misc->pmp_owned && !misc->pmp_sleep)
+		dev_warn_once(dev, "PMP is described but not running: sleeping without it\n");
 	if (!misc->devices[DEV_FABRIC].base)
 		return 0;
 	scoped_guard(mutex, &misc->lock)
@@ -357,7 +393,7 @@ static int __maybe_unused apple_pmgr_misc_suspend_noirq(struct device *dev)
 	struct apple_pmgr_misc *misc = dev_get_drvdata(dev);
 	int i;
 
-	if (misc->pmp_owned) {
+	if (misc->pmp_sleep) {
 		/*
 		 * Lowering DCS under PMP leaves s2idle unable to resume; the
 		 * fabric alone is safe and saves ~0.35 W in s2idle on t6000.
@@ -384,7 +420,7 @@ static int __maybe_unused apple_pmgr_misc_resume_noirq(struct device *dev)
 	int i;
 
 	misc->fabric_now = misc->devices[DEV_FABRIC].active_state;
-	if (misc->pmp_owned) {
+	if (misc->pmp_sleep) {
 		if (misc->devices[DEV_FABRIC].base) {
 			void __iomem *reg = misc->devices[DEV_FABRIC].base + APPLE_CLKGEN_PSTATE;
 			u32 val = readl_relaxed(reg);
@@ -475,7 +511,8 @@ static int apple_pmgr_misc_probe(struct platform_device *pdev)
 		INIT_DEFERRABLE_WORK(&misc->idle_work, apple_pmgr_idle_work);
 		INIT_DELAYED_WORK(&misc->idle_work_prompt, apple_pmgr_idle_work_prompt);
 		apple_pmgr_find_voters(misc);
-		WRITE_ONCE(apple_pmgr_misc_inst, misc);
+		/* Publish only a set-up instance; pairs with the readers' acquire. */
+		smp_store_release(&apple_pmgr_misc_inst, misc);
 		if (READ_ONCE(idle_fabric_pstate) && misc->pmp_owned) {
 			dev_warn(dev, "idle fabric governor disabled: PMP manages the fabric\n");
 			WRITE_ONCE(idle_fabric_pstate, 0);
@@ -522,7 +559,7 @@ static struct platform_driver apple_pmgr_misc_driver = {
 	.driver = {
 		.name = "apple-pmgr-misc",
 		.of_match_table = apple_pmgr_misc_of_match,
-		/* The governor's workers and holders outlive any unbind. */
+		/* The governor's workers and holders would outlive an unbind. */
 		.suppress_bind_attrs = true,
 		.pm = pm_ptr(&apple_pmgr_misc_pm_ops),
 	},
