@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include <kunit/test.h>
+#include <linux/array_size.h>
 #include <linux/bitfield.h>
 #include <linux/module.h>
 
@@ -10,6 +11,11 @@
 		 TPS_DATA_STATUS_USB3_CONNECTION | TPS_DATA_STATUS_DP_CONNECTION | \
 		 FIELD_PREP(TPS_DATA_STATUS_DP_PIN_ASSIGNMENT_MASK, 1))
 #define HPD	CD321X_DATA_STATUS_HPD_LEVEL
+/* The same dock giving the USB 3 lanes to DisplayPort: pin assignment C. */
+#define DP_C	(DP_D & ~TPS_DATA_STATUS_USB3_CONNECTION)
+/* A USB-C to DisplayPort cable: pin assignment E, or F with USB 3. */
+#define DP_E	(TPS_DATA_STATUS_DATA_CONNECTION | TPS_DATA_STATUS_DP_CONNECTION)
+#define DP_F	(DP_E | TPS_DATA_STATUS_USB2_CONNECTION | TPS_DATA_STATUS_USB3_CONNECTION)
 
 static void cd321x_dp_first_hpd_connects_test(struct kunit *test)
 {
@@ -97,6 +103,46 @@ static void cd321x_dp_pin_change_reconnects_test(struct kunit *test)
 
 	KUNIT_EXPECT_TRUE(test, cd321x_dp_teardown(&u));
 	KUNIT_EXPECT_EQ(test, cd321x_dp_event(&u, true), CD321X_DP_EVENT_CONNECTED);
+}
+
+/*
+ * C <-> D and E <-> F change only USB3_CONNECTION, but they change the
+ * DisplayPort lane count, so the lanes are rebuilt with HPD held high.
+ */
+static void cd321x_dp_usb3_pin_change_reconnects_test(struct kunit *test)
+{
+	const u32 pins[][2] = {
+		{ DP_D, DP_C }, { DP_C, DP_D }, { DP_F, DP_E }, { DP_E, DP_F },
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(pins); i++) {
+		struct cd321x_dp_update u = {
+			.data_status = pins[i][1] | HPD,
+			.changed = pins[i][0] ^ pins[i][1],
+			.route_active = true,
+			.sink_reported = true,
+		};
+
+		/* Neither DP_CONNECTION nor the pin assignment field moves. */
+		KUNIT_EXPECT_FALSE(test, u.changed & CD321X_DP_MODE_BITS);
+		KUNIT_EXPECT_TRUE(test, cd321x_dp_mode_changed(u.data_status, u.changed));
+		KUNIT_EXPECT_TRUE(test, cd321x_dp_teardown(&u));
+		KUNIT_EXPECT_EQ(test, cd321x_dp_event(&u, true), CD321X_DP_EVENT_CONNECTED);
+	}
+}
+
+/* Without DisplayPort, USB 3 coming or going is not a lane change. */
+static void cd321x_dp_usb3_change_without_dp_test(struct kunit *test)
+{
+	u32 usb2 = TPS_DATA_STATUS_DATA_CONNECTION | TPS_DATA_STATUS_USB2_CONNECTION;
+	u32 usb3 = TPS_DATA_STATUS_USB3_CONNECTION;
+	u32 dp = TPS_DATA_STATUS_DP_CONNECTION;
+
+	KUNIT_EXPECT_FALSE(test, cd321x_dp_mode_changed(usb2, usb3));
+	KUNIT_EXPECT_FALSE(test, cd321x_dp_mode_changed(usb2 | usb3, usb3));
+	/* Leaving DisplayPort is a mode change whatever happens to USB 3. */
+	KUNIT_EXPECT_TRUE(test, cd321x_dp_mode_changed(usb2, dp | usb3));
 }
 
 /* A power or USB-only update leaves a live display alone. */
@@ -254,6 +300,8 @@ static struct kunit_case cd321x_dp_cases[] = {
 	KUNIT_CASE(cd321x_dp_hpd_low_tears_down_test),
 	KUNIT_CASE(cd321x_dp_exit_tears_down_test),
 	KUNIT_CASE(cd321x_dp_pin_change_reconnects_test),
+	KUNIT_CASE(cd321x_dp_usb3_pin_change_reconnects_test),
+	KUNIT_CASE(cd321x_dp_usb3_change_without_dp_test),
 	KUNIT_CASE(cd321x_dp_unrelated_update_test),
 	KUNIT_CASE(cd321x_dp_display_taken_test),
 	KUNIT_CASE(cd321x_dp_hpd_pulse_retrains_test),
