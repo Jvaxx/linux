@@ -675,7 +675,8 @@ static int dchid_open(struct hid_device *hdev)
 		}
 	}
 
-	iface->open = true;
+	/* Pairs with the acquire in dchid_handle_report(); publishes iface->hid. */
+	smp_store_release(&iface->open, true);
 	return 0;
 }
 
@@ -683,7 +684,7 @@ static void dchid_close(struct hid_device *hdev)
 {
 	struct dchid_iface *iface = hdev->driver_data;
 
-	iface->open = false;
+	WRITE_ONCE(iface->open, false);
 }
 
 static int dchid_parse(struct hid_device *hdev)
@@ -1063,14 +1064,12 @@ static void dchid_handle_event(struct dockchannel_hid *dchid, void *data, size_t
 
 static void dchid_handle_report(struct dchid_iface *iface, void *data, size_t length)
 {
-	struct dockchannel_hid *dchid = iface->dchid;
-
-	if (!iface->hid) {
-		dev_warn(dchid->dev, "Report received but %s is not initialized!\n", iface->name);
-		return;
-	}
-
-	if (!iface->open)
+	/*
+	 * An interface starts reporting as soon as it is enabled, which is
+	 * before its HID device has been registered and opened. Until then
+	 * there is nobody to deliver the reports to.
+	 */
+	if (!smp_load_acquire(&iface->open))
 		return;
 
 	hid_input_report(iface->hid, HID_INPUT_REPORT, data, length, 1);
