@@ -272,6 +272,41 @@ static inline bool afk_ring_payload_fits(u32 ptr, u32 bytes, size_t bufsz)
 	       bytes <= bufsz - ptr - sizeof(struct afk_qe);
 }
 
+/*
+ * Check the receive ring pointers before reading an entry. The consumer
+ * only advances rptr in whole blocks of @stride bytes and stops when it
+ * meets wptr, so the producer has to keep wptr block aligned and inside
+ * the ring as well; wptr == bufsz is never written, it wraps to 0.
+ */
+static inline bool afk_ring_ptrs_valid(u32 rptr, u32 wptr, size_t bufsz,
+				       u32 stride)
+{
+	return stride && bufsz >= sizeof(struct afk_qe) &&
+	       rptr <= bufsz - sizeof(struct afk_qe) && wptr < bufsz &&
+	       !(rptr % stride) && !(wptr % stride);
+}
+
+/*
+ * One RECV notification drains at most as many entries as the ring has
+ * blocks, so a producer that keeps moving wptr cannot hold the ordered
+ * receive worker. Entries written after this pass come with their own
+ * RECV notification.
+ */
+static inline unsigned int afk_ring_drain_budget(size_t bufsz, u32 stride)
+{
+	return stride ? bufsz / stride : 1;
+}
+
+static inline unsigned int afk_ring_drain(bool (*recv)(void *ctx), void *ctx,
+					  unsigned int budget)
+{
+	unsigned int n = 0;
+
+	while (n < budget && recv(ctx))
+		n++;
+	return n;
+}
+
 struct epic_hdr {
 	u8 version;
 	__le16 seq;

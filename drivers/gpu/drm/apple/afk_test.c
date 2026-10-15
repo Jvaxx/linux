@@ -49,7 +49,58 @@ static void afk_ring_payload_fits_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, afk_ring_payload_fits(0, U32_MAX, 0x1000));
 }
 
+static void afk_ring_ptrs_test(struct kunit *test)
+{
+	KUNIT_EXPECT_TRUE(test, afk_ring_ptrs_valid(0, 0, 0x1000, 0x40));
+	KUNIT_EXPECT_TRUE(test, afk_ring_ptrs_valid(0xfc0, 0x40, 0x1000, 0x40));
+	KUNIT_EXPECT_TRUE(test, afk_ring_ptrs_valid(0x80, 0xf80, 0x1000, 0x80));
+	/* The write pointer must lie inside the ring. */
+	KUNIT_EXPECT_FALSE(test, afk_ring_ptrs_valid(0, 0x1000, 0x1000, 0x40));
+	KUNIT_EXPECT_FALSE(test, afk_ring_ptrs_valid(0, U32_MAX, 0x1000, 0x40));
+	KUNIT_EXPECT_FALSE(test, afk_ring_ptrs_valid(0x1000, 0, 0x1000, 0x40));
+	KUNIT_EXPECT_FALSE(test, afk_ring_ptrs_valid(U32_MAX, 0, 0x1000, 0x40));
+	/* Both pointers must be block aligned. */
+	KUNIT_EXPECT_FALSE(test, afk_ring_ptrs_valid(0, 0x20, 0x1000, 0x40));
+	KUNIT_EXPECT_FALSE(test, afk_ring_ptrs_valid(0x10, 0, 0x1000, 0x40));
+	KUNIT_EXPECT_FALSE(test, afk_ring_ptrs_valid(0x40, 0x80, 0x1000, 0x80));
+	/* An uninitialised ring has no valid pointers. */
+	KUNIT_EXPECT_FALSE(test, afk_ring_ptrs_valid(0, 0, 0x1000, 0));
+	KUNIT_EXPECT_FALSE(test, afk_ring_ptrs_valid(0, 0, 0, 0x40));
+}
+
+struct afk_drain_ctx {
+	unsigned int calls, entries;
+};
+
+/* A producer that publishes @entries entries, or one that never stops. */
+static bool afk_drain_recv(void *data)
+{
+	struct afk_drain_ctx *ctx = data;
+
+	return ++ctx->calls <= ctx->entries;
+}
+
+static void afk_ring_drain_test(struct kunit *test)
+{
+	struct afk_drain_ctx ctx = { .entries = 3 };
+	unsigned int budget = afk_ring_drain_budget(0x1000, 0x40);
+
+	KUNIT_EXPECT_EQ(test, budget, 64U);
+	KUNIT_EXPECT_EQ(test, afk_ring_drain(afk_drain_recv, &ctx, budget), 3U);
+	KUNIT_EXPECT_EQ(test, ctx.calls, 4U);
+
+	/* A write pointer that keeps moving ahead exhausts the budget. */
+	ctx = (struct afk_drain_ctx){ .entries = UINT_MAX };
+	KUNIT_EXPECT_EQ(test, afk_ring_drain(afk_drain_recv, &ctx, budget), budget);
+	KUNIT_EXPECT_EQ(test, ctx.calls, budget);
+
+	/* Without a ring the single pass reports the missing setup. */
+	KUNIT_EXPECT_EQ(test, afk_ring_drain_budget(0, 0), 1U);
+}
+
 static struct kunit_case afk_ring_cases[] = {
+	KUNIT_CASE(afk_ring_ptrs_test),
+	KUNIT_CASE(afk_ring_drain_test),
 	KUNIT_CASE(afk_ring_stride_test),
 	KUNIT_CASE(afk_ring_payload_fits_test),
 	{}
