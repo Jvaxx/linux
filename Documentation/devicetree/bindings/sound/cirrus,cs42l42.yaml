@@ -14,8 +14,9 @@ description:
   It provides a high-dynamic range, stereo DAC for audio playback and a mono
   high-dynamic-range ADC for audio capture. There is an integrated headset
   detection block.
-  CS42L83 systems may have platform-managed supplies without regulator
-  phandles, as on Apple Silicon boards.
+
+  On Apple Silicon machines the supplies of the CS42L83 are platform-managed
+  rails that are not described as regulators, so they are optional there.
 
 properties:
   compatible:
@@ -30,8 +31,6 @@ properties:
 
   '#sound-dai-cells':
     const: 0
-
-  sound-name-prefix: true
 
   VP-supply:
     description:
@@ -194,7 +193,9 @@ properties:
 required:
   - compatible
   - reg
+
 allOf:
+  - $ref: dai-common.yaml#
   - if:
       properties:
         compatible:
@@ -207,7 +208,7 @@ allOf:
         - VL-supply
         - VA-supply
 
-additionalProperties: false
+unevaluatedProperties: false
 
 examples:
   - |
