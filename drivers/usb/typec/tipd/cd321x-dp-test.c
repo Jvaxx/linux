@@ -173,10 +173,11 @@ static void cd321x_dp_display_taken_test(struct kunit *test)
 }
 
 /*
- * HPD went low and back within the debounce on the same dock and lanes: the
- * route is kept and its link rechecked, so the picture does not drop.
+ * HPD went low and back within the debounce on the same dock and lanes.
+ * That is not an IRQ_HPD: the sink may have been replaced behind the dock,
+ * so it is reported gone and connected again.
  */
-static void cd321x_dp_hpd_pulse_retrains_test(struct kunit *test)
+static void cd321x_dp_hpd_bounce_reconnects_test(struct kunit *test)
 {
 	struct cd321x_dp_update u = {
 		.data_status = DP_D | HPD,
@@ -185,8 +186,14 @@ static void cd321x_dp_hpd_pulse_retrains_test(struct kunit *test)
 		.sink_reported = true,
 	};
 
-	KUNIT_EXPECT_FALSE(test, cd321x_dp_teardown(&u));
-	KUNIT_EXPECT_EQ(test, cd321x_dp_event(&u, true), CD321X_DP_EVENT_RETRAIN);
+	KUNIT_EXPECT_TRUE(test, cd321x_dp_teardown(&u));
+	KUNIT_EXPECT_EQ(test, cd321x_dp_event(&u, true), CD321X_DP_EVENT_CONNECTED);
+
+	/* An IRQ_HPD in the same window does not make the bounce harmless. */
+	u.data_status |= CD321X_DATA_STATUS_HPD_IRQ;
+	u.changed |= CD321X_DATA_STATUS_HPD_IRQ;
+	KUNIT_EXPECT_TRUE(test, cd321x_dp_teardown(&u));
+	KUNIT_EXPECT_EQ(test, cd321x_dp_event(&u, true), CD321X_DP_EVENT_CONNECTED);
 }
 
 /* An IRQ_HPD attention with HPD held high asks for a link check. */
@@ -223,8 +230,8 @@ static void cd321x_dp_hpd_rise_connects_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, cd321x_dp_event(&u, true), CD321X_DP_EVENT_CONNECTED);
 }
 
-/* C <-> D changes the DisplayPort lane count: no pulse, a reconnect. */
-static void cd321x_dp_pulse_with_lane_change_test(struct kunit *test)
+/* An HPD bounce with a C <-> D lane change: a reconnect either way. */
+static void cd321x_dp_bounce_with_lane_change_test(struct kunit *test)
 {
 	struct cd321x_dp_update u = {
 		.data_status = DP_D | HPD,
@@ -241,12 +248,12 @@ static void cd321x_dp_pulse_with_lane_change_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, cd321x_dp_event(&u, true), CD321X_DP_EVENT_CONNECTED);
 }
 
-/* A replug, flip or new dock inside the debounce is still a reconnect. */
-static void cd321x_dp_pulse_with_link_reset_test(struct kunit *test)
+/* A replug, flip or new dock with an IRQ_HPD is still a reconnect. */
+static void cd321x_dp_irq_hpd_with_link_reset_test(struct kunit *test)
 {
 	struct cd321x_dp_update u = {
 		.data_status = DP_D | HPD | CD321X_DATA_STATUS_HPD_IRQ,
-		.changed = HPD | CD321X_DATA_STATUS_HPD_IRQ,
+		.changed = CD321X_DATA_STATUS_HPD_IRQ,
 		.link_reset = true,
 		.route_active = true,
 		.sink_reported = true,
@@ -304,11 +311,11 @@ static struct kunit_case cd321x_dp_cases[] = {
 	KUNIT_CASE(cd321x_dp_usb3_change_without_dp_test),
 	KUNIT_CASE(cd321x_dp_unrelated_update_test),
 	KUNIT_CASE(cd321x_dp_display_taken_test),
-	KUNIT_CASE(cd321x_dp_hpd_pulse_retrains_test),
+	KUNIT_CASE(cd321x_dp_hpd_bounce_reconnects_test),
 	KUNIT_CASE(cd321x_dp_irq_hpd_retrains_test),
 	KUNIT_CASE(cd321x_dp_hpd_rise_connects_test),
-	KUNIT_CASE(cd321x_dp_pulse_with_lane_change_test),
-	KUNIT_CASE(cd321x_dp_pulse_with_link_reset_test),
+	KUNIT_CASE(cd321x_dp_bounce_with_lane_change_test),
+	KUNIT_CASE(cd321x_dp_irq_hpd_with_link_reset_test),
 	KUNIT_CASE(cd321x_dp_retrain_needs_live_sink_test),
 	KUNIT_CASE(cd321x_dp_retry_after_teardown_test),
 	{}
