@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * J700 MT7932 Bluetooth experiment, reconstructed from the attributed
- * protocol contracts and public Linux interfaces. Original transport research:
- * DJ (DjDeveloperr), Ace (Acelogic), and Ryan Murray.
+ * Bluetooth transport for the MediaTek MT7932 radio in the Apple MacBook Neo
+ * (J700), whose Bluetooth controller is the second function of the radio's
+ * PCIe device. Transport research by DJ (DjDeveloperr), Ace (Acelogic) and
+ * Ryan Murray.
  *
  * Firmware and board inputs are supplied locally. System sleep preserves the
  * transport arena and uses the firmware quiesce/restore handshake. Unload
@@ -733,7 +734,7 @@ static int bt7932_ipc_state(struct bt7932 *bt, u8 *state)
 		value = readl(bt->bar + BT7932_STATE);
 		if (value == U32_MAX)
 			return -EIO;
-		/* The reviewed early-state rule replaces memory with the BAR byte. */
+		/* Until the state in memory passes 1, the BAR register holds it. */
 		*state = value & 0xff;
 	}
 	return 0;
@@ -816,7 +817,7 @@ static void bt7932_channels(struct bt7932 *bt)
 		bt7932_publish_counter(bt, bt->host_transfer, channel, BT7932_DEPTH - 1);
 		bt7932_ring_doorbell(bt, geometry[channel].doorbell);
 	}
-	/* The reviewed cold IPC transition starts ACTIVE; no initial sleep ACK. */
+	/* The IPC starts active after a cold start; no sleep ACK is due. */
 	bt->last_sleep = 0;
 	WRITE_ONCE(bt->awake, true);
 	WRITE_ONCE(bt->ipc_ready, true);
@@ -1472,7 +1473,7 @@ static struct pci_driver bt7932_driver = {
 };
 module_pci_driver(bt7932_driver);
 
-MODULE_DESCRIPTION("Experimental standalone J700 MT7932 Bluetooth PCIe transport");
+MODULE_DESCRIPTION("MediaTek MT7932 Bluetooth PCIe transport for the Apple MacBook Neo");
 MODULE_LICENSE("GPL");
 MODULE_FIRMWARE(BT7932_FW_B0);
 MODULE_FIRMWARE(BT7932_FW_B1);
