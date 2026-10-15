@@ -475,4 +475,3 @@ int ane_t6021_boot_start(struct ane_t6021 *ane, int stop_after, int table_mode, 
 			 sres);
 	return r;
 }
-
