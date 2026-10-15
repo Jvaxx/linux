@@ -13,6 +13,7 @@
  *	Tomasz Figa <tfiga@chromium.org>
  */
 
+#include <kunit/visibility.h>
 #include <linux/dev_printk.h>
 
 #include <media/v4l2-h264.h>
@@ -46,6 +47,7 @@ struct avd_h264_run {
 
 	s32 cur_poc;
 	u8 num_valid;
+	u32 slice_data_off;
 };
 
 /* state */
@@ -386,6 +388,39 @@ static void stream_weights(struct avd_ctx *ctx, struct avd_h264_run *run)
 	}
 }
 
+/*
+ * Find the slice data in a slice: skip the two bytes in front of the slice
+ * header, then the header_len bytes of the header itself, which do not count
+ * its emulation prevention bytes. At least one byte of slice data must follow.
+ */
+VISIBLE_IF_KUNIT bool avd_h264_find_slice_data(const u8 *data, u32 len,
+					       u32 header_len, u32 *off)
+{
+	u32 pos = 2, bytes_read = 2;
+
+	while (bytes_read < header_len && pos < len) {
+		if (data[pos - 2] != 0x00 || data[pos - 1] != 0x00 ||
+		    data[pos] != 0x03)
+			bytes_read++;
+		pos++;
+	}
+
+	if (pos >= len)
+		return false;
+
+	*off = pos;
+	return true;
+}
+
+/* Bytes of slice header in front of the slice data. */
+static u32 avd_h264_header_len(const struct avd_h264_run *run)
+{
+	/* CABAC slice data starts on a byte boundary. */
+	bool cabac = run->pps->flags & V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE;
+
+	return (run->slice_params->header_bit_size + (cabac ? 7 : 0)) / 8;
+}
+
 static void stream_slice(struct avd_ctx *ctx, struct avd_h264_run *run)
 {
 	const struct v4l2_ctrl_h264_decode_params *decode = run->decode_params;
@@ -396,21 +431,7 @@ static void stream_slice(struct avd_ctx *ctx, struct avd_h264_run *run)
 	u32 payload_len = h264_ctx->active_slice->size;
 	bool en_mode = (pps->flags & V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE) ==
 		       0;
-	const u8 *data = h264_ctx->active_slice->cpu;
-
-	u32 min_off = (sl->header_bit_size + (en_mode ? 0 : 7)) / 8;
-
-	/* emulation byte. header_bit_size does not include this.
-	 * I wonder if its worth it to just not support this. */
-	u32 off = 2;
-	u32 bytes_read = 2;
-
-	while (bytes_read < min_off && off < payload_len) {
-		if (data[off - 2] != 0x00 || data[off - 1] != 0x00 ||
-		    data[off] != 0x03)
-			bytes_read++;
-		off++;
-	}
+	u32 off = run->slice_data_off;
 
 	dma_addr_t slc_a84 = h264_ctx->active_slice->addr + off;
 
@@ -796,6 +817,16 @@ static int avd_h264_run(struct avd_ctx *ctx)
 	struct vb2_v4l2_buffer *src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
 	u32 payload_len = vb2_get_plane_payload(&src->vb2_buf, 0);
 	const u8 *data = vb2_plane_vaddr(&src->vb2_buf, 0);
+
+	if (!data || !avd_h264_find_slice_data(data, payload_len,
+					       avd_h264_header_len(&run),
+					       &run.slice_data_off)) {
+		dev_dbg_ratelimited(ctx->dev->dev,
+				    "slice has no data after its header\n");
+		avd_run_postamble(ctx, &run.base);
+		return -EINVAL;
+	}
+
 	h264_ctx->active_slice = &h264_ctx->slices[h264_ctx->slice_num];
 	ret = avd_buf_alloc(ctx->dev, h264_ctx->active_slice, payload_len);
 	if (ret)

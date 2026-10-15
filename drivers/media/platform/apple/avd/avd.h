@@ -292,6 +292,11 @@ void avd_job_finish(struct avd_ctx *ctx, enum vb2_buffer_state result);
 void avd_run_preamble(struct avd_ctx *ctx, struct avd_run *run);
 void avd_run_postamble(struct avd_ctx *ctx, struct avd_run *run);
 
+#if IS_ENABLED(CONFIG_KUNIT)
+bool avd_h264_find_slice_data(const u8 *data, u32 len, u32 header_len,
+			      u32 *off);
+#endif
+
 extern const struct avd_coded_fmt_ops avd_h264_fmt_ops;
 extern const struct avd_coded_fmt_ops avd_hevc_fmt_ops;
 extern const struct avd_coded_fmt_ops avd_vp9_fmt_ops;
