@@ -1699,7 +1699,6 @@ static int atcphy_configure_lanes(struct apple_atcphy *atcphy, enum atcphy_mode 
 #define J700_AUX_CLAMP_SELECT BIT(8)
 #define J700_AUX_CLAMP_ENABLE BIT(9)
 
-
 static int j700_aux_enable(struct apple_atcphy *atcphy)
 {
 	u32 clamp = J700_AUX_CLAMP_SELECT | J700_AUX_CLAMP_ENABLE;
@@ -2599,7 +2598,7 @@ static int atc_tunnel_command(struct apple_atcphy *atcphy, u32 command)
 		    FIELD_PREP(AUSPLL_APB_CMD_OVERRIDE_CMD, command) |
 		    AUSPLL_APB_CMD_OVERRIDE_REQ | AUSPLL_APB_CMD_OVERRIDE_UNK28);
 	ret = readl_poll_timeout(atcphy->regs.core + AUSPLL_APB_CMD_OVERRIDE,
-				value, value & AUSPLL_APB_CMD_OVERRIDE_ACK, 10, 10000);
+				 value, value & AUSPLL_APB_CMD_OVERRIDE_ACK, 10, 10000);
 	core_clear32(atcphy, AUSPLL_APB_CMD_OVERRIDE, AUSPLL_APB_CMD_OVERRIDE_REQ);
 	return ret;
 }
@@ -2688,8 +2687,8 @@ static int atc_tunnel_start_t602x(struct apple_atcphy *atcphy)
 	    gates != 0x0000e001)
 		return -EBUSY;
 	ret = readl_poll_timeout(atcphy->regs.core + ACIOPHY_CMN_SHM_STS_REG0,
-				value, value & ACIOPHY_CMN_SHM_STS_REG0_CMD_READY,
-				10, 10000);
+				 value, value & ACIOPHY_CMN_SHM_STS_REG0_CMD_READY,
+				 10, 10000);
 	if (ret)
 		return ret;
 	atcphy->tunnel_attempted = true;
@@ -2748,7 +2747,7 @@ static int atc_tunnel_start_t602x(struct apple_atcphy *atcphy)
 	if (ret)
 		goto restore;
 	ret = readl_poll_timeout(atcphy->regs.core + ACIOPHY_DP_PCLK_STAT,
-				value, value & ACIOPHY_AUSPLL_LOCK, 10, 10000);
+				 value, value & ACIOPHY_AUSPLL_LOCK, 10, 10000);
 	if (ret)
 		goto restore;
 	ret = atc_tunnel_command(atcphy, 0x2000);
