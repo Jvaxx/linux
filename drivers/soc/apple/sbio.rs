@@ -1100,12 +1100,28 @@ impl SepData {
 
     fn attach_bringup(&self) {
         if self.profile.nonce_session {
-            if !self.bring_sensor_online() {
-                dev_warn!(
-                    self.dev,
-                    "sensor: authenticated attach incomplete; capture unavailable\n"
-                );
+            // A bring-up that fails on the bus leaves nothing a new attempt
+            // cannot undo: each attempt power-cycles the sensor and, after a
+            // failed one, clears the enclave's partial registration first,
+            // as every verify does.
+            const ATTEMPTS: u32 = 3;
+            for attempt in 1..=ATTEMPTS {
+                if self.bring_sensor_online() {
+                    return;
+                }
+                if attempt < ATTEMPTS {
+                    dev_warn!(
+                        self.dev,
+                        "sensor: attach-time bring-up attempt {} of {} failed; starting again\n",
+                        attempt,
+                        ATTEMPTS
+                    );
+                }
             }
+            dev_warn!(
+                self.dev,
+                "sensor: authenticated attach incomplete; capture unavailable\n"
+            );
             return;
         }
         if !sensor::is_bound() {
@@ -2004,6 +2020,12 @@ impl SepData {
         let _source = sensor::power_source();
         self.sensor_power_ns.store(shim::boottime_ns(), Relaxed);
         let cycled = sensor::power_cycle();
+        if !cycled && self.profile.nonce_session {
+            // A sensor that was not reset may still hold the session of an
+            // earlier attempt; registering it again cannot be trusted.
+            dev_err!(self.dev, "sensor: the power cycle failed; not registering the sensor\n");
+            return None;
+        }
         if !sensor::cs_timing().is_hardware() {
             dev_warn!(
                 self.dev,
