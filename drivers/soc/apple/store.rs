@@ -87,9 +87,36 @@ enum Damage {
     Intent,
 }
 
+/// Backing I/O of a [`Store`], separate so that the format handling can be
+/// tested without a filesystem.
+pub(crate) trait StoreIo {
+    fn size(&self) -> Result<u64>;
+    fn read_exact(&self, off: u64, buf: &mut [u8]) -> Result;
+    fn write_all(&self, off: u64, buf: &[u8]) -> Result;
+    fn sync(&self) -> Result;
+}
+
+impl StoreIo for shim::StoreFile {
+    fn size(&self) -> Result<u64> {
+        shim::StoreFile::size(self)
+    }
+
+    fn read_exact(&self, off: u64, buf: &mut [u8]) -> Result {
+        shim::StoreFile::read_exact(self, off, buf)
+    }
+
+    fn write_all(&self, off: u64, buf: &[u8]) -> Result {
+        shim::StoreFile::write_all(self, off, buf)
+    }
+
+    fn sync(&self) -> Result {
+        shim::StoreFile::sync(self)
+    }
+}
+
 // Not internally locked; the caller holds a mutex around all access.
-pub(crate) struct Store {
-    file: shim::StoreFile,
+pub(crate) struct Store<F = shim::StoreFile> {
+    file: F,
     slots: [Slot; SLOT_COUNT],
     generation: u64,
     pub(crate) recovered: bool,
@@ -110,7 +137,7 @@ fn le64(buf: &[u8], off: usize) -> u64 {
 /// That is all an interrupted creation leaves, and such a file holds nothing
 /// to keep; anything else may be what is left of a store. Reads at most a
 /// store's worth of the file.
-fn describe(file: &shim::StoreFile, size: u64) -> Option<&'static str> {
+fn describe<F: StoreIo>(file: &F, size: u64) -> Option<&'static str> {
     if size == 0 {
         return Some("empty");
     }
@@ -132,9 +159,14 @@ fn describe(file: &shim::StoreFile, size: u64) -> Option<&'static str> {
 }
 
 impl Store {
-    pub(crate) fn open() -> Result<Store> {
+    pub(crate) fn open() -> Result<Self> {
         let (file, created) = shim::StoreFile::open_host(STORE_PATH)?;
+        Self::from_file(file, created)
+    }
+}
 
+impl<F: StoreIo> Store<F> {
+    fn from_file(file: F, created: bool) -> Result<Self> {
         let mut store = Store {
             file,
             slots: [Slot::FREE; SLOT_COUNT],
