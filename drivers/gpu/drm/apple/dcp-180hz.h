@@ -28,6 +28,7 @@ void dcp_180hz_invalidate(struct apple_dcp *dcp);
 void dcp_180hz_notify(struct apple_dcp *dcp);
 void dcp_180hz_catalog_changed(struct apple_dcp *dcp);
 bool dcp_180hz_mode_current(struct apple_dcp *dcp, const struct dcp_display_mode *mode);
+bool dcp_external_modes_ready(struct apple_dcp *dcp);
 bool dcp_180hz_pending(struct apple_dcp *dcp, const struct dcp_display_mode *mode);
 void dcp_180hz_retry(struct apple_dcp *dcp);
 int dcp_180hz_init(struct apple_dcp *dcp);
