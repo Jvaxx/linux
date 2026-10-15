@@ -2874,3 +2874,90 @@ module_platform_driver! {
     description: "Apple T8140 AOP audio: microphones, headphone jack and speakers",
     license: "Dual MIT/GPL",
 }
+
+/// The speaker ceiling and the copy-path conversion are the whole digital
+/// protection of the J700 speakers below the daemon: check them where they
+/// are built, without the hardware.
+#[kunit_tests(snd_soc_t8140_aop_audio_speaker)]
+mod tests {
+    use super::*;
+
+    /// macaudio's level for the J700 while no daemon holds the lock:
+    /// MAX98360A_DB(safe_vol = -20).
+    const LOCKED_VOLUME: usize = 87;
+    /// 10^(0.5 / 20) in parts per 10^9.
+    const HALF_DB_PPB: u128 = 1_059_253_725;
+    /// 0.5 as a float32: the amplifier's full scale on the wire.
+    const F32_HALF: u32 = 0x3f00_0000;
+
+    #[test]
+    fn the_top_of_the_volume_range_is_the_amplifier_full_scale() {
+        assert_eq!(
+            SPKR_VOLUME_Q31[SPKR_VOLUME_MAX as usize] as i64,
+            SPKR_CEILING_Q31
+        );
+        assert_eq!(SPKR_CEILING_Q31, 1 << 30);
+        assert_eq!(f32_bits_of_q31(SPKR_CEILING_Q31 as i32), F32_HALF);
+    }
+
+    #[test]
+    fn the_volume_table_falls_in_half_db_steps_to_mute() {
+        assert_eq!(SPKR_VOLUME_Q31[0], 0);
+        for i in 2..=SPKR_VOLUME_MAX as usize {
+            let (lo, hi) = (SPKR_VOLUME_Q31[i - 1] as u128, SPKR_VOLUME_Q31[i] as u128);
+            assert!(hi > lo);
+            // hi / lo == 10^(0.5/20) to within the table's rounding
+            let expect = lo * HALF_DB_PPB / 1_000_000_000;
+            assert!(hi.abs_diff(expect) <= 2);
+        }
+    }
+
+    #[test]
+    fn the_locked_level_is_20_db_below_full_scale() {
+        let locked = SPKR_VOLUME_Q31[LOCKED_VOLUME] as i64;
+        // 10 * locked == ceiling to within the table's rounding (0.1 ppm)
+        assert!((10 * locked - SPKR_CEILING_Q31).abs() <= 10);
+    }
+
+    #[test]
+    fn no_sample_at_any_volume_exceeds_the_full_scale() {
+        for &gain in SPKR_VOLUME_Q31.iter() {
+            for sample in [
+                i32::MAX,
+                i32::MIN,
+                i32::MAX - 1,
+                i32::MIN + 1,
+                1 << 30,
+                -(1 << 30),
+                1,
+                -1,
+                0,
+            ] {
+                let bits = spkr_f32_bits(sample, gain);
+                assert!(bits & 0x7fff_ffff <= F32_HALF);
+            }
+        }
+        // the extremes at full volume: just under and exactly at full scale
+        assert_eq!(
+            spkr_f32_bits(i32::MAX, SPKR_CEILING_Q31 as u32),
+            0x3eff_ffff
+        );
+        assert_eq!(
+            spkr_f32_bits(i32::MIN, SPKR_CEILING_Q31 as u32),
+            0x8000_0000 | F32_HALF
+        );
+        // and 20 dB down at the locked level
+        let locked = spkr_f32_bits(i32::MIN, SPKR_VOLUME_Q31[LOCKED_VOLUME]);
+        // 0.05 as a float32 is 0x3d4c_cccd; the conversion truncates
+        assert!(locked & 0x7fff_ffff <= 0x3d4c_cccd && locked & 0x7fff_ffff > 0x3d4c_cccd - 64);
+    }
+
+    #[test]
+    fn the_float_conversion_is_exact_on_powers_of_two() {
+        assert_eq!(f32_bits_of_q31(0), 0);
+        assert_eq!(f32_bits_of_q31(1 << 29), 0x3e80_0000); // 0.25
+        assert_eq!(f32_bits_of_q31(-(1 << 30)), 0xbf00_0000); // -0.5
+        assert_eq!(f32_bits_of_q31(1), 0x3000_0000); // 2^-31
+        assert_eq!(f32_bits_of_q31(i32::MIN), 0xbf80_0000); // -1.0
+    }
+}
