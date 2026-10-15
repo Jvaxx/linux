@@ -123,7 +123,7 @@ static int mt_stock_config(struct mt7932 *m)
 		if (ret)
 			goto free;
 	}
-	dev_info(&m->pdev->dev, "STOCK_CONFIG_SUBMITTED: %u original/PHY-derived entries\n", count);
+	dev_dbg(&m->pdev->dev, "STOCK_CONFIG_SUBMITTED: %u original/PHY-derived entries\n", count);
 free:
 	kfree(records);
 out:
@@ -165,9 +165,9 @@ static int mt_publish_policy(struct mt7932 *m, const struct mt7932_reg_snapshot 
 	/* Native SETs have no response/atomic policy-commit event. Command
 	 * submission is not misrepresented as firmware readback or an ACK.
 	 */
-	dev_info(&m->pdev->dev, "REGULATORY_POLICY_SUBMITTED: %c%c firmware=%c%c channels=%u (native no-response SETs)\n",
-		 reg->alpha2[0], reg->alpha2[1], reg->domain[0], reg->domain[1],
-		 (reg->length - 12) / 8);
+	dev_dbg(&m->pdev->dev, "REGULATORY_POLICY_SUBMITTED: %c%c firmware=%c%c channels=%u (native no-response SETs)\n",
+		reg->alpha2[0], reg->alpha2[1], reg->domain[0], reg->domain[1],
+		(reg->length - 12) / 8);
 	return 0;
 }
 
@@ -226,7 +226,7 @@ static int mt_startup_once(struct mt7932 *m)
 		ret = mt_calibration_gate(m);
 	if (!ret)
 		ret = mt_request(m, 0x3e, true, true, false, roam_lock, sizeof(roam_lock));
-	dev_info(&m->pdev->dev, "OWN_CALIBRATION_STARTUP_RESULT: %d\n", ret);
+	dev_dbg(&m->pdev->dev, "OWN_CALIBRATION_STARTUP_RESULT: %d\n", ret);
 	if (!ret)
 		ret = mt_enable_scan(m);
 	if (ret)
@@ -385,9 +385,9 @@ static void mt_startup_work(struct work_struct *work)
 				 reg.alpha2[0], reg.alpha2[1], generation, ret,
 				 m->policy_failed || m->link_failed);
 		else
-			dev_info(&m->pdev->dev, "REGULATORY_READY: %c%c firmware=%c%c generation=%u current=%u\n",
-				 reg.alpha2[0], reg.alpha2[1], reg.domain[0], reg.domain[1],
-				 generation, !m->reg_pending);
+			dev_dbg(&m->pdev->dev, "REGULATORY_READY: %c%c firmware=%c%c generation=%u current=%u\n",
+				reg.alpha2[0], reg.alpha2[1], reg.domain[0], reg.domain[1],
+				generation, !m->reg_pending);
 		spin_unlock_irqrestore(&m->response_lock, flags);
 next:
 		mutex_unlock(&m->command_mutex);
@@ -496,8 +496,8 @@ static void mt_regulatory_notify(struct wiphy *wiphy, struct regulatory_request 
 	if (READ_ONCE(m->interface_registered))
 		schedule_work(&m->startup_work);
 	spin_unlock_irqrestore(&m->response_lock, irqflags);
-	dev_info_ratelimited(&m->pdev->dev, "REGULATORY_REQUEST: %c%c initiator=%u generation=%u\n",
-		 reg.alpha2[0], reg.alpha2[1], request->initiator, m->reg_generation);
+	dev_dbg(&m->pdev->dev, "REGULATORY_REQUEST: %c%c initiator=%u generation=%u\n",
+		reg.alpha2[0], reg.alpha2[1], request->initiator, m->reg_generation);
 }
 
 static const struct cfg80211_ops mt_cfg_ops = {
@@ -611,6 +611,6 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 		return ret;
 	WRITE_ONCE(m->interface_registered, true);
 	schedule_work(&m->startup_work);
-	dev_info(&m->pdev->dev, "REGULATORY_GATE_REGISTERED: cfg80211 country policy required\n");
+	dev_dbg(&m->pdev->dev, "REGULATORY_GATE_REGISTERED: cfg80211 country policy required\n");
 	return 0;
 }
