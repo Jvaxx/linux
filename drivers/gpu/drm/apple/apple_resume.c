@@ -6,6 +6,7 @@
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_uapi.h>
 #include <drm/drm_crtc.h>
+#include <drm/drm_encoder.h>
 #include <drm/drm_modes.h>
 #include <drm/drm_modeset_helper_vtables.h>
 #include <drm/drm_print.h>
@@ -54,10 +55,19 @@ void apple_drm_drop_stale_crtcs(struct drm_atomic_commit *state)
 			drm_atomic_set_fb_for_plane(plane_state, NULL);
 		}
 		for_each_new_connector_in_state(state, connector, conn_state, j) {
+			if (conn_state->crtc != crtc)
+				continue;
 			/* Detaching from a CRTC already in the state cannot fail. */
-			if (conn_state->crtc == crtc &&
-			    WARN_ON(drm_atomic_set_crtc_for_connector(conn_state, NULL)))
+			if (WARN_ON(drm_atomic_set_crtc_for_connector(conn_state, NULL)))
 				return;
+			/*
+			 * Nor does a connector without a CRTC keep an encoder:
+			 * the resume check warns about one left routed.
+			 */
+			if (conn_state->best_encoder)
+				crtc_state->encoder_mask &=
+					~drm_encoder_mask(conn_state->best_encoder);
+			conn_state->best_encoder = NULL;
 		}
 		crtc_state->active = false;
 		if (WARN_ON(drm_atomic_set_mode_for_crtc(crtc_state, NULL)))
