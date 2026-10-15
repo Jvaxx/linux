@@ -1807,7 +1807,6 @@ static int atcphy_configure_lanes(struct apple_atcphy *atcphy, enum atcphy_mode 
 #define J700_AUX_CLAMP_SELECT BIT(8)
 #define J700_AUX_CLAMP_ENABLE BIT(9)
 
-
 static int j700_aux_enable(struct apple_atcphy *atcphy)
 {
 	u32 clamp = J700_AUX_CLAMP_SELECT | J700_AUX_CLAMP_ENABLE;
