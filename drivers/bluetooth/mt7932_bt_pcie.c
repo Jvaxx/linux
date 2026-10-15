@@ -140,7 +140,6 @@ struct bt7932 {
 	bool stopping, runtime_forbidden;
 	enum bt7932_recovery recovery;
 	enum bt7932_pm_state pm_state;
-	u64 tx_packets, rx_packets, diagnostics;
 };
 
 static void bt7932_ring_doorbell(struct bt7932 *bt, unsigned int bit)
@@ -583,7 +582,6 @@ static void bt7932_tx_work(struct work_struct *work)
 		ring->host = (ring->host + 1) & BT7932_MASK;
 		bt7932_publish_counter(bt, bt->host_transfer, channel, ring->host);
 		bt7932_ring_doorbell(bt, geometry[channel].doorbell);
-		bt->tx_packets++;
 		bt->hdev->stat.byte_tx += skb->len;
 		mutex_unlock(&bt->lock);
 		kfree_skb(skb);
@@ -628,10 +626,7 @@ static int bt7932_rx_locked(struct bt7932 *bt, unsigned int channel)
 			hci_skb_pkt_type(skb) = geo->packet;
 			skb_put_data(skb, descriptor + 16, length);
 			bt->hdev->stat.byte_rx += length;
-			bt->rx_packets++;
 			hci_recv_frame(bt->hdev, skb);
-		} else if (!geo->packet) {
-			bt->diagnostics++;
 		}
 		slot = (slot + 1) & BT7932_MASK;
 	}
