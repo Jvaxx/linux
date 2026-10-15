@@ -22,6 +22,8 @@
  * Author: Sven Peter <sven@kernel.org>
  */
 
+#include <kunit/static_stub.h>
+
 #include <dt-bindings/phy/phy.h>
 #include <linux/bitfield.h>
 #include <linux/cleanup.h>
@@ -2859,6 +2861,9 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 	int ret = 0;
 	u32 reg;
 
+	if (IS_ENABLED(CONFIG_PHY_APPLE_ATC_KUNIT_TEST))
+		KUNIT_STATIC_STUB_REDIRECT(atcphy_configure, atcphy, mode);
+
 	lockdep_assert_held(&atcphy->lock);
 	if (atcphy->pipe_pending)
 		return -EBUSY;
@@ -3742,6 +3747,11 @@ static int atcphy_mux_set_locked(struct apple_atcphy *atcphy, enum atcphy_mode t
 		return 0;
 	}
 
+	/* A re-probe after failed role shutdown must leave the live PIPE alone. */
+	if (!atcphy->fixed_usb2 && target_mode == APPLE_ATCPHY_MODE_OFF &&
+	    atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY)
+		return -EBUSY;
+
 	switch (target_mode) {
 	case APPLE_ATCPHY_MODE_TBT:
 	case APPLE_ATCPHY_MODE_USB4:
@@ -3849,6 +3859,7 @@ static int atcphy_probe_mux(struct apple_atcphy *atcphy)
 		.drvdata = atcphy,
 		.fwnode = atcphy->dev->fwnode,
 		.set = atcphy_mux_set,
+		.safe_after_role = !atcphy->fixed_usb2,
 	};
 
 	mux = typec_mux_register(atcphy->dev, &mux_desc);

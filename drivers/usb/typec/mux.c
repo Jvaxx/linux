@@ -317,6 +317,23 @@ static void typec_mux_context_put(struct typec_mux_context *context)
 	kfree(context);
 }
 
+/* Immutable provider policy; the handle pins each provider until put. */
+bool typec_mux_safe_after_role(struct typec_mux *mux)
+{
+	unsigned int i;
+
+	if (IS_ERR_OR_NULL(mux))
+		return false;
+
+	for (i = 0; i < mux->num_mux_devs; i++) {
+		if (mux->mux_devs[i]->safe_after_role)
+			return true;
+	}
+
+	return false;
+}
+EXPORT_SYMBOL_GPL(typec_mux_safe_after_role);
+
 static int mux_fwnode_match(struct device *dev, const void *fwnode)
 {
 	if (!is_typec_mux_dev(dev))
@@ -651,6 +668,7 @@ typec_mux_register(struct device *parent, const struct typec_mux_desc *desc)
 	mux_dev->finish = desc->finish;
 	mux_dev->commit = desc->commit;
 	mux_dev->abort = desc->abort;
+	mux_dev->safe_after_role = desc->safe_after_role;
 
 	device_initialize(&mux_dev->dev);
 	mux_dev->dev.parent = parent;
