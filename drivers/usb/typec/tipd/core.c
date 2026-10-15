@@ -1507,7 +1507,6 @@ static int
 cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
-	struct fwnode_handle *connector_fwnode = NULL;
 	int ret;
 
 	INIT_DELAYED_WORK(&cd321x->update_work, cd321x_update_work);
@@ -1529,10 +1528,10 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 		goto err_unregister_altmodes;
 	}
 
-	if (fwnode_property_present(fwnode, "displayport"))
-		connector_fwnode = fwnode_find_reference(fwnode, "displayport", 0);
-	if (!IS_ERR_OR_NULL(connector_fwnode))
-		cd321x->connector_fwnode = connector_fwnode;
+	cd321x->connector_fwnode = fwnode_find_reference(fwnode, "displayport", 0);
+	if (IS_ERR(cd321x->connector_fwnode))
+		cd321x->connector_fwnode = NULL;
+
 	cd321x->tbt_switch = fwnode_typec_thunderbolt_switch_get(fwnode);
 	if (IS_ERR(cd321x->tbt_switch)) {
 		ret = PTR_ERR(cd321x->tbt_switch);
