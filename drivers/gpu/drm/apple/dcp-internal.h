@@ -498,6 +498,7 @@ struct apple_dcp {
 
 void dcp_firmware_metadata_connection(struct apple_dcp *dcp, u64 generation, bool connected);
 void dcp_firmware_metadata_hotplug(struct apple_dcp *dcp, bool connected);
+void dcp_firmware_metadata_announced(struct apple_dcp *dcp);
 void dcp_firmware_metadata_begin(struct apple_dcp *dcp);
 void dcp_firmware_metadata_attributes(struct apple_dcp *dcp,
 				      const struct dcp_display_metadata *attributes);

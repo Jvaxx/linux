@@ -139,6 +139,7 @@ static void dpavservep_detach(struct apple_dcp *d) { (void)d; detaches++; }
 static void dcp_firmware_metadata_hotplug(struct apple_dcp *d, bool c) { (void)d; (void)c; }
 static void dcp_firmware_metadata_connection(struct apple_dcp *d, u64 g, bool c)
 { (void)d; (void)g; (void)c; }
+static void dcp_firmware_metadata_announced(struct apple_dcp *d) { (void)d; }
 static int dcp_external_disconnect(struct apple_dcp *, bool);
 static struct apple_dcp display;
 static void drm_connector_oob_hotplug_event(void *node, int status)
