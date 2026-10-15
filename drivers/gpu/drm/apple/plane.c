@@ -430,7 +430,7 @@ static const u32 dcp_primary_formats[] = {
 #endif
 };
 
-/* H17P 10-bit XRGB alpha semantics have not been qualified. */
+/* The H17P alpha semantics of 10-bit XRGB are unknown. */
 static const u32 dcp_primary_formats_h17p[] = {
 	DRM_FORMAT_ARGB2101010,
 	DRM_FORMAT_XRGB8888,

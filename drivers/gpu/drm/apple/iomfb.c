@@ -901,7 +901,7 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 	     (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
 	      handled &&
 	      !iomfb_check_callback_h17p(dcp, tag, hdr->in_len, hdr->out_len)))) {
-		dev_err(dev, "unqualified IOMFB callback %d (%u, %u)\n",
+		dev_err(dev, "unsupported IOMFB callback %d (%u, %u)\n",
 			tag, hdr->in_len, hdr->out_len);
 		dcp->crashed = true;
 		return;
