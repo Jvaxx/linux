@@ -393,6 +393,8 @@ struct apple_dcp {
 	bool active;
 	/* A successful initial enable keeps the H17P pipe running across DPMS. */
 	bool pipe_enabled_h17p;
+	/* Messages from the coprocessor are held in the mailbox for sleep. */
+	bool rx_held;
 
 	/* eDP display without DP-HDMI conversion */
 	bool main_display;

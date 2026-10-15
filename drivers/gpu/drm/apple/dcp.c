@@ -6065,6 +6065,40 @@ static void dcp_drain_for_sleep(struct apple_dcp *dcp)
 	dev_warn(dcp->dev, "brightness change still pending at suspend\n");
 }
 
+/*
+ * DPMS off leaves the internal H17P pipe scanning out (see dcp_poweroff()),
+ * and while it scans out the firmware publishes a property to the AP on every
+ * frame.  The mailbox interrupt is not suspended, so each of those messages
+ * wakes a CPU out of suspend-to-idle about 60 times a second.  Hold the
+ * messages in the mailbox for system sleep and process them at resume.
+ * apple-drm is a consumer of this device, so its suspend handler has blanked
+ * the panel before this runs and its resume handler restores the CRTC after.
+ */
+static void dcp_hold_for_sleep(struct apple_dcp *dcp)
+{
+	if (!dcp_uses_soft_dpms(dcp) || dcp->fw_compat != DCP_FIRMWARE_H17P ||
+	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G ||
+	    READ_ONCE(dcp->crashed))
+		return;
+
+	iomfb_pause_presentation(dcp, true);
+	if (iomfb_queue_settle(dcp, msecs_to_jiffies(500))) {
+		iomfb_pause_presentation(dcp, false);
+		return;
+	}
+	apple_rtkit_hold_rx(dcp->rtk);
+	dcp->rx_held = true;
+}
+
+static void dcp_release_after_sleep(struct apple_dcp *dcp)
+{
+	if (!dcp->rx_held)
+		return;
+	dcp->rx_held = false;
+	apple_rtkit_resume_rx(dcp->rtk);
+	iomfb_pause_presentation(dcp, false);
+}
+
 static int dcp_platform_suspend(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
@@ -6145,6 +6179,8 @@ static int dcp_platform_suspend(struct device *dev)
 	 * shutdown properly yet.
 	 */
 	device_set_wakeup_path(dev);
+	/* Last: the steps above still talk to the coprocessor. */
+	dcp_hold_for_sleep(dcp);
 
 	return 0;
 }
@@ -6161,6 +6197,7 @@ static int dcp_platform_resume(struct device *dev)
 	if (dcp->external_native)
 		dcp_fabric_hdmi_reinit(dcp, "after system sleep");
 	/* Observe future edges before sampling any edges lost in sleep. */
+	dcp_release_after_sleep(dcp);
 	dcp_enable_typec_work(dcp);
 	if (dcp->hdmi_hpd_irq)
 		dcp_fabric_run_resume(&dcp_resume_ops, dcp);
