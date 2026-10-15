@@ -68,7 +68,7 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 	/* Resets are synchronous, and only work if the device is powered and clocked. */
 	if (reg & APPLE_PMGR_RESET && pstate != APPLE_PMGR_PS_ACTIVE)
 		dev_err_ratelimited(ps->dev, "PS %s: powering off with RESET active\n",
-			genpd->name);
+				    genpd->name);
 
 	if (pstate != APPLE_PMGR_PS_ACTIVE && (ps->force_disable || ps->force_reset)) {
 		u32 reg_pre = reg & ~(APPLE_PMGR_AUTO_ENABLE | APPLE_PMGR_FLAGS |
@@ -88,8 +88,9 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 			APPLE_PMGR_PS_SET_TIMEOUT);
 
 		if (ret < 0)
-			dev_err_ratelimited(ps->dev, "PS %s: Failed to set reset/disable bits (now: 0x%x)\n",
-				genpd->name, reg);
+			dev_err_ratelimited(ps->dev,
+					    "PS %s: Failed to set reset/disable bits (now: 0x%x)\n",
+					    genpd->name, cur);
 	}
 
 	/* Do not replay the hardware-owned BUSY bit in this whole-word write. */
@@ -119,8 +120,9 @@ static int apple_pmgr_ps_set(struct generic_pm_domain *genpd, u32 pstate, bool a
 	}
 
 	if (ret < 0)
-		dev_err_ratelimited(ps->dev, "PS %s: Failed to reach power state 0x%x (requested 0x%x, now: 0x%x)\n",
-			genpd->name, pstate, reg, cur);
+		dev_err_ratelimited(ps->dev,
+				    "PS %s: Failed to reach power state 0x%x (requested 0x%x, now: 0x%x)\n",
+				    genpd->name, pstate, reg, cur);
 
 	if (auto_enable) {
 		/* Not all devices implement this; this is a no-op where not implemented. */
@@ -222,7 +224,8 @@ static int apple_pmgr_reset_assert(struct reset_controller_dev *rcdev, unsigned 
 
 	if (ps->genpd.status == GENPD_STATE_OFF)
 		dev_err_ratelimited(ps->dev,
-			"PS 0x%x: asserting RESET while powered down\n", ps->offset);
+				    "PS 0x%x: asserting RESET while powered down\n",
+				    ps->offset);
 
 	dev_dbg(ps->dev, "PS 0x%x: assert reset\n", ps->offset);
 	/* Quiesce device before asserting reset */
@@ -252,7 +255,8 @@ static int apple_pmgr_reset_deassert(struct reset_controller_dev *rcdev, unsigne
 
 	if (ps->genpd.status == GENPD_STATE_OFF)
 		dev_err_ratelimited(ps->dev,
-			"PS 0x%x: RESET was deasserted while powered down\n", ps->offset);
+				    "PS 0x%x: RESET was deasserted while powered down\n",
+				    ps->offset);
 
 	spin_unlock_irqrestore(&ps->genpd.slock, flags);
 
