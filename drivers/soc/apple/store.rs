@@ -441,6 +441,14 @@ pub(crate) const fn crc16_ccitt_false(data: &[u8]) -> u16 {
 // Canonical CCITT-FALSE check value; guards against a reflected/XOR variant.
 static_assert!(crc16_ccitt_false(b"123456789") == 0x29B1);
 
+// The driver as it shipped before this validation, changed only to reach its
+// file through `StoreIo`. The tests use it as the reference for compatibility
+// in both directions.
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[allow(dead_code)]
+#[path = "store_shipped.rs"]
+mod shipped;
+
 #[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
 #[::kernel::macros::kunit_tests(apple_sep_host_store)]
 mod tests {
@@ -829,6 +837,196 @@ mod tests {
         file.poke(entry(SLOT_COUNT - 1, 18), &(MAX_VALUE as u32).to_le_bytes());
         let value = reopen(&file)?.read(&Key::root(0xf3))?;
         assert_eq!(value.map(|v| v.len()), Some(MAX_VALUE));
+        Ok(())
+    }
+
+    /// Opens `file` with the shipped driver.
+    fn open_shipped(file: &MemoryFile) -> Result<shipped::Store<&MemoryFile>> {
+        shipped::Store::open(file)
+    }
+
+    /// `key` as the shipped driver spells it.
+    fn as_shipped(key: &Key) -> shipped::Key {
+        shipped::Key {
+            kind: key.kind,
+            uuid: key.uuid,
+        }
+    }
+
+    /// A record value whose every byte differs from those of other seeds.
+    fn value(len: usize, seed: u8) -> Result<KVec<u8>> {
+        let mut v = KVec::with_capacity(len, GFP_KERNEL)?;
+        for i in 0..len {
+            v.push(seed.wrapping_add(i as u8).wrapping_mul(31), GFP_KERNEL)?;
+        }
+        Ok(v)
+    }
+
+    /// Every kind, a non-root key, an empty value, full blocks and overwrites.
+    fn history() -> Result<KVec<(Key, KVec<u8>)>> {
+        let mut ops = KVec::new();
+        let other = Key {
+            kind: 0xf0,
+            uuid: [0x5c; 16],
+        };
+        for (key, len, seed) in [
+            (Key::root(0xf1), 300, 1),
+            (Key::root(0xf5), 0, 2),
+            (Key::root(0xf2), MAX_VALUE, 3),
+            (other, 16, 4),
+            (Key::root(0xf1), 600, 5),
+            (Key::root(0xf3), 1, 6),
+            (Key::root(0xf4), MAX_VALUE - 1, 7),
+            (Key::root(0xf0), 16, 8),
+            (Key::root(0xf5), 12, 9),
+        ] {
+            ops.push((key, value(len, seed)?), GFP_KERNEL)?;
+        }
+        Ok(ops)
+    }
+
+    /// Whether this driver and the shipped one read the same value for every
+    /// key in `ops` from `file`.
+    fn both_read(file: &MemoryFile, ops: &[(Key, KVec<u8>)]) -> Result<bool> {
+        let mut new = reopen(file)?;
+        let mut shipped = open_shipped(file)?;
+        if shipped.fresh {
+            return Ok(false);
+        }
+        for (key, _) in ops {
+            if new.read(key)?.as_deref() != shipped.read(&as_shipped(key))?.as_deref() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    #[test]
+    fn writes_match_the_shipped_driver_byte_for_byte() -> Result {
+        let ours = MemoryFile::new();
+        let theirs = MemoryFile::new();
+        let mut new = Store::from_file(&ours, true)?;
+        let mut shipped = open_shipped(&theirs)?;
+        assert!(ours.same(&theirs));
+        for (key, value) in history()?.iter() {
+            new.write(key, value)?;
+            shipped.write(&as_shipped(key), value)?;
+            assert!(ours.same(&theirs));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn both_drivers_reject_the_same_writes() -> Result {
+        let mut long = KVec::new();
+        long.resize(MAX_VALUE + 1, 0x5a, GFP_KERNEL)?;
+        let ours = written(&[(Key::root(0xf1), b"index")])?;
+        let theirs = ours.copy()?;
+        let mut new = reopen(&ours)?;
+        let mut shipped = open_shipped(&theirs)?;
+        for (key, value) in [
+            (Key::root(0xef), &b"x"[..]),
+            (Key::root(0xf6), &b"x"[..]),
+            (Key::root(0xf2), &long[..]),
+        ] {
+            let ours_failed = new.write(&key, value).err();
+            assert!(ours_failed.is_some());
+            assert!(ours_failed == shipped.write(&as_shipped(&key), value).err());
+        }
+        assert!(new.read(&Key::root(0xef)).is_err());
+        assert!(shipped.read(&as_shipped(&Key::root(0xef))).is_err());
+        assert!(ours.same(&theirs));
+        Ok(())
+    }
+
+    #[test]
+    fn each_driver_opens_the_others_store_in_place() -> Result {
+        let ops = history()?;
+        let (first, second) = ops.split_at(4);
+
+        // Shipped writer, new reader, then the other way round.
+        let file = MemoryFile::new();
+        let mut shipped = open_shipped(&file)?;
+        for (key, value) in first {
+            shipped.write(&as_shipped(key), value)?;
+        }
+        assert!(both_read(&file, &ops)?);
+        let mut new = reopen(&file)?;
+        for (key, value) in second {
+            new.write(key, value)?;
+        }
+        assert!(both_read(&file, &ops)?);
+        for (key, _) in ops.iter() {
+            let stored = open_shipped(&file)?.read(&as_shipped(key))?;
+            let last = ops
+                .iter()
+                .rev()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| &v[..]);
+            assert!(stored.as_deref() == last);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn torn_writes_open_in_either_driver() -> Result {
+        let key = Key::root(0xf2);
+        let old = value(MAX_VALUE, 0x11)?;
+        let new = value(MAX_VALUE, 0x22)?;
+        // A write is an intent superblock, the new block, then the new table.
+        // Each is cut off after every multiple of the atomic write size.
+        for writer_is_new in [false, true] {
+            for nth in 0..3 {
+                for keep in (0..=BLOCK_SIZE).step_by(ATOMIC_WRITE) {
+                    let file = MemoryFile::new();
+                    open_shipped(&file)?.write(&as_shipped(&key), &old)?;
+                    open_shipped(&file)?.write(&as_shipped(&Key::root(0xf5)), b"lockout")?;
+                    file.cut(nth, keep);
+                    let failed = if writer_is_new {
+                        reopen(&file)?.write(&key, &new).is_err()
+                    } else {
+                        open_shipped(&file)?.write(&as_shipped(&key), &new).is_err()
+                    };
+                    assert!(failed);
+                    file.restore_power();
+
+                    // Only a table that reached the disk publishes the value.
+                    let expect = if nth == 2 && keep > 0 { &new } else { &old };
+                    let crashed = file.copy()?;
+                    for new_first in [false, true] {
+                        let file = crashed.copy()?;
+                        if new_first {
+                            assert!(reopen(&file)?.read(&key)?.as_deref() == Some(&expect[..]));
+                        }
+                        let mut shipped = open_shipped(&file)?;
+                        assert!(!shipped.fresh);
+                        assert!(shipped.read(&as_shipped(&key))?.as_deref() == Some(&expect[..]));
+                        let lockout = reopen(&file)?.read(&Key::root(0xf5))?;
+                        assert!(lockout.as_deref() == Some(&b"lockout"[..]));
+                        assert!(reopen(&file)?.read(&key)?.as_deref() == Some(&expect[..]));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_shipped_driver_erased_what_this_one_refuses() -> Result {
+        let key = Key::root(0xf1);
+        let truncated = written(&[(key, b"index")])?;
+        truncated
+            .bytes
+            .borrow_mut()
+            .truncate(STORE_SIZE - BLOCK_SIZE);
+        let unknown = written(&[(key, b"index")])?;
+        unknown.poke(SB_VERSION, &2u32.to_le_bytes());
+        for file in [truncated, unknown] {
+            assert!(refused(&file)?);
+            let mut shipped = open_shipped(&file)?;
+            assert!(shipped.fresh);
+            assert!(shipped.read(&as_shipped(&key))?.is_none());
+        }
         Ok(())
     }
 }
