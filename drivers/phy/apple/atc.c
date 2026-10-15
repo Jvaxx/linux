@@ -3381,9 +3381,8 @@ static int atcphy_probe_rcdev(struct apple_atcphy *atcphy)
 	return devm_reset_controller_register(atcphy->dev, &atcphy->rcdev);
 }
 
-static int atcphy_sw_set(struct typec_switch_dev *sw, enum typec_orientation orientation)
+static int atcphy_set_orientation(struct apple_atcphy *atcphy, enum typec_orientation orientation)
 {
-	struct apple_atcphy *atcphy = typec_switch_get_drvdata(sw);
 	bool swap_lanes;
 
 	guard(mutex)(&atcphy->lock);
@@ -3410,6 +3409,11 @@ static int atcphy_sw_set(struct typec_switch_dev *sw, enum typec_orientation ori
 		atcphy->pipe_state, atcphy->host_active);
 
 	return 0;
+}
+
+static int atcphy_sw_set(struct typec_switch_dev *sw, enum typec_orientation orientation)
+{
+	return atcphy_set_orientation(typec_switch_get_drvdata(sw), orientation);
 }
 
 static void atcphy_typec_switch_unregister(void *data)
@@ -3802,9 +3806,8 @@ static int atcphy_mux_set_locked(struct apple_atcphy *atcphy, enum atcphy_mode t
 	return atcphy_configure(atcphy, target_mode);
 }
 
-static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *state)
+static int atcphy_mux_update(struct apple_atcphy *atcphy, const struct typec_mux_state *state)
 {
-	struct apple_atcphy *atcphy = typec_mux_get_drvdata(mux);
 	struct atcphy_usb3_pm pm = {};
 	enum atcphy_mode target_mode;
 	int ret;
@@ -3827,6 +3830,11 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 	ret = atcphy_mux_set_locked(atcphy, target_mode);
 	atcphy_usb3_pm_put(&pm);
 	return ret;
+}
+
+static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *state)
+{
+	return atcphy_mux_update(typec_mux_get_drvdata(mux), state);
 }
 
 static void atcphy_typec_mux_unregister(void *data)
