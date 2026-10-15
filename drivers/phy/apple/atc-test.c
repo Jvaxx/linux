@@ -157,6 +157,13 @@ static void atcphy_test_usb3_port_ready(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, atcphy_usb3_port_ready(atcphy));
 }
 
+static void atcphy_test_cancel_port_work(void *data)
+{
+	struct apple_atcphy *atcphy = data;
+
+	cancel_delayed_work_sync(&atcphy->usb3_port_work);
+}
+
 /*
  * A J700-style PHY behind a fixed hub, in DisplayPort + USB3 with the PIPE on
  * USB3 for a running host, but without a device tree node. A mux update that
@@ -166,6 +173,11 @@ static void atcphy_test_usb3_port_ready(struct kunit *test)
 static struct apple_atcphy *atcphy_test_alloc_fixed_hub(struct kunit *test)
 {
 	struct apple_atcphy *atcphy = atcphy_test_alloc_dev(test, true);
+	int ret;
+
+	INIT_DELAYED_WORK(&atcphy->usb3_port_work, atcphy_usb3_port_work);
+	ret = kunit_add_action_or_reset(test, atcphy_test_cancel_port_work, atcphy);
+	KUNIT_ASSERT_EQ(test, ret, 0);
 
 	atcphy->hw = &atcphy_hw_t8140;
 	/* The lane and DisplayPort tunables a J700 has */
@@ -280,6 +292,20 @@ static int atcphy_test_mode(struct apple_atcphy *atcphy, enum atcphy_mode target
 	return atcphy_test_steps()->mode_ret;
 }
 
+/* Retries stay queued until a test runs them, in its own context. */
+static unsigned long atcphy_test_retry_delay(unsigned int retry)
+{
+	return MAX_JIFFY_OFFSET;
+}
+
+static bool atcphy_test_run_retry(struct apple_atcphy *atcphy)
+{
+	if (!cancel_delayed_work_sync(&atcphy->usb3_port_work))
+		return false;
+	atcphy_usb3_port_work(&atcphy->usb3_port_work.work);
+	return true;
+}
+
 static struct atcphy_test_steps *atcphy_test_stub_steps(struct kunit *test)
 {
 	struct atcphy_test_steps *steps = kunit_kzalloc(test, sizeof(*steps), GFP_KERNEL);
@@ -290,6 +316,7 @@ static struct atcphy_test_steps *atcphy_test_stub_steps(struct kunit *test)
 	kunit_activate_static_stub(test, atcphy_usb3_port_off, atcphy_test_port_off);
 	kunit_activate_static_stub(test, atcphy_usb3_port_on, atcphy_test_port_on);
 	kunit_activate_static_stub(test, atcphy_mux_set_locked, atcphy_test_mode);
+	kunit_activate_static_stub(test, atcphy_usb3_port_retry_delay, atcphy_test_retry_delay);
 
 	return steps;
 }
@@ -397,6 +424,58 @@ static void atcphy_test_update_port_owed(struct kunit *test)
 	steps->mode_port_on = false;
 	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_D), -EIO);
 	KUNIT_EXPECT_STREQ(test, steps->log, "g0m");
+}
+
+/* A power-on owed after a USB failure is retried, while it is owed, a few times */
+static void atcphy_test_update_port_retry(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_fixed_hub(test);
+	struct atcphy_test_steps *steps = atcphy_test_stub_steps(test);
+	unsigned int i;
+
+	atcphy->usb3_port_off = true;
+	steps->mode_port_on = true;
+
+	/* Out of memory for the hub request: the update keeps the display */
+	steps->port_on_ret = -ENOMEM;
+	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_D), 0);
+	KUNIT_EXPECT_STREQ(test, steps->log, "g0m1");
+
+	/* and with no further Type-C event, the retry brings the port up */
+	memset(steps->log, 0, sizeof(steps->log));
+	steps->port_on_ret = 0;
+	KUNIT_EXPECT_TRUE(test, atcphy_test_run_retry(atcphy));
+	KUNIT_EXPECT_STREQ(test, steps->log, "g1");
+	KUNIT_EXPECT_FALSE(test, atcphy->usb3_port_off);
+	KUNIT_EXPECT_FALSE(test, atcphy_test_run_retry(atcphy));
+
+	/* A retry finding the host gone leaves the port to the next host */
+	atcphy->usb3_port_off = true;
+	steps->port_on_ret = -ENOMEM;
+	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_D), 0);
+	atcphy->host_active = false;
+	memset(steps->log, 0, sizeof(steps->log));
+	KUNIT_EXPECT_TRUE(test, atcphy_test_run_retry(atcphy));
+	KUNIT_EXPECT_STREQ(test, steps->log, "g");
+	KUNIT_EXPECT_FALSE(test, atcphy_test_run_retry(atcphy));
+	atcphy->host_active = true;
+
+	/* A port that keeps failing is given up after a few retries */
+	memset(steps->log, 0, sizeof(steps->log));
+	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_D), 0);
+	for (i = 0; i < ATCPHY_USB3_PORT_RETRIES; i++)
+		KUNIT_EXPECT_TRUE(test, atcphy_test_run_retry(atcphy));
+	KUNIT_EXPECT_FALSE(test, atcphy_test_run_retry(atcphy));
+	KUNIT_EXPECT_STREQ(test, steps->log, "g0m1g1g1g1g1g1");
+	KUNIT_EXPECT_TRUE(test, atcphy->usb3_port_off);
+
+	/* A mode change fails on the last step, and is retried from there too */
+	memset(steps->log, 0, sizeof(steps->log));
+	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_C), -ENOMEM);
+	steps->port_on_ret = 0;
+	KUNIT_EXPECT_TRUE(test, atcphy_test_run_retry(atcphy));
+	KUNIT_EXPECT_STREQ(test, steps->log, "g0m1g1");
+	KUNIT_EXPECT_FALSE(test, atcphy->usb3_port_off);
 }
 
 /* A mode the PHY cannot run is turned down before USB3 goes down for it */
@@ -738,6 +817,7 @@ static struct kunit_case atcphy_mux_test_cases[] = {
 	KUNIT_CASE(atcphy_test_update_port_order),
 	KUNIT_CASE(atcphy_test_update_port_failure),
 	KUNIT_CASE(atcphy_test_update_port_owed),
+	KUNIT_CASE(atcphy_test_update_port_retry),
 	KUNIT_CASE(atcphy_test_update_unsupported),
 	KUNIT_CASE(atcphy_test_update_port_taken),
 	KUNIT_CASE(atcphy_test_set_port_on),
