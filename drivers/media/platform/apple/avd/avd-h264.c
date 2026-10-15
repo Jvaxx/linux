@@ -695,7 +695,9 @@ static int avd_h264_realloc_slices(struct avd_ctx *ctx)
 	size_t alloc_slice_num;
 
 	tmp = h264_ctx->slices;
-	alloc_slice_num = (h264_ctx->alloc_slice_num * 3) / 2;
+	/* grow by half, and by at least one for a one-row picture */
+	alloc_slice_num = h264_ctx->alloc_slice_num +
+			  max_t(size_t, h264_ctx->alloc_slice_num / 2, 1);
 	h264_ctx->slices = kzalloc(sizeof(*h264_ctx->slices) * alloc_slice_num,
 				   GFP_KERNEL);
 	if (!h264_ctx->slices) {
@@ -708,6 +710,10 @@ static int avd_h264_realloc_slices(struct avd_ctx *ctx)
 	memcpy(h264_ctx->slices, tmp,
 	       sizeof(*h264_ctx->slices) * h264_ctx->slice_num);
 	kfree(tmp);
+
+	/* a slice that arrives before the frame's header has no job table yet */
+	if (!ctx->job.segments)
+		return 0;
 
 	tmp = ctx->job.segments;
 	ctx->job.segments = kvcalloc(alloc_slice_num + 1,
@@ -781,8 +787,7 @@ static int avd_h264_run(struct avd_ctx *ctx)
 
 	avd_h264_run_preamble(ctx, &run);
 
-	if (ctx->job.segments &&
-	    h264_ctx->slice_num >= h264_ctx->alloc_slice_num) {
+	if (h264_ctx->slice_num >= h264_ctx->alloc_slice_num) {
 		ret = avd_h264_realloc_slices(ctx);
 		if (ret)
 			goto err_free_jobs;
