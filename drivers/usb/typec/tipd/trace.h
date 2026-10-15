@@ -12,8 +12,10 @@
 #if !defined(_TPS6598X_TRACE_H_) || defined(TRACE_HEADER_MULTI_READ)
 #define _TPS6598X_TRACE_H_
 
+#include "cd321x-dp.h"
 #include "tps6598x.h"
 
+#include <drm/drm_connector.h>
 #include <linux/stringify.h>
 #include <linux/types.h>
 #include <linux/tracepoint.h>
@@ -425,6 +427,42 @@ TRACE_EVENT(cd321x_data_status,
 		  __entry->data_status & TPS_DATA_STATUS_DP_CONNECTION ? ", DP pinout " : "",
 		  maybe_show_data_status_dp_pin_assignment(__entry->data_status)
 		)
+);
+
+TRACE_DEFINE_ENUM(connector_status_connected);
+TRACE_DEFINE_ENUM(connector_status_disconnected);
+TRACE_DEFINE_ENUM(connector_status_unknown);
+
+#define show_dp_hotplug_status(status) \
+	__print_symbolic(status, \
+		{ connector_status_connected,		"connected" }, \
+		{ connector_status_disconnected,	"disconnected" }, \
+		{ connector_status_unknown,		"unknown" })
+
+TRACE_EVENT(cd321x_dp_hotplug,
+	    TP_PROTO(const struct cd321x_dp_update *u,
+		     enum drm_connector_status status),
+	    TP_ARGS(u, status),
+
+	    TP_STRUCT__entry(__field(u32, data_status)
+			     __field(u32, changed)
+			     __field(bool, route_active)
+			     __field(int, status)),
+
+	    TP_fast_assign(__entry->data_status = u->data_status;
+			   __entry->changed = u->changed;
+			   __entry->route_active = u->route_active;
+			   __entry->status = status;),
+
+	    TP_printk("%s: route %d, HPD %d%s%s, changed %s%s",
+		      show_dp_hotplug_status(__entry->status),
+		      __entry->route_active,
+		      !!(__entry->data_status & CD321X_DATA_STATUS_HPD_LEVEL),
+		      __entry->data_status & TPS_DATA_STATUS_DP_CONNECTION ? ", DP pinout " : "",
+		      maybe_show_data_status_dp_pin_assignment(__entry->data_status),
+		      show_cd321x_data_status_flags(__entry->changed),
+		      __entry->changed & TPS_DATA_STATUS_DP_PIN_ASSIGNMENT_MASK ?
+			      "|DP_PIN_ASSIGNMENT" : "")
 );
 
 #endif /* _TPS6598X_TRACE_H_ */
