@@ -842,10 +842,14 @@ static void cd321x_update_done(struct cd321x *cd321x)
 }
 
 static void cd321x_dp_notify(struct cd321x *cd321x,
+			     const struct cd321x_dp_update *u,
 			     enum drm_connector_status status)
 {
-	if (IS_REACHABLE(CONFIG_DRM) && cd321x->connector_fwnode)
-		drm_connector_oob_hotplug_event(cd321x->connector_fwnode, status);
+	if (!IS_REACHABLE(CONFIG_DRM) || !cd321x->connector_fwnode)
+		return;
+
+	trace_cd321x_dp_hotplug(u, status);
+	drm_connector_oob_hotplug_event(cd321x->connector_fwnode, status);
 }
 
 static void cd321x_update_work(struct work_struct *work)
@@ -922,7 +926,7 @@ static void cd321x_update_work(struct work_struct *work)
 	 */
 	dp.link_reset = !new_connected || was_disconnected;
 	if (cd321x_dp_teardown(&dp))
-		cd321x_dp_notify(cd321x, connector_status_disconnected);
+		cd321x_dp_notify(cd321x, &dp, connector_status_disconnected);
 
 	/*
 	 * ACIO carries the tunneled PCIe reset handshake over the still-live
@@ -1035,7 +1039,7 @@ static void cd321x_update_work(struct work_struct *work)
 
 	if (cd321x_dp_event(&dp, cd321x->display_route_active) ==
 	    CD321X_DP_EVENT_CONNECTED)
-		cd321x_dp_notify(cd321x, connector_status_connected);
+		cd321x_dp_notify(cd321x, &dp, connector_status_connected);
 
 	power_supply_changed(tps->psy);
 	cd321x_update_done(cd321x);
