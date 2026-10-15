@@ -76,7 +76,11 @@
  * the board, whose downstream ports serve the Type-C connectors (Apple J700). Such a controller is
  * a host whatever happens at the connectors and never sees a role change: it is brought up in
  * DWC3_APPLE_HOST at probe and stays there. The Type-C port controllers only drive the PHY's
- * Type-C mux for the SuperSpeed lanes, and the PHY follows those mode changes on its own.
+ * Type-C mux for the SuperSpeed lanes, and the PHY follows those mode changes on its own. It keeps
+ * to the order above for the SuperSpeed side: the USB core holds the controller's SuperSpeed root
+ * port powered off for the PHY, port runtime PM included, from before the PIPE goes to the dummy
+ * backend until the PIPE is back on the USB3 PHY. The USB2 root port and the hub on it stay up
+ * throughout.
  *
  * Whenever the core is up, for either kind of port, it is kept running across system sleep, see
  * dwc3_apple_init(). In host mode xHCI then keeps running in suspend-to-idle when a USB device
