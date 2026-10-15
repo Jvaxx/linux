@@ -1177,10 +1177,7 @@
 			#mbox-cells = <0>;
 			status = "disabled";
 		};
-	};
-};
 
-&soc {
 		disp0_dart: iommu@412300000 {
 			compatible = "apple,t8140-dart", "apple,t8110-dart";
 			reg = <0x4 0x12300000 0x0 0xc000>;
@@ -1791,6 +1788,7 @@
 			power-domains = <&ps_ane_sys>;
 			status = "disabled";
 		};
+	};
 };
 
 #include "t8140-pmgr.dtsi"
