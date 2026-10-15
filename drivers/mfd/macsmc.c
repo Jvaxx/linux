@@ -203,11 +203,14 @@ EXPORT_SYMBOL(apple_smc_rw);
 
 int apple_smc_get_key_by_index(struct apple_smc *smc, int index, smc_key *key)
 {
+	u32 data;
 	int ret;
 
-	ret = apple_smc_cmd(smc, SMC_MSG_GET_KEY_BY_INDEX, index, 0, 0, key);
+	ret = apple_smc_cmd(smc, SMC_MSG_GET_KEY_BY_INDEX, index, 0, 0, &data);
+	if (ret < 0)
+		return ret;
 
-	*key = swab32(*key);
+	*key = swab32(data);
 	return ret;
 }
 EXPORT_SYMBOL(apple_smc_get_key_by_index);
