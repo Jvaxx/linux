@@ -45,6 +45,19 @@ config BT_MTK7932_PCIE
 
 	  To build as a module, choose M. The module is mt7932_bt_pcie.
 
+config BT_MTK7932_PCIE_KUNIT_TEST
+	bool "KUnit tests for the MT7932 Bluetooth transport" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && BT_MTK7932_PCIE
+	default KUNIT_ALL_TESTS
+	help
+	  Build KUnit tests into the MT7932 Bluetooth transport. They check,
+	  without radio hardware, that HCI packets whose length does not
+	  match their header are rejected in both directions, and that a
+	  board file with a bad layout or checksum is never sent to the
+	  controller.
+
+	  If unsure, say N.
+
 config BT_HCIBTUSB
 	tristate "HCI USB driver"
 	depends on USB
