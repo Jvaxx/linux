@@ -1334,6 +1334,8 @@ impl File {
             data.usc_exec_base,
         )?;
 
+        queue.reserve_render_scs(data.render_scs_layout)?;
+
         data.queue_id = resv.index().try_into()?;
         resv.fill(Arc::pin_init(new_mutex!(queue), GFP_KERNEL)?)?;
 
