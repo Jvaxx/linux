@@ -74,8 +74,10 @@ static int macsmc_rtc_get_time(struct device *dev, struct rtc_time *tm)
 	ret = apple_smc_read(rtc->smc, SMC_KEY(CLKM), &ctr, RTC_BYTES);
 	if (ret < 0)
 		return ret;
-	if (ret != RTC_BYTES)
+	if (ret != RTC_BYTES) {
+		ctr = 0;
 		return -EIO;
+	}
 
 	if (rtc->offset_in_seconds)
 		return macsmc_rtc_get_time_secs(rtc, ctr, tm);
@@ -107,8 +109,10 @@ static int macsmc_rtc_set_time(struct device *dev, struct rtc_time *tm)
 	ret = apple_smc_read(rtc->smc, SMC_KEY(CLKM), &ctr, RTC_BYTES);
 	if (ret < 0)
 		return ret;
-	if (ret != RTC_BYTES)
+	if (ret != RTC_BYTES) {
+		ctr = 0;
 		return -EIO;
+	}
 
 	if (rtc->offset_in_seconds) {
 		__le64 off_secs;
