@@ -344,6 +344,8 @@ struct apple_dcp {
 	bool active;
 	/* A successful initial enable keeps the H17P pipe running across DPMS. */
 	bool pipe_enabled_h17p;
+	/* The internal H17P pipe was powered off for system sleep. */
+	bool pipe_asleep_h17p;
 
 	/* eDP display without DP-HDMI conversion */
 	bool main_display;
@@ -527,6 +529,7 @@ bool iomfb_queue_drain(struct apple_dcp *dcp, unsigned long timeout);
 int iomfb_queue_settle(struct apple_dcp *dcp, unsigned long timeout);
 void iomfb_pause_presentation(struct apple_dcp *dcp, bool pause);
 int iomfb_external_power_h17p(struct apple_dcp *dcp, bool on);
+int iomfb_internal_power_h17p(struct apple_dcp *dcp, bool on);
 int iomfb_queue(struct apple_dcp *dcp, struct iomfb_transaction *transaction);
 void iomfb_queue_crc_h17p(struct apple_dcp *dcp, u32 swap_id);
 

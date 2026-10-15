@@ -768,7 +768,12 @@ static void iomfb_external_device_complete(struct apple_dcp *dcp, void *out, voi
 	dcp_set_parameter_dcp(dcp, false, &parameter, iomfb_external_parameter_complete, data);
 }
 
-int iomfb_external_power_h17p(struct apple_dcp *dcp, bool on)
+/*
+ * Power the pipe with A473 and wait for the firmware to echo the state.  An
+ * external pipe is powered on through its display-device sequence; the
+ * internal one has its client open since boot and takes A473 alone.
+ */
+static int iomfb_power_h17p(struct apple_dcp *dcp, bool on, bool external)
 {
 	struct dcp_set_power_state_req_h17p request = { .unklong = on };
 	struct dcp_external_power_cookie *cookie;
@@ -784,18 +789,30 @@ int iomfb_external_power_h17p(struct apple_dcp *dcp, bool on)
 	init_completion(&cookie->wait.done);
 	kref_init(&cookie->wait.refcount);
 	kref_get(&cookie->wait.refcount);
-	if (on) {
+	if (on && external) {
 		u32 handle = 2;
 
 		iomfb_opaque_x_reset_h17p(dcp);
 		dcp_set_display_device(dcp, false, &handle, iomfb_external_device_complete, cookie);
 	} else {
+		if (on)
+			iomfb_opaque_x_reset_h17p(dcp);
 		dcp_set_power_state(dcp, true, &request, iomfb_external_power_complete, cookie);
 	}
 	ret = wait_for_completion_timeout(&cookie->wait.done, msecs_to_jiffies(500));
 	ret = ret ? (int)READ_ONCE(cookie->wait.status) : -ETIMEDOUT;
 	kref_put(&cookie->wait.refcount, release_wait_cookie);
 	return ret;
+}
+
+int iomfb_external_power_h17p(struct apple_dcp *dcp, bool on)
+{
+	return iomfb_power_h17p(dcp, on, true);
+}
+
+int iomfb_internal_power_h17p(struct apple_dcp *dcp, bool on)
+{
+	return iomfb_power_h17p(dcp, on, false);
 }
 
 void iomfb_start_h17p(struct apple_dcp *dcp)

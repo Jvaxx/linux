@@ -4586,9 +4586,8 @@ static void dcp_platform_shutdown(struct platform_device *pdev)
 }
 
 /*
- * The display stays powered across system sleep, and the blanking present
- * queued by the DRM and backlight suspend handlers must reach the firmware
- * before its mailbox interrupt is suspended.
+ * The blanking present queued by the DRM and backlight suspend handlers must
+ * reach the firmware before the pipe is powered off for system sleep.
  */
 static void dcp_drain_for_sleep(struct apple_dcp *dcp)
 {
@@ -4629,6 +4628,57 @@ static void dcp_drain_for_sleep(struct apple_dcp *dcp)
 	dev_warn(dcp->dev, "brightness change still pending at suspend\n");
 }
 
+/*
+ * DPMS off leaves the internal H17P pipe scanning out (see dcp_poweroff()),
+ * and while it scans out the firmware publishes a property to the AP on every
+ * frame.  The mailbox interrupt is not suspended, so each of those messages
+ * wakes a CPU out of suspend-to-idle about 60 times a second.  Power the pipe
+ * off for system sleep with the same A473 request that powers the external
+ * pipe down; apple-drm is a consumer of this device, so the DRM suspend
+ * handler has already blanked the panel and resume powers the pipe back on
+ * before DRM restores the CRTC.
+ */
+static void dcp_sleep_internal_pipe(struct apple_dcp *dcp)
+{
+	int ret;
+
+	if (!dcp_uses_soft_dpms(dcp) || dcp->fw_compat != DCP_FIRMWARE_H17P ||
+	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G ||
+	    !READ_ONCE(dcp->pipe_enabled_h17p) || READ_ONCE(dcp->crashed))
+		return;
+
+	iomfb_pause_presentation(dcp, true);
+	ret = iomfb_queue_settle(dcp, msecs_to_jiffies(500));
+	if (!ret)
+		ret = iomfb_internal_power_h17p(dcp, false);
+	if (ret) {
+		dev_warn(dcp->dev, "display pipe left on for sleep: %d\n", ret);
+		iomfb_pause_presentation(dcp, false);
+		return;
+	}
+	/* Framebuffers stay retained: the next swap after wake releases them. */
+	WRITE_ONCE(dcp->pipe_enabled_h17p, false);
+	dcp->pipe_asleep_h17p = true;
+}
+
+static void dcp_wake_internal_pipe(struct apple_dcp *dcp)
+{
+	int ret;
+
+	if (!dcp->pipe_asleep_h17p)
+		return;
+	dcp->pipe_asleep_h17p = false;
+
+	ret = iomfb_internal_power_h17p(dcp, true);
+	if (ret) {
+		/* dcp_poweron() retries the enable when the CRTC comes back. */
+		dev_err(dcp->dev, "display pipe power on after sleep failed: %d\n", ret);
+	} else {
+		WRITE_ONCE(dcp->pipe_enabled_h17p, true);
+	}
+	iomfb_pause_presentation(dcp, false);
+}
+
 static int dcp_platform_suspend(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
@@ -4655,6 +4705,7 @@ static int dcp_platform_suspend(struct device *dev)
 	 */
 	dcp_disable_typec_work(dcp, false);
 	cancel_delayed_work_sync(&dcp->swap_watchdog_wq);
+	dcp_sleep_internal_pipe(dcp);
 
 	if (dcp->avep)
 		av_service_disconnect(dcp);
@@ -4680,6 +4731,7 @@ static int dcp_platform_resume(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
+	dcp_wake_internal_pipe(dcp);
 	dcp_enable_typec_work(dcp);
 	if (dcp->hdmi_hpd_irq)
 		enable_irq(dcp->hdmi_hpd_irq);
