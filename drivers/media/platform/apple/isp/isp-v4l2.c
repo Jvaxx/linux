@@ -1013,6 +1013,24 @@ static void isp_free_meta_surfaces(struct apple_isp *isp)
 	}
 }
 
+static int isp_vb2_queue_init(struct apple_isp *isp)
+{
+	struct vb2_queue *vbq = &isp->vbq;
+
+	vbq->drv_priv = isp;
+	vbq->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	vbq->io_modes = VB2_MMAP;
+	vbq->dev = isp->dev;
+	vbq->ops = &isp_vb2_ops;
+	vbq->mem_ops = &vb2_dma_sg_memops;
+	vbq->buf_struct_size = sizeof(struct isp_buffer);
+	vbq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+	vbq->min_queued_buffers = ISP_MIN_FRAMES;
+	vbq->lock = &isp->video_lock;
+
+	return vb2_queue_init(vbq);
+}
+
 int apple_isp_setup_video(struct apple_isp *isp)
 {
 	struct video_device *vdev = &isp->vdev;
@@ -1085,18 +1103,7 @@ int apple_isp_setup_video(struct apple_isp *isp)
 		goto ctrl_free;
 	}
 
-	vbq->drv_priv = isp;
-	vbq->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	vbq->io_modes = VB2_MMAP;
-	vbq->dev = isp->dev;
-	vbq->ops = &isp_vb2_ops;
-	vbq->mem_ops = &vb2_dma_sg_memops;
-	vbq->buf_struct_size = sizeof(struct isp_buffer);
-	vbq->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
-	vbq->min_queued_buffers = ISP_MIN_FRAMES;
-	vbq->lock = &isp->video_lock;
-
-	err = vb2_queue_init(vbq);
+	err = isp_vb2_queue_init(isp);
 	if (err) {
 		dev_err(isp->dev, "failed to init vb2 queue: %d\n", err);
 		goto v4l2_unregister;
@@ -1157,3 +1164,7 @@ void apple_isp_free_video(struct apple_isp *isp)
 {
 	isp_free_meta_surfaces(isp);
 }
+
+#if IS_ENABLED(CONFIG_VIDEO_APPLE_ISP_KUNIT_TEST)
+#include "isp-v4l2-test.c"
+#endif
