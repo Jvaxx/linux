@@ -228,7 +228,9 @@ static int tps6598x_set_data_role(struct tps6598x *tps,
 		role_val = USB_ROLE_NONE;
 
 	ret = usb_role_switch_set_role(tps->role_sw, role_val);
-	if (ret)
+	/* An unregistered role switch has already stopped its controller. */
+	if (ret && (connected || ret != -EOPNOTSUPP ||
+		    usb_role_switch_get_role(tps->role_sw) != USB_ROLE_NONE))
 		return ret;
 	typec_set_data_role(tps->port, role);
 	return 0;
@@ -289,6 +291,12 @@ static void tps6598x_drop_partner(struct tps6598x *tps, u32 status)
 	typec_set_vconn_role(tps->port, TPS_STATUS_TO_TYPEC_VCONN(status));
 }
 
+/* The mux provider knows whether this is a fixed host or a switched PHY. */
+static bool tps6598x_safe_after_role(struct tps6598x *tps)
+{
+	return tps->role_sw && typec_mux_safe_after_role(tps->mux);
+}
+
 static int tps6598x_disconnect(struct tps6598x *tps, u32 status)
 {
 	struct typec_mux_state safe = { .mode = TYPEC_STATE_SAFE };
@@ -302,13 +310,16 @@ static int tps6598x_disconnect(struct tps6598x *tps, u32 status)
 		ret = typec_mux_begin(tps->mux, &safe);
 		if (ret)
 			return ret;
-		/* Park while the host still supplies the PIPE backend clock. */
-		ret = typec_mux_apply(tps->mux);
-		if (ret)
-			return ret;
+		/* Leave shared PHY shutdown to its USB role consumer. */
+		if (!tps6598x_safe_after_role(tps)) {
+			ret = typec_mux_apply(tps->mux);
+			if (ret)
+				return ret;
+		}
 	}
 	ret = tps6598x_set_data_role(tps, TPS_STATUS_TO_TYPEC_DATAROLE(status), false);
 	if (ret) {
+		/* Keep recovery ownership; a live PHY must not receive SAFE. */
 		typec_mux_abort(tps->mux);
 		return ret;
 	}
@@ -2076,12 +2087,21 @@ static int cd321x_remove(struct tps6598x *tps)
 	ret = typec_mux_begin(tps->mux, &safe);
 	if (ret)
 		return ret;
-	/* Park while the host still supplies the PIPE backend clock. */
-	ret = typec_mux_apply(tps->mux);
-	if (ret)
-		return ret;
+	/*
+	 * Ordinary PHYs need role shutdown before SAFE. A fixed host must park
+	 * now while its controller supplies the PIPE backend clock, even when
+	 * the firmware graph exposes a no-op role switch for that host.
+	 */
+	if (!tps6598x_safe_after_role(tps)) {
+		ret = typec_mux_apply(tps->mux);
+		if (ret)
+			return ret;
+	}
 	ret = usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
-	if (ret) {
+	/* An unregistered switch means the controller is already stopped. */
+	if (ret && (ret != -EOPNOTSUPP ||
+		    usb_role_switch_get_role(tps->role_sw) != USB_ROLE_NONE)) {
+		/* Keep recovery ownership; a live PHY must not receive SAFE. */
 		typec_mux_abort(tps->mux);
 		return ret;
 	}

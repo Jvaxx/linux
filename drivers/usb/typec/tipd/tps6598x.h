@@ -339,8 +339,8 @@ struct tps6598x {
 	struct typec_capability typec_cap;
 	struct typec_mux *mux;
 	/*
-	 * Set by ->remove() once it has parked the mux in SAFE, so that
-	 * tps6598x_disconnect() only ends that mux transaction.
+	 * Set by ->remove() while its SAFE transaction is still open, so that
+	 * tps6598x_disconnect() ends it after shutting down the USB role.
 	 */
 	bool remove_safe_prepared;
 
