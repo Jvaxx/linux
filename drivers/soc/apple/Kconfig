@@ -37,6 +37,16 @@ config APPLE_MCC
 
 	  Say 'y' or 'm' here if you have an Apple T8140 SoC.
 
+config APPLE_MCC_KUNIT_TEST
+	bool "KUnit tests for Apple MCC allocation and unwind" if !KUNIT_ALL_TESTS
+	depends on APPLE_MCC=y && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Test allocation failure after a plane has been enabled, and cache
+	  handoff on shutdown, using simulated registers. Verify that failure
+	  also cleans up the plane whose state is uncertain. These tests do not
+	  access physical hardware and are only useful for kernel developers.
+
 config APPLE_PMGR_MISC
 	bool "Apple SoC PMGR miscellaneous support"
 	depends on PM
