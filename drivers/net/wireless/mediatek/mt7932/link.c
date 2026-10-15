@@ -532,7 +532,6 @@ report:
 		m->station_connected = jiffies;
 		m->station_signal_valid = false;
 		m->station_rx_rate_valid = false;
-		m->station_tx_rate_valid = false;
 		spin_unlock(&m->data_lock);
 		mt_cqm_reset(m);
 	}
@@ -643,8 +642,6 @@ int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 	m->connect_center = 0;
 	memset(&m->connect_chandef, 0, sizeof(m->connect_chandef));
 	m->connection_generation++;
-	m->station_rate_query_failed = false;
-	m->station_rate_query_time = jiffies - HZ;
 	m->connect_cancelled = false;
 	m->peer_valid = false;
 	m->connecting = true;
