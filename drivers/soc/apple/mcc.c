@@ -61,9 +61,10 @@ static int apple_mcc_wait_boot_dma(struct device *dev)
 		if (pdev)
 			put_device(&pdev->dev);
 		if (!bound) {
+			ret = dev_err_probe(dev, -EPROBE_DEFER, "waiting for %pOF to bind\n",
+					    it.node);
 			of_node_put(it.node);
-			return dev_err_probe(dev, -EPROBE_DEFER, "waiting for %pOF to bind\n",
-					     it.node);
+			return ret;
 		}
 	}
 
