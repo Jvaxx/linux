@@ -1711,11 +1711,25 @@ impl SepData {
         }
     }
 
+    /// Reports frames the sensor exchange had to read again or discard.
+    fn note_sensor_recoveries(&self) {
+        let (reread, drained) = sensor::take_recoveries();
+        if reread != 0 || drained != 0 {
+            dev_warn!(
+                self.dev,
+                "sensor: re-read {} frame(s) the sensor still offered after a garbled read, discarded {} stale frame(s)\n",
+                reread,
+                drained
+            );
+        }
+    }
+
     /// Reports a failed registration step with what the sensor shows
     /// afterwards: its state, patch acknowledgment, whether it presents an
     /// identifier and the length of any frame it holds. Never the
     /// identifier, the serial or any key material.
     fn sensor_step_failed(&self, step: &CStr) {
+        self.note_sensor_recoveries();
         let ms = self.sensor_ms();
         match sensor::status() {
             Ok(st) => dev_warn!(
@@ -1847,6 +1861,7 @@ impl SepData {
             return false;
         }
         self.bringup.store(BRINGUP_ESTABLISHED, Relaxed);
+        self.note_sensor_recoveries();
         let _ = self.log_identity_count(c"after sensor serial registration");
         true
     }
