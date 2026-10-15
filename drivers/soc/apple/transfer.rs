@@ -177,6 +177,10 @@ pub(crate) struct Reassembly {
     done: Option<Completed>,
     sending: Option<u32>,
     grants: u32,
+    // Counts exchanges begun. A reply is matched only by its opcode, so a
+    // late reply to an exchange that timed out would otherwise complete the
+    // next exchange with the same opcode.
+    generation: u64,
 }
 
 impl Reassembly {
@@ -186,7 +190,14 @@ impl Reassembly {
             done: None,
             sending: None,
             grants: 0,
+            generation: 0,
         }
+    }
+
+    /// The exchange a message arriving now can belong to. Sampled before the
+    /// message is read and passed back to [`Self::on_chunk`].
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub(crate) fn begin(&mut self, opcode: u32) -> Result<()> {
@@ -194,6 +205,7 @@ impl Reassembly {
             return Err(EBUSY);
         }
         self.done = None;
+        self.generation = self.generation.wrapping_add(1);
         self.active = Some(Active {
             opcode,
             total: 0,
@@ -242,7 +254,16 @@ impl Reassembly {
         self.abort();
     }
 
-    pub(crate) fn on_chunk(&mut self, marker: u8, packet: &Packet, payload: &[u8]) -> Progress {
+    /// Takes one chunk of a reply. `generation` is [`Self::generation`] as
+    /// sampled when the message arrived: a chunk that arrived before the
+    /// current exchange began belongs to an earlier one and is dropped.
+    pub(crate) fn on_chunk(
+        &mut self,
+        generation: u64,
+        marker: u8,
+        packet: &Packet,
+        payload: &[u8],
+    ) -> Progress {
         if marker < MARKER_FIRST {
             return Progress::Notification;
         }
@@ -262,6 +283,9 @@ impl Reassembly {
         let Some(active_opcode) = self.active.as_ref().map(|a| a.opcode) else {
             return Progress::Ignored;
         };
+        if generation != self.generation {
+            return Progress::Ignored;
+        }
 
         // Checked before the opcode test below, deliberately.
         if marker == MARKER_ERROR {
@@ -369,5 +393,62 @@ impl Reassembly {
     fn finish(&mut self, status: DeviceStatus, payload: KVec<u8>) {
         self.active = None;
         self.done = Some(Completed { status, payload });
+    }
+}
+
+#[kernel::macros::kunit_tests(apple_sep_transfer)]
+mod tests {
+    use super::*;
+
+    const OPCODE: u32 = 0x48;
+
+    fn reply(err: u32) -> Packet {
+        Packet {
+            version: VERSION,
+            total: 0,
+            offset: 0,
+            flags: 0,
+            err,
+            opcode: OPCODE,
+            chunk: 0,
+        }
+    }
+
+    #[test]
+    fn a_reply_to_the_current_exchange_completes_it() {
+        let mut rx = Reassembly::new();
+        assert!(rx.begin(OPCODE).is_ok());
+        let generation = rx.generation();
+        assert!(matches!(
+            rx.on_chunk(generation, MARKER_FIRST, &reply(0), &[]),
+            Progress::Complete
+        ));
+        assert!(rx.take_done().is_some_and(|done| done.status.is_ok()));
+    }
+
+    #[test]
+    fn a_late_reply_does_not_complete_the_next_exchange() {
+        let mut rx = Reassembly::new();
+        assert!(rx.begin(OPCODE).is_ok());
+        // The reply to the first exchange is being read when it times out.
+        let late = rx.generation();
+        rx.abort();
+        assert!(rx.take_done().is_some());
+        // A retry begins the same opcode before the late reply is delivered.
+        assert!(rx.begin(OPCODE).is_ok());
+        assert!(matches!(
+            rx.on_chunk(late, MARKER_FIRST, &reply(0), &[]),
+            Progress::Ignored
+        ));
+        assert!(matches!(
+            rx.on_chunk(late, MARKER_ERROR, &reply(0x16), &[]),
+            Progress::Ignored
+        ));
+        assert!(rx.take_done().is_none());
+        let current = rx.generation();
+        assert!(matches!(
+            rx.on_chunk(current, MARKER_FIRST, &reply(0), &[]),
+            Progress::Complete
+        ));
     }
 }

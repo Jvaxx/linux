@@ -2617,6 +2617,9 @@ impl SepData {
         if !self.sbio_ready.load(Relaxed) {
             return;
         }
+        // Before reading the reply: a requester that times out meanwhile and
+        // begins a new exchange must not receive it.
+        let generation = self.sbio_rx.lock().generation();
 
         // notification and the enclave's DMA are not ordered; buffer may still be poison
         if !self.ool_await_written(&self.ool_sbio, 0, transfer::HEADER_LEN) {
@@ -2655,7 +2658,7 @@ impl SepData {
             }
         };
 
-        let progress = self.sbio_rx.lock().on_chunk(marker, &packet, &payload);
+        let progress = self.sbio_rx.lock().on_chunk(generation, marker, &packet, &payload);
 
         match progress {
             transfer::Progress::NeedMore(cont) => {
