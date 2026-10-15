@@ -410,9 +410,8 @@ static bool apple_nvme_in_inherited_rtkit_range(struct apple_nvme *anv,
 
 	/*
 	 * A range property or a partial System RAM intersection does not prove
-	 * ownership. Every page must be reserved and present in the linear map.
-	 * Native m1n1 reserves the predecessor's inherited allocation prefix.
-	 * RAM excluded by a resident EL2 stage needs a separate cache contract.
+	 * ownership. Every page must be reserved and present in the linear map,
+	 * as the bootloader leaves the buffers it hands over.
 	 */
 	if (region_intersects(bfr->iova, bfr->size, IORESOURCE_SYSTEM_RAM,
 			      IORES_DESC_NONE) != REGION_INTERSECTS)
@@ -1640,8 +1639,8 @@ static void apple_nvme_reset_work(struct work_struct *work)
 			 * Post-M4 ANS cannot be reset through PMGR: the reset
 			 * assert raises an SError. A previous boot stage that
 			 * stopped the coprocessor cleanly leaves its firmware
-			 * resident, so mirror the qualified U-Boot handoff:
-			 * set RUN and run a fresh RTKit boot handshake.
+			 * resident, so set RUN and run a fresh RTKit boot
+			 * handshake.
 			 */
 			dev_dbg(anv->dev,
 				"post-M4 firmware handoff: restarting stopped ANS without reset\n");
