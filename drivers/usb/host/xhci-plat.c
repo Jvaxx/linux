@@ -367,6 +367,15 @@ int xhci_plat_probe(struct platform_device *pdev, struct device *sysdev, const s
 			goto put_usb3_hcd;
 	}
 
+	/*
+	 * Let the USB core keep hubs awake that need it for wakeup, see
+	 * XHCI_RUN_IN_S2IDLE. Only now are all quirk sources merged, the xhci_hcd
+	 * quirks module parameter included.
+	 */
+	hcd->runs_in_s2idle = !!(xhci->quirks & XHCI_RUN_IN_S2IDLE);
+	if (xhci->shared_hcd)
+		xhci->shared_hcd->runs_in_s2idle = hcd->runs_in_s2idle;
+
 	device_enable_async_suspend(&pdev->dev);
 	pm_runtime_put_noidle(&pdev->dev);
 
