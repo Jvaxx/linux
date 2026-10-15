@@ -50,9 +50,10 @@ config BT_MTK7932_PCIE_KUNIT_TEST
 	help
 	  Build KUnit tests into the MT7932 Bluetooth transport. They check,
 	  without radio hardware, that HCI packets whose length does not
-	  match their header are rejected in both directions, and that a
+	  match their header are rejected in both directions, that a
 	  board file with a bad layout or checksum is never sent to the
-	  controller.
+	  controller, and which received events end a system sleep with
+	  Bluetooth wakeup enabled.
 
 	  If unsure, say N.
 
