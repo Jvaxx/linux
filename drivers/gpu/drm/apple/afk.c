@@ -344,6 +344,17 @@ static struct apple_epic_service *afk_epic_find_service(struct apple_dcp_afkep *
 	return NULL;
 }
 
+static bool afk_epic_channel_retired(struct apple_dcp_afkep *ep, u32 channel)
+{
+	u32 i;
+
+	for (i = 0; i < ep->num_channels; i++)
+		if (afk_service_retired(&ep->services[i], channel))
+			return true;
+
+	return false;
+}
+
 static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 			       enum epic_type etype, enum epic_category ecat, u8 stype,
 			       const void *payload, size_t payload_len, u64 token);
@@ -579,8 +590,12 @@ static void afk_recv_handle_teardown(struct apple_dcp_afkep *ep, u32 channel)
 
 	service = afk_epic_find_service(ep, channel);
 	if (!service) {
-		dev_warn(ep->dcp->dev, "AFK[ep:%02x]: teardown for disabled channel %u\n",
-			 ep->endpoint, channel);
+		if (afk_epic_channel_retired(ep, channel))
+			dev_dbg(ep->dcp->dev, "AFK[ep:%02x]: teardown for retired channel %u\n",
+				ep->endpoint, channel);
+		else
+			dev_warn(ep->dcp->dev, "AFK[ep:%02x]: teardown for unknown channel %u\n",
+				 ep->endpoint, channel);
 		return;
 	}
 
