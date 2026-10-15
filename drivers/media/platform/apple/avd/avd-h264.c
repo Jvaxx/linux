@@ -641,8 +641,10 @@ static int avd_h264_start(struct avd_ctx *ctx)
 	h264_ctx->slices =
 		kzalloc(sizeof(*h264_ctx->slices) * h264_ctx->alloc_slice_num,
 			GFP_KERNEL);
-	if (!h264_ctx->slices)
+	if (!h264_ctx->slices) {
+		ret = -ENOMEM;
 		goto err_free_ctx;
+	}
 
 	ret = avd_h264_alloc_bufs(ctx);
 	if (ret)
