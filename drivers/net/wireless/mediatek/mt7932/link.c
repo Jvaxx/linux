@@ -425,7 +425,7 @@ void mt_connect_work(struct work_struct *work)
 		goto free;
 	/* Initial station policy: framework M=0 branch and no optional flags.
 	 * This yields flag2 independently of credentials; no scan-result count
-	 * belongs in this field. The recovered framework uses listen interval20.
+	 * belongs in this field. The original driver uses listen interval 20.
 	 * Other platform flag policies remain unsupported, not guessed mappings.
 	 */
 	ret = mt7932_connect_body(body, 856, m->connect_ssid, m->connect_ssid_length,

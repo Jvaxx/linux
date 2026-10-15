@@ -80,7 +80,7 @@ struct mt7932_cal_segment {
 };
 
 /* Validate the entire original container before selecting any data to send.
- * NEO_MT7932_STOCK_ARTIFACTS_AND_CAL_CONVERSION: raw BLOB, not a transcript.
+ * The input is the raw BLOB container, not a converted transcript.
  */
 static inline int mt7932_cal_validate(const u8 *data, size_t size)
 {
