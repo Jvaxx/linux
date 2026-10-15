@@ -75,6 +75,7 @@
 #include <linux/sizes.h>
 #include <linux/string.h>
 #include <linux/types.h>
+#include <video/nomodeset.h>
 
 enum {
 	GATE_DCP_DART,
@@ -1563,8 +1564,7 @@ static void __init gate_t8122_dcpext_one(struct device_node *np)
 	struct device_node *common[GATE_T8122_XBARS] = {};
 	struct of_phandle_args args;
 	struct of_changeset *cs;
-	const char *label, *pmp_note;
-	bool pmp_request = false;
+	const char *label;
 	int ret, i, nxbar = 0;
 	u32 ready;
 
@@ -1606,7 +1606,8 @@ static void __init gate_t8122_dcpext_one(struct device_node *np)
 					       i, &args))
 			break;
 		xbar[i] = args.np;
-		if (!of_device_is_compatible(xbar[i], "apple,t6020-display-crossbar") ||
+		if (args.args_count != 1 || args.args[0] ||
+		    !of_device_is_compatible(xbar[i], "apple,t6020-display-crossbar") ||
 		    !gate_disabled(xbar[i]))
 			break;
 		common[i] = gate_t8122_atc_common(xbar[i]);
@@ -1625,17 +1626,16 @@ static void __init gate_t8122_dcpext_one(struct device_node *np)
 		goto put;
 	}
 
-	/* The PMP DISPEXT request, if the PMP was added (see above). */
+	/*
+	 * The PMP DISPEXT request: the first external mode set does not
+	 * complete without it, so there is no dcpext without it, as on T6030.
+	 */
 	entry = gate_pmp_dispext_entry(0);
-	if (!entry) {
-		pmp_note = "no PMP DISPEXT request (the PMP is not described)";
-	} else if (!entry->phandle ||
-		   !of_device_is_compatible(entry, "apple,t6000-pmp-v2-report-entry") ||
-		   !gate_disabled(entry)) {
-		pmp_note = "no PMP DISPEXT request (its report entry is not usable)";
-	} else {
-		pmp_request = true;
-		pmp_note = "PMP DISPEXT request";
+	if (!entry || !entry->phandle ||
+	    !of_device_is_compatible(entry, "apple,t6000-pmp-v2-report-entry") ||
+	    !gate_disabled(entry)) {
+		gate_ext_refuse(np, "its PMP DISPEXT request is not described or not usable");
+		goto put;
 	}
 
 	cs = gate_cs_alloc();
@@ -1645,7 +1645,7 @@ static void __init gate_t8122_dcpext_one(struct device_node *np)
 	}
 	ret = gate_set_u32(cs, ps, "apple,min-state", PMGR_PS_ACTIVE);
 	/* The driver waits for this request's acknowledgement before RUN. */
-	if (!ret && pmp_request) {
+	if (!ret) {
 		ret = gate_set_u32(cs, np, "apple,pmp-report", entry->phandle);
 		if (!ret)
 			ret = of_changeset_update_prop_string(cs, entry, "status", "okay");
@@ -1678,8 +1678,8 @@ static void __init gate_t8122_dcpext_one(struct device_node *np)
 		gate_ext_refuse(np, "the gate could not enable it");
 		goto put;
 	}
-	gate_info("enabled %pOF with its Type-C routes, DARTs, mailbox, %d display crossbar(s) with ATC common power kept on, display DART %pOF in the display subsystem, CPU power floor and %s; started by the display driver\n",
-		  np, nxbar, disp_dart, pmp_note);
+	gate_info("enabled %pOF with its Type-C routes, DARTs, mailbox, %d display crossbar(s) with ATC common power kept on, display DART %pOF in the display subsystem, CPU power floor and PMP DISPEXT request; started by the display driver\n",
+		  np, nxbar, disp_dart);
 put:
 	for (i = 0; i < GATE_T8122_XBARS; i++) {
 		of_node_put(common[i]);
@@ -1702,6 +1702,15 @@ static void __init gate_t8122_dcpext(bool panel)
 			gate_ext_refuse(np, "the internal display was not handed over");
 		else if (!gate_t8122_dcpext_requested)
 			gate_ext_refuse(np, "disabled on the command line");
+		/*
+		 * Enabled routes make the Type-C ports wait for the display
+		 * driver's mode switches: without a display driver that would
+		 * take USB from both ports of a J613.
+		 */
+		else if (!IS_ENABLED(CONFIG_DRM_APPLE))
+			gate_ext_refuse(np, "the display driver is not built");
+		else if (IS_ENABLED(CONFIG_VIDEO) && video_firmware_drivers_only())
+			gate_ext_refuse(np, "nomodeset is on the command line");
 		else
 			gate_t8122_dcpext_one(np);
 	}

@@ -165,8 +165,9 @@ config APPLE_T6030_DISPLAY_GATE
 	  apple_t6030_display.enable=0 keeps the boot framebuffer.
 
 	  The same gate serves T8122 (M3) device trees with
-	  apple,t8122-handoff. No T8122 PMP description is built in yet, so
-	  on T8122 it never enables anything.
+	  apple,t8122-handoff and the T8122 PMP overlay. It enables the T8122
+	  external display processor only when the boot loader has marked it
+	  apple,t8122-dcpext-firmware-ready, and not with nomodeset.
 
 	  It also serves T6031 (M3 Max) device trees with apple,t6031-handoff,
 	  but only for a boot with apple_t6031_display.enable=1 on the kernel
