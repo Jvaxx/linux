@@ -147,6 +147,11 @@ struct ane_request {
 	u32 bar[DRM_ANE_TILE_COUNT];
 };
 
+#if IS_ENABLED(CONFIG_KUNIT)
+int ane_submit_check_sizes(const struct drm_ane_submit *args, size_t cmd_size,
+			   size_t btsp_size);
+#endif
+
 /*
  * Reclaim wedge-preserved BO ranges (unmap, release nodes and pages).
  * Only legal once DMA is provably quiescent: after a successful

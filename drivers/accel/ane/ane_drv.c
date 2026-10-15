@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Copyright 2022 Eileen Yoon <eyn@gmx.com> */
 
+#include <kunit/visibility.h>
 #include <linux/atomic.h>
 #include <linux/device.h>
 #include <linux/iommu.h>
 #include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/of_device.h>
+#include <linux/overflow.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
@@ -583,6 +585,26 @@ static int ane_bo_free(struct drm_device *drm, void *data,
 	return 0;
 }
 
+/*
+ * SUBMIT runs a chain of td_count task descriptors of td_size bytes. They lie
+ * in the first tsk_size bytes of handles[0], ahead of the weights, and the
+ * engine starts from a copy of the first descriptor in the bootstrap buffer.
+ * Check that each buffer holds what the engine is told to read from it.
+ */
+VISIBLE_IF_KUNIT int ane_submit_check_sizes(const struct drm_ane_submit *args,
+					    size_t cmd_size, size_t btsp_size)
+{
+	u32 span;
+
+	if (check_mul_overflow(args->td_count, args->td_size, &span) ||
+	    span > args->tsk_size || args->tsk_size >= cmd_size ||
+	    args->td_size > btsp_size)
+		return -EINVAL;
+
+	return 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(ane_submit_check_sizes);
+
 static int ane_submit(struct drm_device *drm, void *data, struct drm_file *file)
 {
 	struct ane_device *ane = drm->dev_private;
@@ -624,9 +646,7 @@ static int ane_submit(struct drm_device *drm, void *data, struct drm_file *file)
 			goto put;
 		}
 		gem[bdx] = &bo->base;
-		if (!bo->iova ||
-		    (bdx == CMD_BUF_BDX &&
-		     args->tsk_size >= (bo->npages << ane->shift))) {
+		if (!bo->iova) {
 			err = -EINVAL;
 			goto put;
 		}
@@ -647,10 +667,13 @@ static int ane_submit(struct drm_device *drm, void *data, struct drm_file *file)
 		goto put;
 	}
 	btsp = &bo->base;
-	if (!bo->iova || args->td_size > bo->base.size) {
+	if (!bo->iova) {
 		err = -EINVAL;
 		goto put;
 	}
+	err = ane_submit_check_sizes(args, gem[CMD_BUF_BDX]->size, btsp->size);
+	if (err)
+		goto put;
 	req.btsp_iova = lower_32_bits(bo->iova);
 
 	/*
