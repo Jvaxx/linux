@@ -566,6 +566,40 @@ static void atcphy_test_stopped_reset(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, aon & PIPEHANDLER_AON_GEN_DWC3_RESET_N);
 }
 
+/* A SuperSpeed problem does not keep the host behind a fixed hub from starting */
+static void atcphy_test_host_start_without_usb3(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_fixed_hub(test);
+	struct phy *phy = kunit_kzalloc(test, sizeof(*phy), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, phy);
+	phy_set_drvdata(phy, atcphy);
+	atcphy_test_fake_regs(test, atcphy);
+	atcphy->host_active = false;
+
+	/* An unfinished lane change: the PIPE stays parked for the next mux update */
+	atcphy->mode_dirty = true;
+	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
+	KUNIT_EXPECT_EQ(test, atcphy_usb3_set_mode(phy, PHY_MODE_USB_HOST, 0), 0);
+	KUNIT_EXPECT_TRUE(test, atcphy->host_active);
+	KUNIT_EXPECT_TRUE(test, atcphy->mode_dirty);
+	KUNIT_EXPECT_EQ(test, atcphy->pipe_state, ATCPHY_PIPEHANDLER_STATE_DUMMY);
+
+	/* A handoff that cannot finish, as the PIPE lock is refused */
+	atcphy->mode_dirty = false;
+	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_USB3;
+	atcphy->pipe_pending = true;
+	KUNIT_EXPECT_EQ(test, atcphy_usb3_set_mode(phy, PHY_MODE_USB_HOST, 0), 0);
+	KUNIT_EXPECT_TRUE(test, atcphy->pipe_pending);
+
+	/* A Type-C port's controller still waits for the lanes */
+	atcphy = atcphy_test_alloc(test, false);
+	mutex_init(&atcphy->lock);
+	phy_set_drvdata(phy, atcphy);
+	atcphy->mode_dirty = true;
+	KUNIT_EXPECT_EQ(test, atcphy_usb3_set_mode(phy, PHY_MODE_USB_HOST, 0), -EBUSY);
+}
+
 #if IS_REACHABLE(CONFIG_USB)
 /* Only the controller's SuperSpeed root hub is ever handed the port changes */
 static void atcphy_test_usb3_root(struct kunit *test)
@@ -710,6 +744,7 @@ static struct kunit_case atcphy_mux_test_cases[] = {
 	KUNIT_CASE(atcphy_test_host_start),
 	KUNIT_CASE(atcphy_test_stopped_power_off),
 	KUNIT_CASE(atcphy_test_stopped_reset),
+	KUNIT_CASE(atcphy_test_host_start_without_usb3),
 #if IS_REACHABLE(CONFIG_USB)
 	KUNIT_CASE(atcphy_test_usb3_root),
 #endif
