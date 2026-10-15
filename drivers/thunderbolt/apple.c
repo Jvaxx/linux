@@ -2552,7 +2552,11 @@ static int apple_cio_prepare(struct device *dev)
 
 	guard(mutex)(&acio->lock);
 
-	if (acio->current_cable_info) {
+	/*
+	 * Routers are kept awake across system sleep unless router_sleep is
+	 * set; only a router told to sleep loses an active connection.
+	 */
+	if (READ_ONCE(router_sleep) && acio->current_cable_info) {
 		dev_err(dev, "unable to suspend while a USB4/Thunderbolt connection is active\n");
 		return -EBUSY;
 	}
