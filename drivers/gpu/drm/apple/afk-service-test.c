@@ -238,4 +238,5 @@ static struct kunit_suite afk_service_suite = {
 };
 
 kunit_test_suite(afk_service_suite);
+MODULE_IMPORT_NS("EXPORTED_FOR_KUNIT_TESTING");
 MODULE_LICENSE("Dual MIT/GPL");
