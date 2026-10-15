@@ -15,6 +15,7 @@
 
 #include <kunit/visibility.h>
 #include <linux/dev_printk.h>
+#include <linux/mm.h>
 
 #include <media/v4l2-h264.h>
 #include <media/videobuf2-dma-contig.h>
@@ -29,6 +30,12 @@
 #define H264_FLAG_NOT_IDR(v)			FIELD_PREP(BIT(21), !!(v))
 
 #define H264_TRANSFORM_8X8_MODE(v)		FIELD_PREP(BIT(7), !!(v))
+
+/*
+ * Most slices held for one picture. This bounds the slice table, the job
+ * table and the memory that a client can pin.
+ */
+#define MAX_SLICES	4096
 
 struct avd_h264_run {
 	struct avd_run base;
@@ -63,6 +70,8 @@ struct avd_h264_ctx {
 	struct avd_buf *active_slice;
 	size_t slice_num;
 	size_t alloc_slice_num;
+	/* allocated size of the held slices */
+	size_t slice_bytes;
 
 	struct avd_h264_bufs {
 		struct avd_buf inst;
@@ -611,11 +620,21 @@ static int avd_h264_validate_sps(struct avd_ctx *ctx,
 	return 0;
 }
 
+/* Free the slices held for the current picture. */
+static void avd_h264_drop_slices(struct avd_ctx *ctx)
+{
+	struct avd_h264_ctx *h264_ctx = ctx->priv;
+
+	for (size_t i = 0; i < h264_ctx->slice_num; i++)
+		avd_buf_free(ctx->dev, &h264_ctx->slices[i]);
+	h264_ctx->slice_num = 0;
+	h264_ctx->slice_bytes = 0;
+}
+
 static void avd_h264_stop(struct avd_ctx *ctx)
 {
 	struct avd_h264_ctx *h264_ctx = ctx->priv;
 	struct avd_dev *dev = ctx->dev;
-	int i;
 
 	if (!h264_ctx)
 		return;
@@ -628,8 +647,7 @@ static void avd_h264_stop(struct avd_ctx *ctx)
 	avd_buf_free(dev, &h264_ctx->bufs.ip_above);
 	avd_buf_free(dev, &h264_ctx->bufs.mv_above_info);
 
-	for (i = 0; i < h264_ctx->slice_num; i++)
-		avd_buf_free(dev, &h264_ctx->slices[i]);
+	avd_h264_drop_slices(ctx);
 	kfree(h264_ctx->slices);
 
 	kfree(h264_ctx);
@@ -659,9 +677,8 @@ static int avd_h264_start(struct avd_ctx *ctx)
 	/* assume one slice per row */
 	h264_ctx->alloc_slice_num =
 		ctrl->p_new.p_h264_sps->pic_height_in_map_units_minus1 + 1;
-	h264_ctx->slices =
-		kzalloc(sizeof(*h264_ctx->slices) * h264_ctx->alloc_slice_num,
-			GFP_KERNEL);
+	h264_ctx->slices = kcalloc(h264_ctx->alloc_slice_num,
+				   sizeof(*h264_ctx->slices), GFP_KERNEL);
 	if (!h264_ctx->slices) {
 		ret = -ENOMEM;
 		goto err_free_ctx;
@@ -709,7 +726,7 @@ static void avd_h264_run_preamble(struct avd_ctx *ctx, struct avd_h264_run *run)
 	run->addresses.mv_color = run->base.y_out + (dst_len - mv_color_len);
 }
 
-static int avd_h264_realloc_slices(struct avd_ctx *ctx)
+static int avd_h264_realloc_slices(struct avd_ctx *ctx, size_t max_slices)
 {
 	struct avd_h264_ctx *h264_ctx = ctx->priv;
 	void *tmp;
@@ -719,7 +736,8 @@ static int avd_h264_realloc_slices(struct avd_ctx *ctx)
 	/* grow by half, and by at least one for a one-row picture */
 	alloc_slice_num = h264_ctx->alloc_slice_num +
 			  max_t(size_t, h264_ctx->alloc_slice_num / 2, 1);
-	h264_ctx->slices = kzalloc(sizeof(*h264_ctx->slices) * alloc_slice_num,
+	alloc_slice_num = min(alloc_slice_num, max_slices);
+	h264_ctx->slices = kcalloc(alloc_slice_num, sizeof(*h264_ctx->slices),
 				   GFP_KERNEL);
 	if (!h264_ctx->slices) {
 		/* make deallocating a little easier */
@@ -799,6 +817,42 @@ static bool avd_h264_refs_valid(const struct avd_h264_run *run)
 	return true;
 }
 
+/*
+ * Every slice codes at least one macroblock, so a picture has no more slices
+ * than macroblocks, counting both fields of a frame.
+ */
+static size_t avd_h264_max_slices(const struct v4l2_ctrl_h264_sps *sps)
+{
+	size_t mbs = (size_t)(sps->pic_width_in_mbs_minus1 + 1) *
+		     (sps->pic_height_in_map_units_minus1 + 1);
+
+	if (!(sps->flags & V4L2_H264_SPS_FLAG_FRAME_MBS_ONLY))
+		mbs *= 2;
+
+	return min_t(size_t, mbs, MAX_SLICES);
+}
+
+/*
+ * Coded data held for one picture. A picture of PCM macroblocks is about the
+ * size of the decoded one and emulation prevention adds at most one byte for
+ * every two, so twice the decoded buffer is enough; MAX_SLICES pages leave
+ * room for small pictures cut into many slices.
+ */
+static size_t avd_h264_slice_budget(size_t decoded_size)
+{
+	return max_t(size_t, 2 * decoded_size, MAX_SLICES * PAGE_SIZE);
+}
+
+/* Check that one more slice of len bytes fits in the current picture. */
+VISIBLE_IF_KUNIT bool avd_h264_slice_fits(const struct v4l2_ctrl_h264_sps *sps,
+					  size_t held, size_t held_bytes,
+					  u32 len, size_t decoded_size)
+{
+	return held < avd_h264_max_slices(sps) &&
+	       held_bytes + PAGE_ALIGN((size_t)len) <=
+	       avd_h264_slice_budget(decoded_size);
+}
+
 static int avd_h264_run(struct avd_ctx *ctx)
 {
 	struct avd_h264_ctx *h264_ctx = ctx->priv;
@@ -807,12 +861,6 @@ static int avd_h264_run(struct avd_ctx *ctx)
 	int ret;
 
 	avd_h264_run_preamble(ctx, &run);
-
-	if (h264_ctx->slice_num >= h264_ctx->alloc_slice_num) {
-		ret = avd_h264_realloc_slices(ctx);
-		if (ret)
-			goto err_free_jobs;
-	}
 
 	struct vb2_v4l2_buffer *src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
 	u32 payload_len = vb2_get_plane_payload(&src->vb2_buf, 0);
@@ -827,12 +875,30 @@ static int avd_h264_run(struct avd_ctx *ctx)
 		return -EINVAL;
 	}
 
+	if (!avd_h264_slice_fits(run.sps, h264_ctx->slice_num,
+				 h264_ctx->slice_bytes, payload_len,
+				 ctx->decoded_fmt.fmt.pix_mp.plane_fmt[0].sizeimage)) {
+		dev_err_ratelimited(ctx->dev->dev,
+				    "too many slices for one picture, dropping it\n");
+		/* The unsubmitted job table points at the dropped slices. */
+		avd_h264_drop_slices(ctx);
+		ret = -EINVAL;
+		goto err_free_jobs;
+	}
+
+	if (h264_ctx->slice_num >= h264_ctx->alloc_slice_num) {
+		ret = avd_h264_realloc_slices(ctx, avd_h264_max_slices(run.sps));
+		if (ret)
+			goto err_free_jobs;
+	}
+
 	h264_ctx->active_slice = &h264_ctx->slices[h264_ctx->slice_num];
 	ret = avd_buf_alloc(ctx->dev, h264_ctx->active_slice, payload_len);
 	if (ret)
 		goto err_free_jobs;
 	memcpy(h264_ctx->active_slice->cpu, data, payload_len);
 	h264_ctx->slice_num++;
+	h264_ctx->slice_bytes += PAGE_ALIGN((size_t)payload_len);
 	h264_ctx->monochrome = run.sps->chroma_format_idc == 0;
 
 	/* Build the P/B{0,1} ref lists. */
@@ -887,14 +953,10 @@ static void avd_h264_done(struct avd_ctx *ctx, struct vb2_v4l2_buffer *src_buf,
 			  struct vb2_v4l2_buffer *dst_buf,
 			  enum vb2_buffer_state result)
 {
-	struct avd_dev *avd = ctx->dev;
 	struct avd_h264_ctx *h264_ctx = ctx->priv;
-	int i;
 
 	if (!(src_buf->flags & V4L2_BUF_FLAG_M2M_HOLD_CAPTURE_BUF)) {
-		for (i = 0; i < h264_ctx->slice_num; i++)
-			avd_buf_free(avd, &h264_ctx->slices[i]);
-		h264_ctx->slice_num = 0;
+		avd_h264_drop_slices(ctx);
 
 		/* 4:0:0 has no chroma to decode; the picture is grey */
 		if (h264_ctx->monochrome && dst_buf && result == VB2_BUF_STATE_DONE) {
