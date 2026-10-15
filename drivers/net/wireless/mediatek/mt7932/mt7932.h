@@ -254,6 +254,4 @@ void mt_power_work(struct work_struct *work);
 int mt_power_init(struct mt7932 *m);
 void mt_station_update_rate(struct mt7932 *m, const u8 *mac);
 
-bool mt_transport_polled(void);
-
 #endif
