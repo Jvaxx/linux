@@ -1856,10 +1856,8 @@ static int j700_aux_disable(struct apple_atcphy *atcphy)
 
 static int atcphy_enable_dp_aux(struct apple_atcphy *atcphy)
 {
-	if (atcphy->hw->has_t8140_dp) {
-		dev_info_once(atcphy->dev, "Applied T8140 DisplayPort setup lists\n");
+	if (atcphy->hw->has_t8140_dp)
 		return j700_aux_enable(atcphy);
-	}
 
 	/* FIXME */
 	/* T8122 PHYs with DP support enable AUX in atcphy_dp_aux_on_t8122() */
