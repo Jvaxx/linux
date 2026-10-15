@@ -135,8 +135,8 @@ static void dcpavserv_init(struct apple_epic_service *service, const char *name,
 		return;
 	}
 	if (v2) {
-		dev_info(dcp->dev, "DCPAVSERV: AFKV2 EDID service ready on channel %u\n",
-			 service->channel);
+		dev_dbg(dcp->dev, "DCPAVSERV: AFKV2 EDID service ready on channel %u\n",
+			service->channel);
 		dcpavserv_notify_edid(service);
 	}
 }
