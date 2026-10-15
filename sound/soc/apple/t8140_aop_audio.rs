@@ -1550,8 +1550,14 @@ const PCM_PERIOD_BYTES_MAX: usize = 0x10000;
 /// 16384 frames (341 ms), while still allowing the largest PipeWire quantum.
 const SPKR_BUFFER_MAX: usize = 128 * 1024;
 
-fn copy_str(target: &mut [u8], source: &[u8]) {
-    target[..source.len()].copy_from_slice(source)
+/// Copies the NUL-terminated `source` into the fixed-size C string field
+/// `target`; EINVAL if it does not fit.
+fn copy_str(target: &mut [u8], source: &[u8]) -> Result {
+    target
+        .get_mut(..source.len())
+        .ok_or(EINVAL)?
+        .copy_from_slice(source);
+    Ok(())
 }
 
 // ---- ASoC component: DPCM front-end PCMs on the ADMAC channels, back-end
@@ -2604,16 +2610,19 @@ impl SndSocT8140AopDriver {
         let id_str = CString::try_from_fmt(fmt!("Apple{}AOP", *chassis))?;
         let shortname = CString::try_from_fmt(fmt!("{} {} AOP", *machine_kind, *chassis))?;
         let longname = CString::try_from_fmt(fmt!("{} {} AOP Audio", *machine_kind, *chassis))?;
-        // SAFETY: `card` was created by `snd_card_new` above; the fixed-size name fields are filled
-        // with NUL-terminated strings that fit.
-        unsafe {
-            copy_str(
-                &mut (*this.card).driver,
-                c"t8140-aop-audio".to_bytes_with_nul(),
+        // SAFETY: `card` was created by `snd_card_new` above and is not
+        // registered yet, so nothing else accesses it.
+        let card = unsafe { &mut *this.card };
+        let named = copy_str(&mut card.driver, c"t8140-aop-audio".to_bytes_with_nul())
+            .and_then(|()| copy_str(&mut card.id, id_str.to_bytes_with_nul()))
+            .and_then(|()| copy_str(&mut card.shortname, shortname.to_bytes_with_nul()))
+            .and_then(|()| copy_str(&mut card.longname, longname.to_bytes_with_nul()));
+        if let Err(e) = named {
+            dev_err!(
+                data.dev,
+                "apple,chassis-name or apple,machine-kind too long for the card names\n"
             );
-            copy_str(&mut (*this.card).id, id_str.to_bytes_with_nul());
-            copy_str(&mut (*this.card).shortname, shortname.to_bytes_with_nul());
-            copy_str(&mut (*this.card).longname, longname.to_bytes_with_nul());
+            return Err(e);
         }
 
         this.new_pcm(0, c"lpai", c"Low-Power Microphone", &Self::LPAI_OPS)?;
@@ -2664,14 +2673,15 @@ impl SndSocT8140AopDriver {
             return Err(Error::from_errno(ret));
         }
         // SAFETY: `pcm` was created by `snd_pcm_new` above; the ops are static and the private
-        // data is an `Arc` released by `pcm_free_private`; `name` fits the fixed-size field.
+        // data is an `Arc` released by `pcm_free_private`.
         unsafe {
             bindings::snd_pcm_set_ops(pcm, bindings::SNDRV_PCM_STREAM_CAPTURE as i32, ops);
             (*pcm).private_data = self.data.clone().into_foreign().cast();
             (*pcm).private_free = Some(pcm_free_private);
             (*pcm).info_flags = 0;
-            copy_str(&mut (*pcm).name, name.to_bytes_with_nul());
         }
+        // SAFETY: as above.
+        copy_str(unsafe { &mut (*pcm).name }, name.to_bytes_with_nul())?;
         if device == 0 {
             // The low-power microphone's buffer is filled by the driver from
             // the source ring; the array's is set up on its DMA device at
@@ -2959,5 +2969,27 @@ mod tests {
         assert_eq!(f32_bits_of_q31(-(1 << 30)), 0xbf00_0000); // -0.5
         assert_eq!(f32_bits_of_q31(1), 0x3000_0000); // 2^-31
         assert_eq!(f32_bits_of_q31(i32::MIN), 0xbf80_0000); // -1.0
+    }
+}
+
+/// The card and PCM names are copied into ALSA's fixed-size fields from
+/// device-tree strings.
+#[kunit_tests(snd_soc_t8140_aop_audio_names)]
+mod name_tests {
+    use super::*;
+
+    #[test]
+    fn a_name_that_fits_is_copied_with_its_nul() {
+        let mut field = [0xffu8; 16];
+        assert!(copy_str(&mut field, c"AppleJ700AOP".to_bytes_with_nul()).is_ok());
+        assert_eq!(&field[..13], b"AppleJ700AOP\0");
+    }
+
+    #[test]
+    fn a_name_longer_than_its_field_is_refused() {
+        let mut field = [0u8; 16];
+        let long = c"AppleJ700LongerChassisAOP".to_bytes_with_nul();
+        assert!(copy_str(&mut field, long).is_err());
+        assert_eq!(field, [0u8; 16]);
     }
 }
