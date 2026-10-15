@@ -62,6 +62,9 @@
 #define BT7932_CONTROL_POOL_SIZE (BT7932_DEPTH * BT7932_CONTROL_SIZE)
 #define BT7932_COMPLETION_SIZE (BT7932_DEPTH * 0x18)
 #define BT7932_TX_QUEUE_MAX 128
+/* Vendor command telling the controller that the host goes to sleep. */
+#define BT7932_OP_HOST_SLEEP 0xfc6f
+#define BT7932_HOST_SLEEP_PLEN 7
 
 #define BT7932_FW_B0 "mediatek/MT7932B0_OS_TypeB_0.1.44.0_241001003711.bin"
 #define BT7932_FW_B1 "mediatek/MT7932B1_OS_TypeB_2.0.177.0_260706180356.bin"
@@ -616,51 +619,64 @@ static int bt7932_tx_progress(struct bt7932 *bt, unsigned int channel)
 	return 0;
 }
 
+/*
+ * Caller owns lock with the firmware awake. Returns -ENOSPC while the ring is
+ * full, or -EPROTO after faulting the transport.
+ */
+static int bt7932_publish_locked(struct bt7932 *bt, unsigned int channel,
+				 const u8 *data, size_t len)
+{
+	struct bt7932_ring *ring = &bt->rings[channel];
+	u8 *descriptor;
+
+	if (bt7932_tx_progress(bt, channel)) {
+		bt7932_fault_locked(bt, "TX consumer exceeded outstanding descriptors");
+		return -EPROTO;
+	}
+	if (((ring->host + 1) & BT7932_MASK) == ring->previous)
+		return -ENOSPC;
+	descriptor = bt->arena + ring->offset + ring->host * geometry[channel].stride;
+	memset(descriptor, 0, geometry[channel].stride);
+	descriptor[0] = 2;
+	descriptor[1] = len;
+	descriptor[2] = len >> 8;
+	descriptor[3] = len >> 16;
+	put_unaligned_le16(ring->host, descriptor + 12);
+	descriptor[15] = 2;
+	memcpy(descriptor + 16, data, len);
+	ring->host = (ring->host + 1) & BT7932_MASK;
+	bt7932_publish_counter(bt, bt->host_transfer, channel, ring->host);
+	bt7932_ring_doorbell(bt, geometry[channel].doorbell);
+	bt->hdev->stat.byte_tx += len;
+	return 0;
+}
+
 static void bt7932_tx_work(struct work_struct *work)
 {
 	struct bt7932 *bt = container_of(work, struct bt7932, tx_work);
 	struct sk_buff *skb;
+	int ret;
 
 	while ((skb = skb_dequeue(&bt->tx_queue))) {
 		int channel = bt7932_tx_channel(hci_skb_pkt_type(skb));
-		struct bt7932_ring *ring;
-		u16 consumer;
-		u8 *descriptor;
 
 		if (bt7932_wake_and_lock(bt, true)) {
 			kfree_skb(skb);
 			skb_queue_purge(&bt->tx_queue);
 			return;
 		}
-		ring = &bt->rings[channel];
-		if (bt7932_tx_progress(bt, channel)) {
-			bt7932_fault_locked(bt, "TX consumer exceeded outstanding descriptors");
-			mutex_unlock(&bt->lock);
-			kfree_skb(skb);
-			skb_queue_purge(&bt->tx_queue);
-			return;
-		}
-		consumer = ring->previous;
-		if (((ring->host + 1) & BT7932_MASK) == consumer) {
+		ret = bt7932_publish_locked(bt, channel, skb->data, skb->len);
+		if (ret == -ENOSPC) {
 			skb_queue_head(&bt->tx_queue, skb);
 			mutex_unlock(&bt->lock);
 			return;
 		}
-		descriptor = bt->arena + ring->offset + ring->host * geometry[channel].stride;
-		memset(descriptor, 0, geometry[channel].stride);
-		descriptor[0] = 2;
-		descriptor[1] = skb->len;
-		descriptor[2] = skb->len >> 8;
-		descriptor[3] = skb->len >> 16;
-		put_unaligned_le16(ring->host, descriptor + 12);
-		descriptor[15] = 2;
-		memcpy(descriptor + 16, skb->data, skb->len);
-		ring->host = (ring->host + 1) & BT7932_MASK;
-		bt7932_publish_counter(bt, bt->host_transfer, channel, ring->host);
-		bt7932_ring_doorbell(bt, geometry[channel].doorbell);
-		bt->hdev->stat.byte_tx += skb->len;
 		mutex_unlock(&bt->lock);
 		kfree_skb(skb);
+		if (ret) {
+			skb_queue_purge(&bt->tx_queue);
+			return;
+		}
 	}
 }
 
@@ -1483,10 +1499,61 @@ static void bt7932_track_wake(struct bt7932 *bt, bool on)
 }
 
 /*
+ * Before system sleep, the host tells the controller that it is going to
+ * sleep with a vendor command whose parameters are all ones; nothing is sent
+ * when the host is back. It is answered by a vendor event, if at all, so
+ * place it on the command ring directly rather than through the HCI command
+ * flow, and wait until the controller has taken it.
+ *
+ * Returns -EAGAIN if nothing was published (the controller could not be
+ * reached without a fault, or the ring was full), -EBUSY if the command was
+ * published but not taken in time, so that it may still take effect, or
+ * -EIO if the transport faulted.
+ */
+static int bt7932_host_sleep(struct bt7932 *bt)
+{
+	u8 cmd[HCI_COMMAND_HDR_SIZE + BT7932_HOST_SLEEP_PLEN];
+	unsigned long deadline;
+	u16 target;
+	int ret;
+
+	put_unaligned_le16(BT7932_OP_HOST_SLEEP, cmd);
+	cmd[2] = BT7932_HOST_SLEEP_PLEN;
+	memset(cmd + HCI_COMMAND_HDR_SIZE, 0xff, BT7932_HOST_SLEEP_PLEN);
+
+	ret = bt7932_wake_and_lock(bt, true);
+	if (ret)
+		return READ_ONCE(bt->fault) ? -EIO : -EAGAIN;
+	ret = bt7932_publish_locked(bt, 1, cmd, sizeof(cmd));
+	target = bt->rings[1].host;
+	mutex_unlock(&bt->lock);
+	if (ret == -ENOSPC)
+		return -EAGAIN;
+	if (ret)
+		return -EIO;
+
+	deadline = jiffies + msecs_to_jiffies(500);
+	for (;;) {
+		mutex_lock(&bt->lock);
+		ret = bt->fault ? -EIO : 0;
+		if (!ret && bt7932_counter(bt, bt->fw_transfer, 1) == target) {
+			mutex_unlock(&bt->lock);
+			return 0;
+		}
+		mutex_unlock(&bt->lock);
+		if (ret)
+			return ret;
+		if (time_after(jiffies, deadline))
+			return -EBUSY;
+		usleep_range(1000, 2000);
+	}
+}
+
+/*
  * Leave the firmware running with its MSI armed. It keeps the scans that
  * hci_suspend_dev() set up and reports a match like any other event. Returns
- * 0 when armed, -EAGAIN when the transport should be quiesced instead, or
- * -EIO when it failed.
+ * 0 when armed, -EAGAIN when the transport should be quiesced instead,
+ * -EBUSY when the controller state is uncertain, or -EIO when it failed.
  */
 static int bt7932_arm_wakeup(struct bt7932 *bt)
 {
@@ -1497,6 +1564,13 @@ static int bt7932_arm_wakeup(struct bt7932 *bt)
 	if (ret) {
 		dev_warn(dev, "cannot arm the interrupt for wakeup: %d\n", ret);
 		return -EAGAIN;
+	}
+
+	ret = bt7932_host_sleep(bt);
+	if (ret) {
+		disable_irq_wake(bt->irq);
+		dev_warn(dev, "host sleep command failed: %d\n", ret);
+		return ret;
 	}
 
 	mutex_lock(&bt->lock);
@@ -1586,6 +1660,17 @@ static int bt7932_suspend(struct device *dev)
 			return 0;
 		}
 		bt7932_track_wake(bt, false);
+		if (ret == -EBUSY) {
+			/*
+			 * The host sleep command may still take effect, so the
+			 * quiesce cannot be relied on. Fail this suspend and
+			 * reset the controller through HCI recovery.
+			 */
+			dev_err(dev, "host sleep command not taken; resetting the controller\n");
+			hci_resume_dev(bt->hdev);
+			bt7932_reset(bt->hdev);
+			return ret;
+		}
 		if (ret != -EAGAIN) {
 			dev_err(dev, "transport failed while arming wakeup\n");
 			hci_resume_dev(bt->hdev);
