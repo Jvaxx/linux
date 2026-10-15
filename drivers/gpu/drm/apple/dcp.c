@@ -1963,6 +1963,41 @@ void dcp_firmware_metadata_connection(struct apple_dcp *dcp, u64 generation, boo
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 }
 
+static void dcp_firmware_metadata_present_locked(struct apple_dcp *dcp)
+{
+	lockdep_assert_held(&dcp->metadata.lock);
+	dcp->metadata.hpd_seen = true;
+	/*
+	 * Fresh proof may precede HPD assertion after a same-cable loss.
+	 * Keep invalidated firmware metadata and old receipt tickets revoked.
+	 */
+	if (READ_ONCE(dcp->typec_cable_connected) &&
+	    dcp->metadata.epoch.generation == READ_ONCE(dcp->typec_generation))
+		dcp->metadata.epoch.connected = true;
+}
+
+/*
+ * While its pipe is stopped an external display reports no hotplug to DRM
+ * (see dcp_external_hotplug()). When the firmware announces the display
+ * there, as when the link returns from system sleep with the CRTC off, the
+ * announcement still holds for the modes that need it, so record it. The
+ * connector is not notified, just as for an announcement on DPMS wake.
+ *
+ * Only a link requested for the current cable generation can be announced:
+ * a callback that arrives before that belongs to a link already released.
+ */
+void dcp_firmware_metadata_announced(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+
+	if (!dcp_firmware_metadata_enabled(dcp) ||
+	    !READ_ONCE(dcp->dptxport[0].connected))
+		return;
+	spin_lock_irqsave(&dcp->metadata.lock, flags);
+	dcp_firmware_metadata_present_locked(dcp);
+	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+}
+
 void dcp_firmware_metadata_hotplug(struct apple_dcp *dcp, bool connected)
 {
 	struct apple_connector *con = READ_ONCE(dcp->connector);
@@ -1972,14 +2007,7 @@ void dcp_firmware_metadata_hotplug(struct apple_dcp *dcp, bool connected)
 		return;
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
 	if (connected) {
-		dcp->metadata.hpd_seen = true;
-		/*
-		 * Fresh proof may precede HPD assertion after a same-cable loss.
-		 * Keep invalidated firmware metadata and old receipt tickets revoked.
-		 */
-		if (READ_ONCE(dcp->typec_cable_connected) &&
-		    dcp->metadata.epoch.generation == READ_ONCE(dcp->typec_generation))
-			dcp->metadata.epoch.connected = true;
+		dcp_firmware_metadata_present_locked(dcp);
 	} else if (dcp->metadata.hpd_seen) {
 		dcp->metadata.hpd_seen = false;
 		dcp->rate_proof.connection_sequence++;
@@ -2834,6 +2862,8 @@ bool dcp_external_hotplug(struct apple_dcp *dcp, bool connected)
 	if (dcp->iomfb.presentation_paused) {
 		dcp->external_hotplug_pending = true;
 		dcp->external_hotplug_connected = connected;
+		if (connected)
+			dcp_firmware_metadata_announced(dcp);
 		/* Publish initial/new-cable discovery, never same-cable DPMS wake. */
 		if (connected && READ_ONCE(dcp->external_cable) &&
 		    !READ_ONCE(dcp->external_error) &&
