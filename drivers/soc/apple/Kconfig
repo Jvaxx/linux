@@ -160,8 +160,9 @@ config APPLE_SEP_KUNIT_TEST
 	help
 	  Build KUnit tests for the pure logic of the Apple SEP driver: the
 	  mailbox message encoding and decoding, the shared-memory registration
-	  limits and the rules that keep a keybag's lookup identity apart from
-	  the identity the enclave reports. The tests touch no hardware.
+	  limits, the rules that keep a keybag's lookup identity apart from
+	  the identity the enclave reports, and the format and validation of
+	  the Linux host-state store. The tests touch no hardware.
 
 	  If unsure, say N.
 
