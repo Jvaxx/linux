@@ -1462,11 +1462,26 @@ static void atcphy_enable_dummy_phy(struct apple_atcphy *atcphy)
 	      PIPEHANDLER_DUMMY_PHY_EN);
 }
 
+/*
+ * Whether a controller may still be driving the PIPE, which then has to
+ * acknowledge the lock before the PIPE moves. A handoff that did not complete
+ * leaves the PIPE in an unknown state. A controller behind a fixed hub only
+ * drives it in host mode, which it has left by the time it powers the USB3 PHY
+ * off or asserts its reset.
+ */
+static bool atcphy_pipe_live(const struct apple_atcphy *atcphy)
+{
+	if (atcphy->hw->has_t8140_dp && atcphy->fixed_usb2)
+		return atcphy->host_active &&
+		       (atcphy->pipe_pending ||
+			atcphy->pipe_state == ATCPHY_PIPEHANDLER_STATE_USB3);
+
+	return atcphy->pipe_pending;
+}
+
 static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy)
 {
-	bool live_usb3 = atcphy->pipe_pending ||
-		(atcphy->hw->has_t8140_dp && atcphy->fixed_usb2 && atcphy->host_active &&
-		 atcphy->pipe_state == ATCPHY_PIPEHANDLER_STATE_USB3);
+	bool live_usb3 = atcphy_pipe_live(atcphy);
 	int ret;
 
 	ret = atcphy_pipehandler_check(atcphy);
@@ -3036,6 +3051,13 @@ static int atcphy_usb3_power_off(struct phy *phy)
 
 	guard(mutex)(&atcphy->lock);
 
+	/*
+	 * dwc3 has left host mode: nothing drives the PIPE any more, and the
+	 * next host powers its SuperSpeed port on as it starts.
+	 */
+	atcphy->host_active = false;
+	atcphy->usb3_port_off = false;
+
 	ret = atcphy_park_pipehandler(atcphy);
 	if (ret)
 		return ret;
@@ -3044,9 +3066,6 @@ static int atcphy_usb3_power_off(struct phy *phy)
 		if (ret)
 			return ret;
 	}
-	atcphy->host_active = false;
-	/* The next host powers its SuperSpeed port on as it starts. */
-	atcphy->usb3_port_off = false;
 
 	return 0;
 }
@@ -3313,14 +3332,16 @@ static int atcphy_dwc3_reset_assert(struct reset_controller_dev *rcdev, unsigned
 
 	guard(mutex)(&atcphy->lock);
 
+	/* The controller is only reset once it has stopped. */
+	atcphy->host_active = false;
+	atcphy->usb3_port_off = false;
+
 	/* Do not reset the controller or USB2 PHY if PIPE parking fails. */
 	ret = atcphy_park_pipehandler(atcphy);
 	if (ret)
 		return ret;
 
 	_atcphy_dwc3_reset_assert(atcphy);
-	atcphy->host_active = false;
-	atcphy->usb3_port_off = false;
 	atcphy_usb2_power_off(atcphy);
 
 	return 0;
