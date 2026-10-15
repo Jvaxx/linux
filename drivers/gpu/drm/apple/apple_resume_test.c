@@ -179,10 +179,23 @@ static void resume_stale_mode_fails_unfiltered_test(struct kunit *test)
 static void resume_stale_crtc_disabled_test(struct kunit *test)
 {
 	struct resume_test *priv = resume_test_init(test);
+	struct drm_connector_state *conn_state;
+	struct drm_crtc_state *crtc_state;
+	struct drm_atomic_state *state;
 
 	KUNIT_ASSERT_EQ(test, drm_mode_config_helper_suspend(&priv->drm), 0);
 	priv->admissible = false;
-	apple_drm_drop_stale_crtcs(priv->drm.mode_config.suspend_state);
+	state = priv->drm.mode_config.suspend_state;
+	apple_drm_drop_stale_crtcs(state);
+
+	/* The resume check warns about an encoder routed without a CRTC. */
+	conn_state = drm_atomic_get_new_connector_state(state, &priv->connector);
+	crtc_state = drm_atomic_get_new_crtc_state(state, priv->crtc);
+	KUNIT_ASSERT_NOT_NULL(test, conn_state);
+	KUNIT_ASSERT_NOT_NULL(test, crtc_state);
+	KUNIT_EXPECT_NULL(test, conn_state->best_encoder);
+	KUNIT_EXPECT_EQ(test, crtc_state->encoder_mask, 0U);
+
 	KUNIT_EXPECT_EQ(test, drm_mode_config_helper_resume(&priv->drm), 0);
 
 	KUNIT_EXPECT_FALSE(test, priv->crtc->state->enable);
