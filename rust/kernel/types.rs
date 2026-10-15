@@ -559,7 +559,10 @@ pub const NotThreadSafe: NotThreadSafe = PhantomData;
 ///
 /// # Examples
 ///
-/// ```
+/// This macro is crate-private, so these declarations are only available within
+/// the `kernel` crate.
+///
+/// ```ignore
 /// declare_flags_type! {
 ///     /// Flags to be used for foo.
 ///     pub struct FooFlags(u32);

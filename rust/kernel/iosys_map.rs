@@ -186,14 +186,7 @@ impl<'a, T: AsBytes + FromBytes> IoSysMapRef<'a, T> {
         Ok(())
     }
 
-    /// Memset the region starting from `offset`.
-    ///
-    /// `offset` and `len` are in units of `T`, not the number of bytes.
-    ///
-    /// This function can return the following errors:
-    ///
-    /// * [`EOVERFLOW`] if calculating the length of the slice results in an overflow.
-    /// * [`EINVAL`] if the slice would go out of bounds of the memory region.
+    /// Fill the entire mapped region with `value`.
     ///
     /// # Examples
     ///
@@ -204,7 +197,7 @@ impl<'a, T: AsBytes + FromBytes> IoSysMapRef<'a, T> {
     /// # let mut map = tests::VecIoSysMap::new(&[0u8; 3])?;
     /// # {
     /// # let mut map = map.get();
-    /// map.memset(7)?; // (now [7, 7, 7])
+    /// map.memset(7); // (now [7, 7, 7])
     /// # }
     /// #
     /// # map.assert_eq(&[7, 7, 7]);
