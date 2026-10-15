@@ -51,7 +51,7 @@ static int apple_rtkit_helper_shmem_setup(void *cookie, struct apple_rtkit_shmem
 
 	if (!helper->sram) {
 		dev_err(helper->dev,
-			"RTKit buffer request with no SRAM region: %pR", &res);
+			"RTKit buffer request with no SRAM region: %pR\n", &res);
 		return -EFAULT;
 	}
 
@@ -59,7 +59,7 @@ static int apple_rtkit_helper_shmem_setup(void *cookie, struct apple_rtkit_shmem
 
 	if (res.end < res.start || !resource_contains(helper->sram, &res)) {
 		dev_err(helper->dev,
-			"RTKit buffer request outside SRAM region: %pR", &res);
+			"RTKit buffer request outside SRAM region: %pR\n", &res);
 		return -EFAULT;
 	}
 
@@ -139,7 +139,7 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 		helper->sram_base = devm_ioremap_resource(dev, helper->sram);
 		if (IS_ERR(helper->sram_base))
 			return dev_err_probe(dev, PTR_ERR(helper->sram_base),
-					"Failed to map SRAM region");
+					"Failed to map SRAM region\n");
 	}
 
 	if (apple_rtkit_helper_live(helper)) {
@@ -147,7 +147,7 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 						       &apple_rtkit_helper_ops);
 		if (IS_ERR(helper->rtk))
 			return dev_err_probe(dev, PTR_ERR(helper->rtk),
-					     "Failed to adopt RTKit");
+					     "Failed to adopt RTKit\n");
 
 		ret = devm_add_action_or_reset(dev, apple_rtkit_helper_release,
 					       helper->rtk);
@@ -163,7 +163,7 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 		devm_apple_rtkit_init(dev, helper, NULL, 0, &apple_rtkit_helper_ops);
 	if (IS_ERR(helper->rtk))
 		return dev_err_probe(dev, PTR_ERR(helper->rtk),
-				     "Failed to intialize RTKit");
+				     "Failed to initialize RTKit\n");
 
 	writel_relaxed(APPLE_ASC_CPU_CONTROL_RUN,
 		       helper->asc_base + APPLE_ASC_CPU_CONTROL);
@@ -174,7 +174,7 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 	else
 		ret = apple_rtkit_wake(helper->rtk);
 	if (ret != 0)
-		return dev_err_probe(dev, ret, "Failed to wake up coprocessor");
+		return dev_err_probe(dev, ret, "Failed to wake up coprocessor\n");
 
 	return 0;
 }
