@@ -3,6 +3,159 @@
 #ifndef APPLE_ATC_J700_DP_H
 #define APPLE_ATC_J700_DP_H
 
+/* Masks are the union of writes in the public J700 DP start/voltage/stop paths. */
+struct j700_usb_field {
+	u32 offset, mask;
+};
+
+static const struct j700_usb_field j700_usb_fields[] = {
+	{ 0x0008, 0x00015540 },
+	{ 0x000c, 0x00000055 },
+	{ 0x010c, 0x00000555 },
+	{ 0x0200, 0x0000000f },
+	{ 0x9160, 0x00000001 },
+	{ 0x91d4, 0x00000003 },
+	{ 0x91dc, 0x00018000 },
+	{ 0x9210, 0x0000c00f },
+	{ 0x9244, 0x0007ffff },
+	{ 0x9248, 0x10000000 },
+	{ 0xb030, 0x00000c00 },
+	{ 0xb064, 0x0000fc0c },
+	{ 0xb068, 0x000001e0 },
+	{ 0xb06c, 0x0001ee00 },
+	{ 0xb0a4, 0x00000003 },
+	{ 0xb0a8, 0x00ff8000 },
+	{ 0xb0d4, 0x001fff80 },
+	{ 0xb0d8, 0x00000007 },
+	{ 0xb0dc, 0x00000018 },
+	{ 0xc050, 0x0000c00f },
+	{ 0xc0d0, 0x0017ffff },
+	{ 0xc0d4, 0x10000000 },
+	{ 0xd004, 0x33000000 },
+	{ 0xd00c, 0x07000000 },
+	{ 0xd010, 0x00000600 },
+	{ 0xd01c, 0x00c00000 },
+	{ 0xd044, 0xffffffff },
+};
+
+static_assert(ARRAY_SIZE(j700_usb_fields) == 27, "USB context storage size");
+
+static void j700_usb_field(unsigned int index, unsigned int lane, u32 *offset, u32 *mask)
+{
+	*offset = j700_usb_fields[index].offset;
+	*mask = j700_usb_fields[index].mask;
+	if (index < 4)
+		*mask <<= index == 3 ? 4 * lane : lane;
+	else
+		*offset += 0x7000 * lane;
+}
+
+/* Capture before the first DP tunable or idle write; never replace a retained context. */
+static int j700_usb_capture(struct apple_atcphy *p, enum atcphy_mode mode)
+{
+	const struct atcphy_mode_configuration *cfg = atcphy_get_mode_config(p, mode);
+
+	if (!p->hw->has_t8140_dp || !p->fixed_usb2)
+		return 0;
+	if (p->usb_off_pending ||
+	    p->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY || p->pipe_pending)
+		return -EBUSY;
+	for (unsigned int lane = 0; lane < 2; lane++) {
+		if (!cfg->dp_lane[lane] || (p->dp_usb_context_valid & BIT(lane)))
+			continue;
+		for (unsigned int i = 0; i < ARRAY_SIZE(j700_usb_fields); i++) {
+			u32 offset, mask;
+
+			j700_usb_field(i, lane, &offset, &mask);
+			p->dp_usb_context[lane][i] = core_read32(p, offset) & mask;
+		}
+		p->dp_usb_context_valid |= BIT(lane);
+	}
+	return 0;
+}
+
+/* Same control write/delay/poll sequence, retaining its final sample for diagnostics. */
+static int j700_usb_field_update(struct apple_atcphy *p, u32 offset, u32 mask,
+				 u32 value, u32 *observed)
+{
+	core_mask32(p, offset, mask, value);
+	usleep_range(10, 20);
+	return readl_poll_timeout_atomic(p->regs.core + offset, *observed,
+					(*observed & mask) == value, 1, 100);
+}
+
+/* Restore only DP-owned bits, with the PIPE parked and the DP PMA idle. */
+static int j700_usb_restore(struct apple_atcphy *p, enum atcphy_mode mode)
+{
+	const struct atcphy_mode_configuration *cfg = atcphy_get_mode_config(p, mode);
+	const unsigned int power_order[] = { 2, 1, 0, 3 };
+	const unsigned int receiver_order[] = { 4, 0, 6, 2 };
+	int ret;
+
+	if (!p->hw->has_t8140_dp || !p->fixed_usb2)
+		return 0;
+	if (p->usb_off_pending && mode != APPLE_ATCPHY_MODE_OFF)
+		return -EBUSY;
+	if (p->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY || p->pipe_pending)
+		return -EBUSY;
+	if (p->dp_owned_pmas || p->dp_idle_pmas)
+		return -EBUSY;
+	if (mode == APPLE_ATCPHY_MODE_OFF && p->usb_off_drained)
+		return 0;
+	for (unsigned int lane = 0; lane < 2; lane++) {
+		if ((mode != APPLE_ATCPHY_MODE_OFF &&
+		     cfg->lane_mode[lane] != ACIOPHY_LANE_MODE_USB3) ||
+		    !(p->dp_usb_context_valid & BIT(lane)))
+			continue;
+		if (p->dp_usb_context_dirty & BIT(lane)) {
+			for (unsigned int i = 0; i < ARRAY_SIZE(j700_usb_fields); i++) {
+				u32 offset, mask, observed, value = p->dp_usb_context[lane][i];
+
+				if (i == 1 || i == 3)
+					continue;
+				j700_usb_field(i, lane, &offset, &mask);
+				core_mask32(p, offset, mask, value);
+				observed = core_read32(p, offset) & mask;
+				if (observed != value) {
+					dev_dbg(p->dev, "USB restore stage=static pma=%u reg=%#x mask=%#x expected=%#x observed=%#x\n",
+						lane, offset, mask, value, observed);
+					return -EIO;
+				}
+			}
+		}
+		/* Preserve the public PMA power bit order, using saved values. */
+		for (unsigned int i = 0; i < ARRAY_SIZE(power_order); i++) {
+			u32 mask = BIT(4 * lane + power_order[i]);
+			u32 value = p->dp_usb_context[lane][3] & mask, observed;
+
+			ret = j700_usb_field_update(p, 0x200, mask, value, &observed);
+			if (ret) {
+				dev_dbg(p->dev, "USB restore stage=power pma=%u reg=0x200 mask=%#x expected=%#x observed=%#x ret=%d\n",
+					lane, mask, value, observed & mask, ret);
+				return ret;
+			}
+		}
+		/* Restore receiver enables, then release its two idle controls. */
+		for (unsigned int i = 0; i < ARRAY_SIZE(receiver_order); i++) {
+			u32 mask = BIT(lane + receiver_order[i]);
+			u32 value = p->dp_usb_context[lane][1] & mask, observed;
+
+			ret = j700_usb_field_update(p, 0xc, mask, value, &observed);
+			if (ret) {
+				dev_dbg(p->dev, "USB restore stage=receiver pma=%u reg=0xc mask=%#x expected=%#x observed=%#x ret=%d\n",
+					lane, mask, value, observed & mask, ret);
+				return ret;
+			}
+		}
+		/* OFF keeps the shadow until domain shutdown succeeds. */
+		if (mode != APPLE_ATCPHY_MODE_OFF) {
+			p->dp_usb_context_dirty &= ~BIT(lane);
+			p->dp_usb_context_valid &= ~BIT(lane);
+		}
+	}
+	return 0;
+}
+
 /* Retry only the idle operations claimed by an incomplete route change. */
 static int j700_dp_idle_pending(struct apple_atcphy *p)
 {
@@ -269,6 +422,11 @@ static int j700_dp_start(struct apple_atcphy *p, unsigned int pmas, int rate, bo
 
 	if (!pmas || (pmas & ~3U) || rate < 0 || (unsigned int)rate >= ARRAY_SIZE(parameters))
 		return -EINVAL;
+	if (p->hw->has_t8140_dp && p->fixed_usb2) {
+		if ((p->dp_usb_context_valid & pmas) != pmas)
+			return -EIO;
+		p->dp_usb_context_dirty |= pmas;
+	}
 	/* Claim before the first write: failed setup must still be cleaned up. */
 	p->dp_owned_pmas = pmas;
 	p->dp_link_rate = -1;
@@ -320,7 +478,7 @@ static int j700_dp_configure(struct apple_atcphy *p, const struct phy_configure_
 	if ((o->set_rate && !o->link_rate) || (o->set_lanes && !o->lanes))
 		return o->set_voltages ? -EINVAL : j700_dp_stop(p);
 	/* The last completed mode cannot describe a partially changed lane route. */
-	if (p->mode_dirty)
+	if (p->mode_dirty || p->pipe_pending || p->usb_off_pending)
 		return -EBUSY;
 	if (p->mode != APPLE_ATCPHY_MODE_DP && p->mode != APPLE_ATCPHY_MODE_USB3_DP)
 		return -EINVAL;

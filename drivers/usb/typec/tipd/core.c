@@ -840,6 +840,23 @@ static void cd321x_update_work(struct work_struct *work)
 	was_disconnected |= partner_changed;
 
 	/*
+	 * Report sink absence before any fallible hardware transition. A failed
+	 * shutdown retains the route/PHY owner, but cannot keep the sink present.
+	 * Every Type-C port references the same external DCP connector.  Only the
+	 * port which successfully acquired the shared display route may report a
+	 * disconnect.  A second DP sink can negotiate Alt Mode even though its mux
+	 * request is rejected with -EBUSY; treating that sink as the connector
+	 * owner would tear down the display carried by the first port.
+	 */
+	if (IS_REACHABLE(CONFIG_DRM) && cd321x->connector_fwnode &&
+	    dp_route_was_active &&
+	    (!new_connected || was_disconnected || !dp_connected || !dp_hpd ||
+	     dp_hpd_changed || dp_mode_changed)) {
+		drm_connector_oob_hotplug_event(cd321x->connector_fwnode,
+					      connector_status_disconnected);
+	}
+
+	/*
 	 * ACIO carries the tunneled PCIe reset handshake over the still-live
 	 * Type-C data path. Close a disappearing USB4/TBT session before dropping
 	 * the USB role; otherwise the role transition tears down the ATC lanes and
@@ -859,20 +876,6 @@ static void cd321x_update_work(struct work_struct *work)
 		ret = usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
 		if (ret)
 			goto retry;
-	}
-
-	/*
-	 * Every Type-C port references the same external DCP connector.  Only the
-	 * port which successfully acquired the shared display route may report a
-	 * disconnect.  A second DP sink can negotiate Alt Mode even though its mux
-	 * request is rejected with -EBUSY; treating that sink as the connector
-	 * owner would tear down the display carried by the first port.
-	 */
-	if (IS_REACHABLE(CONFIG_DRM) && cd321x->connector_fwnode &&
-	    dp_route_was_active &&
-	    (!new_connected || was_disconnected || !dp_connected || !dp_hpd ||
-	     dp_hpd_changed || dp_mode_changed)) {
-		drm_connector_oob_hotplug_event(cd321x->connector_fwnode, connector_status_disconnected);
 	}
 
 	/* Process partner disconnection or change */
@@ -1580,7 +1583,17 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 	cd321x->state.alt = NULL;
 	cd321x->state.mode = TYPEC_STATE_SAFE;
 	cd321x->state.data = NULL;
-	cd321x->state_valid = !typec_set_mode(tps->port, TYPEC_STATE_SAFE);
+	ret = typec_set_mode(tps->port, TYPEC_STATE_SAFE);
+	cd321x->state_valid = !ret;
+	/*
+	 * A fixed host can register its SuperSpeed root after the mux provider.
+	 * Wait for that consumer at probe instead of exhausting the cable retry
+	 * budget before it exists. Host startup does not depend on this port.
+	 */
+	if (ret == -EAGAIN) {
+		ret = -EPROBE_DEFER;
+		goto err_put_switch;
+	}
 
 	cd321x->tbt_notifier.notifier_call = cd321x_tbt_notify;
 	ret = typec_thunderbolt_switch_register_notifier(cd321x->tbt_switch,
@@ -1595,6 +1608,8 @@ err_put_switch:
 	typec_thunderbolt_switch_put(cd321x->tbt_switch);
 	cd321x->tbt_switch = NULL;
 err_unregister_mux:
+	fwnode_handle_put(cd321x->connector_fwnode);
+	cd321x->connector_fwnode = NULL;
 	typec_mux_put(cd321x->mux);
 	cd321x->mux = NULL;
 err_unregister_altmodes:
@@ -1619,6 +1634,8 @@ cd321x_unregister_port(struct tps6598x *tps)
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
 
 	cd321x_stop_work(cd321x);
+	fwnode_handle_put(cd321x->connector_fwnode);
+	cd321x->connector_fwnode = NULL;
 	typec_thunderbolt_switch_put(cd321x->tbt_switch);
 	cd321x->tbt_switch = NULL;
 	typec_mux_put(cd321x->mux);
