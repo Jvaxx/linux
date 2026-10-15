@@ -476,10 +476,11 @@
 	 * aop_he_nrcs0/1, aop_i2cm3 and aop_spi1 are off at boot and the HE
 	 * NRCS pair does not power up, so those stay unmanaged).  The audio
 	 * fabric parents (audio_a, audio_fr, audio_p, audio_leap_a,
-	 * audio_leap_c) are on at boot and the AOP firmware relies on them:
-	 * letting genpd switch audio_p off during a runtime-PM cycle of
-	 * audio_leap_mca left the firmware unable to answer LPAI power
-	 * requests, so they are always-on; only the leaves (audio_leap_tx0,
+	 * audio_leap_c) are off at boot, and the AOP firmware relies on them
+	 * once they are on: letting genpd switch audio_p off during a
+	 * runtime-PM cycle of audio_leap_mca left the firmware unable to
+	 * answer LPAI power requests, so they are always-on and the driver
+	 * turns them on at probe; only the leaves (audio_leap_tx0,
 	 * audio_leap_mca, audio_leap_ns_a, ...) are runtime-managed.
 	 */
 	ps_aop_filter: power-controller@4000 {
@@ -517,7 +518,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "audio_a";
-		/* AOP-owned audio fabric: on at boot, the firmware expects it to stay on */
+		/* AOP audio fabric: the firmware expects it to stay on */
 		apple,always-on;
 		power-domains = <&ps_aop_filter>;
 	};
@@ -538,7 +539,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "audio_fr";
-		/* AOP-owned audio fabric: on at boot, the firmware expects it to stay on */
+		/* AOP audio fabric: the firmware expects it to stay on */
 		apple,always-on;
 		power-domains = <&ps_audio_a>;
 	};
@@ -549,7 +550,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "audio_p";
-		/* AOP-owned audio fabric: on at boot, the firmware expects it to stay on */
+		/* AOP audio fabric: the firmware expects it to stay on */
 		apple,always-on;
 		power-domains = <&ps_audio_fr>;
 	};
@@ -560,7 +561,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "audio_leap_a";
-		/* AOP-owned audio fabric: on at boot, the firmware expects it to stay on */
+		/* AOP audio fabric: the firmware expects it to stay on */
 		apple,always-on;
 		power-domains = <&ps_audio_fr>;
 	};
@@ -607,7 +608,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "audio_leap_c";
-		/* AOP-owned audio fabric: on at boot, the firmware expects it to stay on */
+		/* AOP audio fabric: the firmware expects it to stay on */
 		apple,always-on;
 		power-domains = <&ps_audio_leap_a>;
 	};
@@ -1112,7 +1113,7 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "nub_ocla";
-		apple,always-on;
+		apple,always-on; /* critical in the Apple Device Tree */
 		status = "okay";
 	};
 
@@ -1492,7 +1493,7 @@
 		#reset-cells = <0>;
 		label = "smc_i2cm0";
 		power-domains = <&ps_smc_fabric>;
-		apple,always-on;
+		apple,always-on; /* on in the Apple Device Tree, like smc_i2cm1/2 */
 		status = "okay";
 	};
 
