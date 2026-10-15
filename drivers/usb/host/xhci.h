@@ -1986,6 +1986,7 @@ struct xhci_hub *xhci_get_rhub(struct usb_hcd *hcd);
 enum usb_link_tunnel_mode xhci_port_is_tunneled(struct xhci_hcd *xhci,
 						struct xhci_port *port);
 void xhci_hc_died(struct xhci_hcd *xhci);
+void xhci_quiesce_dying(struct xhci_hcd *xhci);
 
 #ifdef CONFIG_PM
 int xhci_bus_suspend(struct usb_hcd *hcd);

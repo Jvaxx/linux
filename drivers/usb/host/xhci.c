@@ -139,6 +139,18 @@ int xhci_halt(struct xhci_hcd *xhci)
 }
 
 /*
+ * Stop a controller that is about to be reported dead: mask its interrupts and
+ * halt it, as the other error paths do before xhci_hc_died(). A controller whose
+ * registers no longer answer is left alone. Called with xhci->lock held.
+ */
+void xhci_quiesce_dying(struct xhci_hcd *xhci)
+{
+	if (readl(&xhci->op_regs->status) != ~(u32)0)
+		xhci_halt(xhci);
+}
+EXPORT_SYMBOL_GPL(xhci_quiesce_dying);
+
+/*
  * Set the run bit and wait for the host to be running.
  */
 int xhci_start(struct xhci_hcd *xhci)
