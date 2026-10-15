@@ -393,36 +393,56 @@ static int apple_pmc_dcs_get_cur_state(struct thermal_cooling_device *cdev,
 	return 0;
 }
 
+/*
+ * Caller holds pmc->lock. Vote the capped demand before the other agents
+ * stop being honoured, and drop that vote only once they are honoured
+ * again, so that the rail never dips below either.
+ */
+static int apple_pmc_dcs_limit(struct apple_pmc *pmc, unsigned long state)
+{
+	unsigned int rail = pmc->hw->dcs_rail;
+	int ret;
+
+	WRITE_ONCE(pmc->dcs_state, state);
+	if (state) {
+		apple_pmc_dcs_vote(pmc);
+		return apple_pmc_enable_write(pmc, rail);
+	}
+
+	ret = apple_pmc_enable_write(pmc, rail);
+	if (!ret)
+		apple_pmc_dcs_vote(pmc);
+
+	return ret;
+}
+
 static int apple_pmc_dcs_set_cur_state(struct thermal_cooling_device *cdev,
 				       unsigned long state)
 {
 	struct apple_pmc *pmc = cdev->devdata;
-	unsigned int rail = pmc->hw->dcs_rail;
-	unsigned long flags;
+	unsigned long flags, old;
+	bool limited;
 	int ret = 0;
 
 	if (state > pmc->hw->dcs_max)
 		return -EINVAL;
 
 	raw_spin_lock_irqsave(&pmc->lock, flags);
-	if (state != pmc->dcs_state) {
+	old = pmc->dcs_state;
+	if (state != old) {
+		ret = apple_pmc_dcs_limit(pmc, state);
 		/*
-		 * Vote the capped demand before the other agents stop being
-		 * honoured, and drop that vote only once they are honoured
-		 * again, so that the rail never dips below either.
+		 * The rail enable did not change, so neither did the limit:
+		 * go back to the old state, which the next call then retries
+		 * to leave.
 		 */
-		WRITE_ONCE(pmc->dcs_state, state);
-		if (state) {
-			apple_pmc_dcs_vote(pmc);
-			ret = apple_pmc_enable_write(pmc, rail);
-		} else {
-			ret = apple_pmc_enable_write(pmc, rail);
-			apple_pmc_dcs_vote(pmc);
-		}
+		if (ret)
+			apple_pmc_dcs_limit(pmc, old);
 	}
+	limited = pmc->dcs_state;
 	raw_spin_unlock_irqrestore(&pmc->lock, flags);
 
-	if (state)
+	if (limited)
 		queue_delayed_work(system_freezable_power_efficient_wq,
 				   &pmc->dcs_work,
 				   msecs_to_jiffies(APPLE_PMC_DCS_POLL_MS));
