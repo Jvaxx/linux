@@ -388,6 +388,30 @@ static void mt_scan_quiesce_retirement_test(struct kunit *test)
 	m->wiphy = NULL;
 }
 
+/*
+ * An RF failure while the connect worker is publishing a new connection
+ * must not report the disconnect ahead of the connect: it leaves the report
+ * to the worker. (cfg80211 is not called here: the synthetic netdev has no
+ * wireless device, so a direct report would crash the test.)
+ */
+static void mt_rf_failure_during_publication_test(struct kunit *test)
+{
+	struct mt7932 *m = test->priv;
+
+	m->connecting = false;
+	m->connected = true;
+	m->connect_publishing = true;
+	mt_rf_test_fail(m, -EIO);
+	KUNIT_EXPECT_TRUE(test, m->connect_lost);
+	KUNIT_EXPECT_FALSE(test, m->connected);
+	KUNIT_EXPECT_TRUE(test, m->disconnecting);
+	KUNIT_EXPECT_FALSE(test, netif_carrier_ok(m->netdev));
+	/* Ownership is uncertain after an RF failure: keep the peer. */
+	KUNIT_EXPECT_TRUE(test, m->peer_valid);
+	m->connect_lost = false;
+	m->connect_publishing = false;
+}
+
 static struct kunit_case mt_rf_test_cases[] = {
 	KUNIT_CASE(mt_startup_band1_queue_drain_test),
 	KUNIT_CASE(mt_missing_policy_admission_retry_test),
@@ -396,6 +420,7 @@ static struct kunit_case mt_rf_test_cases[] = {
 	KUNIT_CASE(mt_rf_failure_blocks_startup_test),
 	KUNIT_CASE(mt_rf_failure_preserves_first_error_test),
 	KUNIT_CASE(mt_scan_quiesce_retirement_test),
+	KUNIT_CASE(mt_rf_failure_during_publication_test),
 	{}
 };
 
