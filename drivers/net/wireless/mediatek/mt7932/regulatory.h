@@ -5,6 +5,8 @@
 /* Private, versioned packaging of original-derived country policy. This is
  * not firmware code and does not replace cfg80211's regulatory database.
  */
+#include <net/cfg80211.h>
+
 #include "channels.h"
 
 #define MT7932_POLICY_TABLES 13
@@ -100,6 +102,36 @@ static inline int mt7932_policy_parse(struct mt7932_policy *out,
 		at += n;
 	}
 	return at == size ? 0 : -EINVAL;
+}
+
+/*
+ * Whether @next differs from the applied @prev only by NO_IR lifted on some
+ * channels, as a beacon hint does in the world domain: same country, firmware
+ * domain header, channel list and limits, and every channel's flags equal to
+ * the applied ones less, at most, NO_IR. Such a change only permits more; the
+ * firmware may keep the stricter domain until it is idle.
+ */
+static inline bool mt7932_reg_only_relaxes(const struct mt7932_reg_snapshot *prev,
+					   const struct mt7932_reg_snapshot *next)
+{
+	unsigned int i, count;
+
+	if (prev->error || next->error || prev->length != next->length ||
+	    prev->length < 12 || prev->length > sizeof(prev->domain) ||
+	    memcmp(prev->alpha2, next->alpha2, 2) ||
+	    memcmp(prev->domain, next->domain, 12) ||
+	    memcmp(prev->power, next->power, sizeof(prev->power)))
+		return false;
+	count = (prev->length - 12) / 8;
+	for (i = 0; i < count; i++) {
+		const u8 *a = prev->domain + 12 + i * 8, *b = next->domain + 12 + i * 8;
+		u32 was = get_unaligned_le32(a + 4), now = get_unaligned_le32(b + 4);
+
+		if (memcmp(a, b, 4) || (now & ~was) ||
+		    ((was & ~now) & ~IEEE80211_CHAN_NO_IR))
+			return false;
+	}
+	return true;
 }
 
 /* Every entry of a validated package starts with its channel number and is
