@@ -188,6 +188,8 @@ fn align_up(v: usize, a: usize) -> usize {
     (v + a - 1) & !(a - 1)
 }
 
+mod aop_ring;
+
 /// Index into the AFK endpoint tables for RTKit endpoint `ep`, if it is one
 /// of the endpoints this driver drives.
 fn afk_endpoint_index(ep: u8) -> Option<usize> {
@@ -621,43 +623,62 @@ impl AFKEndpoint {
             }
         };
         let mut rptr = self.iomem_read32(buf_offset + block_size)? as usize;
-        let mut wptr = self.iomem_read32(buf_offset + block_size * 2)?;
+        let mut wptr = self.iomem_read32(buf_offset + block_size * 2)? as usize;
         mem_sync();
         let base = buf_offset + block_size * 3;
         let mut msg_buf = KVec::new();
-        while wptr as usize != rptr {
-            let mut qeh_bytes = [0; QEH_SIZE];
-            self.memcpy_from_iomem(base + rptr, &mut qeh_bytes)?;
-            let mut qeh = QEHeader::from_bytes(&qeh_bytes);
-            if qeh.magic != QE_MAGIC1 && qeh.magic != QE_MAGIC2 {
-                let magic = qeh.magic;
+        let ring = match aop_ring::Ring::new(buf_size, block_size) {
+            Ok(ring) => ring,
+            Err(e) => {
                 dev_err!(
                     client.dev,
-                    "Invalid magic on ep {}, got {:x}",
+                    "Invalid ring on ep {}: size {:#x} block {:#x}",
                     self.index,
-                    magic
+                    buf_size,
+                    block_size
+                );
+                return Err(e);
+            }
+        };
+        // Entries the producer adds while this pass runs beyond one ring's
+        // worth are left for the doorbell that announces them.
+        let mut budget = ring.capacity();
+        loop {
+            if ring.check_ptr(rptr).is_err() || ring.check_ptr(wptr).is_err() {
+                dev_err!(
+                    client.dev,
+                    "Ring pointers out of range on ep {}: rptr {:#x} wptr {:#x}",
+                    self.index,
+                    rptr,
+                    wptr
                 );
                 return Err(EIO);
             }
-            let room = buf_size.checked_sub(rptr + QEH_SIZE).ok_or(EIO)?;
-            if qeh.size as usize > room {
-                rptr = 0;
-                self.memcpy_from_iomem(base + rptr, &mut qeh_bytes)?;
-                qeh = QEHeader::from_bytes(&qeh_bytes);
-
-                if qeh.magic != QE_MAGIC1 && qeh.magic != QE_MAGIC2 {
-                    let magic = qeh.magic;
-                    dev_err!(
-                        client.dev,
-                        "Invalid magic on ep {}, got {:x}",
-                        self.index,
-                        magic
-                    );
-                    return Err(EIO);
-                }
+            if wptr == rptr || budget == 0 {
+                break;
             }
+            budget -= 1;
+            let mut last = QEHeader::default();
+            let read = ring.read_entry(rptr, |ptr| {
+                let mut qeh_bytes = [0; QEH_SIZE];
+                self.memcpy_from_iomem(base + ptr, &mut qeh_bytes)?;
+                last = QEHeader::from_bytes(&qeh_bytes);
+                Ok(last)
+            });
+            let Ok((qeh, entry, next)) = read else {
+                let (magic, size) = (last.magic, last.size);
+                dev_err!(
+                    client.dev,
+                    "Invalid entry on ep {} at {:#x}: magic {:x} size {:#x}",
+                    self.index,
+                    rptr,
+                    magic,
+                    size
+                );
+                return Err(EIO);
+            };
             msg_buf.resize(qeh.size as usize, 0, GFP_KERNEL)?;
-            self.memcpy_from_iomem(base + rptr + QEH_SIZE, &mut msg_buf)?;
+            self.memcpy_from_iomem(base + entry + QEH_SIZE, &mut msg_buf)?;
             // A message the endpoint cannot handle is skipped. The ring
             // position is still good, and not advancing past the entry would
             // read it again on every doorbell and stall the endpoint for good.
@@ -682,10 +703,10 @@ impl AFKEndpoint {
                     }
                 }
             }
-            rptr = align_up(rptr + QEH_SIZE + qeh.size as usize, block_size) % buf_size;
+            rptr = next;
             mem_sync();
             self.iomem_write32(buf_offset + block_size, rptr as u32)?;
-            wptr = self.iomem_read32(buf_offset + block_size * 2)?;
+            wptr = self.iomem_read32(buf_offset + block_size * 2)? as usize;
             mem_sync();
         }
         Ok(())
