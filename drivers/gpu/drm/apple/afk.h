@@ -266,6 +266,11 @@ struct afk_qe {
 	u8 data[];
 };
 
+static inline bool afk_ring_payload_fits(u32 ptr, u32 bytes, size_t bufsz)
+{
+	return ptr + bytes + sizeof(struct afk_qe) <= bufsz;
+}
+
 struct epic_hdr {
 	u8 version;
 	__le16 seq;
