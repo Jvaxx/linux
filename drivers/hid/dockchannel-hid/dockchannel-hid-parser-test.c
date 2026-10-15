@@ -183,7 +183,21 @@ static void dchid_packet_checksum_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, dchid_verify_checksum(&hdr, body, &checksum));
 }
 
+static void dchid_unaligned_checksum_test(struct kunit *test)
+{
+	struct dchid_hdr hdr = { .hdr_len = sizeof(hdr) };
+	u8 body[16] = {};
+	u32 checksum;
+
+	for (hdr.length = 9; hdr.length < 12; hdr.length++) {
+		put_unaligned_le32(U32_MAX - dchid_checksum(&hdr, sizeof(hdr)), body + 8);
+		memset(body + 12, 0xa5, 4);
+		KUNIT_EXPECT_FALSE(test, dchid_verify_checksum(&hdr, body, &checksum));
+	}
+}
+
 static struct kunit_case dchid_parser_cases[] = {
+	KUNIT_CASE(dchid_unaligned_checksum_test),
 	KUNIT_CASE(dchid_short_ack_test),
 	KUNIT_CASE(dchid_ack_length_test),
 	KUNIT_CASE(dchid_ack_identity_test),
