@@ -2,6 +2,8 @@
 
 CFLAGS_trace.o = -I$(src)
 
+appledrm-y := apple_drv.o apple_resume.o
+appledrm-y += afk.o dcp.o dcp_backlight.o dptxep.o iomfb.o parser.o systemep.o
 appledrm-y := apple_drv.o
 appledrm-y += afk.o dcp.o dcp-fabric.o dcp_backlight.o dptxep.o iomfb.o parser.o systemep.o
 appledrm-y += dcp-hdmi.o
@@ -18,6 +20,7 @@ appledrm-y += iomfb_v14_7.o iomfb_v14_7_link.o
 appledrm-y += iomfb_v26_6.o iomfb_v26_6_link.o
 appledrm-y += iomfb_h17p.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += iomfb_h17p_test.o
+appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += apple_resume_test.o
 appledrm-y += epic/dpavservep.o
 appledrm-y += plane.o
 
