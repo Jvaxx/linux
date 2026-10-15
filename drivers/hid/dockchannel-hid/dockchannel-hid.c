@@ -308,6 +308,11 @@ static u32 dchid_checksum(void *p, size_t length)
 
 static bool dchid_verify_checksum(struct dchid_hdr *hdr, void *data, u32 *checksum)
 {
+	if (!IS_ALIGNED(hdr->length, sizeof(u32))) {
+		*checksum = 0;
+		return false;
+	}
+
 	*checksum = dchid_checksum(hdr, sizeof(*hdr));
 	*checksum += dchid_checksum(data, hdr->length + sizeof(u32));
 	return *checksum == U32_MAX;
