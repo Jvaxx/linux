@@ -3603,23 +3603,18 @@ static void atcphy_usb3_pm_put(struct atcphy_usb3_pm *pm)
 #endif
 }
 
-static int atcphy_mux_set_locked(struct typec_mux_dev *mux, struct typec_mux_state *state)
+/* The PHY mode a Type-C mux state asks for; unsupported states turn the PHY off. */
+static enum atcphy_mode atcphy_typec_target_mode(struct apple_atcphy *atcphy,
+						 const struct typec_mux_state *state)
 {
-	struct apple_atcphy *atcphy = typec_mux_get_drvdata(mux);
 	enum atcphy_mode target_mode;
-	int ret;
-
-	guard(mutex)(&atcphy->lock);
-	dev_dbg(atcphy->dev, "mux mode=%lu svid=%04x current=%u fixed=%u dp=%u ss=%u\n",
-		state->mode, state->alt ? state->alt->svid : 0, atcphy->mode,
-		atcphy->fixed_usb2, atcphy->dp_tunables, atcphy->ss_tunables);
 
 	if (state->mode == TYPEC_STATE_SAFE) {
 		target_mode = APPLE_ATCPHY_MODE_OFF;
 	} else if (state->mode == TYPEC_STATE_USB) {
 		target_mode = APPLE_ATCPHY_MODE_USB3;
 	} else if (!state->alt && state->mode == TYPEC_MODE_USB4) {
-		struct enter_usb_data *data = state->data;
+		const struct enter_usb_data *data = state->data;
 		u32 eudo_usb_mode = FIELD_GET(EUDO_USB_MODE_MASK, data->eudo);
 
 		switch (eudo_usb_mode) {
@@ -3673,7 +3668,17 @@ static int atcphy_mux_set_locked(struct typec_mux_dev *mux, struct typec_mux_sta
 	if (atcphy->fixed_usb2 && target_mode == APPLE_ATCPHY_MODE_OFF)
 		target_mode = APPLE_ATCPHY_MODE_USB2;
 
-	dev_dbg(atcphy->dev, "mux target=%u\n", target_mode);
+	return target_mode;
+}
+
+static int atcphy_mux_set_locked(struct apple_atcphy *atcphy, enum atcphy_mode target_mode)
+{
+	int ret;
+
+	guard(mutex)(&atcphy->lock);
+	dev_dbg(atcphy->dev, "mux target=%u current=%u dirty=%u\n", target_mode,
+		atcphy->mode, atcphy->mode_dirty);
+
 	if (atcphy->mode == target_mode && !atcphy->mode_dirty) {
 		/* Retry a failed PIPE setup without disturbing the configured lanes. */
 		if (atcphy->fixed_usb2 && atcphy->host_active &&
@@ -3757,12 +3762,20 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 {
 	struct apple_atcphy *atcphy = typec_mux_get_drvdata(mux);
 	struct atcphy_usb3_pm pm = {};
+	enum atcphy_mode target_mode;
 	int ret;
+
+	scoped_guard(mutex, &atcphy->lock) {
+		dev_dbg(atcphy->dev, "mux mode=%lu svid=%04x current=%u fixed=%u dp=%u ss=%u\n",
+			state->mode, state->alt ? state->alt->svid : 0, atcphy->mode,
+			atcphy->fixed_usb2, atcphy->dp_tunables, atcphy->ss_tunables);
+		target_mode = atcphy_typec_target_mode(atcphy, state);
+	}
 
 	ret = atcphy_usb3_pm_get(atcphy, &pm);
 	if (ret)
 		return ret;
-	ret = atcphy_mux_set_locked(mux, state);
+	ret = atcphy_mux_set_locked(atcphy, target_mode);
 	atcphy_usb3_pm_put(&pm);
 	return ret;
 }
