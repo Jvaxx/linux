@@ -40,6 +40,10 @@
 #include <linux/thermal.h>
 #include <linux/workqueue.h>
 
+#if IS_ENABLED(CONFIG_APPLE_PMC_KUNIT_TEST)
+#include <kunit/static_stub.h>
+#endif
+
 #define APPLE_PMC_MAX_RAILS	8
 #define APPLE_PMC_MAX_AGENTS	32
 #define APPLE_PMC_MAX_STATES	16
@@ -115,6 +119,9 @@ static struct dentry *apple_pmc_debugfs_root;
 
 static u32 apple_pmc_enable_read(struct apple_pmc *pmc, unsigned int rail)
 {
+#if IS_ENABLED(CONFIG_APPLE_PMC_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(apple_pmc_enable_read, pmc, rail);
+#endif
 	return readl(pmc->rails + pmc->hw->rail_enable + 4 * rail);
 }
 
@@ -125,7 +132,7 @@ static u32 apple_pmc_enable_read(struct apple_pmc *pmc, unsigned int rail)
 static int apple_pmc_enable_write(struct apple_pmc *pmc, unsigned int rail)
 {
 	void __iomem *reg = pmc->rails + pmc->hw->rail_enable + 4 * rail;
-	u32 old = readl(reg);
+	u32 old = apple_pmc_enable_read(pmc, rail);
 	u32 val = pmc->enable[rail];
 
 	if (pmc->dcs_state && rail == pmc->hw->dcs_rail)
@@ -134,7 +141,7 @@ static int apple_pmc_enable_write(struct apple_pmc *pmc, unsigned int rail)
 		return 0;
 
 	writel(val, reg);
-	if (readl(reg) != val) {
+	if (apple_pmc_enable_read(pmc, rail) != val) {
 		dev_err_ratelimited(pmc->dev,
 				    "rail %u enable %#x -> %#x did not stick\n",
 				    rail, old, val);
