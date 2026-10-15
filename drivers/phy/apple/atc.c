@@ -27,6 +27,7 @@
 #include <linux/bitfield.h>
 #include <linux/cleanup.h>
 #include <linux/delay.h>
+#include <linux/devm-helpers.h>
 #include <linux/iopoll.h>
 #include <linux/lockdep.h>
 #include <linux/module.h>
@@ -683,6 +684,8 @@ struct atcphy_hw {
  *               then routes the PIPE itself on later Type-C mode changes
  * @usb3_port_off: The SuperSpeed root port of a fixed-hub controller was powered
  *                 off for a PIPE or lane change and is not powered on again yet
+ * @usb3_port_work: Retries the power-on of @usb3_port_off after a USB failure
+ * @usb3_port_retries: Retries left for @usb3_port_work
  * @mode: Current PHY operating mode
  * @swap_lanes: True if lanes must be swapped due to cable orientation
  * @dp_link_rate: DisplayPort link rate
@@ -749,6 +752,8 @@ struct apple_atcphy {
 	enum atcphy_mode typec_mode;
 	bool host_active;
 	bool usb3_port_off;
+	struct delayed_work usb3_port_work;
+	unsigned int usb3_port_retries;
 	enum atcphy_mode mode;
 	int dp_link_rate;
 	bool swap_lanes;
@@ -3704,6 +3709,77 @@ static int atcphy_usb3_port_on(struct apple_atcphy *atcphy, struct atcphy_usb3_p
 	return ret;
 }
 
+/*
+ * A mux update that keeps the mode does not fail on the USB side, so that the
+ * display it may carry stays up, and no Type-C event need follow any update.
+ * A SuperSpeed port power-on that an update still owes after a USB failure is
+ * retried from here, a few times, with the locks of a mux update, the current
+ * root hub, and only while the PIPE is on the USB3 backend of a running host.
+ * The work is freezable, so it waits across system sleep, and is cancelled on
+ * removal.
+ */
+#define ATCPHY_USB3_PORT_RETRIES	5
+#define ATCPHY_USB3_PORT_RETRY_MS	100
+
+static unsigned long atcphy_usb3_port_retry_delay(unsigned int retry)
+{
+	KUNIT_STATIC_STUB_REDIRECT(atcphy_usb3_port_retry_delay, retry);
+
+	return msecs_to_jiffies(ATCPHY_USB3_PORT_RETRY_MS << retry);
+}
+
+static void atcphy_usb3_port_retry(struct apple_atcphy *atcphy, bool restart, int err)
+{
+	unsigned int retry = 0;
+
+	scoped_guard(mutex, &atcphy->lock) {
+		if (restart)
+			atcphy->usb3_port_retries = ATCPHY_USB3_PORT_RETRIES;
+		if (!atcphy->usb3_port_retries) {
+			dev_warn(atcphy->dev, "SuperSpeed port left off: %d\n", err);
+			return;
+		}
+		retry = ATCPHY_USB3_PORT_RETRIES - atcphy->usb3_port_retries--;
+	}
+	dev_dbg(atcphy->dev, "SuperSpeed port power-on deferred: %d\n", err);
+	mod_delayed_work(system_freezable_wq, &atcphy->usb3_port_work,
+			 atcphy_usb3_port_retry_delay(retry));
+}
+
+/* Power the SuperSpeed port on if it is still owed and the route still ready */
+static int atcphy_usb3_port_restore(struct apple_atcphy *atcphy, struct atcphy_usb3_pm *pm)
+{
+	int ret;
+
+	scoped_guard(mutex, &atcphy->lock) {
+		if (!atcphy->usb3_port_off || !atcphy_usb3_port_ready(atcphy))
+			return 0;
+	}
+	ret = atcphy_usb3_port_on(atcphy, pm);
+	if (ret < 0)
+		return ret;
+	scoped_guard(mutex, &atcphy->lock)
+		atcphy->usb3_port_off = false;
+
+	return 0;
+}
+
+static void atcphy_usb3_port_work(struct work_struct *work)
+{
+	struct apple_atcphy *atcphy = container_of(to_delayed_work(work), struct apple_atcphy,
+						   usb3_port_work);
+	struct atcphy_usb3_pm pm = {};
+	int ret;
+
+	ret = atcphy_usb3_pm_get(atcphy, &pm);
+	if (!ret) {
+		ret = atcphy_usb3_port_restore(atcphy, &pm);
+		atcphy_usb3_pm_put(&pm);
+	}
+	if (ret)
+		atcphy_usb3_port_retry(atcphy, false, ret);
+}
+
 /* The PHY mode a Type-C mux state asks for; unsupported states turn the PHY off. */
 static enum atcphy_mode atcphy_typec_target_mode(struct apple_atcphy *atcphy,
 						 const struct typec_mux_state *state)
@@ -3988,11 +4064,12 @@ out:
 	/*
 	 * With the lanes and the PIPE already as the mode needs them, only
 	 * USB3 is missing, and that must not fail what may be a DisplayPort
-	 * update. The port stays off until the next update.
+	 * update. Either way, retry the port from here.
 	 */
-	if (ret && usb_err && in_mode) {
-		dev_dbg(atcphy->dev, "SuperSpeed port left off: %d\n", ret);
-		return 0;
+	if (ret && usb_err) {
+		atcphy_usb3_port_retry(atcphy, true, ret);
+		if (in_mode)
+			return 0;
 	}
 	return ret;
 }
@@ -4289,6 +4366,9 @@ static int atcphy_probe(struct platform_device *pdev)
 	atcphy->np = dev->of_node;
 	mutex_init(&atcphy->lock);
 	platform_set_drvdata(pdev, atcphy);
+	ret = devm_delayed_work_autocancel(dev, &atcphy->usb3_port_work, atcphy_usb3_port_work);
+	if (ret)
+		return ret;
 
 	ret = atcphy_map_resources(pdev, atcphy);
 	if (ret)
