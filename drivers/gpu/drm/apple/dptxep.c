@@ -84,10 +84,9 @@ struct dptxport_apcall_set_tiled {
 };
 
 /*
- * Ported from aurora-silicon/linux#8: a Thunderbolt DP tunnel uses the same
- * plain CORE|ATC|DIE|CONNECTED target as a direct alt-mode PHY. CORE is the
- * DFP port (0 = dpphy, 1/2 = dpin0/dpin1, dcp->dptx_dfp_port), ATC is the
- * route's own ATC index -- no separate DPIN field.
+ * A Thunderbolt DP tunnel uses the same CORE|ATC|DIE|CONNECTED target as a
+ * direct alt-mode PHY: CORE is the DFP port (0 = dpphy, 1/2 = dpin0/dpin1)
+ * and ATC the route's own ATC index.
  */
 static u32 dptxport_remote_target(struct apple_dcp *dcp, u8 core, u8 atc,
 				  u8 die)
@@ -107,29 +106,13 @@ int dptxport_validate_connection(struct apple_epic_service *service, u8 core,
 	u32 target = dptxport_remote_target(service->ep->dcp, core, atc, die);
 
 	/*
-	 * attributes: role (0 = direct PHY, 1 = Thunderbolt/USB4 DP IN) |
-	 * supportsHPD << 8. A real, hardware-validated reference
-	 * implementation of the equivalent Thunderbolt DP tunnel mechanism
-	 * on a different SoC (aurora-silicon/linux#8) adds this exact role
-	 * bit for its tunnel routes; our own analog-DPIN path has never set
-	 * it, always sending a plain direct-PHY attributes value even
-	 * though this is a genuinely USB4-tunneled connection. DCP firmware
-	 * appears to treat a failed AUX probe as fatal for role=0 but keeps
-	 * training regardless for role=1 (a Thunderbolt tunnel's AUX
-	 * proxying may not respond as fast as a direct PHY's): repeated
-	 * test runs with substantially different Activate/crossbar ordering
-	 * all reached the identical INACTIVE_SINK_DETECTED/DPRX-timeout
-	 * outcome, which points at a signal we are not sending at all
-	 * rather than a timing issue fixable by reordering.
+	 * Attributes: role (0 = direct PHY, 1 = Thunderbolt/USB4 DP IN) |
+	 * supports HPD << 8. Without the DP IN role DCP gives up on a tunnel
+	 * whose AUX channel is slower to answer than a direct PHY's.
 	 */
 	u32 attrs = 0x100 | (dcp_is_usb4_output(service->ep->dcp) ? 1 : 0);
 
 	trace_dptxport_validate_connection(dptx, core, atc, die);
-	dptx->validate_calls++;
-	dev_dbg(service->ep->dcp->dev,
-		 "DPTX validate: call #%u this boot target=0x%x core=%u atc=%u die=%u attrs=0x%x caller=%pS\n",
-		 dptx->validate_calls, target, core, atc, die,
-		 attrs, __builtin_return_address(0));
 
 	cmd.target = cpu_to_le32(target);
 	cmd.unk = cpu_to_le32(attrs);
@@ -172,11 +155,6 @@ int dptxport_connect(struct apple_epic_service *service, u8 core, u8 atc,
 	u32 target = dptxport_remote_target(service->ep->dcp, core, atc, die);
 
 	trace_dptxport_connect(dptx, core, atc, die);
-	dptx->connect_calls++;
-	dev_dbg(service->ep->dcp->dev,
-		 "DPTX connect: call #%u this boot target=0x%x unk=0x%x caller=%pS\n",
-		 dptx->connect_calls, target, unk_field,
-		 __builtin_return_address(0));
 
 	cmd.target = cpu_to_le32(target);
 	cmd.unk = cpu_to_le32(unk_field);
@@ -200,35 +178,13 @@ int dptxport_connect(struct apple_epic_service *service, u8 core, u8 atc,
 
 int dptxport_request_display(struct apple_epic_service *service)
 {
-	struct dptx_port *dptx = service->cookie;
-	int ret;
-
-	dptx->request_calls++;
-	dev_dbg(service->ep->dcp->dev,
-		 "DPTX request_display: call #%u this boot caller=%pS\n",
-		 dptx->request_calls, __builtin_return_address(0));
-	ret = afk_service_call(service, 0, 6, NULL, 0, 16, NULL, 0, 16);
-	dev_dbg(service->ep->dcp->dev,
-		 "DPTX request_display: call #%u result=%d\n",
-		 dptx->request_calls, ret);
-	return ret;
+	return afk_service_call(service, 0, 6, NULL, 0, 16, NULL, 0, 16);
 }
 
 int dptxport_release_display(struct apple_epic_service *service)
 {
-	struct dptx_port *dptx = service->cookie;
-	int ret;
-
 	dcp_180hz_invalidate(service->ep->dcp);
-	dptx->release_calls++;
-	dev_dbg(service->ep->dcp->dev,
-		 "DPTX release_display: call #%u this boot caller=%pS\n",
-		 dptx->release_calls, __builtin_return_address(0));
-	ret = afk_service_call(service, 0, 7, NULL, 0, 16, NULL, 0, 16);
-	dev_dbg(service->ep->dcp->dev,
-		 "DPTX release_display: call #%u result=%d\n",
-		 dptx->release_calls, ret);
-	return ret;
+	return afk_service_call(service, 0, 7, NULL, 0, 16, NULL, 0, 16);
 }
 
 int dptxport_set_hpd_timeout(struct apple_epic_service *service, bool hpd,
@@ -458,23 +414,8 @@ static int dptxport_call_set_active_lane_count(struct apple_epic_service *servic
 		dev_dbg(dcp->dev, "USB4/DPTX: SET_ACTIVE_LANE_COUNT %llu\n",
 			lane_count);
 		/*
-		 * dcp_usb4_drm_allowed() (usb4_force_dptx) used to gate this
-		 * for the old manual-training sysfs knob (module_param_cb
-		 * usb4_dptx_train), removed wholesale in 0dc9f50 when
-		 * apple_dcp_tb_dp_tunnel() replaced it with automatic tunnel
-		 * detection -- but usb4_force_dptx itself, and this gate,
-		 * were left behind with no way left to ever set it true.
-		 * dcp_dptx_connect()'s single wait_for_completion_timeout()
-		 * on linkcfg_completion is now shared by both the alt-mode
-		 * and USB4-tunnel paths (also part of 0dc9f50's unification),
-		 * so gating it here meant every tunneled connect timed out
-		 * after a fully successful DPRX/AUX handshake and lane
-		 * negotiation -- firmware does not send FORCE_HOTPLUG_DETECT
-		 * (the only other completion site) for a tunnel. The
-		 * reference (aurora-silicon/linux#8) completes
-		 * linkcfg_completion here unconditionally; usb4_lane_completion
-		 * has no consumer anywhere in this tree, so this drops both the
-		 * dead gate and the dead completion and matches the reference.
+		 * dcp_dptx_connect() waits for this on alt-mode and tunnel
+		 * routes alike: DCP sends no FORCE_HOTPLUG_DETECT for a tunnel.
 		 */
 		complete(&dptx->linkcfg_completion);
 	}
@@ -514,11 +455,8 @@ static int
 dptxport_call_did_change_link_config(struct apple_epic_service *service)
 {
 	/*
-	 * Ported from aurora-silicon/linux#8: bringing the tunnel crossbar
-	 * connection up (dcp_tunnel_crossbar_up()) now happens in
-	 * dptxport_call(), after this succeeds, gated on
-	 * dptx_tunnel && link_rate -- not inside this handler, and its
-	 * result is never propagated back to DCP as a call failure.
+	 * dptxport_call() brings a tunnel's crossbar connection up after
+	 * this; its result is never reported to DCP as a call failure.
 	 */
 
 	/* assume the link config did change and wait a little bit */
@@ -580,11 +518,10 @@ static int dptxport_call_set_link_rate(struct apple_epic_service *service,
 
 	if (phy_set_rate) {
 		/*
-		 * Ported from aurora-silicon/linux#8: a Thunderbolt DP tunnel
-		 * starts/stops its own pixel clock instead of configuring the
-		 * PHY directly, and never fails the apcall over it -- a
-		 * failed clock just keeps the crossbar connection down
-		 * (dcp->tb_clock_ok), which dcp_tunnel_crossbar_up() checks.
+		 * A Thunderbolt DP tunnel starts and stops its own pixel clock
+		 * instead of configuring the PHY, and never fails the call over
+		 * it: a failed clock keeps the crossbar connection down, see
+		 * dcp_tunnel_crossbar_up().
 		 */
 		if (dptx->atcphy && service->ep->dcp->dptx_tunnel) {
 			dcp_tunnel_set_rate(service->ep->dcp, dptx->atcphy,
@@ -664,12 +601,10 @@ dptxport_call_activate(struct apple_epic_service *service,
 	struct apple_dcp *dcp = service->ep->dcp;
 
 	/*
-	 * Ported from aurora-silicon/linux#8: no crossbar, and no PHY mode
-	 * change for a tunnel (dptx->atcphy must stay in USB4/TBT mode the
-	 * whole connection, see dcp_tunnel_set_rate()). The DP IN adapter is
-	 * only woken (DPTX_INACTIVE=0) here, via dcp_tunnel_dpin_activate();
-	 * waking it earlier hangs the machine. Activate always replies
-	 * success to DCP.
+	 * No PHY mode change for a tunnel: the ATC PHY stays in USB4/TBT
+	 * mode for the whole connection. The DP IN adapter may only be woken
+	 * (DPTX_INACTIVE=0) from here; waking it earlier hangs the machine.
+	 * Activate always replies success to DCP.
 	 */
 	if (dptx->atcphy && !dcp->phy_managed_by_typec)
 		phy_set_mode_ext(dptx->atcphy, PHY_MODE_DP, dcp->index);
@@ -755,11 +690,7 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 
 	switch (idx) {
 	case DPTX_APCALL_WILL_CHANGE_LINKG_CONFIG:
-		/*
-		 * Ported from aurora-silicon/linux#8: a re-link on an
-		 * established tunnel takes the crossbar connection down
-		 * first.
-		 */
+		/* A re-link takes an established tunnel's crossbar down first. */
 		if (service->ep->dcp->dptx_tunnel && dptx->link_rate)
 			dcp_tunnel_crossbar_down(service->ep->dcp);
 		return dptxport_call_will_change_link_config(service);
