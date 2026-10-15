@@ -794,11 +794,131 @@ static void dcp_consume_edid_invalidation(struct apple_connector *connector)
 		dcp_clear_connector_edid(connector);
 }
 
+/*
+ * The external H17P pipeline learns the modes of each cable connection from
+ * firmware messages that can lag the link; see dcp-announce.h.
+ */
+static bool dcp_announce_gated(struct apple_dcp *dcp,
+			       struct apple_connector *connector)
+{
+	return dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL &&
+	       READ_ONCE(dcp->connector) == connector;
+}
+
+/*
+ * Queue the timeout work of a held connection: at once for a hold whose
+ * timeout has not started for the current cable generation, as only that
+ * work starts it.
+ */
+void dcp_announce_arm(struct apple_dcp *dcp)
+{
+	struct dcp_announce *a = &dcp->announce;
+	unsigned long now = jiffies, delay = 0;
+
+	lockdep_assert_held(&dcp->hpd_mutex);
+	if (a->stopped || !a->holding)
+		return;
+	if (a->timed && a->generation == dcp->typec_generation &&
+	    time_before(now, a->deadline))
+		delay = a->deadline - now;
+	mod_delayed_work(system_freezable_wq, &dcp->announce_wq, delay);
+}
+
+/*
+ * Evaluate what DRM is to report for the connection.  @start starts the
+ * timeout of a held connection; only the timeout work does that.
+ */
+static enum dcp_announce_status
+dcp_announce_eval(struct apple_dcp *dcp, struct apple_connector *connector,
+		  bool start)
+{
+	struct dcp_announce *a = &dcp->announce;
+	struct dcp_announce_facts facts = {
+		.generation = dcp->typec_generation,
+		.connected = READ_ONCE(connector->connected),
+		.present = !READ_ONCE(dcp->external_physically_absent),
+		.failed = READ_ONCE(dcp->external_error) || READ_ONCE(dcp->crashed),
+	};
+	enum dcp_announce_status status;
+	unsigned long now = jiffies;
+	bool held = a->holding, announced = a->announced;
+
+	lockdep_assert_held(&dcp->hpd_mutex);
+	if (facts.connected && facts.present && !facts.failed)
+		facts.ready = dcp_external_modes_ready(dcp);
+	status = dcp_announce_update(a, &facts, now);
+	if (status == DCP_ANNOUNCE_HOLD) {
+		if (start)
+			dcp_announce_start(a, now);
+		dcp_announce_arm(dcp);
+	} else if (held) {
+		/* The hold ended: its timeout work has nothing left to do. */
+		cancel_delayed_work(&dcp->announce_wq);
+		if (status == DCP_ANNOUNCE_CONNECTED && !facts.ready && !facts.failed)
+			dev_info(dcp->dev, "display modes not ready after %u ms\n",
+				 announced ? DCP_ANNOUNCE_RESUME_TIMEOUT_MS :
+				 DCP_ANNOUNCE_TIMEOUT_MS);
+	}
+	return status;
+}
+
+/*
+ * Evaluate the connection outside the hotplug worker.  An event that this
+ * makes owed is the worker's to send, so queue it, unless the announcement
+ * is stopped: dcp_enable_typec_work() queues it then.
+ */
+static void dcp_announce_poll(struct apple_dcp *dcp, struct apple_connector *connector,
+			      bool start)
+{
+	bool owed = dcp_announce_owed(&dcp->announce);
+
+	dcp_announce_eval(dcp, connector, start);
+	if (!owed && dcp_announce_owed(&dcp->announce) && !dcp->announce.stopped)
+		schedule_work(&connector->hotplug_wq);
+}
+
+/*
+ * The timeout of a held connection.  It runs on the freezable workqueue, as
+ * the link work does, so the timeout of a hold starts here, once the link
+ * can come back for the hold's generation.  Everything it does is under
+ * hpd_mutex: a hold that ended meanwhile, or an announcement stopped for
+ * teardown or sleep, gets nothing more from here.
+ */
+void dcp_announce_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(to_delayed_work(work), struct apple_dcp,
+					     announce_wq);
+	struct apple_connector *con = READ_ONCE(dcp->connector);
+
+	scoped_guard(mutex, &dcp->hpd_mutex) {
+		if (dcp->announce.holding && !dcp->announce.stopped && con &&
+		    dcp_announce_gated(dcp, con) &&
+		    READ_ONCE(con->dcp) == to_platform_device(dcp->dev))
+			dcp_announce_poll(dcp, con, true);
+	}
+	dcp_test_point(dcp, DCP_TEST_ANNOUNCE_TIMER_DONE);
+}
+
+/* The connection state DRM reports for @connector. */
+bool dcp_connector_connected(struct apple_connector *connector)
+{
+	struct platform_device *pdev = READ_ONCE(connector->dcp);
+	struct apple_dcp *dcp = pdev ? platform_get_drvdata(pdev) : NULL;
+
+	if (!dcp || !dcp_announce_gated(dcp, connector))
+		return READ_ONCE(connector->connected);
+
+	guard(mutex)(&dcp->hpd_mutex);
+	dcp_announce_poll(dcp, connector, false);
+	return dcp->announce.announced;
+}
+
 void dcp_hotplug(struct work_struct *work)
 {
 	struct apple_connector *connector;
 	struct platform_device *pdev;
 	struct apple_dcp *dcp;
+	bool connected;
 	int ret;
 
 	connector = container_of(work, struct apple_connector, hotplug_wq);
@@ -827,12 +947,28 @@ void dcp_hotplug(struct work_struct *work)
 			dcp_clear_connector_edid(connector);
 	}
 
+	if (dcp_announce_gated(dcp, connector)) {
+		enum dcp_announce_status status;
+		bool notify;
+
+		scoped_guard(mutex, &dcp->hpd_mutex) {
+			status = dcp_announce_eval(dcp, connector, false);
+			notify = dcp_announce_notify(&dcp->announce, status);
+			connected = dcp->announce.announced;
+		}
+		/* The last missing fact or the timeout queues this work again. */
+		if (!notify)
+			return;
+	} else {
+		connected = READ_ONCE(connector->connected);
+	}
+
 	/*
 	 * DCP defers link training until we set a display mode. But we set
 	 * display modes from atomic_flush, so userspace needs to trigger a
 	 * flush, or the CRTC gets no signal.
 	 */
-	if (connector->base.state && !READ_ONCE(dcp->mode_state.valid) && connector->connected &&
+	if (connector->base.state && !READ_ONCE(dcp->mode_state.valid) && connected &&
 	    !(dcp_is_usb4_output(dcp) && apple_dp_tunnel_t602x())) {
 		drm_connector_set_link_status_property(&connector->base,
 						       DRM_MODE_LINK_STATUS_BAD);

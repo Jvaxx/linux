@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Copyright 2021 Alyssa Rosenzweig */
 
+#include <kunit/visibility.h>
 #include <linux/align.h>
 #include <linux/bitmap.h>
 #include <linux/clk.h>
@@ -2817,6 +2818,7 @@ static int dcp_external_disconnect(struct apple_dcp *dcp, bool physical)
 			WRITE_ONCE(dcp->typec_cable_connected, false);
 			dcp->typec_generation++;
 			dcp_firmware_metadata_connection(dcp, dcp->typec_generation, false);
+			dcp_announce_end(&dcp->announce);
 		}
 		/* HPD is fenced; retire the AV owner after releasing hpd_mutex. */
 		dpavservep_detach(dcp);
@@ -3046,6 +3048,7 @@ int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 			if (new_cable) {
 				dcp->typec_generation++;
 				dcp_firmware_metadata_connection(dcp, dcp->typec_generation, true);
+				dcp_announce_end(&dcp->announce);
 			}
 			dcp->placeholder_retried = false;
 		}
@@ -4051,29 +4054,45 @@ static void dcp_release_fixed_route(void *data)
 	dcp->typec_mux = NULL;
 }
 
-static void dcp_disable_typec_work(struct apple_dcp *dcp, bool release_cable)
+VISIBLE_IF_KUNIT void dcp_disable_typec_work(struct apple_dcp *dcp, bool release_cable)
 {
 	scoped_guard(mutex, &dcp->hpd_mutex) {
 		if (release_cable)
 			WRITE_ONCE(dcp->typec_cable_connected, false);
 		dcp->typec_generation++;
 		dcp_firmware_metadata_connection(dcp, dcp->typec_generation, false);
+		/* Nothing arms the timeout work past its drain below. */
+		dcp->announce.stopped = true;
 	}
 	if (release_cable && dcp_is_external_h17p(dcp))
 		dpavservep_detach(dcp);
 	/* Block new enqueues as well as draining users of the AFK endpoints. */
 	disable_delayed_work_sync(&dcp->typec_reconnect_wq);
 	disable_delayed_work_sync(&dcp->placeholder_edid_wq);
+	disable_delayed_work_sync(&dcp->announce_wq);
 	cancel_work_sync(&dcp->external_stop_work);
 }
 
-static void dcp_enable_typec_work(struct apple_dcp *dcp)
+VISIBLE_IF_KUNIT void dcp_enable_typec_work(struct apple_dcp *dcp)
 {
 	enable_delayed_work(&dcp->typec_reconnect_wq);
 	enable_delayed_work(&dcp->placeholder_edid_wq);
+	enable_delayed_work(&dcp->announce_wq);
 	/* A cable can be routed before the DRM component binds. */
 	if (READ_ONCE(dcp->typec_cable_connected))
 		mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq, 0);
+	if (dcp_is_external_h17p(dcp)) {
+		struct apple_connector *con = READ_ONCE(dcp->connector);
+
+		guard(mutex)(&dcp->hpd_mutex);
+		dcp->announce.stopped = false;
+		/* A hold that crossed system sleep waits for the new link from now. */
+		dcp_announce_arm(dcp);
+		/* Send an event that came due while stopped. */
+		if (dcp_announce_owed(&dcp->announce) && con &&
+		    READ_ONCE(con->dcp) == to_platform_device(dcp->dev))
+			schedule_work(&con->hotplug_wq);
+	}
 }
 
 static bool dcp_external_is_idle(struct apple_dcp *dcp)
@@ -4285,7 +4304,7 @@ err_piodma:
  * We need to shutdown DCP before tearing down the display subsystem. Otherwise
  * the DCP will crash and briefly flash a green screen of death.
  */
-static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
+VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
@@ -4315,6 +4334,14 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 			cancel_work_sync(&dcp->bl_update_wq);
 		}
 		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
+		/*
+		 * Stop the announcement before draining the hotplug work: that
+		 * work arms the timeout work, which in turn queues it.
+		 */
+		scoped_guard(mutex, &dcp->hpd_mutex)
+			dcp->announce.stopped = true;
+		disable_delayed_work_sync(&dcp->announce_wq);
+		dcp_test_point(dcp, DCP_TEST_UNBIND_ANNOUNCE_STOPPED);
 		cancel_work_sync(&dcp->vblank_wq);
 		if (dcp->connector)
 			cancel_work_sync(&dcp->connector->hotplug_wq);
@@ -4478,6 +4505,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 			  dcp_typec_reconnect_work);
 	INIT_DELAYED_WORK(&dcp->placeholder_edid_wq,
 			  dcp_placeholder_edid_work);
+	INIT_DELAYED_WORK(&dcp->announce_wq, dcp_announce_work);
 	INIT_DELAYED_WORK(&dcp->bl_fallback_wq, dcp_work_backlight_fallback);
 	/* System sleep and shutdown cancel these even if no bind succeeded. */
 	INIT_WORK(&dcp->vblank_wq, dcp_delayed_vblank);
@@ -4488,6 +4516,8 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	/* Balanced by enable at successful component bind. */
 	disable_delayed_work(&dcp->typec_reconnect_wq);
 	disable_delayed_work(&dcp->placeholder_edid_wq);
+	disable_delayed_work(&dcp->announce_wq);
+	dcp->announce.stopped = true;
 
 	platform_set_drvdata(pdev, dcp);
 
@@ -4650,7 +4680,7 @@ static void dcp_platform_remove(struct platform_device *pdev)
 	component_del(&pdev->dev, &dcp_comp_ops);
 }
 
-static void dcp_platform_shutdown(struct platform_device *pdev)
+VISIBLE_IF_KUNIT void dcp_platform_shutdown(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 

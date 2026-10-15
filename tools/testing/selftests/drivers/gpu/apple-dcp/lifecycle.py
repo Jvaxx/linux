@@ -92,6 +92,7 @@ static void cancel_delayed_work_sync(struct delayed_work *w) { w->work.pending =
 static void mod_delayed_work(int q, struct delayed_work *w, int t)
 { (void)q; (void)t; w->work.pending = true; }
 struct apple_connector { bool connected, edid_invalidation_pending; };
+struct dcp_announce { int ends; };
 struct apple_dcp {
  int external_lock, hpd_mutex;
  struct { int lock; bool presentation_paused; } iomfb;
@@ -107,6 +108,7 @@ struct apple_dcp {
  u64 external_generation, external_rx_generation, external_crtc_generation;
  u64 external_stop_generation, typec_generation;
  int external_error, mode_state; void *avep;
+ struct dcp_announce announce;
 };
 struct platform_device { struct apple_dcp *data; };
 static struct apple_dcp *platform_get_drvdata(struct platform_device *p) { return p->data; }
@@ -140,6 +142,7 @@ static void dcp_firmware_metadata_hotplug(struct apple_dcp *d, bool c) { (void)d
 static void dcp_firmware_metadata_connection(struct apple_dcp *d, u64 g, bool c)
 { (void)d; (void)g; (void)c; }
 static void dcp_firmware_metadata_announced(struct apple_dcp *d) { (void)d; }
+static void dcp_announce_end(struct dcp_announce *a) { a->ends++; }
 static int dcp_external_disconnect(struct apple_dcp *, bool);
 static struct apple_dcp display;
 static void drm_connector_oob_hotplug_event(void *node, int status)

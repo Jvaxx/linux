@@ -18,6 +18,7 @@
 
 #include "dptxep.h"
 #include "dcp_backlight.h"
+#include "dcp-announce.h"
 #include "dcp-display-metadata.h"
 #include "dcp-metadata-epoch.h"
 #include "dcp-180hz.h"
@@ -204,6 +205,11 @@ struct apple_dcp_hw_data {
 	u32 firmware_display_windows;
 	u32 firmware_scratch;
 	u32 firmware_request;
+};
+
+enum dcp_test_point {
+	DCP_TEST_ANNOUNCE_TIMER_DONE,		/* past hpd_mutex in the timeout work */
+	DCP_TEST_UNBIND_ANNOUNCE_STOPPED,	/* unbind drained the timeout work */
 };
 
 /* TODO: move IOMFB members to its own struct */
@@ -443,6 +449,13 @@ struct apple_dcp {
 	struct completion typec_iomfb_hpd_ready;
 	struct delayed_work typec_reconnect_wq;
 	u32 typec_reconnect_tries;
+	/* hpd_mutex: what DRM reports for the external display, and when */
+	struct dcp_announce announce;
+	struct delayed_work announce_wq;
+#if IS_ENABLED(CONFIG_DRM_APPLE_KUNIT_TEST)
+	/* Lets a test stop work where it races, see dcp_test_point(). */
+	void (*test_point)(struct apple_dcp *dcp, enum dcp_test_point point);
+#endif
 
 	struct gpio_desc *hdmi_hpd;
 	struct gpio_desc *hdmi_pwren;
@@ -535,6 +548,27 @@ void iomfb_queue_crc_h17p(struct apple_dcp *dcp, u32 swap_id);
 void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);
 void dcp_handle_hotplug_actions(struct apple_dcp *dcp, unsigned int action);
 bool dcp_external_hotplug(struct apple_dcp *dcp, bool connected);
+void dcp_announce_arm(struct apple_dcp *dcp);
+void dcp_announce_work(struct work_struct *work);
+
+/* A KUnit test can wait here for the work it races with. */
+static inline void dcp_test_point(struct apple_dcp *dcp, enum dcp_test_point point)
+{
+#if IS_ENABLED(CONFIG_DRM_APPLE_KUNIT_TEST)
+	void (*test_point)(struct apple_dcp *dcp, enum dcp_test_point point);
+
+	test_point = READ_ONCE(dcp->test_point);
+	if (test_point)
+		test_point(dcp, point);
+#endif
+}
+
+#if IS_ENABLED(CONFIG_KUNIT)
+void dcp_comp_unbind(struct device *dev, struct device *main, void *data);
+void dcp_platform_shutdown(struct platform_device *pdev);
+void dcp_disable_typec_work(struct apple_dcp *dcp, bool release_cable);
+void dcp_enable_typec_work(struct apple_dcp *dcp);
+#endif
 
 int dcp_backlight_init(struct apple_dcp *dcp, struct device *dev);
 void dcp_backlight_stop(struct apple_dcp *dcp);
