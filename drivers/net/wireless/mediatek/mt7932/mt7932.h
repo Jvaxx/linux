@@ -147,6 +147,10 @@ struct mt7932 {
 	u8 connect_ssid_length, connect_channel, peer_wtbl;
 	bool connecting, connected, peer_valid, link_failed, connect_open;
 	bool disconnecting, disconnect_seen, disconnect_event_received, disconnect_local;
+	/* The connect worker is reporting its outcome; an RF failure meanwhile
+	 * sets connect_lost for the worker to report. Under response_lock.
+	 */
+	bool connect_publishing, connect_lost;
 	u16 disconnect_reason;
 	int connect_error;
 	u32 event_cipher;
