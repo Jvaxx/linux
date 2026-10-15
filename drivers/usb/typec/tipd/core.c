@@ -819,6 +819,7 @@ static void cd321x_dp_notify(struct cd321x *cd321x,
 		return;
 
 	trace_cd321x_dp_hotplug(u, status);
+	cd321x->dp_sink_reported = status != connector_status_disconnected;
 	drm_connector_oob_hotplug_event(cd321x->connector_fwnode, status);
 }
 
@@ -857,6 +858,7 @@ static void cd321x_update_work(struct work_struct *work)
 		.data_status = st.data_status,
 		.changed = st.data_status_changed,
 		.route_active = cd321x->display_route_active,
+		.sink_reported = cd321x->dp_sink_reported,
 	};
 
 	enum usb_role old_role = usb_role_switch_get_role(tps->role_sw);
@@ -1007,9 +1009,17 @@ static void cd321x_update_work(struct work_struct *work)
 	if (ret)
 		goto retry;
 
-	if (cd321x_dp_event(&dp, cd321x->display_route_active) ==
-	    CD321X_DP_EVENT_CONNECTED)
+	switch (cd321x_dp_event(&dp, cd321x->display_route_active)) {
+	case CD321X_DP_EVENT_NONE:
+		break;
+	case CD321X_DP_EVENT_CONNECTED:
 		cd321x_dp_notify(cd321x, &dp, connector_status_connected);
+		break;
+	case CD321X_DP_EVENT_RETRAIN:
+		/* An unknown status asks the connector to recheck its link. */
+		cd321x_dp_notify(cd321x, &dp, connector_status_unknown);
+		break;
+	}
 
 	power_supply_changed(tps->psy);
 	cd321x_update_done(cd321x);

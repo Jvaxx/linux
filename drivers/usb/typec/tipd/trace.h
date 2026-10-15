@@ -447,16 +447,18 @@ TRACE_EVENT(cd321x_dp_hotplug,
 	    TP_STRUCT__entry(__field(u32, data_status)
 			     __field(u32, changed)
 			     __field(bool, route_active)
+			     __field(bool, sink_reported)
 			     __field(int, status)),
 
 	    TP_fast_assign(__entry->data_status = u->data_status;
 			   __entry->changed = u->changed;
 			   __entry->route_active = u->route_active;
+			   __entry->sink_reported = u->sink_reported;
 			   __entry->status = status;),
 
-	    TP_printk("%s: route %d, HPD %d%s%s, changed %s%s",
+	    TP_printk("%s: route %d, sink %d, HPD %d%s%s, changed %s%s",
 		      show_dp_hotplug_status(__entry->status),
-		      __entry->route_active,
+		      __entry->route_active, __entry->sink_reported,
 		      !!(__entry->data_status & CD321X_DATA_STATUS_HPD_LEVEL),
 		      __entry->data_status & TPS_DATA_STATUS_DP_CONNECTION ? ", DP pinout " : "",
 		      maybe_show_data_status_dp_pin_assignment(__entry->data_status),
