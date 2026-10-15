@@ -177,7 +177,7 @@ static void bt7932_fault_locked(struct bt7932 *bt, const char *reason)
 	dev_err(&bt->pdev->dev, "terminal transport fault: %s; owned DMA retained, external reset required\n",
 		reason);
 	for (channel = 0; channel < BT7932_CHANNELS; channel++)
-		dev_err(&bt->pdev->dev, "ring%u host=%u firmware=%u previous=%u\n", channel,
+		dev_dbg(&bt->pdev->dev, "ring%u host=%u firmware=%u previous=%u\n", channel,
 			bt7932_counter(bt, bt->host_transfer, channel),
 			bt7932_counter(bt, bt->fw_transfer, channel), bt->rings[channel].previous);
 	pci_clear_master(bt->pdev);
@@ -409,8 +409,8 @@ static int bt7932_arena(struct bt7932 *bt)
 	context[0x51] = 13;
 	context[0x53] = 2;
 	dma_wmb();
-	dev_info(&bt->pdev->dev, "owned SID2 arena=%pad bytes=%zu image=%pad bytes=%zu, both low32\n",
-		 &bt->arena_dma, bt->arena_size, &bt->image_dma, bt->image_size);
+	dev_dbg(&bt->pdev->dev, "owned SID2 arena=%pad bytes=%zu image=%pad bytes=%zu, both low32\n",
+		&bt->arena_dma, bt->arena_size, &bt->image_dma, bt->image_size);
 	return 0;
 }
 
@@ -724,7 +724,7 @@ static int bt7932_download(struct bt7932 *bt)
 	}
 	writel(0x188d1807, bt->bar + BT7932_CONNECTION_SELECTOR);
 	writel(1, bt->bar + BT7932_SEMAPHORE_RELEASE);
-	dev_info(&bt->pdev->dev, "BT_IMAGE_ACCEPTED response1 boot0->2; image remains retained\n");
+	dev_dbg(&bt->pdev->dev, "BT_IMAGE_ACCEPTED response1 boot0->2; image remains retained\n");
 	return 0;
 }
 
@@ -825,7 +825,7 @@ static void bt7932_channels(struct bt7932 *bt)
 	bt->last_sleep = 0;
 	WRITE_ONCE(bt->awake, true);
 	WRITE_ONCE(bt->ipc_ready, true);
-	dev_info(&bt->pdev->dev, "BT_IPC_READY ten retained advertisements;127 RX offers per channel\n");
+	dev_dbg(&bt->pdev->dev, "BT_IPC_READY ten retained advertisements;127 RX offers per channel\n");
 }
 
 static int bt7932_open(struct hci_dev *hdev)
@@ -948,7 +948,7 @@ static int bt7932_setup(struct hci_dev *hdev)
 				   HCI_INIT_TIMEOUT);
 	if (ret)
 		goto fault;
-	dev_info(&bt->pdev->dev, "BT_HCI_SETUP_OK Reset/calibration/PTX/address completed in order\n");
+	dev_dbg(&bt->pdev->dev, "BT_HCI_SETUP_OK Reset/calibration/PTX/address completed in order\n");
 	mutex_lock(&bt->lock);
 	if (bt->recovery == BT7932_RECOVERY_REOPENING)
 		dev_info(&bt->pdev->dev, "controller recovered\n");
@@ -1059,7 +1059,7 @@ static int bt7932_iommu(struct bt7932 *bt)
 		if (ret)
 			dev_err(dev, "BT_IOMMU_REJECT 32-bit DMA mask status=%d\n", ret);
 		else
-			dev_info(dev, "BT_IOMMU_ADMITTED RID101->SID2 matched translated DART\n");
+			dev_dbg(dev, "BT_IOMMU_ADMITTED RID101->SID2 matched translated DART\n");
 	}
 	of_node_put(target);
 	return ret;
@@ -1176,7 +1176,7 @@ static int bt7932_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		ret = -ENOMEM;
 		goto fail;
 	}
-	dev_info(&pdev->dev, "BT_BAR0 resource=%pR\n", &pdev->resource[0]);
+	dev_dbg(&pdev->dev, "BT_BAR0 resource=%pR\n", &pdev->resource[0]);
 	ret = pci_read_config_dword(pdev, BT7932_BOOT_CONFIG, &boot);
 	if (ret || boot == U32_MAX || (boot & 0xf) || ((boot >> 4) & 7) > 1) {
 		dev_err(&pdev->dev, "BT_IDENTITY_REJECT config_status=%d boot=%#x\n", ret, boot);
@@ -1193,7 +1193,7 @@ static int bt7932_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		ret = -ENODEV;
 		goto fail;
 	}
-	dev_info(&pdev->dev, "BT_COLD_ADMISSION ROM=%u bootstate0 chip7932 SID2\n", bt->rom);
+	dev_dbg(&pdev->dev, "BT_COLD_ADMISSION ROM=%u bootstate0 chip7932 SID2\n", bt->rom);
 	ret = bt7932_read_inputs(bt);
 	if (ret)
 		goto fail;
@@ -1254,7 +1254,7 @@ static int bt7932_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (ret < 0)
 		goto retained_fault;
 	bt->registered = true;
-	dev_info(&pdev->dev, "BT_HCI_REGISTERED; setup/discovery/connection remain separate gates\n");
+	dev_dbg(&pdev->dev, "BT_HCI_REGISTERED; setup/discovery/connection remain separate gates\n");
 	return 0;
 retained_fault:
 	mutex_lock(&bt->lock);
