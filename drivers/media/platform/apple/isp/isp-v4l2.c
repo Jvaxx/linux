@@ -1105,7 +1105,7 @@ int apple_isp_setup_video(struct apple_isp *isp)
 	vdev->queue = vbq;
 	vdev->fops = &isp_v4l2_fops;
 	vdev->ioctl_ops = &isp_v4l2_ioctl_ops;
-	vdev->device_caps = V4L2_BUF_TYPE_VIDEO_CAPTURE | V4L2_CAP_STREAMING;
+	vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING;
 	if (isp->multiplanar)
 		vdev->device_caps |= V4L2_CAP_VIDEO_CAPTURE_MPLANE;
 	vdev->entity.flags = MEDIA_ENT_FL_DEFAULT;
