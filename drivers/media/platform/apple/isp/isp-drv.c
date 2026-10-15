@@ -309,8 +309,7 @@ static const char * isp_fw2str(enum isp_firmware_version version)
 #define ISP_FW_VERSION_MAX_LEN	5
 
 static enum isp_firmware_version isp_read_fw_version(struct device *dev,
-						     const char *name,
-						     enum isp_fw_abi abi)
+						     const char *name)
 {
 	u32 ver[ISP_FW_VERSION_MAX_LEN];
 	int size, len;
@@ -324,24 +323,6 @@ static enum isp_firmware_version isp_read_fw_version(struct device *dev,
 	len = of_property_read_variable_u32_array(dev->of_node, name, ver,
 						  ISP_FW_VERSION_MIN_LEN,
 						  ISP_FW_VERSION_MAX_LEN);
-
-	/* H17 command layouts come from match data, not the legacy version table. */
-	if (abi == ISP_FW_ABI_H17) {
-		switch (len) {
-		case 3:
-			dev_info(dev, "%s: %u.%u.%u (H17 interface)\n",
-				 name, ver[0], ver[1], ver[2]);
-			return ISP_FIRMWARE_V_UNKNOWN;
-		case 4:
-			dev_info(dev, "%s: %u.%u.%u.%u (H17 interface)\n",
-				 name, ver[0], ver[1], ver[2], ver[3]);
-			return ISP_FIRMWARE_V_UNKNOWN;
-		case 5:
-			dev_info(dev, "%s: %u.%u.%u.%u.%u (H17 interface)\n",
-				 name, ver[0], ver[1], ver[2], ver[3], ver[4]);
-			return ISP_FIRMWARE_V_UNKNOWN;
-		}
-	}
 
 	switch (len) {
 	case -EINVAL:
@@ -381,16 +362,18 @@ isp_check_firmware_version(struct apple_isp *isp)
 	struct device *dev = isp->dev;
 	enum isp_firmware_version version, compat;
 
+	/* The H17 interface is selected by match data, not by version. */
+	if (isp->hw->fw_abi == ISP_FW_ABI_H17)
+		return ISP_FIRMWARE_V_UNKNOWN;
+
 	/* firmware version is just informative */
-	version = isp_read_fw_version(dev, "apple,firmware-version", isp->hw->fw_abi);
-	compat = isp_read_fw_version(dev, "apple,firmware-compat", isp->hw->fw_abi);
+	version = isp_read_fw_version(dev, "apple,firmware-version");
+	compat = isp_read_fw_version(dev, "apple,firmware-compat");
 
 	dev_dbg(dev, "ISP firmware-compat: %s (FW: %s)\n", isp_fw2str(compat),
 		isp_fw2str(version));
 
-	/* The H17 interface does not depend on it. */
-	if (isp->hw->fw_abi == ISP_FW_ABI_LEGACY &&
-	    !of_property_present(dev->of_node, "apple,firmware-compat"))
+	if (!of_property_present(dev->of_node, "apple,firmware-compat"))
 		dev_warn(dev, "firmware compatibility version not provided, assuming 12.x\n");
 
 	return compat;
