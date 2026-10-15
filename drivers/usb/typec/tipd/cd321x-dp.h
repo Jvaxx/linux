@@ -34,17 +34,26 @@ struct cd321x_dp_update {
 	bool sink_reported;
 };
 
-static inline bool cd321x_dp_mode_changed(u32 changed)
+/*
+ * USB3_CONNECTION is part of the pin assignment while DisplayPort is up: C
+ * and D, and E and F, differ only in it, and moving between them changes
+ * the DisplayPort lane count.  Without DisplayPort it is a plain USB change.
+ */
+static inline bool cd321x_dp_mode_changed(u32 data_status, u32 changed)
 {
-	return changed & CD321X_DP_MODE_BITS;
+	u32 bits = CD321X_DP_MODE_BITS;
+
+	if (data_status & TPS_DATA_STATUS_DP_CONNECTION)
+		bits |= TPS_DATA_STATUS_USB3_CONNECTION;
+
+	return changed & bits;
 }
 
 /*
  * HPD dropped for less than the debounce delay and came back high while the
  * partner, the alternate mode and the pin assignment stayed the same.  The
  * sink is still there, so check and retrain its link rather than report an
- * unplug.  USB3_CONNECTION is part of the pin assignment (C/D, E/F), so a
- * pulse that comes with a lane count change is not one of these.
+ * unplug.
  */
 static inline bool cd321x_dp_hpd_pulse(const struct cd321x_dp_update *u)
 {
@@ -52,8 +61,7 @@ static inline bool cd321x_dp_hpd_pulse(const struct cd321x_dp_update *u)
 	       (u->data_status & TPS_DATA_STATUS_DP_CONNECTION) &&
 	       (u->data_status & CD321X_DATA_STATUS_HPD_LEVEL) &&
 	       (u->changed & CD321X_DATA_STATUS_HPD_LEVEL) &&
-	       !cd321x_dp_mode_changed(u->changed) &&
-	       !(u->changed & TPS_DATA_STATUS_USB3_CONNECTION);
+	       !cd321x_dp_mode_changed(u->data_status, u->changed);
 }
 
 /* Does the display connector lose its sink before this update is applied? */
@@ -65,7 +73,7 @@ static inline bool cd321x_dp_teardown(const struct cd321x_dp_update *u)
 	if (u->link_reset ||
 	    !(u->data_status & TPS_DATA_STATUS_DP_CONNECTION) ||
 	    !(u->data_status & CD321X_DATA_STATUS_HPD_LEVEL) ||
-	    cd321x_dp_mode_changed(u->changed))
+	    cd321x_dp_mode_changed(u->data_status, u->changed))
 		return true;
 
 	return (u->changed & CD321X_DATA_STATUS_HPD_LEVEL) &&
