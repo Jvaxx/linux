@@ -116,6 +116,7 @@ struct apple_nvmmu_tcb {
 
 #define APPLE_ANS_TCB_DMA_FROM_DEVICE BIT(0)
 #define APPLE_ANS_TCB_DMA_TO_DEVICE   BIT(1)
+#define APPLE_ANS_TCB_AES             BIT(2)
 	u8 dma_flags;
 
 	u8 command_id;
@@ -566,8 +567,6 @@ static void apple_nvme_submit_cmd_t8103(struct apple_nvme_queue *q,
 				  struct request *req)
 {
 	struct apple_nvme *anv = queue_to_apple_nvme(q);
-	const u8 *key = NULL;
-	u64 dun = 0;
 	u32 tag = nvme_tag_from_cid(cmd->common.command_id);
 	struct apple_nvmmu_tcb *tcb = &q->tcbs[tag];
 
@@ -585,16 +584,10 @@ static void apple_nvme_submit_cmd_t8103(struct apple_nvme_queue *q,
 		tcb->dma_flags = APPLE_ANS_TCB_DMA_FROM_DEVICE;
 
 	if (unlikely(req->crypt_ctx)) {
-		const struct blk_crypto_key *blk_key = req->crypt_ctx->bc_key;
+		const u8 *key = req->crypt_ctx->bc_key->bytes;
+		__le64 dun_le = cpu_to_le64(req->crypt_ctx->bc_dun[0]);
 
-		key = blk_key->bytes;
-		dun = req->crypt_ctx->bc_dun[0];
-	}
-
-	if (key) {
-		__le64 dun_le = cpu_to_le64(dun);
-
-		tcb->dma_flags |= BIT(2);
+		tcb->dma_flags |= APPLE_ANS_TCB_AES;
 		memcpy(tcb->aes_iv, &dun_le, sizeof(dun_le));
 		memset(tcb->_aes_unk, 0, sizeof(tcb->_aes_unk));
 		memcpy(tcb->_aes_unk, key, 4);
@@ -862,10 +855,10 @@ static __always_inline void apple_nvme_unmap_rq(struct request *req)
 
 	tag = nvme_tag_from_cid(iod->cmd.common.command_id);
 	tcb = &iod->q->tcbs[tag];
-	if (unlikely(tcb->dma_flags & BIT(2))) {
+	if (unlikely(tcb->dma_flags & APPLE_ANS_TCB_AES)) {
 		memzero_explicit(tcb->aes_iv, sizeof(tcb->aes_iv));
 		memzero_explicit(tcb->_aes_unk, sizeof(tcb->_aes_unk));
-		tcb->dma_flags &= ~BIT(2);
+		tcb->dma_flags &= ~APPLE_ANS_TCB_AES;
 	}
 }
 
