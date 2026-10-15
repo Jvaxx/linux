@@ -22,9 +22,8 @@
  * Author: Sven Peter <sven@kernel.org>
  */
 
-#include <kunit/static_stub.h>
-
 #include <dt-bindings/phy/phy.h>
+#include <kunit/static_stub.h>
 #include <linux/bitfield.h>
 #include <linux/cleanup.h>
 #include <linux/delay.h>
@@ -678,6 +677,8 @@ struct atcphy_hw {
  *              it when the PHY is brought back up after a power-off
  * @host_active: dwc3 has selected host mode on the USB3 PHY; a fixed-hub port
  *               then routes the PIPE itself on later Type-C mode changes
+ * @usb3_port_off: The SuperSpeed root port of a fixed-hub controller was powered
+ *                 off for a PIPE or lane change and is not powered on again yet
  * @mode: Current PHY operating mode
  * @swap_lanes: True if lanes must be swapped due to cable orientation
  * @dp_link_rate: DisplayPort link rate
@@ -743,6 +744,7 @@ struct apple_atcphy {
 	bool fixed_usb2;
 	enum atcphy_mode typec_mode;
 	bool host_active;
+	bool usb3_port_off;
 	enum atcphy_mode mode;
 	int dp_link_rate;
 	bool swap_lanes;
@@ -3043,6 +3045,8 @@ static int atcphy_usb3_power_off(struct phy *phy)
 			return ret;
 	}
 	atcphy->host_active = false;
+	/* The next host powers its SuperSpeed port on as it starts. */
+	atcphy->usb3_port_off = false;
 
 	return 0;
 }
@@ -3059,6 +3063,8 @@ static int atcphy_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode
 	switch (mode) {
 	case PHY_MODE_USB_HOST:
 		atcphy->host_active = true;
+		/* A host that starts up powers the ports of its root hubs itself. */
+		atcphy->usb3_port_off = false;
 		break;
 	case PHY_MODE_USB_DEVICE:
 		atcphy->host_active = false;
@@ -3314,6 +3320,7 @@ static int atcphy_dwc3_reset_assert(struct reset_controller_dev *rcdev, unsigned
 
 	_atcphy_dwc3_reset_assert(atcphy);
 	atcphy->host_active = false;
+	atcphy->usb3_port_off = false;
 	atcphy_usb2_power_off(atcphy);
 
 	return 0;
@@ -3412,71 +3419,31 @@ static int atcphy_probe_switch(struct apple_atcphy *atcphy)
 }
 
 /*
- * The fixed USB2 hub keeps the host controller active, but its independent
- * SuperSpeed root hub may autosuspend while PIPE still needs it awake.
- * Own a bounded root-hub resume reference across a Type-C handoff. Resume
- * precedes the ATC lock: USB PM can call back into the PHY on recovery.
+ * The controller of a fixed-hub port stays up across Type-C mode changes, so
+ * the PHY moves the PIPE while its SuperSpeed root port is powered off, see
+ * atcphy_mux_update(). Hold the controller, its xHCI device and the awake
+ * SuperSpeed root hub across the change: hub_wq then cannot use the port in
+ * between, and none of them can go away. They are taken before the ATC lock,
+ * as USB PM can call back into the PHY on recovery.
  */
 struct atcphy_usb3_pm {
 	struct platform_device *controller;
 	struct device *host;
 	struct usb_device *root;
-	struct usb_device *link;
 };
 
 #if IS_REACHABLE(CONFIG_USB)
-/* The root's runtime state does not cover selective suspend of its port. */
-static int atcphy_usb3_link_get(struct atcphy_usb3_pm *pm)
+/* The SuperSpeed root hub of the controller; its USB2 root hub never matches */
+static bool atcphy_usb3_is_root(const struct usb_device *udev, const struct device *controller)
 {
-	struct usb_device *link;
-	int ret;
-
-	/* The graph identifies the controller, not a port in a multiport root. */
-	if (pm->root->maxchild != 1)
-		return pm->root->maxchild ? -ENODEV : -EAGAIN;
-	link = usb_hub_find_child(pm->root, 1);
-	if (!link)
-		return 0;
-	pm->link = usb_get_dev(link);
-	usb_lock_device(pm->link);
-	if (READ_ONCE(pm->link->state) == USB_STATE_NOTATTACHED) {
-		ret = 0;
-		goto unlock_link;
-	}
-	ret = pm_runtime_resume_and_get(&pm->link->dev);
-	if (ret < 0)
-		goto unlock_link;
-	if (READ_ONCE(pm->link->state) == USB_STATE_NOTATTACHED) {
-		pm_runtime_put_noidle(&pm->link->dev);
-		ret = -ENODEV;
-		goto unlock_link;
-	}
-	return 0;
-
-unlock_link:
-	usb_unlock_device(pm->link);
-	usb_put_dev(pm->link);
-	pm->link = NULL;
-	return ret;
-}
-
-static void atcphy_usb3_link_put(struct atcphy_usb3_pm *pm)
-{
-	if (!pm->link)
-		return;
-	usb_mark_last_busy(pm->link);
-	pm_runtime_put_autosuspend(&pm->link->dev);
-	usb_unlock_device(pm->link);
-	usb_put_dev(pm->link);
-	pm->link = NULL;
+	return !udev->parent && udev->speed >= USB_SPEED_SUPER && udev->bus->sysdev == controller;
 }
 
 static int atcphy_usb3_pm_find(struct usb_device *udev, void *data)
 {
 	struct atcphy_usb3_pm *pm = data;
 
-	if (udev->parent || udev->speed < USB_SPEED_SUPER ||
-	    udev->bus->sysdev != &pm->controller->dev)
+	if (!atcphy_usb3_is_root(udev, &pm->controller->dev))
 		return 0;
 
 	pm->root = usb_get_dev(udev);
@@ -3492,6 +3459,8 @@ static int atcphy_usb3_pm_get(struct apple_atcphy *atcphy, struct atcphy_usb3_pm
 	struct usb_hcd *hcd;
 	int ret;
 #endif
+
+	KUNIT_STATIC_STUB_REDIRECT(atcphy_usb3_pm_get, atcphy, pm);
 
 	if (!atcphy->fixed_usb2 || !atcphy->hw->has_t8140_dp)
 		return 0;
@@ -3543,26 +3512,17 @@ static int atcphy_usb3_pm_get(struct apple_atcphy *atcphy, struct atcphy_usb3_pm
 		ret = -ENODEV;
 		goto unlock_root;
 	}
+	/* The graph identifies the controller, not a port in a multiport root. */
+	if (pm->root->maxchild != 1) {
+		ret = pm->root->maxchild ? -ENODEV : -EAGAIN;
+		goto unlock_root;
+	}
 	ret = pm_runtime_resume_and_get(&pm->root->dev);
 	if (ret < 0)
 		goto unlock_root;
 	if (READ_ONCE(pm->root->state) == USB_STATE_NOTATTACHED ||
-	    HCD_DEAD(hcd) || !HCD_HW_ACCESSIBLE(hcd)) {
-		pm_runtime_put_noidle(&pm->root->dev);
-		ret = -ENODEV;
-		goto unlock_root;
-	}
-	/* Resume the attached upstream link before taking the ATC mutex. */
-	ret = atcphy_usb3_link_get(pm);
-	if (ret) {
-		usb_mark_last_busy(pm->root);
-		pm_runtime_put_autosuspend(&pm->root->dev);
-		goto unlock_root;
-	}
-	if (READ_ONCE(pm->root->state) == USB_STATE_NOTATTACHED ||
 	    READ_ONCE(hcd->state) != HC_STATE_RUNNING ||
 	    HCD_DEAD(hcd) || !HCD_HW_ACCESSIBLE(hcd)) {
-		atcphy_usb3_link_put(pm);
 		pm_runtime_put_noidle(&pm->root->dev);
 		ret = -ENODEV;
 		goto unlock_root;
@@ -3594,9 +3554,6 @@ static void atcphy_usb3_pm_put(struct atcphy_usb3_pm *pm)
 	if (!pm->root)
 		return;
 
-	/* Release child ownership before the root: keep the lock order hierarchical. */
-	atcphy_usb3_link_put(pm);
-
 	/* Restore normal runtime policy after both success and failed parking. */
 	usb_mark_last_busy(pm->root);
 	pm_runtime_put_autosuspend(&pm->root->dev);
@@ -3610,6 +3567,64 @@ static void atcphy_usb3_pm_put(struct atcphy_usb3_pm *pm)
 	pm->root = NULL;
 	pm->controller = NULL;
 #endif
+}
+
+/*
+ * Whether the controller of a fixed-hub port may run its SuperSpeed port: the
+ * PIPE is on the USB3 backend for its host, and no lane or PIPE change is left
+ * unfinished.
+ */
+static bool atcphy_usb3_port_ready(const struct apple_atcphy *atcphy)
+{
+	return atcphy->fixed_usb2 && atcphy->host_active && !atcphy->mode_dirty &&
+	       !atcphy->pipe_pending && atcphy->pipe_state == ATCPHY_PIPEHANDLER_STATE_USB3;
+}
+
+/*
+ * Take the controller's SuperSpeed port down before the PIPE moves: the device
+ * on it is disconnected and the port held powered off, so that nothing drives
+ * the PIPE when it is handed over. Nothing else of the controller stops, its
+ * USB2 root port and the fixed hub on it included. Returns 1 when there is no
+ * such port to take down, and for a port that someone else switched off: that
+ * stays theirs and is not powered on again.
+ */
+static int atcphy_usb3_port_off(struct apple_atcphy *atcphy, struct atcphy_usb3_pm *pm)
+{
+	int ret = 1;
+
+	KUNIT_STATIC_STUB_REDIRECT(atcphy_usb3_port_off, atcphy, pm);
+
+#if IS_REACHABLE(CONFIG_USB)
+	if (!pm->root)
+		return 1;
+
+	ret = usb_hub_port_power_off(pm->root, 1);
+	if (ret < 0)
+		dev_warn(atcphy->dev, "Failed to power the SuperSpeed port off: %d\n", ret);
+#endif
+	return ret;
+}
+
+/*
+ * Bring the SuperSpeed port up again once the PIPE is back on the USB3 backend.
+ * Returns 1 for a port that someone else has taken over since it went down,
+ * through its "disable" attribute: it stays off.
+ */
+static int atcphy_usb3_port_on(struct apple_atcphy *atcphy, struct atcphy_usb3_pm *pm)
+{
+	int ret = 1;
+
+	KUNIT_STATIC_STUB_REDIRECT(atcphy_usb3_port_on, atcphy, pm);
+
+#if IS_REACHABLE(CONFIG_USB)
+	if (!pm->root)
+		return 1;
+
+	ret = usb_hub_port_power_on(pm->root, 1);
+	if (ret < 0)
+		dev_warn(atcphy->dev, "Failed to power the SuperSpeed port on: %d\n", ret);
+#endif
+	return ret;
 }
 
 /* The PHY mode a Type-C mux state asks for; unsupported states turn the PHY off. */
@@ -3681,12 +3696,11 @@ static enum atcphy_mode atcphy_typec_target_mode(struct apple_atcphy *atcphy,
 }
 
 /*
- * Whether a mux update leaves both the lanes and the PIPE as they are. That is
- * the case when the mode does not change and no earlier PIPE handoff to a
- * running controller behind a fixed hub is still outstanding. A DisplayPort
- * HPD or status update with an unchanged pin assignment is one of these.
+ * Whether the lanes and the PIPE are as @target_mode needs them: the mode does
+ * not change, and no earlier PIPE handoff to a running controller behind a
+ * fixed hub is still outstanding.
  */
-static bool atcphy_mux_is_noop(const struct apple_atcphy *atcphy, enum atcphy_mode target_mode)
+static bool atcphy_mux_in_mode(const struct apple_atcphy *atcphy, enum atcphy_mode target_mode)
 {
 	if (atcphy->mode != target_mode || atcphy->mode_dirty)
 		return false;
@@ -3696,11 +3710,49 @@ static bool atcphy_mux_is_noop(const struct apple_atcphy *atcphy, enum atcphy_mo
 		  atcphy->pipe_pending));
 }
 
-static int atcphy_mux_set_locked(struct apple_atcphy *atcphy, enum atcphy_mode target_mode)
+/*
+ * Whether a mux update leaves both the lanes and the PIPE as they are, and
+ * owes no SuperSpeed port its power either. A DisplayPort HPD or status
+ * update with an unchanged pin assignment is one of these.
+ */
+static bool atcphy_mux_is_noop(const struct apple_atcphy *atcphy, enum atcphy_mode target_mode)
+{
+	return atcphy_mux_in_mode(atcphy, target_mode) &&
+	       !(atcphy->usb3_port_off && atcphy_usb3_port_ready(atcphy));
+}
+
+/* Whether the PHY can run @mode at all, which needs no lane or PIPE work to tell */
+static int atcphy_mux_check(const struct apple_atcphy *atcphy, enum atcphy_mode mode)
+{
+	switch (mode) {
+	case APPLE_ATCPHY_MODE_TBT:
+	case APPLE_ATCPHY_MODE_USB4:
+		if (!atcphy->hw->has_usb4)
+			return -EOPNOTSUPP;
+		fallthrough;
+	case APPLE_ATCPHY_MODE_USB3:
+	case APPLE_ATCPHY_MODE_USB3_DP:
+	case APPLE_ATCPHY_MODE_DP:
+		if (atcphy->hw->has_t8140_dp && atcphy_modes[mode].enable_dp_aux &&
+		    !atcphy->dp_tunables)
+			return -EOPNOTSUPP;
+		/* Without the lane tunables the SuperSpeed lanes are not calibrated */
+		if (!atcphy->ss_tunables)
+			return -EOPNOTSUPP;
+		break;
+	case APPLE_ATCPHY_MODE_OFF:
+	case APPLE_ATCPHY_MODE_USB2:
+		break;
+	}
+
+	return 0;
+}
+
+static int atcphy_mux_switch(struct apple_atcphy *atcphy, enum atcphy_mode target_mode)
 {
 	int ret;
 
-	guard(mutex)(&atcphy->lock);
+	lockdep_assert_held(&atcphy->lock);
 	dev_dbg(atcphy->dev, "mux target=%u current=%u dirty=%u\n", target_mode,
 		atcphy->mode, atcphy->mode_dirty);
 
@@ -3725,26 +3777,9 @@ static int atcphy_mux_set_locked(struct apple_atcphy *atcphy, enum atcphy_mode t
 	    atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY)
 		return -EBUSY;
 
-	switch (target_mode) {
-	case APPLE_ATCPHY_MODE_TBT:
-	case APPLE_ATCPHY_MODE_USB4:
-		if (!atcphy->hw->has_usb4)
-			return -EOPNOTSUPP;
-		fallthrough;
-	case APPLE_ATCPHY_MODE_USB3:
-	case APPLE_ATCPHY_MODE_USB3_DP:
-	case APPLE_ATCPHY_MODE_DP:
-		if (atcphy->hw->has_t8140_dp && atcphy_modes[target_mode].enable_dp_aux &&
-		    !atcphy->dp_tunables)
-			return -EOPNOTSUPP;
-		/* Without the lane tunables the SuperSpeed lanes are not calibrated */
-		if (!atcphy->ss_tunables)
-			return -EOPNOTSUPP;
-		break;
-	case APPLE_ATCPHY_MODE_OFF:
-	case APPLE_ATCPHY_MODE_USB2:
-		break;
-	}
+	ret = atcphy_mux_check(atcphy, target_mode);
+	if (ret)
+		return ret;
 	atcphy->typec_mode = target_mode;
 
 	if (atcphy->fixed_usb2) {
@@ -3757,6 +3792,8 @@ static int atcphy_mux_set_locked(struct apple_atcphy *atcphy, enum atcphy_mode t
 		 * from a later set_mode call. Even another USB3 mode can move the
 		 * backend to the other PMA when orientation changes. Park before
 		 * rebuilding the lanes, then reconnect while dwc3 is in host mode.
+		 * The controller's SuperSpeed port is off by now, see
+		 * atcphy_mux_update().
 		 */
 		ret = atcphy_park_pipehandler(atcphy);
 		if (ret)
@@ -3789,10 +3826,28 @@ static int atcphy_mux_set_locked(struct apple_atcphy *atcphy, enum atcphy_mode t
 	return atcphy_configure(atcphy, target_mode);
 }
 
+/*
+ * Change the mode under the PHY lock. @port_on tells whether the SuperSpeed
+ * port of a fixed-hub controller, taken down for the change, can come up again.
+ */
+static int atcphy_mux_set_locked(struct apple_atcphy *atcphy, enum atcphy_mode target_mode,
+				 bool *port_on)
+{
+	int ret;
+
+	KUNIT_STATIC_STUB_REDIRECT(atcphy_mux_set_locked, atcphy, target_mode, port_on);
+
+	guard(mutex)(&atcphy->lock);
+	ret = atcphy_mux_switch(atcphy, target_mode);
+	*port_on = atcphy->usb3_port_off && atcphy_usb3_port_ready(atcphy);
+	return ret;
+}
+
 static int atcphy_mux_update(struct apple_atcphy *atcphy, const struct typec_mux_state *state)
 {
 	struct atcphy_usb3_pm pm = {};
 	enum atcphy_mode target_mode;
+	bool in_mode, port_on, usb_err = true;
 	int ret;
 
 	scoped_guard(mutex, &atcphy->lock) {
@@ -3801,23 +3856,73 @@ static int atcphy_mux_update(struct apple_atcphy *atcphy, const struct typec_mux
 			atcphy->fixed_usb2, atcphy->dp_tunables, atcphy->ss_tunables);
 		target_mode = atcphy_typec_target_mode(atcphy, state);
 		/*
-		 * Only a lane or PIPE change needs the USB3 root hub below.
-		 * Taking it means waiting for the hub's ongoing work, which
-		 * includes a whole enumeration with its timeouts, and would
-		 * hold up a DisplayPort update that changes neither.
+		 * Only a lane or PIPE change, or a SuperSpeed port still owed
+		 * its power, needs the USB3 root hub below. Taking it means
+		 * waiting for the hub's ongoing work, which includes a whole
+		 * enumeration with its timeouts, and would hold up a
+		 * DisplayPort update that changes neither.
 		 */
 		if (atcphy_mux_is_noop(atcphy, target_mode)) {
 			/* Record matching requests for the next PHY init to restore. */
 			atcphy->typec_mode = target_mode;
 			return 0;
 		}
+		/* Turn down a mode the PHY cannot run before USB3 goes down for it. */
+		ret = atcphy_mux_check(atcphy, target_mode);
+		if (ret)
+			return ret;
+		in_mode = atcphy_mux_in_mode(atcphy, target_mode);
 	}
 
 	ret = atcphy_usb3_pm_get(atcphy, &pm);
 	if (ret)
-		return ret;
-	ret = atcphy_mux_set_locked(atcphy, target_mode);
+		goto out;
+
+	/*
+	 * The order in which dwc3 is taken down and brought up around a PHY
+	 * change (see dwc3-apple.c), for the SuperSpeed side only: the
+	 * controller's SuperSpeed port goes down before the PIPE is parked and
+	 * the lanes are rebuilt, and comes up only once the PIPE is on the USB3
+	 * backend again. It stays down after a failed change, and in a mode
+	 * without USB3.
+	 */
+	ret = atcphy_usb3_port_off(atcphy, &pm);
+	if (ret < 0) {
+		/* typec_mux_set() skips EOPNOTSUPP, which would report a false success. */
+		if (ret == -EOPNOTSUPP)
+			ret = -ENODEV;
+		goto put;
+	}
+	/* A port that someone else switched off is no longer the PHY's to restore. */
+	scoped_guard(mutex, &atcphy->lock)
+		atcphy->usb3_port_off = !ret;
+
+	ret = atcphy_mux_set_locked(atcphy, target_mode, &port_on);
+	usb_err = false;
+	if (port_on) {
+		int err = atcphy_usb3_port_on(atcphy, &pm);
+
+		if (err >= 0) {
+			scoped_guard(mutex, &atcphy->lock)
+				atcphy->usb3_port_off = false;
+		} else if (!ret || ret == -EOPNOTSUPP) {
+			/* A port left off must not hide behind a code typec_mux_set() skips */
+			ret = err;
+			usb_err = true;
+		}
+	}
+put:
 	atcphy_usb3_pm_put(&pm);
+out:
+	/*
+	 * With the lanes and the PIPE already as the mode needs them, only
+	 * USB3 is missing, and that must not fail what may be a DisplayPort
+	 * update. The port stays off until the next update.
+	 */
+	if (ret && usb_err && in_mode) {
+		dev_dbg(atcphy->dev, "SuperSpeed port left off: %d\n", ret);
+		return 0;
+	}
 	return ret;
 }
 

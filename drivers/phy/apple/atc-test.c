@@ -5,6 +5,7 @@
  */
 
 #include <kunit/device.h>
+#include <kunit/static_stub.h>
 #include <kunit/test.h>
 
 static struct apple_atcphy *atcphy_test_alloc(struct kunit *test, bool fixed_usb2)
@@ -91,6 +92,13 @@ static void atcphy_test_noop_same_mode(struct kunit *test)
 	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
 	atcphy->pipe_pending = true;
 	KUNIT_EXPECT_TRUE(test, atcphy_mux_is_noop(atcphy, APPLE_ATCPHY_MODE_USB3_DP));
+
+	/* A mode without USB3 leaves the SuperSpeed port off */
+	atcphy = atcphy_test_alloc(test, true);
+	atcphy->mode = APPLE_ATCPHY_MODE_DP;
+	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
+	atcphy->usb3_port_off = true;
+	KUNIT_EXPECT_TRUE(test, atcphy_mux_is_noop(atcphy, APPLE_ATCPHY_MODE_DP));
 }
 
 static void atcphy_test_noop_needs_work(struct kunit *test)
@@ -114,6 +122,39 @@ static void atcphy_test_noop_needs_work(struct kunit *test)
 	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_USB3;
 	atcphy->pipe_pending = true;
 	KUNIT_EXPECT_FALSE(test, atcphy_mux_is_noop(atcphy, APPLE_ATCPHY_MODE_USB3_DP));
+	atcphy->pipe_pending = false;
+
+	/* or its SuperSpeed port, still off since the last handoff */
+	atcphy->usb3_port_off = true;
+	KUNIT_EXPECT_FALSE(test, atcphy_mux_is_noop(atcphy, APPLE_ATCPHY_MODE_USB3_DP));
+}
+
+/* The controller's SuperSpeed port only runs on a completed USB3 route */
+static void atcphy_test_usb3_port_ready(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc(test, true);
+
+	KUNIT_EXPECT_TRUE(test, atcphy_usb3_port_ready(atcphy));
+
+	atcphy->mode_dirty = true;
+	KUNIT_EXPECT_FALSE(test, atcphy_usb3_port_ready(atcphy));
+	atcphy->mode_dirty = false;
+
+	atcphy->pipe_pending = true;
+	KUNIT_EXPECT_FALSE(test, atcphy_usb3_port_ready(atcphy));
+	atcphy->pipe_pending = false;
+
+	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
+	KUNIT_EXPECT_FALSE(test, atcphy_usb3_port_ready(atcphy));
+	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_USB3;
+
+	atcphy->host_active = false;
+	KUNIT_EXPECT_FALSE(test, atcphy_usb3_port_ready(atcphy));
+
+	/* A Type-C port's controller is never handled here */
+	atcphy = atcphy_test_alloc(test, false);
+	atcphy->host_active = true;
+	KUNIT_EXPECT_FALSE(test, atcphy_usb3_port_ready(atcphy));
 }
 
 /*
@@ -127,6 +168,9 @@ static struct apple_atcphy *atcphy_test_alloc_fixed_hub(struct kunit *test)
 	struct apple_atcphy *atcphy = atcphy_test_alloc_dev(test, true);
 
 	atcphy->hw = &atcphy_hw_t8140;
+	/* The lane and DisplayPort tunables a J700 has */
+	atcphy->ss_tunables = true;
+	atcphy->dp_tunables = true;
 	mutex_init(&atcphy->lock);
 
 	return atcphy;
@@ -182,6 +226,328 @@ static void atcphy_test_update_takes_usb(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_D), -ENODEV);
 }
 
+/*
+ * The steps of a mux update on a fixed-hub port, recorded by static stubs
+ * for the USB side and for the locked mode change: g(et the root hub),
+ * 0 (SuperSpeed port off), m(ode change) and 1 (SuperSpeed port on).
+ */
+struct atcphy_test_steps {
+	char log[16];
+	int pm_get_ret;
+	int port_off_ret;
+	int port_on_ret;
+	int mode_ret;
+	bool mode_port_on;
+};
+
+static struct atcphy_test_steps *atcphy_test_steps(void)
+{
+	return kunit_get_current_test()->priv;
+}
+
+static void atcphy_test_step(char step)
+{
+	struct atcphy_test_steps *steps = atcphy_test_steps();
+	size_t len = strlen(steps->log);
+
+	if (len < sizeof(steps->log) - 1)
+		steps->log[len] = step;
+}
+
+static int atcphy_test_pm_get(struct apple_atcphy *atcphy, struct atcphy_usb3_pm *pm)
+{
+	atcphy_test_step('g');
+	return atcphy_test_steps()->pm_get_ret;
+}
+
+static int atcphy_test_port_off(struct apple_atcphy *atcphy, struct atcphy_usb3_pm *pm)
+{
+	atcphy_test_step('0');
+	return atcphy_test_steps()->port_off_ret;
+}
+
+static int atcphy_test_port_on(struct apple_atcphy *atcphy, struct atcphy_usb3_pm *pm)
+{
+	atcphy_test_step('1');
+	return atcphy_test_steps()->port_on_ret;
+}
+
+static int atcphy_test_mode(struct apple_atcphy *atcphy, enum atcphy_mode target_mode,
+			    bool *port_on)
+{
+	atcphy_test_step('m');
+	*port_on = atcphy_test_steps()->mode_port_on;
+	return atcphy_test_steps()->mode_ret;
+}
+
+static struct atcphy_test_steps *atcphy_test_stub_steps(struct kunit *test)
+{
+	struct atcphy_test_steps *steps = kunit_kzalloc(test, sizeof(*steps), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, steps);
+	test->priv = steps;
+	kunit_activate_static_stub(test, atcphy_usb3_pm_get, atcphy_test_pm_get);
+	kunit_activate_static_stub(test, atcphy_usb3_port_off, atcphy_test_port_off);
+	kunit_activate_static_stub(test, atcphy_usb3_port_on, atcphy_test_port_on);
+	kunit_activate_static_stub(test, atcphy_mux_set_locked, atcphy_test_mode);
+
+	return steps;
+}
+
+/* The SuperSpeed port goes down before the PHY changes and comes back after it */
+static void atcphy_test_update_port_order(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_fixed_hub(test);
+	struct atcphy_test_steps *steps = atcphy_test_stub_steps(test);
+
+	/* A new pin assignment with USB3 routed again */
+	steps->mode_port_on = true;
+	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_C), 0);
+	KUNIT_EXPECT_STREQ(test, steps->log, "g0m1");
+	KUNIT_EXPECT_FALSE(test, atcphy->usb3_port_off);
+
+	/* An update keeping the mode touches neither */
+	memset(steps->log, 0, sizeof(steps->log));
+	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_D), 0);
+	KUNIT_EXPECT_STREQ(test, steps->log, "");
+
+	/* A mode without USB3: the port stays down */
+	steps->mode_port_on = false;
+	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_C), 0);
+	KUNIT_EXPECT_STREQ(test, steps->log, "g0m");
+	KUNIT_EXPECT_TRUE(test, atcphy->usb3_port_off);
+}
+
+/* No PIPE or lane work unless the port went down, and no port up after a failure */
+static void atcphy_test_update_port_failure(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_fixed_hub(test);
+	struct atcphy_test_steps *steps = atcphy_test_stub_steps(test);
+
+	steps->port_off_ret = -EPIPE;
+	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_C), -EPIPE);
+	KUNIT_EXPECT_STREQ(test, steps->log, "g0");
+
+	memset(steps->log, 0, sizeof(steps->log));
+	steps->port_off_ret = 0;
+	steps->mode_ret = -ETIMEDOUT;
+	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_C), -ETIMEDOUT);
+	KUNIT_EXPECT_STREQ(test, steps->log, "g0m");
+
+	/* A change refused before it touched the USB3 route brings the port back */
+	memset(steps->log, 0, sizeof(steps->log));
+	steps->mode_ret = -EOPNOTSUPP;
+	steps->mode_port_on = true;
+	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_C), -EOPNOTSUPP);
+	KUNIT_EXPECT_STREQ(test, steps->log, "g0m1");
+
+	/* and if that fails, the Type-C core must not take the refusal for success */
+	memset(steps->log, 0, sizeof(steps->log));
+	steps->port_on_ret = -ENOMEM;
+	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_C), -ENOMEM);
+	KUNIT_EXPECT_STREQ(test, steps->log, "g0m1");
+	steps->port_on_ret = 0;
+
+	/* A hub that cannot switch the port is no success the Type-C core skips */
+	memset(steps->log, 0, sizeof(steps->log));
+	steps->port_off_ret = -EOPNOTSUPP;
+	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_C), -ENODEV);
+	KUNIT_EXPECT_STREQ(test, steps->log, "g0");
+}
+
+/* A port owed only its power is brought up, and USB alone never fails the display */
+static void atcphy_test_update_port_owed(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_fixed_hub(test);
+	struct atcphy_test_steps *steps = atcphy_test_stub_steps(test);
+
+	atcphy->usb3_port_off = true;
+
+	/* An update keeping the pin assignment */
+	steps->mode_port_on = true;
+	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_D), 0);
+	KUNIT_EXPECT_STREQ(test, steps->log, "g0m1");
+	KUNIT_EXPECT_FALSE(test, atcphy->usb3_port_off);
+	atcphy->usb3_port_off = true;
+
+	/* The same, with the root hub gone */
+	memset(steps->log, 0, sizeof(steps->log));
+	steps->pm_get_ret = -ENODEV;
+	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_D), 0);
+	KUNIT_EXPECT_STREQ(test, steps->log, "g");
+
+	/* or failing to take the port down */
+	memset(steps->log, 0, sizeof(steps->log));
+	steps->pm_get_ret = 0;
+	steps->port_off_ret = -EPIPE;
+	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_D), 0);
+	KUNIT_EXPECT_STREQ(test, steps->log, "g0");
+
+	/* A new pin assignment still needs the USB side */
+	memset(steps->log, 0, sizeof(steps->log));
+	steps->pm_get_ret = -ENODEV;
+	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_C), -ENODEV);
+	KUNIT_EXPECT_STREQ(test, steps->log, "g");
+
+	/* A failed mode change is no USB failure */
+	memset(steps->log, 0, sizeof(steps->log));
+	steps->pm_get_ret = 0;
+	steps->port_off_ret = 0;
+	steps->mode_ret = -EIO;
+	steps->mode_port_on = false;
+	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_D), -EIO);
+	KUNIT_EXPECT_STREQ(test, steps->log, "g0m");
+}
+
+/* A mode the PHY cannot run is turned down before USB3 goes down for it */
+static void atcphy_test_update_unsupported(struct kunit *test)
+{
+	struct typec_altmode tbt = { .svid = USB_TYPEC_TBT_SID };
+	struct typec_mux_state state = { .alt = &tbt, .mode = TYPEC_STATE_MODAL };
+	struct apple_atcphy *atcphy = atcphy_test_alloc_fixed_hub(test);
+	struct atcphy_test_steps *steps = atcphy_test_stub_steps(test);
+
+	/* Thunderbolt, which this PHY does not have */
+	KUNIT_EXPECT_EQ(test, atcphy_mux_update(atcphy, &state), -EOPNOTSUPP);
+	KUNIT_EXPECT_STREQ(test, steps->log, "");
+
+	/* DisplayPort without its tunables */
+	atcphy->dp_tunables = false;
+	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_C), -EOPNOTSUPP);
+	KUNIT_EXPECT_STREQ(test, steps->log, "");
+	KUNIT_EXPECT_FALSE(test, atcphy->usb3_port_off);
+}
+
+/* The locked mode change as it reports the port: up once the PHY took it down */
+static int atcphy_test_mode_ready(struct apple_atcphy *atcphy, enum atcphy_mode target_mode,
+				  bool *port_on)
+{
+	atcphy_test_step('m');
+	*port_on = atcphy->usb3_port_off && atcphy_test_steps()->mode_port_on;
+	return atcphy_test_steps()->mode_ret;
+}
+
+/* A port that userspace switched off while the PHY had it down stays off */
+static void atcphy_test_update_port_taken(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_fixed_hub(test);
+	struct atcphy_test_steps *steps = atcphy_test_stub_steps(test);
+
+	kunit_activate_static_stub(test, atcphy_mux_set_locked, atcphy_test_mode_ready);
+	steps->mode_port_on = true;
+
+	/* Unplugged, with the port down for the PHY, then disabled through sysfs */
+	atcphy->mode = APPLE_ATCPHY_MODE_USB2;
+	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
+	atcphy->usb3_port_off = true;
+
+	/* The replug finds the port off for someone else, and leaves it to them */
+	steps->port_off_ret = 1;
+	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_D), 0);
+	KUNIT_EXPECT_STREQ(test, steps->log, "g0m");
+	KUNIT_EXPECT_FALSE(test, atcphy->usb3_port_off);
+
+	/* Disabled while the PHY moved the lanes: nothing is owed afterwards */
+	memset(steps->log, 0, sizeof(steps->log));
+	steps->port_off_ret = 0;
+	steps->port_on_ret = 1;
+	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_C), 0);
+	KUNIT_EXPECT_STREQ(test, steps->log, "g0m1");
+	KUNIT_EXPECT_FALSE(test, atcphy->usb3_port_off);
+}
+
+/*
+ * Zeroed memory in place of the core, PIPE handler and USB2 PHY registers:
+ * enough to park the PIPE and power the PHY off, with a PIPE lock request
+ * that is never acknowledged.
+ */
+static void atcphy_test_fake_regs(struct kunit *test, struct apple_atcphy *atcphy)
+{
+	void *core = kunit_kzalloc(test, ATCPHY_MISC + 4, GFP_KERNEL);
+	void *pipehandler = kunit_kzalloc(test, PIPEHANDLER_NONSELECTED_OVERRIDE + 4, GFP_KERNEL);
+	void *usb2phy = kunit_kzalloc(test, USB2PHY_MISCTUNE + 4, GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, core);
+	KUNIT_ASSERT_NOT_NULL(test, pipehandler);
+	KUNIT_ASSERT_NOT_NULL(test, usb2phy);
+	atcphy->regs.core = (__force void __iomem *)core;
+	atcphy->regs.pipehandler = (__force void __iomem *)pipehandler;
+	atcphy->regs.usb2phy = (__force void __iomem *)usb2phy;
+}
+
+/* The locked mode change reports a port that can come up again */
+static void atcphy_test_set_port_on(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_fixed_hub(test);
+	bool port_on = true;
+
+	/* The port was not taken down */
+	KUNIT_EXPECT_EQ(test, atcphy_mux_set_locked(atcphy, APPLE_ATCPHY_MODE_USB3_DP, &port_on),
+			0);
+	KUNIT_EXPECT_FALSE(test, port_on);
+
+	/* The port is down and the PIPE already on the USB3 backend */
+	atcphy->usb3_port_off = true;
+	KUNIT_EXPECT_EQ(test, atcphy_mux_set_locked(atcphy, APPLE_ATCPHY_MODE_USB3_DP, &port_on),
+			0);
+	KUNIT_EXPECT_TRUE(test, port_on);
+
+	/* A change that failed, here an unplug whose PIPE lock was refused */
+	atcphy_test_fake_regs(test, atcphy);
+	KUNIT_EXPECT_EQ(test, atcphy_mux_set_locked(atcphy, APPLE_ATCPHY_MODE_USB2, &port_on),
+			-ETIMEDOUT);
+	KUNIT_EXPECT_TRUE(test, atcphy->mode_dirty);
+	KUNIT_EXPECT_FALSE(test, port_on);
+}
+
+/* A host that starts up powers its SuperSpeed port on itself */
+static void atcphy_test_host_start(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_fixed_hub(test);
+	struct phy *phy = kunit_kzalloc(test, sizeof(*phy), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, phy);
+	phy_set_drvdata(phy, atcphy);
+	atcphy->usb3_port_off = true;
+
+	KUNIT_EXPECT_EQ(test, atcphy_usb3_set_mode(phy, PHY_MODE_USB_HOST, 0), 0);
+	KUNIT_EXPECT_FALSE(test, atcphy->usb3_port_off);
+	KUNIT_EXPECT_TRUE(test, atcphy_mux_is_noop(atcphy, APPLE_ATCPHY_MODE_USB3_DP));
+}
+
+#if IS_REACHABLE(CONFIG_USB)
+/* Only the controller's SuperSpeed root hub is ever handed the port changes */
+static void atcphy_test_usb3_root(struct kunit *test)
+{
+	struct device *controller = kunit_kzalloc(test, 2 * sizeof(*controller), GFP_KERNEL);
+	struct usb_bus *bus = kunit_kzalloc(test, 2 * sizeof(*bus), GFP_KERNEL);
+	struct usb_device *udev = kunit_kzalloc(test, 2 * sizeof(*udev), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, controller);
+	KUNIT_ASSERT_NOT_NULL(test, bus);
+	KUNIT_ASSERT_NOT_NULL(test, udev);
+	bus[0].sysdev = &controller[0];
+	bus[1].sysdev = &controller[1];
+
+	udev[0].bus = &bus[0];
+	udev[0].speed = USB_SPEED_SUPER_PLUS;
+	KUNIT_EXPECT_TRUE(test, atcphy_usb3_is_root(&udev[0], &controller[0]));
+
+	/* The USB2 root hub, with the fixed hub on it */
+	udev[1].bus = &bus[0];
+	udev[1].speed = USB_SPEED_HIGH;
+	KUNIT_EXPECT_FALSE(test, atcphy_usb3_is_root(&udev[1], &controller[0]));
+
+	/* A device on the SuperSpeed root port */
+	udev[1].speed = USB_SPEED_SUPER;
+	udev[1].parent = &udev[0];
+	KUNIT_EXPECT_FALSE(test, atcphy_usb3_is_root(&udev[1], &controller[0]));
+
+	/* The SuperSpeed root hub of another controller */
+	KUNIT_EXPECT_FALSE(test, atcphy_usb3_is_root(&udev[0], &controller[1]));
+}
+#endif
+
 /* USB shutdown can turn the lanes off before the SAFE mux request arrives. */
 static struct apple_atcphy *atcphy_test_alloc_powered_off(struct kunit *test)
 {
@@ -210,8 +576,9 @@ static void atcphy_test_safe_after_poweroff(struct kunit *test)
 static void atcphy_test_locked_safe_after_poweroff(struct kunit *test)
 {
 	struct apple_atcphy *atcphy = atcphy_test_alloc_powered_off(test);
+	bool port_on;
 
-	KUNIT_EXPECT_EQ(test, atcphy_mux_set_locked(atcphy, APPLE_ATCPHY_MODE_OFF), 0);
+	KUNIT_EXPECT_EQ(test, atcphy_mux_set_locked(atcphy, APPLE_ATCPHY_MODE_OFF, &port_on), 0);
 	KUNIT_EXPECT_EQ(test, atcphy->typec_mode, APPLE_ATCPHY_MODE_OFF);
 }
 
@@ -240,13 +607,15 @@ static void atcphy_test_safe_live_pipe(struct kunit *test)
 {
 	struct apple_atcphy *atcphy = atcphy_test_alloc_dev(test, false);
 	struct atcphy_test_configure config = {};
+	bool port_on;
 
 	test->priv = &config;
 	kunit_activate_static_stub(test, atcphy_configure, atcphy_test_configure_stub);
 	atcphy->hw = &atcphy_hw_t8103;
 	atcphy->typec_mode = APPLE_ATCPHY_MODE_USB3;
 	mutex_init(&atcphy->lock);
-	KUNIT_EXPECT_EQ(test, atcphy_mux_set_locked(atcphy, APPLE_ATCPHY_MODE_OFF), -EBUSY);
+	KUNIT_EXPECT_EQ(test, atcphy_mux_set_locked(atcphy, APPLE_ATCPHY_MODE_OFF, &port_on),
+			-EBUSY);
 	KUNIT_EXPECT_EQ(test, config.calls, 0U);
 	KUNIT_EXPECT_EQ(test, atcphy->mode, APPLE_ATCPHY_MODE_USB3_DP);
 	KUNIT_EXPECT_EQ(test, atcphy->typec_mode, APPLE_ATCPHY_MODE_USB3);
@@ -278,8 +647,19 @@ static struct kunit_case atcphy_mux_test_cases[] = {
 	KUNIT_CASE(atcphy_test_target_mode_fixed_hub),
 	KUNIT_CASE(atcphy_test_noop_same_mode),
 	KUNIT_CASE(atcphy_test_noop_needs_work),
+	KUNIT_CASE(atcphy_test_usb3_port_ready),
 	KUNIT_CASE(atcphy_test_update_skips_usb),
 	KUNIT_CASE(atcphy_test_update_takes_usb),
+	KUNIT_CASE(atcphy_test_update_port_order),
+	KUNIT_CASE(atcphy_test_update_port_failure),
+	KUNIT_CASE(atcphy_test_update_port_owed),
+	KUNIT_CASE(atcphy_test_update_unsupported),
+	KUNIT_CASE(atcphy_test_update_port_taken),
+	KUNIT_CASE(atcphy_test_set_port_on),
+	KUNIT_CASE(atcphy_test_host_start),
+#if IS_REACHABLE(CONFIG_USB)
+	KUNIT_CASE(atcphy_test_usb3_root),
+#endif
 	KUNIT_CASE(atcphy_test_safe_after_poweroff),
 	KUNIT_CASE(atcphy_test_locked_safe_after_poweroff),
 	KUNIT_CASE(atcphy_test_safe_live_pipe),

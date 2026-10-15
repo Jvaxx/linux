@@ -21,9 +21,10 @@ config PHY_APPLE_ATC_KUNIT_TEST
 	help
 	  Build the KUnit tests for the Type-C mux decisions of the Apple
 	  Type-C PHY driver into the driver. They check how Type-C states
-	  map to PHY modes and which mux updates may skip the lane and
-	  PIPE work. The tests need no hardware and run when the driver
-	  is loaded.
+	  map to PHY modes, which mux updates may skip the lane and PIPE
+	  work, and that a port behind a fixed hub has the controller's
+	  SuperSpeed port off while its PIPE moves. The tests need no
+	  hardware and run when the driver is loaded.
 
 	  If unsure, say N.
 
