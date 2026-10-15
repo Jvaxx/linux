@@ -25,6 +25,7 @@ mod profile;
 mod proto;
 mod refkey;
 mod refkey_seal;
+mod registration;
 mod rxring;
 mod sbio;
 mod scrd;
@@ -251,9 +252,9 @@ enum SbioOutcome {
     Other,
 }
 
-const BRINGUP_FRESH: u32 = 0;
-const BRINGUP_IDENTIFIED: u32 = 1;
-const BRINGUP_ESTABLISHED: u32 = 2;
+const BRINGUP_FRESH: u32 = registration::FRESH;
+const BRINGUP_IDENTIFIED: u32 = registration::IDENTIFIED;
+const BRINGUP_ESTABLISHED: u32 = registration::ESTABLISHED;
 
 pub(crate) struct PatchLoaded(());
 
@@ -643,6 +644,9 @@ struct SepData {
     touchid_failed: Atomic<bool>,
 
     bringup: Atomic<u32>,
+    // The enclave accepted an identification of the sensor since it booted,
+    // even if the registration it began then failed.
+    sensor_held: Atomic<bool>,
 
     #[pin]
     ool_sks: Mutex<Option<OolPair>>,
@@ -854,6 +858,7 @@ impl SepData {
                 sks_initialized: Atomic::new(false),
                 sks_wedged: Atomic::new(0),
                 bringup: Atomic::new(BRINGUP_FRESH),
+                sensor_held: Atomic::new(false),
                 keybag_designated: Atomic::new(false),
                 bringup_started: Atomic::new(false),
                 touchid_started: Atomic::new(false),
