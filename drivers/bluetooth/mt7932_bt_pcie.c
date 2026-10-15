@@ -67,10 +67,6 @@
 #define BT7932_CAL "mediatek/j700-mt7932-btcal.bin"
 #define BT7932_ADDR "mediatek/j700-mt7932-bdaddr.bin"
 
-static bool enable = true;
-module_param(enable, bool, 0600);
-MODULE_PARM_DESC(enable, "Probe the transport (default: on); no effect on an already bound device");
-
 struct bt7932_geometry {
 	u16 stride;
 	u16 payload;
@@ -1129,9 +1125,6 @@ static int bt7932_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	u16 command;
 	int ret;
 
-	/* enable=0 leaves the function unbound for diagnosis. */
-	if (!READ_ONCE(enable))
-		return -ENODEV;
 	if (!of_machine_is_compatible("apple,j700") ||
 	    !of_machine_is_compatible("apple,t8140") ||
 	    pci_domain_nr(pdev->bus) || pdev->bus->number != 1 || pdev->devfn != PCI_DEVFN(0, 1))
