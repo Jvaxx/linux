@@ -2,6 +2,8 @@
 #ifndef MT7932_PACKET_H
 #define MT7932_PACKET_H
 
+#include <linux/bits.h>
+
 #include "protocol.h"
 #include "channels.h"
 
@@ -10,9 +12,19 @@ struct mt7932_rx_frame {
 	size_t length;
 	u32 timestamp, rcpi, rxv;
 	u16 frame_control, sequence_control, qos_control, wtbl;
-	u8 channel, amsdu;
+	u8 channel, amsdu, sec_mode;
 	bool translated, group4, signal_valid, rate_valid, unicast;
+	bool cipher_mismatch;
 };
+
+/* RX descriptor word1: the cipher the hardware decrypted the frame with (0
+ * when it did not decrypt it), and the cipher and cipher-length mismatch
+ * flags. The layout is the connac2 one.
+ */
+#define MT7932_RXD1_SEC_MODE_SHIFT	16
+#define MT7932_RXD1_SEC_MODE_MASK	0x1f
+#define MT7932_RXD1_CIPHER_MISMATCH	BIT(23)
+#define MT7932_RXD1_CIPHER_LEN_MISMATCH	BIT(24)
 
 /* Strict non-monitor subset of the RX descriptor; its groups are ordered
  * 4, 1, 2, 3, 5, not by numerical group identifier.
@@ -54,6 +66,9 @@ static inline int mt7932_rx_frame(const u8 *packet, size_t size, struct mt7932_r
 	out->wtbl = w1 & 0x3ff;
 	out->unicast = ((w3 >> 16) & 3) == 1;
 	out->amsdu = w4 & 3;
+	out->sec_mode = (w1 >> MT7932_RXD1_SEC_MODE_SHIFT) & MT7932_RXD1_SEC_MODE_MASK;
+	out->cipher_mismatch = w1 & (MT7932_RXD1_CIPHER_MISMATCH |
+				     MT7932_RXD1_CIPHER_LEN_MISMATCH);
 	if (!mt7932_channel_band(out->channel))
 		return -EOPNOTSUPP;
 	if ((out->translated && (w2 & (1U << 27))) || (!out->translated && out->amsdu))
@@ -101,6 +116,18 @@ static inline int mt7932_rx_frame(const u8 *packet, size_t size, struct mt7932_r
 		out->sequence_control = get_unaligned_le16(out->data + 22);
 	}
 	return 0;
+}
+
+/*
+ * On a protected connection, deliver only frames the hardware decrypted with
+ * the cipher and key length it expected. The firmware runs the WPA2 handshake
+ * itself, so the host has no unprotected EAPOL to accept. Nothing is
+ * decrypted on an open connection.
+ */
+static inline bool mt7932_rx_protection_ok(const struct mt7932_rx_frame *frame,
+					   bool open)
+{
+	return open || (frame->sec_mode && !frame->cipher_mismatch);
 }
 
 static inline int mt7932_rx_signal(const struct mt7932_rx_frame *frame, u8 antenna_mask)
