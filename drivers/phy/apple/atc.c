@@ -3070,9 +3070,38 @@ static int atcphy_usb3_power_off(struct phy *phy)
 	return 0;
 }
 
+/* Route the PIPE to the backend of the current mode for the role dwc3 selected. */
+static int atcphy_usb3_route(struct apple_atcphy *atcphy, bool host)
+{
+	int ret;
+
+	lockdep_assert_held(&atcphy->lock);
+
+	/*
+	 * We may get multiple calls to set_mode (for host mode e.g. at least one from the dwc3 glue
+	 * driver and then another one from the generic xhci code) but must only configure the
+	 * PIPE handler once. Nothing needs to be done either when the PIPE is already routed to
+	 * the backend the current mode uses, which includes the dummy backend of the USB2 modes.
+	 */
+	/* A failed lane/domain transition must be restored before routing PIPE. */
+	if (atcphy->mode_dirty)
+		return -EBUSY;
+	if (atcphy->pipe_pending) {
+		ret = atcphy_park_pipehandler(atcphy);
+		if (ret)
+			return ret;
+	}
+	if (atcphy->pipe_state == atcphy_modes[atcphy->mode].pipehandler_state &&
+	    !atcphy->pipe_pending)
+		return 0;
+
+	return atcphy_configure_pipehandler(atcphy, host);
+}
+
 static int atcphy_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode)
 {
 	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
+	int ret;
 
 	guard(mutex)(&atcphy->lock);
 
@@ -3092,26 +3121,22 @@ static int atcphy_usb3_set_mode(struct phy *phy, enum phy_mode mode, int submode
 		return -EINVAL;
 	}
 
+	ret = atcphy_usb3_route(atcphy, mode == PHY_MODE_USB_HOST);
+	if (!ret || !atcphy->fixed_usb2 || mode != PHY_MODE_USB_HOST)
+		return ret;
+
 	/*
-	 * We may get multiple calls to set_mode (for host mode e.g. at least one from the dwc3 glue
-	 * driver and then another one from the generic xhci code) but must only configure the
-	 * PIPE handler once. Nothing needs to be done either when the PIPE is already routed to
-	 * the backend the current mode uses, which includes the dummy backend of the USB2 modes.
+	 * The host behind a fixed hub serves that hub as well, and when this
+	 * fails, xHCI registers neither of its root hubs. Let it start, with
+	 * the PIPE parked if that works: the Type-C mux update that restores
+	 * the lanes or retries the handoff routes the PIPE, with the
+	 * SuperSpeed port off.
 	 */
-	/* A failed lane/domain transition must be restored before routing PIPE. */
-	if (atcphy->mode_dirty)
-		return -EBUSY;
-	if (atcphy->pipe_pending) {
-		int ret = atcphy_park_pipehandler(atcphy);
-
-		if (ret)
-			return ret;
-	}
-	if (atcphy->pipe_state == atcphy_modes[atcphy->mode].pipehandler_state &&
-	    !atcphy->pipe_pending)
-		return 0;
-
-	return atcphy_configure_pipehandler(atcphy, mode == PHY_MODE_USB_HOST);
+	if (atcphy_park_pipehandler(atcphy))
+		dev_warn(atcphy->dev, "Host starts with its PIPE not parked\n");
+	else
+		dev_dbg(atcphy->dev, "Host starts without USB3: %d\n", ret);
+	return 0;
 }
 
 static const struct phy_ops apple_atc_usb3_phy_ops = {
