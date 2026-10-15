@@ -2469,28 +2469,32 @@ static void atc_tunnel_wake_t8103(struct apple_atcphy *atcphy)
 	udelay(2);
 }
 
-static int atc_tunnel_start_t8103(struct apple_atcphy *atcphy, u8 rate)
+/* The pixel clock selector for a DP link rate code. */
+static int atc_tunnel_rate_selector(u8 rate)
 {
-	u32 selector, value;
-	int ret;
-
-	lockdep_assert_held(&atcphy->lock);
 	switch (rate) {
 	case 0x06:	/* RBR */
-		selector = 4;
-		break;
+		return 4;
 	case 0x0a:	/* HBR */
-		selector = 3;
-		break;
+		return 3;
 	case 0x14:	/* HBR2 */
-		selector = 1;
-		break;
+		return 1;
 	case 0x1e:	/* HBR3 */
-		selector = 0;
-		break;
+		return 0;
 	default:
 		return -EINVAL;
 	}
+}
+
+static int atc_tunnel_start_t8103(struct apple_atcphy *atcphy, u8 rate)
+{
+	int selector, ret;
+	u32 value;
+
+	lockdep_assert_held(&atcphy->lock);
+	selector = atc_tunnel_rate_selector(rate);
+	if (selector < 0)
+		return selector;
 	if (atcphy->tunnel_clock_on) {
 		if (atcphy->tunnel_rate == rate)
 			return 0;
@@ -2644,22 +2648,6 @@ static void atc_tunnel_restore(struct apple_atcphy *atcphy)
 	atcphy->tunnel_saved = false;
 	atcphy->tunnel_attempted = false;
 	atcphy->tunnel_rate = 0;
-}
-
-static int atc_tunnel_rate_selector(u8 rate)
-{
-	switch (rate) {
-	case 0x06:
-		return 4;
-	case 0x0a:
-		return 3;
-	case 0x14:
-		return 1;
-	case 0x1e:
-		return 0;
-	default:
-		return -EINVAL;
-	}
 }
 
 /*
