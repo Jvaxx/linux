@@ -30,12 +30,10 @@ properties:
           - const: apple,agx-g14s
 
   reg:
-    minItems: 2
-    maxItems: 3
+    maxItems: 2
 
   reg-names:
-    minItems: 2
-    maxItems: 3
+    maxItems: 2
 
   power-domains:
     maxItems: 1
@@ -93,12 +91,10 @@ allOf:
         reg:
           items:
             - description: GFX coprocessor control registers
-            - description: GFX1 coprocessor control registers
             - description: GPU block MMIO registers
         reg-names:
           items:
             - const: asc
-            - const: asc1
             - const: sgx
         mboxes:
           items:
