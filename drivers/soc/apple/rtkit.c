@@ -608,6 +608,17 @@ static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 		apple_rtkit_common_rx_get_buffer(rtk, &rtk->oslog_buffer,
 						 APPLE_RTKIT_EP_OSLOG, msg);
 		break;
+	case 3:
+	case 4:
+	case 5:
+		/*
+		 * OpenBSD's public RTKit consumer recognizes these opaque events
+		 * without an ACK. Keep their payload visible without interpreting
+		 * it as a buffer address or a decoded firmware error.
+		 */
+		dev_info(rtk->dev, "RTKit: OSLog event %u: %016llx (undecoded)\n",
+			 type, msg);
+		break;
 	default:
 		dev_warn(rtk->dev, "RTKit: Unknown oslog message: %llx\n",
 			 msg);
