@@ -368,6 +368,26 @@ static int mux_fwnode_match(struct device *dev, const void *fwnode)
 	return device_match_fwnode(dev, fwnode);
 }
 
+/*
+ * The connection lookup checks that a mux's own node is available, but the
+ * device that registers a mux can sit further up: a display processor
+ * registers its Type-C routes, which are child nodes of its own. Under a
+ * node that is not available, such as one the boot loader left disabled,
+ * nothing ever registers the mux.
+ */
+static bool typec_mux_ancestors_available(const struct fwnode_handle *fwnode)
+{
+	struct fwnode_handle *parent;
+
+	fwnode_for_each_parent_node(fwnode, parent) {
+		if (!fwnode_device_is_available(parent)) {
+			fwnode_handle_put(parent);
+			return false;
+		}
+	}
+	return true;
+}
+
 static void *typec_mux_match(const struct fwnode_handle *fwnode,
 			     const char *id, void *data)
 {
@@ -389,7 +409,7 @@ static void *typec_mux_match(const struct fwnode_handle *fwnode,
 	dev = class_find_device(&typec_mux_class, NULL, fwnode,
 				mux_fwnode_match);
 	if (!dev)
-		return ERR_PTR(-EPROBE_DEFER);
+		return typec_mux_ancestors_available(fwnode) ? ERR_PTR(-EPROBE_DEFER) : NULL;
 
 	/* Skip duplicates */
 	for (i = 0; i < TYPEC_MUX_MAX_DEVS; i++)
