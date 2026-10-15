@@ -1047,7 +1047,12 @@ static void cd321x_update_work(struct work_struct *work)
 		cd321x_dp_notify(cd321x, &dp, connector_status_connected);
 		break;
 	case CD321X_DP_EVENT_RETRAIN:
-		/* An unknown status asks the connector to recheck its link. */
+		/*
+		 * Report the HPD level as for any other update, so a connector
+		 * that has lost the sink meanwhile connects it again.  Then an
+		 * unknown status asks the connector to recheck its link.
+		 */
+		cd321x_dp_notify(cd321x, &dp, connector_status_connected);
 		cd321x_dp_notify(cd321x, &dp, connector_status_unknown);
 		break;
 	}
