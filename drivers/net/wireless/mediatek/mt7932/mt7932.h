@@ -2,7 +2,6 @@
 #ifndef MT7932_H
 #define MT7932_H
 
-
 #include <linux/average.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
@@ -30,7 +29,6 @@
 #include "regulatory.h"
 #include "rate.h"
 #include "capabilities.h"
-
 
 #define W 0xd4000
 #define H 0xd6000

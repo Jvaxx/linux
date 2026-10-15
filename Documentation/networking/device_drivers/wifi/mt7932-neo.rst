@@ -1,7 +1,7 @@
 .. SPDX-License-Identifier: GPL-2.0-only
 
-MT7932 radio bring-up on the MacBook Neo
-======================================
+MediaTek MT7932 radio on the MacBook Neo
+========================================
 
 J700 MT7932 Wi-Fi uses cfg80211 and NetworkManager with firmware-managed
 WPA2-CCMP authentication. Bluetooth uses a transport on the radio's second

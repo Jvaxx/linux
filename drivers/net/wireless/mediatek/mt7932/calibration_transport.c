@@ -1,7 +1,5 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+// SPDX-License-Identifier: GPL-2.0-only
 #include "mt7932.h"
-
-
 
 /* Called only by the serialized command owner, never from the RX consumer. */
 int mt_cal_procedure(struct mt7932 *m, struct mt7932_cal_piece *pieces,
