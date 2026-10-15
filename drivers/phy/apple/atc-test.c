@@ -515,6 +515,57 @@ static void atcphy_test_host_start(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, atcphy_mux_is_noop(atcphy, APPLE_ATCPHY_MODE_USB3_DP));
 }
 
+/* A fixed-hub PHY whose USB3 handoff failed while the host was up */
+static struct apple_atcphy *atcphy_test_alloc_failed_handoff(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_fixed_hub(test);
+
+	atcphy_test_fake_regs(test, atcphy);
+	atcphy->pipe_pending = true;
+	atcphy->usb3_port_off = true;
+
+	/* The running host has to acknowledge the PIPE lock */
+	scoped_guard(mutex, &atcphy->lock)
+		KUNIT_EXPECT_EQ(test, atcphy_park_pipehandler(atcphy), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, atcphy->pipe_state, ATCPHY_PIPEHANDLER_STATE_USB3);
+	KUNIT_EXPECT_TRUE(test, atcphy->pipe_pending);
+
+	return atcphy;
+}
+
+/* Once dwc3 has stopped, its USB3 PHY power-off parks the PIPE without one */
+static void atcphy_test_stopped_power_off(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_failed_handoff(test);
+	struct phy *phy = kunit_kzalloc(test, sizeof(*phy), GFP_KERNEL);
+
+	KUNIT_ASSERT_NOT_NULL(test, phy);
+	phy_set_drvdata(phy, atcphy);
+
+	KUNIT_EXPECT_EQ(test, atcphy_usb3_power_off(phy), 0);
+	KUNIT_EXPECT_EQ(test, atcphy->pipe_state, ATCPHY_PIPEHANDLER_STATE_DUMMY);
+	KUNIT_EXPECT_FALSE(test, atcphy->pipe_pending);
+	KUNIT_EXPECT_EQ(test, atcphy->mode, APPLE_ATCPHY_MODE_OFF);
+	KUNIT_EXPECT_FALSE(test, atcphy->host_active);
+	KUNIT_EXPECT_FALSE(test, atcphy->usb3_port_off);
+}
+
+/* and so does the reset that dwc3 asserts once it has stopped */
+static void atcphy_test_stopped_reset(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_failed_handoff(test);
+	u32 aon;
+
+	KUNIT_EXPECT_EQ(test, atcphy_dwc3_reset_assert(&atcphy->rcdev, 0), 0);
+	KUNIT_EXPECT_EQ(test, atcphy->pipe_state, ATCPHY_PIPEHANDLER_STATE_DUMMY);
+	KUNIT_EXPECT_FALSE(test, atcphy->pipe_pending);
+	KUNIT_EXPECT_FALSE(test, atcphy->host_active);
+	KUNIT_EXPECT_FALSE(test, atcphy->usb3_port_off);
+	aon = readl(atcphy->regs.pipehandler + PIPEHANDLER_AON_GEN);
+	KUNIT_EXPECT_TRUE(test, aon & PIPEHANDLER_AON_GEN_DWC3_FORCE_CLAMP_EN);
+	KUNIT_EXPECT_FALSE(test, aon & PIPEHANDLER_AON_GEN_DWC3_RESET_N);
+}
+
 #if IS_REACHABLE(CONFIG_USB)
 /* Only the controller's SuperSpeed root hub is ever handed the port changes */
 static void atcphy_test_usb3_root(struct kunit *test)
@@ -657,6 +708,8 @@ static struct kunit_case atcphy_mux_test_cases[] = {
 	KUNIT_CASE(atcphy_test_update_port_taken),
 	KUNIT_CASE(atcphy_test_set_port_on),
 	KUNIT_CASE(atcphy_test_host_start),
+	KUNIT_CASE(atcphy_test_stopped_power_off),
+	KUNIT_CASE(atcphy_test_stopped_reset),
 #if IS_REACHABLE(CONFIG_USB)
 	KUNIT_CASE(atcphy_test_usb3_root),
 #endif
