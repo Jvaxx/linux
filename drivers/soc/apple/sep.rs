@@ -592,6 +592,11 @@ struct SepData {
     #[pin]
     dma_ring: Mutex<Option<shmem::ShMem>>,
 
+    // One SBIO request/reply exchange at a time: the endpoint has a single
+    // out-of-line buffer and `sbio_rx` tracks a single transfer.
+    #[pin]
+    sbio_exchange_lock: Mutex<()>,
+
     #[pin]
     sbio_rx: Mutex<transfer::Reassembly>,
 
@@ -858,6 +863,7 @@ impl SepData {
                 scrd_probe <- new_mutex!(ScrdProbe::new()),
                 scrd_wq <- new_condvar!("SepData::scrd_wq"),
                 dma_ring <- new_mutex!(Some(dma_ring)),
+                sbio_exchange_lock <- new_mutex!(()),
                 sbio_rx <- new_mutex!(transfer::Reassembly::new()),
                 sbio_wq <- new_condvar!("SepData::sbio_wq"),
                 sbio_ready: Atomic::new(false),
