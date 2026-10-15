@@ -187,7 +187,7 @@ static void resume_stale_crtc_disabled_test(struct kunit *test)
 	priv->admissible = false;
 	state = priv->drm.mode_config.suspend_state;
 	/* The caller tells userspace about the CRTC it had and lost. */
-	KUNIT_EXPECT_TRUE(test, apple_drm_drop_stale_crtcs(state));
+	KUNIT_EXPECT_EQ(test, apple_drm_drop_stale_crtcs(state), drm_crtc_mask(priv->crtc));
 
 	/* The resume check warns about an encoder routed without a CRTC. */
 	conn_state = drm_atomic_get_new_connector_state(state, &priv->connector);
@@ -218,8 +218,8 @@ static void resume_admissible_crtc_restored_test(struct kunit *test)
 	struct resume_test *priv = resume_test_init(test);
 
 	KUNIT_ASSERT_EQ(test, drm_mode_config_helper_suspend(&priv->drm), 0);
-	KUNIT_EXPECT_FALSE(test,
-			   apple_drm_drop_stale_crtcs(priv->drm.mode_config.suspend_state));
+	KUNIT_EXPECT_EQ(test, apple_drm_drop_stale_crtcs(priv->drm.mode_config.suspend_state),
+			0U);
 	KUNIT_EXPECT_EQ(test, drm_mode_config_helper_resume(&priv->drm), 0);
 
 	KUNIT_EXPECT_TRUE(test, priv->crtc->state->enable);
@@ -256,8 +256,8 @@ static void resume_stale_dpms_off_crtc_disabled_test(struct kunit *test)
 
 	KUNIT_ASSERT_EQ(test, drm_mode_config_helper_suspend(&priv->drm), 0);
 	priv->admissible = false;
-	KUNIT_EXPECT_TRUE(test,
-			  apple_drm_drop_stale_crtcs(priv->drm.mode_config.suspend_state));
+	KUNIT_EXPECT_EQ(test, apple_drm_drop_stale_crtcs(priv->drm.mode_config.suspend_state),
+			drm_crtc_mask(priv->crtc));
 	KUNIT_EXPECT_EQ(test, drm_mode_config_helper_resume(&priv->drm), 0);
 	KUNIT_EXPECT_FALSE(test, priv->crtc->state->enable);
 	KUNIT_EXPECT_NULL(test, priv->connector.state->crtc);
