@@ -59,7 +59,7 @@ makes the driver core unbind Bluetooth before Wi-Fi; unloading
 DMA pointers, and refuses function reset while its Bluetooth sibling is live.
 The probe rejects a function that is
 not cold, which is what now prevents a reprobe after a failed or uncertain
-admission; ``enable=0`` leaves the function unbound. The transport also
+admission. The transport also
 disables ASPM on the shared link. Like the Wi-Fi driver, it reads its firmware
 while probing, so build it as a module. The tested Wi-Fi driver owns function
 0 and Bluetooth owns function 1.
