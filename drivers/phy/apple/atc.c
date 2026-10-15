@@ -2962,6 +2962,12 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 	/* Take the USB3 PHY out of reset */
 	core_set32(atcphy, ATCPHY_POWER_CTRL, ATCPHY_POWER_PHY_RESET_N);
 	/*
+	 * NOTE: Not what macos does, it takes the phy out of reset right before
+	 * writing to ACIOPHY_CFG0_COMMON_SMALL, does lane configuration with phy
+	 * out of reset, and the poll is right after AUS_COMMON_SHIM_BLK_BIAS_REG
+	 * write. Does not seem to matter, but if something does not work,
+	 * consider re-ordering things to macos order.
+	 *
 	 * T8122 only calibrates for the USB3 PIPE; the T8140/T8142 PHYs, woken in
 	 * every mode, wait for the calibration in every mode as on 7.1.
 	 */
