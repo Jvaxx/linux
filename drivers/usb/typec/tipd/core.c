@@ -888,6 +888,7 @@ static void cd321x_update_work(struct work_struct *work)
 	struct cd321x_dp_update dp = {
 		.data_status = st.data_status,
 		.changed = st.data_status_changed,
+		.irq_hpd = cd321x->dp_irq_hpd,
 		.route_active = cd321x->display_route_active,
 		.sink_reported = cd321x->dp_sink_reported,
 	};
@@ -994,6 +995,7 @@ static void cd321x_update_work(struct work_struct *work)
 
 	/* If the plug is disconnected, we are done */
 	if (!new_connected) {
+		cd321x->dp_irq_hpd = false;
 		cd321x_update_done(cd321x);
 		return;
 	}
@@ -1040,6 +1042,8 @@ static void cd321x_update_work(struct work_struct *work)
 	if (ret)
 		goto retry;
 
+	/* An IRQ_HPD is delivered now, or overtaken by a connect. */
+	cd321x->dp_irq_hpd = false;
 	switch (cd321x_dp_event(&dp, cd321x->display_route_active)) {
 	case CD321X_DP_EVENT_NONE:
 		break;
@@ -1072,6 +1076,12 @@ retry:
 
 static void cd321x_queue_status(struct cd321x *cd321x)
 {
+	cd321x->dp_irq_hpd =
+		cd321x_dp_irq_hpd(cd321x->dp_irq_hpd,
+				  cd321x->update_status.data_status,
+				  cd321x->tps.data_status,
+				  le32_to_cpu(cd321x->update_status.dp_sid_status.status_rx),
+				  le32_to_cpu(cd321x->dp_sid_status.status_rx));
 	cd321x->update_status.status_changed |= cd321x->update_status.status ^ cd321x->tps.status;
 	cd321x->update_status.data_status_changed |=
 		cd321x->update_status.data_status ^ cd321x->tps.data_status;
