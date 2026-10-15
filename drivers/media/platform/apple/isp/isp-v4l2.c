@@ -292,13 +292,20 @@ static int isp_vb2_queue_setup(struct vb2_queue *vq, unsigned int *nbuffers,
 {
 	struct apple_isp *isp = vb2_get_drv_priv(vq);
 	struct isp_format *fmt = isp_get_current_format(isp);
+	unsigned int q_num_bufs = vb2_get_num_buffers(vq);
 
 	/* This is not strictly neccessary but makes it easy to enforce that
 	 * at most 16 buffers are submitted at once. ISP on t6001 (FW 12.3)
 	 * times out if more buffers are submitted than set in the buffer pool
 	 * config before streaming is started.
+	 *
+	 * REQBUFS frees the old buffers first, CREATE_BUFS adds to them, so
+	 * count the buffers the queue already has.
 	 */
-	*nbuffers = min_t(unsigned int, *nbuffers, ISP_MAX_BUFFERS);
+	if (q_num_bufs >= ISP_MAX_BUFFERS)
+		return -ENOBUFS;
+	*nbuffers = min_t(unsigned int, *nbuffers,
+			  ISP_MAX_BUFFERS - q_num_bufs);
 
 	if (*num_planes) {
 		if (sizes[0] < fmt->total_size)
