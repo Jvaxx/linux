@@ -209,7 +209,6 @@ struct apple_nvme {
 	/* Protects reset_ready against RTKit crash callbacks. */
 	spinlock_t event_lock;
 	bool reset_ready;
-	bool handoff_disabled;
 	struct list_head quarantine_node;
 	resource_size_t controller_start;
 	bool quarantined;
@@ -336,33 +335,15 @@ static bool apple_nvme_can_adopt_rtkit(struct apple_nvme *anv)
 		return false;
 	cc = readl(anv->mmio_nvme + NVME_REG_CC);
 	csts = readl(anv->mmio_nvme + NVME_REG_CSTS);
-	if (csts & NVME_CSTS_CFS)
-		return false;
 
 	/*
-	 * CPU_RUN/BOOT_STATUS alone survive inactive sessions. A disabled
-	 * controller requires the producer's explicit live-session contract.
-	 * Borrowed buffers still require reserved RAM and protected SART ranges.
+	 * CPU_RUN and BOOT_STATUS alone survive a session that has gone
+	 * inactive. Only a controller that the previous owner left enabled
+	 * and ready identifies a live session. Borrowed buffers still require
+	 * reserved RAM and protected SART ranges.
 	 */
-	if (anv->handoff_disabled)
-		return !(cc & NVME_CC_ENABLE) && !(csts & NVME_CSTS_RDY);
-	return (cc & NVME_CC_ENABLE) && (csts & NVME_CSTS_RDY);
-}
-
-static int apple_nvme_read_handoff(struct apple_nvme *anv)
-{
-	const char *handoff;
-	int ret;
-
-	ret = of_property_read_string(anv->dev->of_node, "apple,rtkit-handoff",
-				      &handoff);
-	if (ret == -EINVAL)
-		return 0;
-	if (ret || !anv->hw->needs_ioq_registers ||
-	    strcmp(handoff, "nvme-disabled-v1"))
-		return -EINVAL;
-	anv->handoff_disabled = true;
-	return apple_nvme_can_adopt_rtkit(anv) ? 0 : -EIO;
+	return (cc & NVME_CC_ENABLE) && (csts & NVME_CSTS_RDY) &&
+	       !(csts & NVME_CSTS_CFS);
 }
 
 static inline struct apple_nvme *queue_to_apple_nvme(struct apple_nvme_queue *q)
@@ -2315,12 +2296,6 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 		}
 	} else {
 		anv->mmio_nvmmu = anv->mmio_nvme;
-	}
-
-	ret = apple_nvme_read_handoff(anv);
-	if (ret) {
-		dev_err_probe(dev, ret, "Invalid live firmware handoff\n");
-		goto out_detach_genpd;
 	}
 
 	if (anv->hw->has_lsq_nvmmu) {
