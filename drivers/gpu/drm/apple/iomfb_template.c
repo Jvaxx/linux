@@ -1022,6 +1022,7 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 
 			spin_lock_irqsave(&dcp->metadata.lock, flags);
 			dcp->rate_proof.catalog_sequence++;
+			dcp->metadata.catalog_ticket.associated = false;
 			spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 			dcp_180hz_catalog_changed(dcp);
 		}
@@ -1070,6 +1071,11 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 				modes[i].automatic_catalog_sequence = dcp->rate_proof.catalog_sequence;
 		dcp->modes = modes;
 		dcp->nr_modes = nr_modes;
+		/* Only a complete receipt for a current cable is that cable's catalogue. */
+		dcp->metadata.catalog_ticket = rate_ticket;
+		dcp->metadata.catalog_ticket.associated &= nr_modes > 0;
+		dcp->metadata.catalog_connection_sequence =
+			dcp->chunks.automatic_connection_sequence;
 		spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 		/* Notify removals as well as newly eligible modes, outside the lock. */
 		dcp_180hz_catalog_changed(dcp);

@@ -304,6 +304,9 @@ struct apple_dcp {
 		struct dcp_display_metadata attributes;
 		struct drm_display_mode preferred;
 		struct dcp_metadata_ticket attributes_ticket, timing_ticket;
+		/* The connection whose TimingElements filled the mode catalogue. */
+		struct dcp_metadata_ticket catalog_ticket;
+		u64 catalog_connection_sequence;
 		bool attributes_valid, timing_valid, hpd_seen;
 	} metadata;
 
