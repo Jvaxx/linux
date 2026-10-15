@@ -16,6 +16,7 @@
 #include <linux/io.h>
 #include <linux/module.h>
 #include <linux/platform_device.h>
+#include <linux/pm.h>
 #include <linux/slab.h>
 #include <linux/spi/spi.h>
 #include <linux/spi/spi-mem.h>
@@ -593,6 +594,35 @@ static int apple_qspi_probe(struct platform_device *pdev)
 	return 0;
 }
 
+static int apple_qspi_suspend(struct device *dev)
+{
+	struct spi_controller *ctlr = dev_get_drvdata(dev);
+
+	return spi_controller_suspend(ctlr);
+}
+
+/*
+ * The controller loses its configuration when its power domain is gated
+ * during system sleep. Restore it before the first operation after resume.
+ */
+static int apple_qspi_resume(struct device *dev)
+{
+	struct spi_controller *ctlr = dev_get_drvdata(dev);
+	struct apple_qspi *qspi = spi_controller_get_devdata(ctlr);
+	int ret;
+
+	ret = apple_qspi_hw_reset(qspi);
+	if (ret) {
+		dev_err(dev, "controller reset failed on resume: %d\n", ret);
+		return ret;
+	}
+
+	return spi_controller_resume(ctlr);
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(apple_qspi_pm_ops, apple_qspi_suspend,
+				apple_qspi_resume);
+
 static const struct of_device_id apple_qspi_of_match[] = {
 	{ .compatible = "apple,t8140-qspi" },
 	{}
@@ -604,6 +634,7 @@ static struct platform_driver apple_qspi_driver = {
 	.driver = {
 		.name = "apple-qspi",
 		.of_match_table = apple_qspi_of_match,
+		.pm = pm_sleep_ptr(&apple_qspi_pm_ops),
 	},
 };
 module_platform_driver(apple_qspi_driver);
