@@ -151,18 +151,46 @@ static int apple_pmc_enable_update(struct apple_pmc *pmc, unsigned int rail,
 	return apple_pmc_enable_write(pmc, rail);
 }
 
+/*
+ * Caller holds pmc->lock. Put the rails up to and including @last back to
+ * the enables in @prev, after a change failed on @last.
+ */
+static void apple_pmc_enable_restore(struct apple_pmc *pmc, const u32 *prev,
+				     unsigned int last)
+{
+	unsigned int rail;
+
+	for (rail = 0; rail <= last; rail++) {
+		pmc->enable[rail] = prev[rail];
+		apple_pmc_enable_write(pmc, rail);
+	}
+}
+
+/*
+ * Enable or disable @agent on every rail. If a rail does not take the
+ * change, undo it on the rails changed so far: genpd keeps a domain whose
+ * power_on() fails off, and never calls its power_off(), so an agent left
+ * enabled on some rails would stay enabled for good.
+ */
 static int apple_pmc_agent_enable(struct apple_pmc *pmc, unsigned int agent,
 				  bool enable)
 {
+	u32 prev[APPLE_PMC_MAX_RAILS];
 	unsigned long flags;
 	unsigned int rail;
 	int ret = 0;
 
 	raw_spin_lock_irqsave(&pmc->lock, flags);
-	for (rail = 0; rail < pmc->hw->rails && !ret; rail++)
+	memcpy(prev, pmc->enable, sizeof(prev));
+	for (rail = 0; rail < pmc->hw->rails; rail++) {
 		ret = apple_pmc_enable_update(pmc, rail,
 					      enable ? BIT(agent) : 0,
 					      enable ? 0 : BIT(agent));
+		if (ret) {
+			apple_pmc_enable_restore(pmc, prev, rail);
+			break;
+		}
+	}
 	raw_spin_unlock_irqrestore(&pmc->lock, flags);
 
 	return ret;
