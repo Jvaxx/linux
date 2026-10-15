@@ -26,8 +26,6 @@ config HID_DOCKCHANNEL_KUNIT_TEST
 
 	  If unsure, say N.
 
-endmenu
-
 config HID_DOCKCHANNEL_PARSER_KUNIT_TEST
 	bool "KUnit tests for DockChannel HID message parsing" if !KUNIT_ALL_TESTS
 	depends on HID_DOCKCHANNEL && KUNIT=y
@@ -37,3 +35,5 @@ config HID_DOCKCHANNEL_PARSER_KUNIT_TEST
 	  input-report and acknowledgment handlers. Cover short headers,
 	  oversized lengths, interface indices and acknowledgment identity.
 	  The tests run without a DockChannel or HID device.
+
+endmenu
