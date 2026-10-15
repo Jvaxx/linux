@@ -848,7 +848,7 @@ static void cd321x_dp_notify(struct cd321x *cd321x,
 	if (!IS_REACHABLE(CONFIG_DRM) || !cd321x->connector_fwnode)
 		return;
 
-	trace_cd321x_dp_hotplug(u, status);
+	trace_cd321x_dp_hotplug(cd321x->tps.dev, u, status);
 	cd321x->dp_sink_reported = status != connector_status_disconnected;
 	drm_connector_oob_hotplug_event(cd321x->connector_fwnode, status);
 }
@@ -875,10 +875,19 @@ static void cd321x_update_work(struct work_struct *work)
 
 	bool old_connected = !!tps->partner;
 	bool new_connected = st.status & TPS_STATUS_PLUG_PRESENT;
-	bool was_disconnected = cd321x->pm.force_reconnect ||
-		(st.status_changed & (TPS_STATUS_PLUG_PRESENT | TPS_STATUS_PLUG_UPSIDE_DOWN)) ||
-		(st.data_status_changed & (TPS_DATA_STATUS_TBT_CONNECTION |
-					   CD321X_DATA_STATUS_USB4_CONNECTION));
+	u32 reset = 0;
+
+	if (cd321x->pm.force_reconnect)
+		reset |= CD321X_DP_RESET_FORCED;
+	if (st.status_changed & TPS_STATUS_PLUG_PRESENT)
+		reset |= CD321X_DP_RESET_PLUG;
+	if (st.status_changed & TPS_STATUS_PLUG_UPSIDE_DOWN)
+		reset |= CD321X_DP_RESET_FLIP;
+	if (st.data_status_changed & (TPS_DATA_STATUS_TBT_CONNECTION |
+				      CD321X_DATA_STATUS_USB4_CONNECTION))
+		reset |= CD321X_DP_RESET_TUNNEL;
+
+	bool was_disconnected = reset;
 
 	bool usb_connection = st.data_status &
 			      (TPS_DATA_STATUS_USB2_CONNECTION | TPS_DATA_STATUS_USB3_CONNECTION);
@@ -912,13 +921,19 @@ static void cd321x_update_work(struct work_struct *work)
 	}
 
 	bool is_pd = pwr_opmode == TYPEC_PWR_MODE_PD;
-	bool partner_changed = old_connected && new_connected &&
-		(was_disconnected || is_pd != cd321x->cur_partner_is_pd ||
+	bool new_partner = old_connected && new_connected &&
+		(is_pd != cd321x->cur_partner_is_pd ||
 		 (is_pd && memcmp(&st.partner_identity,
 				  &cd321x->cur_partner_identity, sizeof(struct usb_pd_identity))));
+	bool partner_changed = new_partner ||
+		(old_connected && new_connected && was_disconnected);
 
 	/* A different dock must release the old routing before reconfiguration. */
 	was_disconnected |= partner_changed;
+	if (new_partner)
+		reset |= CD321X_DP_RESET_PARTNER;
+	if (!new_connected)
+		reset |= CD321X_DP_RESET_UNPLUG;
 
 	/*
 	 * Report the sink as gone before any hardware transition that can fail:
@@ -928,7 +943,7 @@ static void cd321x_update_work(struct work_struct *work)
 	 * sink can enter Alt Mode while its mux request fails with -ENOSPC, and
 	 * must not tear down the display carried by the other port.
 	 */
-	dp.link_reset = !new_connected || was_disconnected;
+	dp.link_reset = reset;
 	if (cd321x_dp_teardown(&dp))
 		cd321x_dp_notify(cd321x, &dp, connector_status_disconnected);
 
