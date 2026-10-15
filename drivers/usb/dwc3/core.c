@@ -606,6 +606,7 @@ void dwc3_event_buffers_cleanup(struct dwc3 *dwc)
 	reg = dwc3_readl(dwc, DWC3_GEVNTCOUNT(0));
 	dwc3_writel(dwc, DWC3_GEVNTCOUNT(0), reg);
 }
+EXPORT_SYMBOL_GPL(dwc3_event_buffers_cleanup);
 
 static void dwc3_core_num_eps(struct dwc3 *dwc)
 {
