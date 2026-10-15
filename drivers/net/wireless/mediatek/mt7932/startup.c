@@ -317,6 +317,20 @@ static void mt_policy_disable(struct mt7932 *m, const struct mt7932_policy *poli
  * Consume the flag under the same lock as the worker publication, so repeated
  * userspace requests cannot continually invalidate an in-flight attempt.
  */
+/* response_lock held: start the pass a deferred relaxation is waiting for. */
+void mt_reg_apply_deferred_locked(struct mt7932 *m)
+{
+	lockdep_assert_held(&m->response_lock);
+	if (!m->reg_deferral || m->stopping)
+		return;
+	m->reg_deferral = false;
+	m->reg_desired = m->reg_deferred;
+	m->reg_generation++;
+	WRITE_ONCE(m->reg_pending, true);
+	if (READ_ONCE(m->interface_registered))
+		schedule_work(&m->startup_work);
+}
+
 void mt_retry_missing_policy(struct mt7932 *m)
 {
 	unsigned long flags;
@@ -513,7 +527,24 @@ static void mt_regulatory_notify(struct wiphy *wiphy, struct regulatory_request 
 		spin_unlock_irqrestore(&m->response_lock, irqflags);
 		return;
 	}
+	if (!m->reg_pending && m->connected && !m->disconnecting &&
+	    mt7932_reg_only_relaxes(&m->reg_desired, &reg) &&
+	    memcmp(&reg, &m->reg_desired, sizeof(reg))) {
+		/* A pass would end the connection only to permit more than the
+		 * firmware now allows. Keep the stricter applied domain and run
+		 * the pass once the connection has ended.
+		 */
+		m->reg_deferred = reg;
+		m->reg_deferral = true;
+		spin_unlock_irqrestore(&m->response_lock, irqflags);
+		for_each_set_bit(i, m->policy_disabled, MT7932_CHANNELS)
+			mt_channel(m, i)->flags |= IEEE80211_CHAN_DISABLED;
+		dev_dbg(&m->pdev->dev, "REGULATORY_RELAXATION_DEFERRED: %c%c until disconnected\n",
+			reg.alpha2[0], reg.alpha2[1]);
+		return;
+	}
 	if (!memcmp(&reg, &m->reg_desired, sizeof(reg)) && !m->reg_pending) {
+		m->reg_deferral = false;
 		spin_unlock_irqrestore(&m->response_lock, irqflags);
 		/* The applied package still holds, but cfg80211 has just
 		 * rebuilt the channel flags without its disables.
@@ -523,6 +554,7 @@ static void mt_regulatory_notify(struct wiphy *wiphy, struct regulatory_request 
 		return;
 	}
 	m->reg_desired = reg;
+	m->reg_deferral = false;
 	m->reg_generation++;
 	/* The next package pass records its own set. */
 	bitmap_zero(m->policy_disabled, MT7932_CHANNELS);

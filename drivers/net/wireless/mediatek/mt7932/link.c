@@ -715,6 +715,7 @@ void mt_disconnect_work(struct work_struct *work)
 	spin_lock_irqsave(&m->response_lock, flags);
 	m->disconnecting = false;
 	cfg80211_disconnected(m->netdev, reason, NULL, 0, local, GFP_ATOMIC);
+	mt_reg_apply_deferred_locked(m);
 	spin_unlock_irqrestore(&m->response_lock, flags);
 	dev_dbg(&m->pdev->dev, "DISCONNECTED: teardown=%d local=%u\n", ret, local);
 }
