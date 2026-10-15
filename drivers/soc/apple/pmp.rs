@@ -339,7 +339,9 @@ impl PmpData {
                 }
                 size = len as u32;
             } else {
-                dev_info!(self.dev, "unknown property {:?}", name_str);
+                // Not every boot loader provides every tunable the firmware
+                // asks for, and the firmware starts without them.
+                dev_dbg!(self.dev, "unknown property {:?}", name_str);
             }
         }
         state.ioreg_entries.push(size, GFP_KERNEL)?;
