@@ -206,6 +206,9 @@ int apple_smc_get_key_by_index(struct apple_smc *smc, int index, smc_key *key)
 	u32 data;
 	int ret;
 
+	if (index < 0 || index >= smc->key_count)
+		return -EINVAL;
+
 	ret = apple_smc_cmd(smc, SMC_MSG_GET_KEY_BY_INDEX, index, 0, 0, &data);
 	if (ret < 0)
 		return ret;
