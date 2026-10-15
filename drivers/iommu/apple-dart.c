@@ -267,6 +267,7 @@ struct apple_dart {
 	u32 four_level : 1;
 	u32 locked : 1;
 	u32 tunneled : 1;
+	u32 per_stream : 1;
 	u32 power_retained : 1;
 	struct apple_tunable *tunables;
 	u16 version;
@@ -434,11 +435,13 @@ static struct apple_dart_domain *to_dart_domain(struct iommu_domain *dom)
  * Asahi's stream remapping programs only the first stream of a map and
  * remaps the others onto it. A PCIe-C tunnel DART keeps programming and
  * invalidating every stream on its own, with the ordered accesses of
- * apple_dart_writel().
+ * apple_dart_writel(). So do the T8140 and T8142 DARTs (per_stream): their
+ * locked streams keep firmware-owned roots and filtering state of their own,
+ * and their static remaps come from apple,remap-streams.
  */
 static bool apple_dart_remaps_streams(struct apple_dart *dart)
 {
-	return dart->hw->enable_remap && !dart->tunneled;
+	return dart->hw->enable_remap && !dart->tunneled && !dart->per_stream;
 }
 
 static void
@@ -1704,8 +1707,22 @@ out:
 
 static bool apple_dart_capable(struct device *dev, enum iommu_cap cap)
 {
+	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
+	struct apple_dart_stream_map *stream_map;
+	int i;
+
 	switch (cap) {
 	case IOMMU_CAP_DEFERRED_FLUSH:
+		/*
+		 * A deferred flush invalidates whole streams. On a T8140 or
+		 * T8142 DART the firmware may still be translating through
+		 * the same stream, and a whole-stream invalidate can fault
+		 * its live accesses, so keep those DARTs on strict flushes.
+		 */
+		if (cfg)
+			for_each_stream_map(i, cfg, stream_map)
+				if (stream_map->dart->per_stream)
+					return false;
 		return true;
 	default:
 		return false;
@@ -2068,6 +2085,8 @@ static int apple_dart_probe(struct platform_device *pdev)
 	dart->dev = dev;
 	dart->hw = of_device_get_match_data(dev);
 	dart->tunneled = tunneled;
+	dart->per_stream = of_device_is_compatible(dev->of_node, "apple,t8140-dart") ||
+			   of_device_is_compatible(dev->of_node, "apple,t8142-dart");
 	if (tunneled) {
 		pd_np = of_parse_phandle(dev->of_node, "power-domains", 0);
 		if (pd_np) {
