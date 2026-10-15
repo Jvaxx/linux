@@ -1294,8 +1294,6 @@
 			#mbox-cells = <0>;
 			status = "disabled";
 		};
-	};
-};
 
 &soc {
 		disp0_dart: iommu@412300000 {
@@ -1998,6 +1996,7 @@
 			power-domains = <&ps_ane_sys>;
 			status = "disabled";
 		};
+	};
 };
 
 #include "t8140-pmgr.dtsi"
