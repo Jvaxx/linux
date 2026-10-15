@@ -113,7 +113,10 @@ static int macsmc_rtc_set_time(struct device *dev, struct rtc_time *tm)
 	if (rtc->offset_in_seconds) {
 		__le64 off_secs;
 
-		/* The counter's fraction of a second carries into the new time */
+		/*
+		 * The offset holds whole seconds, so the counter's fraction of a
+		 * second is lost: the clock may run up to a second ahead.
+		 */
 		off_secs = cpu_to_le64(rtc_tm_to_time64(tm) - (ctr >> RTC_SEC_SHIFT));
 		ret = nvmem_cell_write(rtc->rtc_offset, &off_secs, sizeof(off_secs));
 		return ret < 0 ? ret : 0;
