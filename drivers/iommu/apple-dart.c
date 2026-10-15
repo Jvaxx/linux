@@ -322,12 +322,11 @@ struct apple_dart {
 /*
  * PCIe-C is a cable-powered aperture and can report a failed transaction as
  * an asynchronous external abort unless each access is completed before the
- * next instruction retires.  A live /dev/mem diagnostic using the same
- * Device-nGnRnE attributes and the exact 64-SID reset sequence is stable when
- * every access is followed by dsb sy + isb.  ioremap_np() supplies the memory
- * type, but writel() only supplies the normal I/O ordering barrier on arm64.
- * Match the proven access semantics for the tunneled DART while leaving all
- * always-on DARTs on the normal fast path.
+ * next instruction retires.  The DART reset sequence is only stable with
+ * Device-nGnRnE attributes and a dsb sy + isb after every access.
+ * ioremap_np() supplies the memory type, but writel() only supplies the
+ * normal I/O ordering barrier on arm64, so add the barriers here for the
+ * tunneled DART and leave all always-on DARTs on the normal fast path.
  */
 static inline void apple_dart_writel(struct apple_dart *dart, u32 value,
 				    u32 offset)
@@ -2656,9 +2655,9 @@ static int apple_dart_probe(struct platform_device *pdev)
 	 * PCIe-C is a cable-powered aperture whose writes must complete before
 	 * the following transaction.  The normal arm64 ioremap() mapping is
 	 * Device-nGnRE and allowed the first posted DART reset write to surface as
-	 * an asynchronous external abort at a later instruction.  The identical
-	 * reset sequence is stable through /dev/mem's Device-nGnRnE mapping, and
-	 * PCI configuration forwarding already requires the same non-posted
+	 * an asynchronous external abort at a later instruction.  The same
+	 * reset sequence is stable with a Device-nGnRnE mapping, and PCI
+	 * configuration forwarding already requires the same non-posted
 	 * ordering.  Keep ordinary always-on DARTs on their existing mapping.
 	 */
 	if (tunneled)
@@ -2716,26 +2715,20 @@ static int apple_dart_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_clk_disable;
 	if (tunneled && dart->tunables) {
-		dev_info(dev, "applying %zu firmware PCIe-C DART tunables\n",
-			 dart->tunables->sz);
+		dev_dbg(dev, "applying %zu PCIe-C DART tunables\n",
+			dart->tunables->sz);
 		apple_dart_apply_tunables(dart);
-		dev_info(dev, "firmware PCIe-C DART tunables applied\n");
 	}
 
-	/*
-	 * The cable-powered T8110 DART does not provide a safely probeable
-	 * parameter block at this point in PCIe tunnel activation.  The SError
-	 * raised by these reads is asynchronous, which made the following trace
-	 * boundary look guilty on different boots. The device tree supplies the
-	 * immutable topology: 16 KiB pages, 42-bit addresses and 64 SIDs. Use that
-	 * description before making any DART MMIO access.
-	 */
 	if (tunneled) {
 		/*
-		 * PARAMS is not safe to read on a tunneled DART. T8110 is
-		 * 16 KiB pages, 42-bit addresses, 64 streams and four levels.
-		 * A T8020 PCIe-C DART is 16 KiB pages, a 32-bit IOVA, a 36-bit
-		 * PA and as many streams as its register block describes.
+		 * The parameter registers of a tunneled DART cannot be read
+		 * safely at this point of PCIe tunnel activation: the read
+		 * raises an asynchronous SError.  The topology is fixed
+		 * instead.  T8110 is 16 KiB pages, 42-bit addresses, 64
+		 * streams and four levels.  A T8020 PCIe-C DART is 16 KiB
+		 * pages, a 32-bit IOVA, a 36-bit PA and as many streams as its
+		 * register block describes.
 		 */
 		if (dart->hw->type == DART_T8110) {
 			dart->pgsize = 1 << DART_PCIEC_PAGE_SHIFT;
@@ -2752,9 +2745,9 @@ static int apple_dart_probe(struct platform_device *pdev)
 			dart->num_streams = dart->hw->max_sid_count;
 			dart->four_level = false;
 		}
-		dev_info(dev,
-			 "PCIe-C DART using fixed topology: pagesize %#x, %u streams, AS %u -> %u\n",
-			 dart->pgsize, dart->num_streams, dart->ias, dart->oas);
+		dev_dbg(dev,
+			"PCIe-C DART using fixed topology: pagesize %#x, %u streams, AS %u -> %u\n",
+			dart->pgsize, dart->num_streams, dart->ias, dart->oas);
 		goto params_done;
 	}
 
@@ -2826,9 +2819,9 @@ params_done:
 		ret = -EINVAL;
 		goto err_clk_disable;
 	} else {
-		dev_info(dev,
-			 "aliasing DMA range %pad..%pad at DART offset %pad\n",
-			 &dart->dma_min, &dart->dma_max, &dart->dma_offset);
+		dev_dbg(dev,
+			"aliasing DMA range %pad..%pad at DART offset %pad\n",
+			&dart->dma_min, &dart->dma_max, &dart->dma_offset);
 	}
 
 	/*
