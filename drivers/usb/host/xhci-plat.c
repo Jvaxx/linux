@@ -534,6 +534,13 @@ VISIBLE_IF_KUNIT bool xhci_plat_keep_running(u64 quirks, suspend_state_t target,
 }
 EXPORT_SYMBOL_IF_KUNIT(xhci_plat_keep_running);
 
+/* Whether a controller that was left running reads back as stopped or failed */
+VISIBLE_IF_KUNIT bool xhci_plat_stopped(u32 usbsts)
+{
+	return usbsts == ~(u32)0 || (usbsts & (STS_HALT | STS_FATAL | STS_HCE));
+}
+EXPORT_SYMBOL_IF_KUNIT(xhci_plat_stopped);
+
 static bool xhci_plat_run_in_s2idle(struct device *dev)
 {
 	struct usb_hcd	*hcd = dev_get_drvdata(dev);
@@ -629,8 +636,30 @@ static int xhci_plat_resume(struct device *dev)
 	}
 
 	if (priv->running_in_s2idle) {
+		struct xhci_hcd *xhci = hcd_to_xhci(hcd);
+		u32 status = readl(&xhci->op_regs->status);
+
 		priv->running_in_s2idle = 0;
-		dev_dbg(dev, "kept running in suspend-to-idle, skip resume.\n");
+		if (!xhci_plat_stopped(status)) {
+			dev_dbg(dev, "kept running in suspend-to-idle, skip resume.\n");
+			return 0;
+		}
+
+		/*
+		 * The controller was left running on the platform's promise that it
+		 * stays powered, and stopped all the same: power was cut, or it hit an
+		 * error. It is not brought back here. Devices may have been kept awake
+		 * through the sleep, with URBs queued and their interrupt and retry
+		 * paths live, and a reset under them is not safe. Mask its interrupts and
+		 * halt it, and report it dead, which gives back every pending URB and
+		 * lets the USB core disconnect the devices. USB then needs the controller
+		 * bound again.
+		 */
+		dev_err(dev, "stopped in suspend-to-idle (USBSTS %#010x)\n", status);
+		spin_lock_irq(&xhci->lock);
+		xhci_quiesce_dying(xhci);
+		xhci_hc_died(xhci);
+		spin_unlock_irq(&xhci->lock);
 		return 0;
 	}
 

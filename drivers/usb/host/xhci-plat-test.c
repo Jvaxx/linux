@@ -45,6 +45,52 @@ static void xhci_plat_keep_running_other_quirks_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, xhci_plat_keep_running(~0ULL, PM_SUSPEND_TO_IDLE, true, true));
 }
 
+/* A running controller is left alone; a halted, failed or unpowered one is not. */
+static void xhci_plat_stopped_test(struct kunit *test)
+{
+	/* Running, with an event pending and a port change */
+	KUNIT_EXPECT_FALSE(test, xhci_plat_stopped(0));
+	KUNIT_EXPECT_FALSE(test, xhci_plat_stopped(STS_EINT | STS_PORT));
+	/* Halted, Host System Error, Host Controller Error */
+	KUNIT_EXPECT_TRUE(test, xhci_plat_stopped(STS_HALT));
+	KUNIT_EXPECT_TRUE(test, xhci_plat_stopped(STS_FATAL | STS_HALT));
+	KUNIT_EXPECT_TRUE(test, xhci_plat_stopped(STS_HCE));
+	/* Register reads of a powered-off block */
+	KUNIT_EXPECT_TRUE(test, xhci_plat_stopped(~0U));
+}
+
+/*
+ * A controller reported dead is halted with its interrupts masked first:
+ * the USB core ignores the interrupts of a dead HCD, so one left enabled
+ * and pending would never be acknowledged.
+ */
+static void xhci_plat_quiesce_dying_test(struct kunit *test)
+{
+	struct xhci_op_regs *op;
+	struct xhci_hcd *xhci;
+
+	xhci = kunit_kzalloc(test, sizeof(*xhci), GFP_KERNEL);
+	op = kunit_kzalloc(test, sizeof(*op), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, xhci);
+	KUNIT_ASSERT_NOT_NULL(test, op);
+	xhci->op_regs = (__force struct xhci_op_regs __iomem *)op;
+
+	/* A Host System Error with an event pending, interrupts enabled */
+	writel(CMD_RUN | XHCI_IRQS, &xhci->op_regs->command);
+	writel(STS_HALT | STS_FATAL | STS_EINT, &xhci->op_regs->status);
+	xhci_quiesce_dying(xhci);
+	KUNIT_EXPECT_EQ(test, readl(&xhci->op_regs->command) & XHCI_IRQS, 0U);
+	KUNIT_EXPECT_TRUE(test, xhci->xhc_state & XHCI_STATE_HALTED);
+
+	/* Registers that no longer answer are left alone. */
+	xhci->xhc_state = 0;
+	writel(~0U, &xhci->op_regs->status);
+	writel(XHCI_IRQS, &xhci->op_regs->command);
+	xhci_quiesce_dying(xhci);
+	KUNIT_EXPECT_EQ(test, readl(&xhci->op_regs->command), (u32)XHCI_IRQS);
+	KUNIT_EXPECT_FALSE(test, xhci->xhc_state & XHCI_STATE_HALTED);
+}
+
 static u64 xhci_plat_test_quirks(struct kunit *test, const struct property_entry *props)
 {
 	struct device *dev;
@@ -99,6 +145,8 @@ static void xhci_plat_all_property_quirks_test(struct kunit *test)
 static struct kunit_case xhci_plat_test_cases[] = {
 	KUNIT_CASE(xhci_plat_keep_running_test),
 	KUNIT_CASE(xhci_plat_keep_running_other_quirks_test),
+	KUNIT_CASE(xhci_plat_stopped_test),
+	KUNIT_CASE(xhci_plat_quiesce_dying_test),
 	KUNIT_CASE(xhci_plat_no_property_quirks_test),
 	KUNIT_CASE(xhci_plat_run_in_s2idle_property_test),
 	KUNIT_CASE(xhci_plat_all_property_quirks_test),

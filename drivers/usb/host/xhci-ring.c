@@ -1405,6 +1405,7 @@ void xhci_hc_died(struct xhci_hcd *xhci)
 	if (notify)
 		usb_hc_died(xhci_to_hcd(xhci));
 }
+EXPORT_SYMBOL_GPL(xhci_hc_died);
 
 /*
  * When we get a completion for a Set Transfer Ring Dequeue Pointer command,
