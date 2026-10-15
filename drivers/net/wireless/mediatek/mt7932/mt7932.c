@@ -205,7 +205,7 @@ static void mt_receive(struct mt7932 *m, const u8 *packet, size_t length)
 		}
 		goto unlock;
 	}
-	if (mt7932_event_matches(&event, m->waiting) && !m->reply_length) {
+	if (mt7932_event_matches(&event, m->waiting, m->waiting_eid) && !m->reply_length) {
 		memcpy(m->reply, packet, event.length);
 		m->reply_length = event.length;
 		complete(&m->response);
@@ -377,6 +377,7 @@ int mt_request_ext(struct mt7932 *m, u8 cid, u8 ext, bool runtime, bool set, boo
 	reinit_completion(&m->response);
 	spin_lock_irqsave(&m->response_lock, flags);
 	m->waiting = wait ? m->seq : 0;
+	m->waiting_eid = mt7932_reply_eid(cid, runtime);
 	m->reply_length = 0;
 	spin_unlock_irqrestore(&m->response_lock, flags);
 	ret = mt_submit(m, q, ret);
@@ -679,6 +680,8 @@ static int mt_otp_byte(struct mt7932 *m, u32 address, u8 *value)
 	if (m->reply_length < 40)
 		return -EPROTO;
 	*value = m->reply[36];
+	dev_dbg(&m->pdev->dev, "OTP_REPLY: eid=%02x word=%08x address=%08x length=%zu\n",
+		m->reply[28], get_unaligned_le32(m->reply + 32), address, m->reply_length);
 	return 0;
 }
 

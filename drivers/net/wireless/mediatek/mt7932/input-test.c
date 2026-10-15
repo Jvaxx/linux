@@ -116,12 +116,69 @@ static void mt7932_rx_short_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, mt7932_rx_frame(packet, RX_HEADER + 20, &frame), -EMSGSIZE);
 }
 
+static void event_build(u8 *packet, u8 eid, u8 seq, u8 option)
+{
+	memset(packet, 0, 64);
+	put_unaligned_le32(64 | (7U << 27), packet);
+	put_unaligned_le16(40, packet + 24);
+	packet[28] = eid;
+	packet[29] = seq;
+	packet[30] = option;
+}
+
+/* Only the event that answers a command completes it. */
+static void mt7932_event_reply_test(struct kunit *test)
+{
+	struct mt7932_event event;
+	u8 packet[64];
+	int eid = mt7932_reply_eid(0xed, true);
+
+	event_build(packet, 0xed, 9, 0);
+	KUNIT_ASSERT_EQ(test, mt7932_event_parse(packet, sizeof(packet), &event), 0);
+	KUNIT_EXPECT_TRUE(test, mt7932_event_matches(&event, 9, eid));
+	/* Another sequence, the no-reply option bit, or nothing waiting. */
+	KUNIT_EXPECT_FALSE(test, mt7932_event_matches(&event, 10, eid));
+	event.option = 4;
+	KUNIT_EXPECT_FALSE(test, mt7932_event_matches(&event, 9, eid));
+	event.option = 0;
+	KUNIT_EXPECT_FALSE(test, mt7932_event_matches(&event, 0, eid));
+	/* An unrelated event that happens to carry the waiting sequence. */
+	event_build(packet, 0x99, 9, 0);
+	KUNIT_ASSERT_EQ(test, mt7932_event_parse(packet, sizeof(packet), &event), 0);
+	KUNIT_EXPECT_FALSE(test, mt7932_event_matches(&event, 9, eid));
+	KUNIT_EXPECT_FALSE(test, mt7932_event_matches(&event, 9, mt7932_reply_eid(0x8a, true)));
+	KUNIT_EXPECT_FALSE(test, mt7932_event_matches(&event, 9, mt7932_reply_eid(0x03, false)));
+	/* The ROM's patch semaphore answers with its own event only. */
+	KUNIT_EXPECT_FALSE(test, mt7932_event_matches(&event, 9, mt7932_reply_eid(0x10, false)));
+	event_build(packet, 0x04, 9, 0);
+	KUNIT_ASSERT_EQ(test, mt7932_event_parse(packet, sizeof(packet), &event), 0);
+	KUNIT_EXPECT_TRUE(test, mt7932_event_matches(&event, 9, mt7932_reply_eid(0x10, false)));
+	event_build(packet, 0x01, 9, 0);
+	KUNIT_ASSERT_EQ(test, mt7932_event_parse(packet, sizeof(packet), &event), 0);
+	KUNIT_EXPECT_FALSE(test, mt7932_event_matches(&event, 9, mt7932_reply_eid(0x10, false)));
+}
+
+static void mt7932_event_reply_eid_test(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, mt7932_reply_eid(0xed, false), 0xed);
+	KUNIT_EXPECT_EQ(test, mt7932_reply_eid(0xed, true), 0xed);
+	KUNIT_EXPECT_EQ(test, mt7932_reply_eid(0x8a, true), 0xec);
+	KUNIT_EXPECT_EQ(test, mt7932_reply_eid(0xbf, true), 0xbf);
+	KUNIT_EXPECT_EQ(test, mt7932_reply_eid(0x03, false), 0x02);
+	KUNIT_EXPECT_EQ(test, mt7932_reply_eid(0x01, false), 0x01);
+	KUNIT_EXPECT_EQ(test, mt7932_reply_eid(0x05, false), 0x01);
+	KUNIT_EXPECT_EQ(test, mt7932_reply_eid(0x10, false), 0x04);
+	KUNIT_EXPECT_EQ(test, mt7932_reply_eid(0x50, false), -1);
+}
+
 static struct kunit_case mt7932_input_test_cases[] = {
 	KUNIT_CASE(mt7932_rx_decrypted_test),
 	KUNIT_CASE(mt7932_rx_plaintext_test),
 	KUNIT_CASE(mt7932_rx_mismatch_test),
 	KUNIT_CASE(mt7932_rx_integrity_test),
 	KUNIT_CASE(mt7932_rx_short_test),
+	KUNIT_CASE(mt7932_event_reply_test),
+	KUNIT_CASE(mt7932_event_reply_eid_test),
 	{}
 };
 

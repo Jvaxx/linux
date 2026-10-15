@@ -75,6 +75,8 @@ struct mt7932 {
 	unsigned int cal_request_head, cal_request_count;
 	spinlock_t response_lock;
 	u8 seq, waiting;
+	/* Event that answers the waiting command; see mt7932_reply_eid(). */
+	int waiting_eid;
 	u8 mac[ETH_ALEN];
 	u8 reply[MT7932_RX_CAPACITY];
 	size_t reply_length;
