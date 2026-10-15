@@ -1072,33 +1072,54 @@ fn copy_span(
     Ok(dst)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ProducerReportError {
+    Short,
+    Overflow,
+}
+
+fn producer_position(report: &[u8]) -> core::result::Result<(u64, u64), ProducerReportError> {
+    if report.len() < REPORT_MIN_LEN {
+        return Err(ProducerReportError::Short);
+    }
+    let count = le_u64(report, 0x40).map_err(|_| ProducerReportError::Short)?;
+    let absolute = count
+        .checked_add(1)
+        .and_then(|frames| frames.checked_mul(LPAI_FRAME_BYTES as u64))
+        .ok_or(ProducerReportError::Overflow)?;
+    let cursor = le_u64(report, 0x60).map_err(|_| ProducerReportError::Short)?;
+    Ok((absolute, cursor))
+}
+
+fn producer_cursor_matches(absolute: u64, cursor: u64, ring_bytes: usize) -> bool {
+    ring_bytes != 0 && cursor == absolute % ring_bytes as u64
+}
+
 impl ReportListener for SndSocT8140AopData {
     fn process_report(&self, _subtype: u16, report: &[u8]) -> Result<()> {
-        if report.len() < REPORT_MIN_LEN {
-            if !self.report_warnings[0].xchg(true, Relaxed) {
-                dev_warn!(
-                    self.dev,
-                    "short lpai producer report ({} bytes)\n",
-                    report.len()
-                );
+        let (absolute, cursor) = match producer_position(report) {
+            Ok(position) => position,
+            Err(ProducerReportError::Short) => {
+                if !self.report_warnings[0].xchg(true, Relaxed) {
+                    dev_warn!(
+                        self.dev,
+                        "short lpai producer report ({} bytes)\n",
+                        report.len()
+                    );
+                }
+                return Ok(());
             }
-            return Ok(());
-        }
-        let count = le_u64(report, 0x40)?;
-        let Some(absolute) = count
-            .checked_add(1)
-            .and_then(|frames| frames.checked_mul(LPAI_FRAME_BYTES as u64))
-        else {
-            if !self.report_warnings[1].xchg(true, Relaxed) {
-                dev_warn!(self.dev, "overflowing lpai producer counter\n");
+            Err(ProducerReportError::Overflow) => {
+                if !self.report_warnings[1].xchg(true, Relaxed) {
+                    dev_warn!(self.dev, "overflowing lpai producer counter\n");
+                }
+                return Ok(());
             }
-            return Ok(());
         };
         let frames = absolute / LPAI_FRAME_BYTES as u64;
         self.reported.store(true, Relaxed);
-        let cursor = le_u64(report, 0x60)?;
         let ring_bytes = self.ring_bytes.load(Relaxed) as usize;
-        if ring_bytes == 0 || cursor != absolute % ring_bytes as u64 {
+        if !producer_cursor_matches(absolute, cursor, ring_bytes) {
             if !self.report_warnings[2].xchg(true, Relaxed) {
                 dev_warn!(
                     self.dev,
@@ -2991,5 +3012,88 @@ mod name_tests {
         let long = c"AppleJ700LongerChassisAOP".to_bytes_with_nul();
         assert!(copy_str(&mut field, long).is_err());
         assert_eq!(field, [0u8; 16]);
+    }
+}
+
+#[kunit_tests(snd_soc_t8140_aop_audio_parser)]
+mod parser_tests {
+    use super::*;
+
+    #[test]
+    fn short_reply_fields_are_rejected() {
+        let data = [0u8; REPORT_MIN_LEN];
+        for len in 0..4 {
+            assert_eq!(le_u32(&data[..len], 0), Err(EINVAL));
+        }
+        for len in 0..8 {
+            assert_eq!(le_u64(&data[..len], 0), Err(EINVAL));
+        }
+        for len in 0..REPORT_MIN_LEN {
+            assert_eq!(le_u64(&data[..len], 0x60), Err(EINVAL));
+        }
+    }
+
+    #[test]
+    fn unaligned_fields_at_the_end_of_a_reply_are_decoded() {
+        let data = [0xff, 1, 2, 3, 4, 5, 6, 7, 8];
+        assert_eq!(le_u32(&data, 5), Ok(0x0807_0605));
+        assert_eq!(le_u64(&data, 1), Ok(0x0807_0605_0403_0201));
+        assert_eq!(le_u32(&data, 6), Err(EINVAL));
+        assert_eq!(le_u64(&data, 2), Err(EINVAL));
+    }
+
+    fn producer_report(count: u64, cursor: u64) -> [u8; REPORT_MIN_LEN] {
+        let mut report = [0u8; REPORT_MIN_LEN];
+        report[0x40..0x48].copy_from_slice(&count.to_le_bytes());
+        report[0x60..0x68].copy_from_slice(&cursor.to_le_bytes());
+        report
+    }
+
+    #[test]
+    fn short_producer_reports_are_rejected() {
+        let report = producer_report(3199, LPAI_PERIOD_BYTES as u64);
+        for len in 0..REPORT_MIN_LEN {
+            assert_eq!(
+                producer_position(&report[..len]),
+                Err(ProducerReportError::Short)
+            );
+        }
+        assert_eq!(
+            producer_position(&report),
+            Ok((LPAI_PERIOD_BYTES as u64, LPAI_PERIOD_BYTES as u64))
+        );
+    }
+
+    #[test]
+    fn overflowing_producer_positions_are_rejected() {
+        for count in [u64::MAX, u64::MAX / LPAI_FRAME_BYTES as u64] {
+            assert_eq!(
+                producer_position(&producer_report(count, 0)),
+                Err(ProducerReportError::Overflow)
+            );
+        }
+        let count = u64::MAX / LPAI_FRAME_BYTES as u64 - 1;
+        assert_eq!(
+            producer_position(&producer_report(count, 0)),
+            Ok(((count + 1) * LPAI_FRAME_BYTES as u64, 0))
+        );
+    }
+
+    #[test]
+    fn producer_cursors_must_match_the_owned_ring() {
+        assert!(producer_cursor_matches(RING_BYTES as u64, 0, RING_BYTES));
+        assert!(producer_cursor_matches(
+            RING_BYTES as u64 + 8,
+            8,
+            RING_BYTES
+        ));
+        assert!(!producer_cursor_matches(8, 8, 0));
+        assert!(!producer_cursor_matches(
+            8,
+            RING_BYTES as u64 + 8,
+            RING_BYTES
+        ));
+        assert!(!producer_cursor_matches(8, u64::MAX, RING_BYTES));
+        assert!(!producer_cursor_matches(8, 7, RING_BYTES));
     }
 }
