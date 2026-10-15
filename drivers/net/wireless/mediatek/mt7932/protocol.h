@@ -65,9 +65,37 @@ static inline int mt7932_event_parse(const u8 *packet, size_t length,
 	return 0;
 }
 
-static inline bool mt7932_event_matches(const struct mt7932_event *e, u8 seq)
+/*
+ * The event that answers a command waiting for a reply, or -1 for any event.
+ * Extended commands answer with the extended event, the capability query
+ * with its own event, and the boot ROM's status commands with the generic
+ * one. The ROM's register read answers with the access-register event and
+ * its patch semaphore with the patch-semaphore event, as on other connac
+ * devices. Other runtime commands answer with an event of their own ID.
+ * The ROM's OTP read alone still matches on the sequence: its reply event
+ * is not documented, and mt_otp_byte() records the one it receives.
+ */
+static inline int mt7932_reply_eid(u8 cid, bool runtime)
 {
-	return seq && e->seq == seq && !(e->option & 4);
+	if (cid == 0xed)
+		return 0xed;
+	if (runtime)
+		return cid == 0x8a ? 0xec : cid;
+	switch (cid) {
+	case 0x03:
+		return 0x02;
+	case 0x10:
+		return 0x04;
+	case 0x50:
+		return -1;
+	default:
+		return 0x01;
+	}
+}
+
+static inline bool mt7932_event_matches(const struct mt7932_event *e, u8 seq, int eid)
+{
+	return seq && e->seq == seq && !(e->option & 4) && (eid < 0 || e->eid == eid);
 }
 
 #endif
