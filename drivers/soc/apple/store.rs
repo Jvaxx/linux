@@ -73,6 +73,20 @@ const SLOT_ENTRY_SIZE: usize = 24;
 const INTENT_NONE: u8 = 0;
 const INTENT_WRITE: u8 = 1;
 
+/// Why an existing file is refused. It is logged, so it never carries record
+/// contents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Damage {
+    /// The file is shorter than the store.
+    Size,
+    /// The magic, version or geometry is not this format's.
+    Header,
+    /// The slot's record is longer than its block.
+    Slot(usize),
+    /// The pending write intent names a block that holds a committed record.
+    Intent,
+}
+
 // Not internally locked; the caller holds a mutex around all access.
 pub(crate) struct Store {
     file: shim::StoreFile,
@@ -92,9 +106,34 @@ fn le64(buf: &[u8], off: usize) -> u64 {
     u64::from_le_bytes(v)
 }
 
+/// Describes an existing file that holds no store as "empty" or "all zero".
+/// That is all an interrupted creation leaves, and such a file holds nothing
+/// to keep; anything else may be what is left of a store. Reads at most a
+/// store's worth of the file.
+fn describe(file: &shim::StoreFile, size: u64) -> Option<&'static str> {
+    if size == 0 {
+        return Some("empty");
+    }
+    if size > STORE_SIZE as u64 {
+        return None;
+    }
+    let mut buf = KVec::new();
+    buf.resize(BLOCK_SIZE, 0, GFP_KERNEL).ok()?;
+    let mut off = 0;
+    while off < size {
+        let len = (size - off).min(BLOCK_SIZE as u64) as usize;
+        file.read_exact(off, &mut buf[..len]).ok()?;
+        if buf[..len].iter().any(|&b| b != 0) {
+            return None;
+        }
+        off += len as u64;
+    }
+    Some("all zero")
+}
+
 impl Store {
     pub(crate) fn open() -> Result<Store> {
-        let file = shim::StoreFile::open(STORE_PATH)?;
+        let (file, created) = shim::StoreFile::open_host(STORE_PATH)?;
 
         let mut store = Store {
             file,
@@ -104,10 +143,17 @@ impl Store {
             fresh: false,
         };
 
+        // Only a new, empty file is initialised. An existing file may hold the
+        // only copy of the host state, so one that this driver cannot use is
+        // refused and left as it is.
         let size = store.file.size()?;
-        if size < STORE_SIZE as u64 {
+        if created && size == 0 {
             store.create()?;
+            pr_info!("created a new host-state store\n");
             return Ok(store);
+        }
+        if size < STORE_SIZE as u64 {
+            return Err(store.refuse(Damage::Size, size));
         }
 
         let mut sb = KVec::with_capacity(BLOCK_SIZE, GFP_KERNEL)?;
@@ -119,8 +165,7 @@ impl Store {
             || le32(&sb, SB_SLOT_COUNT) as usize != SLOT_COUNT
             || le32(&sb, SB_BLOCK_SIZE) as usize != BLOCK_SIZE
         {
-            store.create()?;
-            return Ok(store);
+            return Err(store.refuse(Damage::Header, size));
         }
 
         store.generation = le64(&sb, SB_GENERATION);
@@ -134,6 +179,10 @@ impl Store {
                 uuid,
                 len: le32(&sb, off + 18),
             };
+            // A longer record would be read from the blocks of the next slots.
+            if store.slots[i].used && store.slots[i].len as usize > MAX_VALUE {
+                return Err(store.refuse(Damage::Slot(i), size));
+            }
         }
 
         // Crash recovery: writes are copy-on-write, so discard the intent, never complete it.
@@ -142,12 +191,39 @@ impl Store {
             store.recovered = true;
             let slot = u16::from_le_bytes([sb[SB_INTENT_SLOT], sb[SB_INTENT_SLOT + 1]]) as usize;
             if intent_kind == INTENT_WRITE && slot < SLOT_COUNT {
+                // The intent names the free block that was being filled. One
+                // that names a committed record is damage, and freeing that
+                // block would discard the record.
+                if store.slots[slot].used {
+                    return Err(store.refuse(Damage::Intent, size));
+                }
                 store.slots[slot] = Slot::FREE;
             }
             store.commit()?;
         }
 
         Ok(store)
+    }
+
+    /// Logs why the existing file is refused, and returns the error. Nothing
+    /// is written to the file.
+    fn refuse(&self, damage: Damage, size: u64) -> Error {
+        let what = match damage {
+            Damage::Size | Damage::Header => describe(&self.file, size),
+            _ => None,
+        };
+        match what {
+            Some(what) => pr_err!(
+                "host-state store failed validation ({:?}, {}), refusing it\n",
+                damage,
+                what
+            ),
+            None => pr_err!(
+                "host-state store failed validation ({:?}), refusing it\n",
+                damage
+            ),
+        }
+        EIO
     }
 
     fn create(&mut self) -> Result<()> {
