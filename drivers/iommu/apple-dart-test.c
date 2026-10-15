@@ -671,6 +671,40 @@ static void apple_dart_test_resume_retained_each_stream(struct kunit *test)
 			dart->hw->ttbr_valid | 0x2000);
 }
 
+/*
+ * A stream of an identity domain bypasses the DART without a page table. Its
+ * consumer may still be doing DMA, so a DART that kept that state is not reset.
+ */
+static void apple_dart_test_resume_retained_bypass_hw(struct kunit *test,
+						      const struct apple_dart_hw *hw)
+{
+	struct apple_dart *dart = apple_dart_test_tunnel(test);
+	u32 enable;
+
+	dart->tunneled = false;
+	dart->hw = hw;
+	dart->num_streams = 16;
+	dart->supports_bypass = true;
+	enable = dart->hw->enable_streams;
+	writel(dart->hw->tcr_bypass, dart->regs + DART_TCR(dart, 3));
+	KUNIT_ASSERT_EQ(test, apple_dart_suspend(dart->dev), 0);
+
+	writel(0, dart->regs + enable);
+	KUNIT_EXPECT_EQ(test, apple_dart_resume(dart->dev), 0);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + enable), 0U);
+	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_TCR(dart, 3)), dart->hw->tcr_bypass);
+}
+
+static void apple_dart_test_resume_retained_bypass_t8103(struct kunit *test)
+{
+	apple_dart_test_resume_retained_bypass_hw(test, &apple_dart_hw_t8103);
+}
+
+static void apple_dart_test_resume_retained_bypass_t8110(struct kunit *test)
+{
+	apple_dart_test_resume_retained_bypass_hw(test, &apple_dart_hw_t8110);
+}
+
 static struct kunit_case apple_dart_test_cases[] = {
 	KUNIT_CASE(apple_dart_test_independent_remap_roots),
 	KUNIT_CASE(apple_dart_test_before_attach),
@@ -689,6 +723,8 @@ static struct kunit_case apple_dart_test_cases[] = {
 	KUNIT_CASE(apple_dart_test_resume_lost),
 	KUNIT_CASE(apple_dart_test_resume_unused),
 	KUNIT_CASE(apple_dart_test_resume_retained_each_stream),
+	KUNIT_CASE(apple_dart_test_resume_retained_bypass_t8103),
+	KUNIT_CASE(apple_dart_test_resume_retained_bypass_t8110),
 	{}
 };
 
