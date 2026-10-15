@@ -80,6 +80,8 @@ static bool inside_host_remove;
 static void *platform_get_drvdata(struct platform_device *d) { return d==&controller?(void *)&apple_context.dwc:(void *)&hcd; }
 static void dwc3_enable_susphy(struct dwc3 *d,bool v) { (void)d;assert(v);susphy_calls++;observed_controller_write(); }
 static void device_init_wakeup(struct device *d,bool b) { (void)d;(void)b; }
+static bool wake_irq_set;
+static void dev_pm_clear_wake_irq(struct device *d) { assert(d==&controller.dev);wake_irq_set=false; }
 static void platform_device_unregister(struct platform_device *d);
 static void dwc3_gadget_exit(struct dwc3 *d) { (void)d;assert(0); }
 static int dwc3_apple_core_stop(struct dwc3_apple *d) { (void)d;return 0; }
@@ -140,7 +142,7 @@ int main(void) {
   xhci_context=(struct xhci_hcd){0};
   inject_remove=true;removal_started=blocked_attempt=release_remove=false;
   atomic_store(&early_write,false);atomic_store(&handoff_active,true);
-  susphy_calls=host_remove_calls=0;
+  susphy_calls=host_remove_calls=0;wake_irq_set=true;
   int ret=safe(&p);
   atomic_store(&handoff_active,false);
   pthread_mutex_lock(&schedule_mutex);release_remove=true;pthread_cond_broadcast(&schedule_cond);pthread_mutex_unlock(&schedule_mutex);
@@ -148,6 +150,8 @@ int main(void) {
   fprintf(stderr,"connected teardown target=%d ret=%d early_write=%d susphy=%d host_remove=%d\n",remove_target,ret,atomic_load(&early_write),susphy_calls,host_remove_calls);
   assert(ret==0&&!atomic_load(&early_write)&&host_remove_calls==1);
   assert(susphy_calls==(remove_target?0:1));balanced(&p);
+  /* Host teardown drops the wake interrupt it armed. */
+  assert(remove_target||!wake_irq_set);
  }
  puts("PASS actual PM wrapper connected to driver-core/DWC3/xHCI removal; synchronous teardown waits until owned transaction ends");
  return 0;
