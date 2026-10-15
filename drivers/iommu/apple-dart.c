@@ -3186,12 +3186,17 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
  */
 static bool apple_dart_state_retained(struct apple_dart *dart)
 {
-	bool translating = false;
+	bool live = false;
 	unsigned int sid, idx;
 
 	for (sid = 0; sid < dart->num_streams; sid++) {
-		if (apple_dart_readl(dart, DART_TCR(dart, sid)) != dart->save_tcr[sid])
+		u32 tcr = apple_dart_readl(dart, DART_TCR(dart, sid));
+
+		if (tcr != dart->save_tcr[sid])
 			return false;
+		/* An identity domain bypasses the DART without any page table. */
+		if (dart->supports_bypass && dart->hw->tcr_bypass && tcr == dart->hw->tcr_bypass)
+			live = true;
 
 		for (idx = 0; idx < dart->hw->ttbr_count; idx++) {
 			u32 ttbr = apple_dart_readl(dart, DART_TTBR(dart, sid, idx));
@@ -3199,12 +3204,15 @@ static bool apple_dart_state_retained(struct apple_dart *dart)
 			if (ttbr != dart->save_ttbr[sid][idx])
 				return false;
 			if (ttbr & dart->hw->ttbr_valid)
-				translating = true;
+				live = true;
 		}
 	}
 
-	/* A DART that lost power reads back as reset, without valid page tables */
-	return translating;
+	/*
+	 * A DART that lost power reads back as reset: no stream bypasses it and
+	 * none has a valid page table.
+	 */
+	return live;
 }
 
 /*
