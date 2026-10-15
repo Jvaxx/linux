@@ -100,6 +100,8 @@ struct dcp_display_mode {
 	struct dcp_color_mode sdr;
 	struct dcp_color_mode best;
 	bool vrr;
+	/* IsPreferred, outside the external SDR path */
+	bool preferred;
 	bool metadata_timing_valid;
 	bool automatic_rgb8_quirk;
 	u64 automatic_connection_sequence;
@@ -119,6 +121,11 @@ struct dimension {
 
 int parse(const void *blob, size_t size, struct dcp_parse_ctx *ctx);
 bool dcp_property_complete(const void *blob, size_t received, size_t advertised);
+#if IS_ENABLED(CONFIG_KUNIT)
+bool dcp_mode_ranks_above(bool preferred, s64 score, bool best_preferred,
+			  s64 best_score);
+#endif
+
 struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 					 unsigned int *count, int width_mm,
 					 int height_mm, unsigned notch_height,

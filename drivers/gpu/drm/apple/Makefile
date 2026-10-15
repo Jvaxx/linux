@@ -14,6 +14,7 @@ appledrm-y += iomfb_v14_7.o
 appledrm-y += iomfb_h17p.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += iomfb_h17p_test.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += apple_resume_test.o
+appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += parser_mode_test.o
 appledrm-y += epic/dpavservep.o
 appledrm-y += plane.o
 
