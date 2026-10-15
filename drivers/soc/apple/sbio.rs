@@ -1701,6 +1701,64 @@ impl SepData {
         }
     }
 
+    fn sensor_ms(&self) -> u64 {
+        shim::boottime_ns().saturating_sub(self.sensor_power_ns.load(Relaxed)) / 1_000_000
+    }
+
+    fn sensor_trace(&self, step: &CStr) {
+        if *module_parameters::sensor_trace.value() != 0 {
+            dev_info!(self.dev, "sensor: {} done at {} ms\n", step, self.sensor_ms());
+        }
+    }
+
+    /// Reports a failed registration step with what the sensor shows
+    /// afterwards: its state, patch acknowledgment, whether it presents an
+    /// identifier and the length of any frame it holds. Never the
+    /// identifier, the serial or any key material.
+    fn sensor_step_failed(&self, step: &CStr) {
+        let ms = self.sensor_ms();
+        match sensor::status() {
+            Ok(st) => dev_warn!(
+                self.dev,
+                "sensor: {} failed {} ms after power-on; sensor now state {} ack {:#04x} identifier {} holding {} bytes{}\n",
+                step,
+                ms,
+                st.state,
+                st.patch_ack(),
+                st.identifier_to_register().is_some(),
+                st.available().unwrap_or(0),
+                if st.is_silent() { c" (silent)" } else { c"" }
+            ),
+            Err(e) => dev_warn!(
+                self.dev,
+                "sensor: {} failed {} ms after power-on; its status read failed too ({:?})\n",
+                step,
+                ms,
+                e
+            ),
+        }
+    }
+
+    /// One enclave request of the registration. A refusal is named.
+    fn sensor_enclave_step(&self, op: &crate::sbio::SbioOp) -> Option<KVec<u8>> {
+        match self.sbio_transfer(op) {
+            Ok(done) if done.status.is_ok() => {
+                self.sensor_trace(op.name());
+                Some(done.payload)
+            }
+            Ok(done) => {
+                dev_warn!(self.dev, "sensor: {} refused with status {}\n", op.name(), done.status);
+                self.sensor_step_failed(op.name());
+                None
+            }
+            Err(e) => {
+                dev_warn!(self.dev, "sensor: {} transfer failed: {:?}\n", op.name(), e);
+                self.sensor_step_failed(op.name());
+                None
+            }
+        }
+    }
+
     fn register_sensor(&self, id: &sensor::Identifier) -> bool {
         let stage = self.bringup.load(Relaxed);
         dev_info!(self.dev, "sbio: registering sensor at bring-up stage {}\n", stage);
@@ -1714,9 +1772,12 @@ impl SepData {
                     return false;
                 }
             };
-            if !self.sensor_session_request(0x48, c"PLATFORM_IDENTITY", &platform)
-                || self.sbio_expect_ok(&crate::sbio::sbio_register_sensor(id)).is_none()
-            {
+            if !self.sensor_session_request(0x48, c"PLATFORM_IDENTITY", &platform) {
+                self.sensor_step_failed(c"PLATFORM_IDENTITY");
+                return false;
+            }
+            self.sensor_trace(c"PLATFORM_IDENTITY");
+            if self.sensor_enclave_step(&crate::sbio::sbio_register_sensor(id)).is_none() {
                 return false;
             }
         }
@@ -1724,7 +1785,7 @@ impl SepData {
         if stage >= BRINGUP_ESTABLISHED {
             let _ = self.log_identity_count(c"before CLEAR_STATE for sensor re-registration");
             if self
-                .sbio_expect_ok(&crate::sbio::sbio_clear_state())
+                .sensor_enclave_step(&crate::sbio::sbio_clear_state())
                 .is_none()
             {
                 return false;
@@ -1752,23 +1813,24 @@ impl SepData {
 
         let serial = match sensor::read_sensor_serial() {
             Ok(serial) => serial,
-            Err(_) => {
+            Err(e) => {
+                dev_warn!(self.dev, "sensor: serial read failed: {:?}\n", e);
+                self.sensor_step_failed(c"serial read");
                 return false;
             }
         };
+        self.sensor_trace(c"serial read");
 
         let op = crate::sbio::sbio_register_sensor_serial(&serial);
-        match self.sbio_call(&op) {
-            SbioOutcome::Ok(_payload) => {
-                if self.profile.nonce_session && !self.authenticate_sensor_session() {
-                    return false;
-                }
-                self.bringup.store(BRINGUP_ESTABLISHED, Relaxed);
-                let _ = self.log_identity_count(c"after sensor serial registration");
-                true
-            }
-            _ => false,
+        if self.sensor_enclave_step(&op).is_none() {
+            return false;
         }
+        if self.profile.nonce_session && !self.authenticate_sensor_session() {
+            return false;
+        }
+        self.bringup.store(BRINGUP_ESTABLISHED, Relaxed);
+        let _ = self.log_identity_count(c"after sensor serial registration");
+        true
     }
 
     fn sensor_platform_identity() -> Result<[u8; 12]> {
@@ -1802,12 +1864,16 @@ impl SepData {
             Ok(nonce) => nonce,
             Err(error) => {
                 dev_err!(self.dev, "sensor: nonce read failed: {:?}\n", error);
+                self.sensor_step_failed(c"nonce read");
                 return false;
             }
         };
+        self.sensor_trace(c"nonce read");
         if !self.sensor_session_request(0x81, c"SENSOR_NONCE", &nonce) {
+            self.sensor_step_failed(c"SENSOR_NONCE");
             return false;
         }
+        self.sensor_trace(c"SENSOR_NONCE");
 
         if !self.sensor_key_loaded.load(Relaxed) {
             let firmware = match kernel::firmware::Firmware::request(
@@ -1826,9 +1892,11 @@ impl SepData {
             if firmware.data().is_empty()
                 || !self.sensor_session_request(0x86, c"SENSOR_ROOT_KEY", firmware.data())
             {
+                self.sensor_step_failed(c"SENSOR_ROOT_KEY");
                 return false;
             }
             self.sensor_key_loaded.store(true, Relaxed);
+            self.sensor_trace(c"SENSOR_ROOT_KEY");
         }
         // Each identification starts a new sensor-side exchange, even though
         // the signed key remains loaded for the lifetime of the enclave.
@@ -1837,6 +1905,7 @@ impl SepData {
 
     fn wake_sensor(&self) -> Option<PatchLoaded> {
         let _source = sensor::power_source();
+        self.sensor_power_ns.store(shim::boottime_ns(), Relaxed);
         let cycled = sensor::power_cycle();
         if !sensor::cs_timing().is_hardware() {
             dev_warn!(
@@ -1877,6 +1946,13 @@ impl SepData {
                 answered_without_identifier = true;
                 continue;
             };
+            if *module_parameters::sensor_trace.value() != 0 {
+                dev_info!(
+                    self.dev,
+                    "sensor: identifier present {} ms after power-on\n",
+                    self.sensor_ms()
+                );
+            }
             if !self.register_sensor(&id) {
                 dev_warn!(self.dev, "sensor: the enclave did not register the sensor\n");
                 return None;
@@ -2090,43 +2166,37 @@ impl SepData {
     }
 
     fn establish_session(&self) -> bool {
-        let share = match self.sbio_call(&crate::sbio::sbio_request_session_share()) {
-            SbioOutcome::Ok(sh) => sh,
-            SbioOutcome::Status16 => {
-                return false;
-            }
-            SbioOutcome::PrerequisiteMissing => {
-                return false;
-            }
-            SbioOutcome::Other => {
-                return false;
-            }
+        let Some(share) = self.sensor_enclave_step(&crate::sbio::sbio_request_session_share())
+        else {
+            return false;
         };
 
         // 0x30 reserved for this reply; length is a floor, take the first 40
         if share.len() < sensor::SESSION_SHARE_LEN {
+            dev_warn!(self.dev, "sensor: short session share ({} bytes)\n", share.len());
             return false;
         }
         let mut out = [0u8; sensor::SESSION_SHARE_LEN];
         out.copy_from_slice(&share[..sensor::SESSION_SHARE_LEN]);
 
         // relay it: class 0x72, no CRC, no padding
-        if sensor::send_session_share(&out).is_err() {
+        if let Err(e) = sensor::send_session_share(&out) {
+            dev_warn!(self.dev, "sensor: sending the session share failed: {:?}\n", e);
+            self.sensor_step_failed(c"session share send");
             return false;
         }
 
         let reply = match sensor::read_session_reply() {
             Ok(r) => r,
-            Err(_) => {
+            Err(e) => {
+                dev_warn!(self.dev, "sensor: session reply read failed: {:?}\n", e);
+                self.sensor_step_failed(c"session reply read");
                 return false;
             }
         };
 
-        match self.sbio_transfer(&crate::sbio::sbio_commit_session_share(&reply)) {
-            Ok(done) if done.status.is_ok() => true,
-            Ok(_) => false,
-            Err(_) => false,
-        }
+        self.sensor_enclave_step(&crate::sbio::sbio_commit_session_share(&reply))
+            .is_some()
     }
 
     // Each failure names its step: a report that only says "sequence counter
@@ -2180,6 +2250,7 @@ impl SepData {
             Ok(done) if done.status.is_ok() => true,
             Ok(done) => {
                 dev_warn!(self.dev, "sequence counter: the enclave refused the sensor's reply, status {}\n", done.status);
+                self.sensor_step_failed(c"challenge commit");
                 false
             }
             Err(e) => {
