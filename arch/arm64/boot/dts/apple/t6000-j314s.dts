@@ -10,8 +10,9 @@
 /dts-v1/;
 
 /*
- * PMP manages system power states; with pmgr-misc leaving fabric and DCS
- * to it, this board resumes from s2idle and idles about 0.8 W lower.
+ * PMP manages system power states; with pmgr-misc leaving DCS to it and
+ * lowering only the fabric for sleep, this board resumes from s2idle and
+ * idles about 0.8 W lower.
  */
 #define APPLE_USE_PMP
 
