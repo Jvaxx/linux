@@ -7,32 +7,31 @@
  * Based on scpi-cpufreq.c
  */
 
+#include <linux/bitfield.h>
+#include <linux/bitops.h>
+#include <linux/cpu.h>
+#include <linux/cpufreq.h>
 #include <linux/cpuhotplug.h>
+#include <linux/cpumask.h>
+#include <linux/delay.h>
+#include <linux/err.h>
 #include <linux/hrtimer.h>
+#include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
 #include <linux/math64.h>
+#include <linux/module.h>
+#include <linux/of.h>
+#include <linux/of_address.h>
+#include <linux/pm_opp.h>
 #include <linux/pm_qos.h>
+#include <linux/slab.h>
 #include <linux/soc/apple/pmp-report.h>
 #include <linux/spinlock.h>
 #include <linux/tick.h>
 #include <linux/timer.h>
 #include <linux/workqueue.h>
-
-#include <linux/bitfield.h>
-#include <linux/bitops.h>
-#include <linux/cpu.h>
-#include <linux/cpufreq.h>
-#include <linux/cpumask.h>
-#include <linux/delay.h>
-#include <linux/err.h>
-#include <linux/io.h>
-#include <linux/iopoll.h>
-#include <linux/module.h>
-#include <linux/of.h>
-#include <linux/of_address.h>
-#include <linux/pm_opp.h>
-#include <linux/slab.h>
 
 #define APPLE_DVFS_CMD				0x20
 #define APPLE_DVFS_CMD_BUSY			BIT(31)
@@ -208,7 +207,6 @@ struct apple_cpu_priv {
 };
 
 static struct cpufreq_driver apple_soc_cpufreq_driver;
-static void apple_soc_cpufreq_exit_with_limits(struct cpufreq_policy *policy);
 
 static const struct apple_soc_cpufreq_info soc_s5l8960x_info = {
 	.has_ps2 = false,
@@ -929,6 +927,9 @@ static void apple_soc_cpufreq_exit(struct cpufreq_policy *policy)
 {
 	struct apple_cpu_priv *priv = policy->driver_data;
 
+	/* Drain firmware-limit updates before releasing the OPP tables. */
+	apple_fast_die_exit(priv);
+
 	dev_pm_opp_free_cpufreq_table(priv->cpu_dev, &policy->freq_table);
 	/*
 	 * The core clears the last CPU from policy->cpus before calling
@@ -946,20 +947,13 @@ static struct cpufreq_driver apple_soc_cpufreq_driver = {
 	.verify		= cpufreq_generic_frequency_table_verify,
 	.get		= apple_soc_cpufreq_get_rate,
 	.init		= apple_soc_cpufreq_init,
-	.exit		= apple_soc_cpufreq_exit_with_limits,
+	.exit		= apple_soc_cpufreq_exit,
 	.target_index	= apple_soc_cpufreq_set_target,
 	.fast_switch	= apple_soc_cpufreq_fast_switch,
 	.register_em	= cpufreq_register_em_with_opp,
 	.set_boost	= cpufreq_boost_set_sw,
 	.suspend	= cpufreq_generic_suspend,
 };
-
-/* Drain firmware-limit updates before releasing the policy's OPP table. */
-static void apple_soc_cpufreq_exit_with_limits(struct cpufreq_policy *policy)
-{
-	apple_fast_die_exit(policy->driver_data);
-	apple_soc_cpufreq_exit(policy);
-}
 
 static int __init apple_soc_cpufreq_module_init(void)
 {
