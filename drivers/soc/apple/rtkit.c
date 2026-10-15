@@ -96,6 +96,8 @@ enum {
 #define APPLE_RTKIT_KDEBUG_ENTRY_SIZE 0x20
 #define APPLE_RTKIT_KDEBUG_BUF_ALIGN  SZ_16K
 #define APPLE_RTKIT_KDEBUG_BUF1_SIZE  SZ_8K
+/* The firmware gives the entry count; cap what it can make the kernel pin. */
+#define APPLE_RTKIT_KDEBUG_BUF0_MAX   SZ_4M
 
 #define APPLE_RTKIT_MIN_SUPPORTED_VERSION 11
 #define APPLE_RTKIT_MAX_SUPPORTED_VERSION 12
@@ -482,6 +484,10 @@ static void apple_rtkit_kdebug_rx(struct apple_rtkit *rtk, u64 msg)
 		}
 
 		size = ALIGN(size, APPLE_RTKIT_KDEBUG_BUF_ALIGN);
+		if (size > APPLE_RTKIT_KDEBUG_BUF0_MAX) {
+			err = -E2BIG;
+			goto error;
+		}
 		err = apple_rtkit_kdebug_alloc_buffer(rtk, &rtk->kdebug_buffer0,
 						      size);
 		if (err)
@@ -1186,7 +1192,8 @@ static int apple_rtkit_wait(struct apple_rtkit *rtk, struct completion *c)
 			return 0;
 	} while (time_before(jiffies, timeout));
 
-	return -ETIME;
+	/* Completed after the last wait, before the deadline check. */
+	return try_wait_for_completion(c) ? 0 : -ETIME;
 }
 
 static int apple_rtkit_wait_for_completion(struct completion *c)
