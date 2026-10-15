@@ -1259,8 +1259,24 @@ static int mt_suspend(struct device *dev)
 	return 0;
 }
 
+/*
+ * Hibernation is refused. Its freeze phase does not call .suspend, so without
+ * this the firmware would keep writing to memory while the image is saved,
+ * and the restored kernel would resume with ring state the firmware of the
+ * booting kernel does not have. Supporting it needs DMA retirement and a full
+ * reinitialisation on restore. Returning an error here has no side effect to
+ * undo: the PM core aborts hibernation before this device changes state.
+ */
+static int mt_freeze(struct device *dev)
+{
+	dev_err(dev, "hibernation is not supported\n");
+	return -EOPNOTSUPP;
+}
+
 static const struct dev_pm_ops mt_pm_ops = {
 	.suspend = mt_suspend,
+	.freeze = mt_freeze,
+	.poweroff = mt_freeze,
 };
 
 static const struct pci_device_id mt_ids[] = {
