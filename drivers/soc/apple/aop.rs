@@ -213,6 +213,7 @@ fn le_u64(b: &[u8], off: usize) -> u64 {
 
 #[inline(always)]
 fn mem_sync() {
+    // SAFETY: a full-system barrier touches no memory or registers of ours.
     unsafe {
         asm!("dsb sy");
     }
@@ -225,6 +226,29 @@ struct QEHeader {
     size: u32,
     channel: u32,
     ty: u32,
+}
+
+/// The size of a ring entry header.
+const QEH_SIZE: usize = mem::size_of::<QEHeader>();
+
+impl QEHeader {
+    fn from_bytes(b: &[u8; QEH_SIZE]) -> QEHeader {
+        QEHeader {
+            magic: le_u32(b, 0),
+            size: le_u32(b, 4),
+            channel: le_u32(b, 8),
+            ty: le_u32(b, 12),
+        }
+    }
+
+    fn to_bytes(self) -> [u8; QEH_SIZE] {
+        let mut b = [0; QEH_SIZE];
+        b[0..4].copy_from_slice(&{ self.magic }.to_le_bytes());
+        b[4..8].copy_from_slice(&{ self.size }.to_le_bytes());
+        b[8..12].copy_from_slice(&{ self.channel }.to_le_bytes());
+        b[12..16].copy_from_slice(&{ self.ty }.to_le_bytes());
+        b
+    }
 }
 
 #[repr(C, packed)]
@@ -601,11 +625,10 @@ impl AFKEndpoint {
         mem_sync();
         let base = buf_offset + block_size * 3;
         let mut msg_buf = KVec::new();
-        const QEH_SIZE: usize = mem::size_of::<QEHeader>();
         while wptr as usize != rptr {
             let mut qeh_bytes = [0; QEH_SIZE];
             self.memcpy_from_iomem(base + rptr, &mut qeh_bytes)?;
-            let mut qeh = unsafe { &*(qeh_bytes.as_ptr() as *const QEHeader) };
+            let mut qeh = QEHeader::from_bytes(&qeh_bytes);
             if qeh.magic != QE_MAGIC1 && qeh.magic != QE_MAGIC2 {
                 let magic = qeh.magic;
                 dev_err!(
@@ -620,7 +643,7 @@ impl AFKEndpoint {
             if qeh.size as usize > room {
                 rptr = 0;
                 self.memcpy_from_iomem(base + rptr, &mut qeh_bytes)?;
-                qeh = unsafe { &*(qeh_bytes.as_ptr() as *const QEHeader) };
+                qeh = QEHeader::from_bytes(&qeh_bytes);
 
                 if qeh.magic != QE_MAGIC1 && qeh.magic != QE_MAGIC2 {
                     let magic = qeh.magic;
@@ -643,7 +666,7 @@ impl AFKEndpoint {
                     self.drop_message(&client.dev, fmt!("short message ({} bytes)", msg_buf.len()))
                 }
                 Some((header, msg)) => {
-                    if let Err(e) = self.handle_ipc(client, qeh, &header, msg) {
+                    if let Err(e) = self.handle_ipc(client, &qeh, &header, msg) {
                         let channel = qeh.channel;
                         self.drop_message(
                             &client.dev,
@@ -789,7 +812,6 @@ impl AFKEndpoint {
         mem_sync();
         let rptr = self.iomem_read32(buf_offset + block_size)? as usize;
         let mut wptr = self.iomem_read32(buf_offset + block_size * 2)? as usize;
-        const QEH_SIZE: usize = mem::size_of::<QEHeader>();
         if wptr < rptr && wptr + QEH_SIZE >= rptr {
             dev_err!(client.dev, "Tx buffer full at endpoint {}", self.index);
             return Err(EIO);
@@ -801,16 +823,11 @@ impl AFKEndpoint {
             channel,
             ty,
         };
-        let qeh_bytes = unsafe {
-            slice::from_raw_parts(
-                &qeh as *const QEHeader as *const u8,
-                mem::size_of::<QEHeader>(),
-            )
-        };
-        self.memcpy_to_iomem(base + wptr, qeh_bytes)?;
+        let qeh_bytes = qeh.to_bytes();
+        self.memcpy_to_iomem(base + wptr, &qeh_bytes)?;
         if payload_len > buf_size.checked_sub(wptr + QEH_SIZE).ok_or(EIO)? {
             wptr = 0;
-            self.memcpy_to_iomem(base + wptr, qeh_bytes)?;
+            self.memcpy_to_iomem(base + wptr, &qeh_bytes)?;
         }
         self.memcpy_to_iomem(base + wptr + QEH_SIZE, header)?;
         self.memcpy_to_iomem(base + wptr + QEH_SIZE + header.len(), data)?;
@@ -1235,11 +1252,11 @@ impl WorkItem for AopServiceRegisterWork {
             .and_then(|x| x.get_child_by_name(this.name));
         let info = bindings::platform_device_info {
             parent: this.data.dev.as_raw(),
-            name: this.name.as_ptr() as *const _,
+            name: this.name.as_char_ptr(),
             id: bindings::PLATFORM_DEVID_AUTO,
             res: ptr::null_mut(),
             num_res: 0,
-            data: &this.service as *const EPICService as *const _,
+            data: ptr::from_ref(&this.service).cast(),
             size_data: mem::size_of::<EPICService>(),
             dma_mask: 0,
             fwnode: fwnode
@@ -1484,7 +1501,7 @@ impl AopData {
                 if *k != key {
                     continue;
                 }
-                arg_bytes[idx..idx + size].copy_from_slice(&(*v as u64).to_le_bytes()[..size]);
+                arg_bytes[idx..idx + size].copy_from_slice(&v.to_le_bytes()[..size]);
                 break;
             }
             idx += size;
@@ -2296,6 +2313,7 @@ impl platform::Driver for AopDriver {
             );
             return Err(ENODEV);
         }
+        // SAFETY: nothing of this device has DMA in flight before probe.
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::new::<42>())? };
         let aop_req = pdev.io_request_by_index(0).ok_or(EINVAL)?;
         let aop_mmio = aop_req.iomap_sized::<AOP_MMIO_SIZE>()?;
@@ -2358,6 +2376,8 @@ impl Drop for AopDriver {
     }
 }
 
+// SAFETY: the wrapped `Arc<dyn AOP>` is `Send + Sync` (the trait requires
+// both), so the handle may move to the thread that unbinds the device.
 unsafe impl Send for AopDriver {}
 
 module_platform_driver! {
