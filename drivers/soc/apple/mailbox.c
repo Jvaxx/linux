@@ -512,6 +512,18 @@ void apple_mbox_stop(struct apple_mbox *mbox)
 }
 EXPORT_SYMBOL(apple_mbox_stop);
 
+void apple_mbox_hold_rx(struct apple_mbox *mbox)
+{
+	disable_irq(mbox->irq_recv_not_empty);
+}
+EXPORT_SYMBOL(apple_mbox_hold_rx);
+
+void apple_mbox_release_rx(struct apple_mbox *mbox)
+{
+	enable_irq(mbox->irq_recv_not_empty);
+}
+EXPORT_SYMBOL(apple_mbox_release_rx);
+
 /*
  * Stop the provider-owned CPU, then quiesce every transport edge before
  * devres releases IRQs or MMIO mappings. Device links order consumer removal
