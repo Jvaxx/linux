@@ -514,9 +514,8 @@ static int macsmc_hwmon_discover_temperatures(struct macsmc_hwmon *hwmon)
 	if (!of_property_read_bool(hwmon->dev->of_node, "apple,discover-temperatures"))
 		return 0;
 
-	/* Dynamic channel numbers must not replace a DT-described thermal policy. */
-	if (hwmon->temp.count ||
-	    of_property_read_bool(hwmon->dev->of_node, "apple,cpu-thermal-policy"))
+	/* Dynamic channel numbers must not replace DT-described channels. */
+	if (hwmon->temp.count)
 		return -EINVAL;
 
 	/* Bound both allocation and mailbox transactions for invalid firmware data. */
