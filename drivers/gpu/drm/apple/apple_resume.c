@@ -27,9 +27,9 @@
  * The suspend state holds every CRTC, plane and connector already, so it is
  * edited directly rather than through helpers that need the modeset locks.
  *
- * Returns true if a CRTC is to be resumed disabled.
+ * Returns the mask of the CRTCs to be resumed disabled.
  */
-bool apple_drm_drop_stale_crtcs(struct drm_atomic_commit *state)
+u32 apple_drm_drop_stale_crtcs(struct drm_atomic_commit *state)
 {
 	const struct drm_crtc_helper_funcs *funcs;
 	struct drm_connector_state *conn_state;
@@ -38,7 +38,7 @@ bool apple_drm_drop_stale_crtcs(struct drm_atomic_commit *state)
 	struct drm_connector *connector;
 	struct drm_plane *plane;
 	struct drm_crtc *crtc;
-	bool dropped = false;
+	u32 dropped = 0;
 	int i, j;
 
 	for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
@@ -64,7 +64,7 @@ bool apple_drm_drop_stale_crtcs(struct drm_atomic_commit *state)
 				continue;
 			/* Detaching from a CRTC already in the state cannot fail. */
 			if (WARN_ON(drm_atomic_set_crtc_for_connector(conn_state, NULL)))
-				return true;
+				return dropped | drm_crtc_mask(crtc);
 			/*
 			 * Nor does a connector without a CRTC keep an encoder:
 			 * the resume check warns about one left routed.
@@ -76,7 +76,7 @@ bool apple_drm_drop_stale_crtcs(struct drm_atomic_commit *state)
 			conn_state->link_status = DRM_LINK_STATUS_BAD;
 		}
 		crtc_state->active = false;
-		dropped = true;
+		dropped |= drm_crtc_mask(crtc);
 		if (WARN_ON(drm_atomic_set_mode_for_crtc(crtc_state, NULL)))
 			break;
 	}
