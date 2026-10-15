@@ -35,7 +35,6 @@
 #include <linux/regmap.h>
 #include <linux/seq_file.h>
 #include <linux/soc/apple/pmc.h>
-#include <linux/uaccess.h>
 #include <linux/workqueue.h>
 
 #define APPLE_CLPC_MAX_CLUSTERS	8
@@ -122,7 +121,6 @@ struct apple_clpc {
 	u8 map[APPLE_CLPC_RAILS][APPLE_CLPC_LEVELS];
 	unsigned int gpu_state[APPLE_CLPC_RAILS];
 	struct apple_clpc_vote vote[APPLE_CLPC_RAILS];
-	int force[APPLE_CLPC_RAILS];
 	u32 mask;
 	u32 saved_floor;
 	bool gpu_on;
@@ -286,7 +284,6 @@ static void apple_clpc_sample(struct apple_clpc *clpc)
 	unsigned int state[APPLE_CLPC_RAILS];
 	unsigned long now = jiffies;
 	unsigned int i, rail;
-	int force;
 
 	clpc->samples++;
 	if (!cpumask_equal(clpc->covered, cpu_possible_mask) &&
@@ -312,9 +309,6 @@ static void apple_clpc_sample(struct apple_clpc *clpc)
 			demand[rail] = max(demand[rail], clpc->gpu_state[rail]);
 		state[rail] = apple_clpc_vote(&clpc->vote[rail], demand[rail],
 					      now);
-		force = READ_ONCE(clpc->force[rail]);
-		if (force >= 0)
-			state[rail] = force;
 	}
 
 	if (apple_pmc_floor_update(clpc->pmc, clpc->agent, clpc->mask,
@@ -345,12 +339,12 @@ static int apple_clpc_status_show(struct seq_file *s, void *unused)
 		   apple_pmc_floor_read(clpc->pmc, clpc->agent),
 		   clpc->saved_floor);
 	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
-		seq_printf(s, "%s: rail %u state %u enabled %u force %d map %u,%u,%u,%u gpu %u\n",
+		seq_printf(s, "%s: rail %u state %u enabled %u map %u,%u,%u,%u gpu %u\n",
 			   rail == APPLE_CLPC_DCS ? "dcs" : "soc",
 			   clpc->hw->rail[rail], clpc->vote[rail].state,
 			   apple_pmc_voter_enabled(clpc->pmc, clpc->agent,
 						   clpc->hw->rail[rail]),
-			   READ_ONCE(clpc->force[rail]), clpc->map[rail][0],
+			   clpc->map[rail][0],
 			   clpc->map[rail][1], clpc->map[rail][2],
 			   clpc->map[rail][3], clpc->gpu_state[rail]);
 	seq_printf(s, "gpu: %s\n", !clpc->gpu_regmap ? "no input" :
@@ -369,48 +363,6 @@ static int apple_clpc_status_show(struct seq_file *s, void *unused)
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(apple_clpc_status);
-
-/*
- * Diagnostic override: "DCS SOC" holds each rail at a fixed state, -1
- * returns that rail to demand control; "-1" alone clears both.
- */
-static ssize_t apple_clpc_force_write(struct file *file,
-				      const char __user *ubuf, size_t len,
-				      loff_t *pos)
-{
-	struct apple_clpc *clpc = file->private_data;
-	int v[APPLE_CLPC_RAILS], n;
-	unsigned int rail;
-	char buf[32];
-
-	if (len >= sizeof(buf))
-		return -EINVAL;
-	if (copy_from_user(buf, ubuf, len))
-		return -EFAULT;
-	buf[len] = '\0';
-
-	n = sscanf(buf, "%d %d", &v[APPLE_CLPC_DCS], &v[APPLE_CLPC_SOC]);
-	if (n == 1 && v[APPLE_CLPC_DCS] == -1)
-		v[APPLE_CLPC_SOC] = -1;
-	else if (n != 2)
-		return -EINVAL;
-
-	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
-		if (v[rail] < -1 || v[rail] > (int)clpc->hw->max_state[rail])
-			return -EINVAL;
-	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
-		WRITE_ONCE(clpc->force[rail], v[rail]);
-
-	dev_info(clpc->dev, "diagnostic override: dcs %d soc %d\n",
-		 v[APPLE_CLPC_DCS], v[APPLE_CLPC_SOC]);
-	return len;
-}
-
-static const struct file_operations apple_clpc_force_fops = {
-	.owner = THIS_MODULE,
-	.open = simple_open,
-	.write = apple_clpc_force_write,
-};
 
 static int apple_clpc_gpu_input(struct apple_clpc *clpc)
 {
@@ -504,7 +456,6 @@ static int apple_clpc_probe(struct platform_device *pdev)
 		if (clpc->hw->rail[rail] >= apple_pmc_rail_count(clpc->pmc))
 			return -EINVAL;
 		clpc->mask |= APPLE_PMC_RAIL_MASK(clpc->hw->rail[rail]);
-		clpc->force[rail] = -1;
 	}
 
 	ret = apple_clpc_parse_map(clpc, dcs_map, APPLE_CLPC_DCS) ?:
@@ -555,8 +506,6 @@ static int apple_clpc_probe(struct platform_device *pdev)
 	clpc->debugfs = debugfs_create_dir(dev_name(dev), NULL);
 	debugfs_create_file("status", 0400, clpc->debugfs, clpc,
 			    &apple_clpc_status_fops);
-	debugfs_create_file("force", 0200, clpc->debugfs, clpc,
-			    &apple_clpc_force_fops);
 
 	ret = devm_add_action_or_reset(dev, apple_clpc_stop, clpc);
 	if (ret)
