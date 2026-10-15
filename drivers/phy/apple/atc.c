@@ -1748,10 +1748,8 @@ static int j700_aux_disable(struct apple_atcphy *atcphy)
 
 static int atcphy_enable_dp_aux(struct apple_atcphy *atcphy)
 {
-	if (atcphy->hw->has_t8140_dp) {
-		dev_info_once(atcphy->dev, "Applied T8140 DisplayPort setup lists\n");
+	if (atcphy->hw->has_t8140_dp)
 		return j700_aux_enable(atcphy);
-	}
 
 	/* FIXME */
 	if (atcphy->hw->gen == ATCPHY_GENERATION_T8122)
@@ -2685,9 +2683,9 @@ static int atc_tunnel_start_t602x(struct apple_atcphy *atcphy)
 	outputs = readl(atcphy->regs.core + AUSPLL_CLKOUT_MASTER);
 	command = readl(atcphy->regs.core + AUSPLL_APB_CMD_OVERRIDE);
 	status = readl(atcphy->regs.core + ACIOPHY_DP_PCLK_STAT);
-	dev_info(atcphy->dev,
-		 "USB4 tunnel clock preflight: +7000=%08x +2200=%08x +2000=%08x +7044=%08x\n",
-		 gates, outputs, command, status);
+	dev_dbg(atcphy->dev,
+		"USB4 tunnel clock preflight: +7000=%08x +2200=%08x +2000=%08x +7044=%08x\n",
+		gates, outputs, command, status);
 	/*
 	 * Before the first rate request, TX_DP_CTRL0 gate bits read 0xe001:
 	 * the enable gates are set, the byte-clock reset is asserted, and the
