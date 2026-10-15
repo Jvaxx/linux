@@ -30,7 +30,7 @@ struct dwc3 { struct phy *usb2_generic_phy[3], *usb3_generic_phy[3];
               int num_usb2_ports, num_usb3_ports, usb2_phy, usb3_phy;
               struct reset_controller_dev *reset;
               int dev, usb_psy, vbus_draw_work; };
-struct dwc3_apple { struct dwc3 dwc; enum dwc3_apple_state state;
+struct dwc3_apple { struct dwc3 dwc; enum dwc3_apple_state state; int irq;
                     struct reset_controller_dev *reset; int lock; void *dev;
                     struct phy *usb2_phy, *usb3_phy;
                     bool fixed_hub, core_active, core_exit_pending, reset_pending;
@@ -90,6 +90,21 @@ static void dwc3_clk_disable(struct dwc3 *d) { (void)d; clocks_disabled++; }
 static void dwc3_host_exit(struct dwc3 *d);
 static void dwc3_gadget_exit(struct dwc3 *d) { (void)d; gadget_exits++; }
 static void dev_pm_syscore_device(void *d, bool s) { (void)d; syscore = s; }
+static bool wake_irq_set;
+
+static int dev_pm_set_wake_irq(void *d, int irq)
+{
+	(void)d;
+	(void)irq;
+	wake_irq_set = true;
+	return 0;
+}
+
+static void dev_pm_clear_wake_irq(void *d)
+{
+	(void)d;
+	wake_irq_set = 0;
+}
 static void dwc3_enable_susphy(struct dwc3 *d, bool s) { (void)d; (void)s; }
 static int atcphy_dwc3_reset_assert(struct reset_controller_dev *, unsigned long);
 static int reset_control_assert(struct reset_controller_dev *r)
