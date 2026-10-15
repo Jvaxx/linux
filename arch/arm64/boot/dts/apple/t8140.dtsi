@@ -674,7 +674,6 @@
 			/* child nodes are added in t8140-pmgr.dtsi */
 		};
 
-
 		aic: interrupt-controller@301000000 {
 			compatible = "apple,t8140-aic3", "apple,t8122-aic3";
 			#interrupt-cells = <3>;
@@ -1311,7 +1310,6 @@
 			gpio-ranges = <&pinctrl_ap 0 0 216>;
 			apple,npins = <216>;
 
-			/* Live J700 ADT /arm-io/gpio0 interrupts (7 groups). */
 			interrupt-controller;
 			#interrupt-cells = <2>;
 			interrupt-parent = <&aic>;
@@ -1322,7 +1320,7 @@
 				     <AIC_IRQ 267 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 268 IRQ_TYPE_LEVEL_HIGH>,
 				     <AIC_IRQ 269 IRQ_TYPE_LEVEL_HIGH>;
-			/* ADT no-restore-gpio-pins entries: 50 and 134. */
+			/* Pins the firmware lists as no-restore */
 			gpio-reserved-ranges = <50 1>, <134 1>;
 			status = "disabled";
 
@@ -1335,7 +1333,6 @@
 				pinmux = <APPLE_PINMUX(170, 1)>,
 					 <APPLE_PINMUX(171, 1)>;
 			};
-
 		};
 
 		avd: avd@381080000 {
@@ -1400,13 +1397,9 @@
 		};
 
 		/*
-		 * AOP (always-on processor).  Live J700 ADT /arm-io/aop
-		 * (arm-io child + 0x210000000): reg[2] is the AOP MMIO window,
-		 * reg[0] the ASCWrap v6 block whose mailbox sits at +0x8000.
-		 * ADT interrupts [391, 390, 393, 392] = send-not-empty,
-		 * send-empty, recv-not-empty, recv-empty.  The firmware
-		 * (j700aop, RTKit 12) is iBoot-loaded and left stopped; Linux
-		 * adopts it and never reloads it.
+		 * AOP (always-on processor). The bootloader loads its RTKit
+		 * firmware and leaves it stopped; Linux starts it and never
+		 * reloads it.
 		 */
 		aop_mbox: mailbox@310608000 {
 			compatible = "apple,t8140-asc-mailbox", "apple,asc-mailbox-v4";
@@ -1422,14 +1415,7 @@
 			status = "disabled";
 		};
 
-		/*
-		 * The AOP "setup port": the second mailbox the J700 AOP firmware
-		 * boots through (ADT /arm-io/aop-exclave-mailbox, absolute
-		 * address 0x35067c000, IRQs [397, 394] = recv-not-empty,
-		 * send-empty).  Register layout measured on hardware:
-		 * A2I control +0x0 (FULL bit 16), I2A control +0x4 (EMPTY bit
-		 * 17), send +0x180/+0x188, recv +0x1b0/+0x1b8.
-		 */
+		/* The AOP "setup port", a second mailbox used while it boots */
 		aop_setup_mbox: mailbox@35067c000 {
 			compatible = "apple,t8140-aop-setup-mailbox";
 			reg = <0x3 0x5067c000 0x0 0x4000>;
