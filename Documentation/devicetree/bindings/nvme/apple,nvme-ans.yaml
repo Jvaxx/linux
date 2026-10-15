@@ -85,30 +85,7 @@ properties:
 
       The SART address filter is documented in iommu/apple,sart.yaml.
 
-  apple,rtkit-handoff:
-    $ref: /schemas/types.yaml#/definitions/string
-    const: nvme-disabled-v1
-    description: |
-      Added at boot by a bootloader that ran the ANS2 firmware and hands it
-      over still running instead of shutting it down. It describes the
-      state that bootloader left behind, not the hardware, and must not be
-      written into a board device tree source. Its presence states that the
-      firmware keeps a negotiated RTKit session, that all NVMe controller
-      DMA has stopped (CC.EN and CSTS.RDY clear), that the SART entries the
-      bootloader programmed are kept, and that every buffer shared with the
-      firmware is reserved in the memory map without no-map.
-
 allOf:
-  - if:
-      properties:
-        compatible:
-          not:
-            contains:
-              const: apple,t8140-nvme-ans2
-    then:
-      properties:
-        apple,rtkit-handoff: false
-
   - if:
       properties:
         compatible:
