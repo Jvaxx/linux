@@ -31,6 +31,9 @@ static void apple_dart_test_before_attach(struct kunit *test)
 	mutex_init(&domain->init_lock);
 	master.stream_maps[0].dart = dart;
 	__set_bit(0, master.stream_maps[0].sidmap);
+	/* of_xlate() starts each master with the window of its DART. */
+	master.dma_min = dart->dma_min;
+	master.dma_max = dart->dma_max;
 	writel(dart->hw->ttbr_valid, dart->regs + DART_TTBR(dart, 0, 0));
 	KUNIT_ASSERT_EQ(test, apple_dart_finalize_domain(domain, &master), 0);
 	ops = domain->pgtbl_ops;
@@ -179,6 +182,7 @@ static void apple_dart_test_gated_commands(struct kunit *test)
 	dev_set_drvdata(dart->dev, dart);
 	dart->regs = (__force void __iomem *)kunit_kzalloc(test, SZ_16K, GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, dart->regs);
+	dart->hw = &apple_dart_hw_t8110;
 	dart->num_streams = 1;
 	dart->pgsize = SZ_16K;
 	dart->version = 0x0202;
