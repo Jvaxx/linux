@@ -627,6 +627,10 @@ struct SepData {
 
     last_capture_end_ns: Atomic<u64>,
 
+    // Boot-time clock at the start of the last sensor power cycle, for
+    // reporting how far into a bring-up a step failed.
+    sensor_power_ns: Atomic<u64>,
+
     device_view_synced: Atomic<bool>,
 
     keybag_designated: Atomic<bool>,
@@ -851,6 +855,7 @@ impl SepData {
                 enrol_material <- new_mutex!(None),
                 enrol_identity_candidates <- new_mutex!(KVec::new()),
                 last_capture_end_ns: Atomic::new(0),
+                sensor_power_ns: Atomic::new(0),
                 device_view_synced: Atomic::new(false),
                 phase: Atomic::new(PHASE_ATTACH),
                 ool_xarm <- new_mutex!(Some(ool_xarm)),
@@ -2470,6 +2475,10 @@ module! {
         os_uuid_lo: u64 {
             default: 0,
             description: "Low 64 bits of an explicit xART OS UUID",
+        },
+        sensor_trace: u8 {
+            default: 0,
+            description: "Trace Touch ID sensor registration steps and timing, never sensor data",
         },
         xarm_trace: u8 {
             default: 0,

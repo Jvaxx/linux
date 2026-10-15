@@ -635,6 +635,14 @@ impl Identifier {
 }
 
 impl Status {
+    /// The length of the frame the sensor offers, if it offers one.
+    pub(crate) fn available(&self) -> Option<u32> {
+        match self.offset12() {
+            Offset12::Available(n) => Some(n),
+            _ => None,
+        }
+    }
+
     pub(crate) fn offset12(&self) -> Offset12 {
         match self.state {
             STATE_IDLE => Offset12::Identifier(u16::from_le_bytes([
