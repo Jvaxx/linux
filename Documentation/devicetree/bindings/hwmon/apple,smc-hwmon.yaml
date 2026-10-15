@@ -103,8 +103,6 @@ allOf:
       required:
         - apple,discover-temperatures
     then:
-      properties:
-        apple,cpu-thermal-policy: false
       patternProperties:
         "^temperature-": false
 
