@@ -334,6 +334,10 @@ static int macsmc_battery_get_charge_behaviour(struct macsmc_power *power)
 		ret = apple_smc_read(power->smc, SMC_KEY(CHTE), chte_buf, 4);
 		if (ret < 0)
 			return ret;
+		if (ret != sizeof(chte_buf)) {
+			memset(chte_buf, 0, sizeof(chte_buf));
+			return -EIO;
+		}
 
 		if (chte_buf[0] == 0x01)
 			return POWER_SUPPLY_CHARGE_BEHAVIOUR_INHIBIT_CHARGE;

@@ -157,6 +157,9 @@ static int apple_smc_rw_locked(struct apple_smc *smc, smc_key key,
 	if (ret < 0)
 		return ret;
 
+	if (rsize && ret > rsize)
+		return -EIO;
+
 	if (rsize) {
 		/*
 		 * Small data <= 4 bytes is returned as part of the reply
@@ -165,9 +168,9 @@ static int apple_smc_rw_locked(struct apple_smc *smc, smc_key key,
 		 * Device memory.
 		 */
 		if (rsize <= 4)
-			memcpy(rbuf, &rdata, rsize);
+			memcpy(rbuf, &rdata, ret);
 		else
-			memcpy_fromio(rbuf, smc->shmem.iomem, rsize);
+			memcpy_fromio(rbuf, smc->shmem.iomem, ret);
 	}
 
 	return ret;
@@ -415,7 +418,7 @@ static int apple_smc_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct device_node *np;
 	struct apple_smc *smc;
-	__be32 count;
+	__be32 count = 0;
 	int ret;
 
 	smc = devm_kzalloc(dev, sizeof(*smc), GFP_KERNEL);
@@ -467,8 +470,10 @@ static int apple_smc_probe(struct platform_device *pdev)
 	BLOCKING_INIT_NOTIFIER_HEAD(&smc->event_handlers);
 
 	ret = apple_smc_read(smc, SMC_KEY(#KEY), &count, sizeof(count));
-	if (ret >= 0 && ret != sizeof(count))
-		ret = -EINVAL;
+	if (ret >= 0 && ret != sizeof(count)) {
+		count = 0;
+		ret = -EIO;
+	}
 	if (ret < 0)
 		return dev_err_probe(smc->dev, ret, "Failed to get key count");
 	smc->key_count = be32_to_cpu(count);
