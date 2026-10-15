@@ -2499,12 +2499,12 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *waiting_s
 		dev_warn(dcp->dev, "dcp_dptx_connect: missing phy\n");
 		return -ENODEV;
 	}
-	dev_info(dcp->dev,
-		 "%s(port=%d) target=%u:%u typec=%d route=%s conn_type=%d connected=%d\n",
-		 __func__, port, dcp->dptx_die, dcp->dptx_phy,
-		 dcp_is_typec_output(dcp),
-		 dcp->active_typec_route ? "borrowed" : "fixed",
-		 dcp->connector_type, dcp->dptxport[port].connected);
+	dev_dbg(dcp->dev,
+		"%s(port=%d) target=%u:%u typec=%d route=%s conn_type=%d connected=%d\n",
+		__func__, port, dcp->dptx_die, dcp->dptx_phy,
+		dcp_is_typec_output(dcp),
+		dcp->active_typec_route ? "borrowed" : "fixed",
+		dcp->connector_type, dcp->dptxport[port].connected);
 
 	mutex_lock(&dcp->hpd_mutex);
 	if (!dptx_service_available(&dcp->dptxport[port])) {
