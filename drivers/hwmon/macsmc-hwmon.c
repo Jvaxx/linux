@@ -685,6 +685,21 @@ static int macsmc_hwmon_create_sensor(struct device *dev, struct apple_smc *smc,
 	return 0;
 }
 
+/* Account for the temperature sensor just set up at the end of @temp. */
+static void macsmc_hwmon_add_temp_channel(struct macsmc_hwmon_sensors *temp,
+					  int create_ret)
+{
+	struct macsmc_hwmon_sensor *sensor = &temp->sensors[temp->count];
+
+	if (create_ret)
+		return;
+
+	sensor->attrs = HWMON_T_INPUT;
+	if (*sensor->label)
+		sensor->attrs |= HWMON_T_LABEL;
+	temp->count++;
+}
+
 /* Discover reporting-only temperatures without a board-specific key table. */
 static int macsmc_hwmon_discover_temperatures(struct macsmc_hwmon *hwmon)
 {
@@ -970,14 +985,9 @@ static int macsmc_hwmon_populate_sensors(struct macsmc_hwmon *hwmon,
 
 		for_each_child_of_node_with_prefix(hwmon_node, key_node, "temperature-") {
 			sensor = &hwmon->temp.sensors[hwmon->temp.count];
-			if (!macsmc_hwmon_create_sensor(hwmon->dev, hwmon->smc, key_node, sensor)) {
-				sensor->attrs = HWMON_T_INPUT;
-
-				if (*sensor->label)
-					sensor->attrs |= HWMON_T_LABEL;
-
-				hwmon->temp.count++;
-			}
+			ret = macsmc_hwmon_create_sensor(hwmon->dev, hwmon->smc,
+							 key_node, sensor);
+			macsmc_hwmon_add_temp_channel(&hwmon->temp, ret);
 		}
 
 		for (list = die_keys; list && (ret = macsmc_hwmon_next_key(&list, key));) {
