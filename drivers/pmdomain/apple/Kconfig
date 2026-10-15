@@ -65,3 +65,14 @@ config APPLE_PMP_REPORT_NEO
 	depends on ARCH_APPLE && OF && PM
 	select PM_GENERIC_DOMAINS
 	default ARCH_APPLE
+config APPLE_PMC_KUNIT_TEST
+	bool "KUnit tests for the Apple PMC voter interface" if !KUNIT_ALL_TESTS
+	depends on APPLE_PMC && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Unit tests for the Apple PMC driver. They check that enabling and
+	  disabling a voter agent only changes that agent on each rail, and
+	  that lifting a DCS limit gives the AP agent its own vote back. The
+	  registers are simulated in memory. Only useful for kernel developers.
+
+endif
