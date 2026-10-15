@@ -1234,8 +1234,8 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 
 	if (!afk_ring_payload_fits(rptr, size, ep->rxbfr.bufsz)) {
 		dev_warn(ep->dcp->dev,
-			 "AFK[ep:%02x]: queue entry out of bounds: 0x%lx > 0x%lx\n",
-			 ep->endpoint, rptr + size + sizeof(*hdr), ep->rxbfr.bufsz);
+			 "AFK[ep:%02x]: queue entry of 0x%x bytes at 0x%x out of bounds\n",
+			 ep->endpoint, size, rptr);
 		return false;
 	}
 
