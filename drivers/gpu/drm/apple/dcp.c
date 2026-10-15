@@ -464,7 +464,7 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 	guard(mutex)(&dcp->external_lock);
 	if (dcp_is_external_h17p(dcp) &&
 	    (dcp->external_error || (dcp->external_power_attempted && !dcp->external_stopped)))
-		return dcp->external_error ?: -EBUSY;
+		return dcp->external_error ?: -EAGAIN;
 
 	dcp_firmware_metadata_connection(dcp, READ_ONCE(dcp->typec_generation), false);
 
@@ -973,7 +973,7 @@ static int dcp_typec_route_prepare(struct typec_mux_dev *mux,
 
 	guard(mutex)(&dcp_typec_fabric_lock);
 	if (state->mode != TYPEC_STATE_SAFE)
-		return port->safe_pending ? -EBUSY : 0;
+		return port->safe_pending ? -EAGAIN : 0;
 	if (!port->owner || port->owner->tunnel)
 		return 0;
 	dcp = port->owner->dcp;
@@ -1060,8 +1060,9 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 
 	if (state->mode == TYPEC_STATE_SAFE && port->safe_pending)
 		return 0;
+	/* The previous SAFE transition has not finished; retry. */
 	if (port->safe_pending)
-		return -EBUSY;
+		return -EAGAIN;
 
 	/*
 	 * Every candidate route for this port is notified with the same state,
@@ -1154,7 +1155,7 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 			dcp_typec_rebalance_locked(NULL, 0);
 		if (!port->owner) {
 			if (hpd)
-				return -EBUSY;
+				return -ENOSPC;
 			port->applied_valid = true;
 			return 0;
 		}
@@ -1173,8 +1174,9 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 		if (!best)
 			best = dcp_typec_lowest_free(port);
 
+		/* Every pipeline is driving another port's display. */
 		if (!best)
-			return -EBUSY;
+			return -ENOSPC;
 
 		ret = dcp_typec_route_activate(best, best->xbar);
 		if (ret)
