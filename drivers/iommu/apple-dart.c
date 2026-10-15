@@ -1343,8 +1343,15 @@ static int apple_dart_domain_flush_tlb_range(struct apple_dart_domain *domain,
 	struct apple_dart_atomic_stream_map *map;
 	struct apple_dart_stream_map stream;
 	struct io_pgtable_cfg *cfg = &io_pgtable_ops_to_pgtable(domain->pgtbl_ops)->cfg;
-	int i, j, ret;
+	const u32 op = DART_T8110_TLB_CMD_OP_FLUSH_SID;
+	int i, j, ret, err = 0;
+	u64 start, end;
 
+	/*
+	 * After an unmap, the caller frees the pages once this returns. Every
+	 * DART that can be reached must therefore be invalidated, even if
+	 * publishing the page table or powering another DART failed.
+	 */
 	for_each_stream_map(i, domain, map) {
 		stream.dart = map->dart;
 		for (j = 0; j < BITS_TO_LONGS(stream.dart->num_streams); j++)
@@ -1355,31 +1362,30 @@ static int apple_dart_domain_flush_tlb_range(struct apple_dart_domain *domain,
 		if (ret < 0) {
 			dev_err_ratelimited(stream.dart->dev,
 				"failed to power DART for TLB synchronization: %d\n", ret);
-			return ret;
+			err = err ?: ret;
+			continue;
 		}
 		ret = stream.dart->locked ?
 			apple_dart_hw_sync_locked(cfg, &stream, true) : 0;
-		if (ret)
+		if (ret) {
 			dev_err_ratelimited(stream.dart->dev,
 				"failed to publish host page-table entries: %d\n", ret);
-		else {
-			/* The range registers take the DVA the device issues. */
-			if (range && stream.dart->fw_mirror && stream.dart->version >= 0x0202)
-				ret = apple_dart_fw_invalidate(&stream, first + domain->dma_offset,
-							       last + domain->dma_offset);
-			else if (range && stream.dart->locked && stream.dart->version >= 0x0202)
-				ret = apple_dart_t8110_hw_tlb_command_range(&stream,
-					DART_T8110_TLB_CMD_OP_FLUSH_SID, true,
-					first + domain->dma_offset,
-					last + domain->dma_offset);
-			else
-				ret = stream.dart->hw->invalidate_tlb(&stream);
+			err = err ?: ret;
 		}
+		/* The range registers take the DVA the device issues. */
+		start = first + domain->dma_offset;
+		end = last + domain->dma_offset;
+		if (range && stream.dart->fw_mirror && stream.dart->version >= 0x0202)
+			ret = apple_dart_fw_invalidate(&stream, start, end);
+		else if (range && stream.dart->locked && stream.dart->version >= 0x0202)
+			ret = apple_dart_t8110_hw_tlb_command_range(&stream, op, true,
+								    start, end);
+		else
+			ret = stream.dart->hw->invalidate_tlb(&stream);
 		pm_runtime_put(stream.dart->dev);
-		if (ret)
-			return ret;
+		err = err ?: ret;
 	}
-	return 0;
+	return err;
 }
 
 static void apple_dart_domain_flush_tlb(struct apple_dart_domain *domain)

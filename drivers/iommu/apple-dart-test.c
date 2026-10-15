@@ -168,6 +168,76 @@ static void apple_dart_test_firmware_roots(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, live[1], 0x4001ULL);
 }
 
+static struct apple_dart *apple_dart_test_t8110(struct kunit *test, const char *name)
+{
+	struct apple_dart *dart;
+
+	dart = kunit_kzalloc(test, sizeof(*dart), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dart);
+	dart->dev = kunit_device_register(test, name);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dart->dev);
+	dart->regs = (__force void __iomem *)kunit_kzalloc(test, SZ_16K, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dart->regs);
+	dart->hw = &apple_dart_hw_t8110;
+	dart->version = 0x0202;
+	dart->num_streams = 1;
+	spin_lock_init(&dart->lock);
+	pm_runtime_set_active(dart->dev);
+	pm_runtime_enable(dart->dev);
+	return dart;
+}
+
+static void apple_dart_test_unmap_flush_after_publish_failure(struct kunit *test)
+{
+	struct iommu_iotlb_gather gather = { .start = 0, .end = SZ_16K - 1 };
+	struct apple_dart_stream_map stream = {};
+	struct apple_dart_domain *domain;
+	struct apple_dart *locked, *other;
+	struct io_pgtable *iop;
+	u64 live[] = { 0x1001, 0, 0, 0 };
+	u64 owned[ARRAY_SIZE(live)] = {};
+	u64 ours[] = { 0x3001, 0, 0, 0 };
+	u32 sentinel = 0x40;
+
+	/* A locked stream whose root slot firmware holds: publishing fails. */
+	locked = apple_dart_test_t8110(test, "apple-dart-flush-locked");
+	locked->locked = true;
+	locked->pgsize = sizeof(live);
+	locked->locked_ttbr[0][0] = live;
+	locked->locked_owned[0][0] = owned;
+	other = apple_dart_test_t8110(test, "apple-dart-flush-other");
+	other->pgsize = SZ_16K;
+
+	iop = kunit_kzalloc(test, sizeof(*iop), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, iop);
+	iop->cfg.apple_dart_cfg.n_ttbrs = 1;
+	iop->cfg.apple_dart_cfg.ttbr[0] = ours;
+	domain = kunit_kzalloc(test, sizeof(*domain), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, domain);
+	domain->pgtbl_ops = &iop->ops;
+	domain->stream_maps[0].dart = locked;
+	atomic_long_set(&domain->stream_maps[0].sidmap[0], 1);
+	domain->stream_maps[1].dart = other;
+	atomic_long_set(&domain->stream_maps[1].sidmap[0], 1);
+
+	writel(sentinel, locked->regs + DART_T8110_TLB_CMD);
+	writel(sentinel, other->regs + DART_T8110_TLB_CMD);
+	stream.dart = locked;
+	__set_bit(0, stream.sidmap);
+	KUNIT_ASSERT_EQ(test, apple_dart_hw_sync_locked(&iop->cfg, &stream, true),
+			-EBUSY);
+
+	/* The pages are freed after this: both DARTs must drop them. */
+	apple_dart_iotlb_sync(&domain->domain, &gather);
+	KUNIT_EXPECT_NE(test, readl(locked->regs + DART_T8110_TLB_CMD), sentinel);
+	KUNIT_EXPECT_NE(test, readl(other->regs + DART_T8110_TLB_CMD), sentinel);
+	KUNIT_EXPECT_EQ(test, live[0], 0x1001ULL);
+	KUNIT_EXPECT_EQ(test, atomic_read(&locked->dev->power.usage_count), 0);
+	KUNIT_EXPECT_EQ(test, atomic_read(&other->dev->power.usage_count), 0);
+	pm_runtime_disable(locked->dev);
+	pm_runtime_disable(other->dev);
+}
+
 static void apple_dart_test_gated_commands(struct kunit *test)
 {
 	struct apple_dart_stream_map stream = {};
@@ -517,6 +587,7 @@ static struct kunit_case apple_dart_test_cases[] = {
 	KUNIT_CASE(apple_dart_test_locked_handoff),
 	KUNIT_CASE(apple_dart_test_sync_unknown_roots),
 	KUNIT_CASE(apple_dart_test_firmware_roots),
+	KUNIT_CASE(apple_dart_test_unmap_flush_after_publish_failure),
 	KUNIT_CASE(apple_dart_test_gated_commands),
 	KUNIT_CASE(apple_dart_test_resume_commands_failure),
 	KUNIT_CASE(apple_dart_test_tunnel_restore),
