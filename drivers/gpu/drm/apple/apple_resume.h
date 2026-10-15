@@ -1,0 +1,11 @@
+/* SPDX-License-Identifier: GPL-2.0-only OR MIT */
+/* Copyright 2026 Ryan Murray */
+
+#ifndef __APPLE_RESUME_H__
+#define __APPLE_RESUME_H__
+
+struct drm_atomic_commit;
+
+void apple_drm_drop_stale_crtcs(struct drm_atomic_commit *state);
+
+#endif /* __APPLE_RESUME_H__ */
