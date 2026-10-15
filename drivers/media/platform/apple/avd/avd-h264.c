@@ -700,8 +700,8 @@ static int avd_h264_realloc_slices(struct avd_ctx *ctx)
 	kfree(tmp);
 
 	tmp = ctx->job.segments;
-	ctx->job.segments = kzalloc(
-		sizeof(*ctx->job.segments) * (alloc_slice_num + 1), GFP_KERNEL);
+	ctx->job.segments = kvcalloc(alloc_slice_num + 1,
+				     sizeof(*ctx->job.segments), GFP_KERNEL);
 	if (!ctx->job.segments) {
 		ctx->job.segments = tmp;
 		return -ENOMEM;
@@ -709,7 +709,7 @@ static int avd_h264_realloc_slices(struct avd_ctx *ctx)
 
 	memcpy(ctx->job.segments, tmp,
 	       sizeof(*ctx->job.segments) * (ctx->job.num + 1));
-	kfree(tmp);
+	kvfree(tmp);
 
 	return 0;
 }
@@ -829,7 +829,8 @@ static int avd_h264_run(struct avd_ctx *ctx)
 	return avd_submit_job(ctx);
 
 err_free_jobs:
-	kfree(ctx->job.segments);
+	kvfree(ctx->job.segments);
+	ctx->job.segments = NULL;
 	avd_run_postamble(ctx, &run.base);
 	return ret;
 }
