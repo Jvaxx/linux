@@ -65,33 +65,4 @@ static inline bool mt7932_rx_rate(u32 rxv, u8 max_nss, struct rate_info *rate)
 	return true;
 }
 
-/* Stock CID85 reply: exact version1 body, owned BSS/MAC and pending sequence.
- * Byte8's station identity and byte0a remain opaque; no invented WTBL test.
- */
-static inline bool mt7932_tx_rate_reply(const struct mt7932_event *event,
-				       u8 sequence, const u8 *peer, u8 max_nss,
-				       struct rate_info *rate)
-{
-	const u8 *body;
-	u32 a, b, c, rxv;
-
-	if (!mt7932_event_matches(event, sequence) || event->eid != 0x21 ||
-	    event->length != 344)
-		return false;
-	body = event->packet + 36;
-	if (body[0] != 1 ||
-	    !(get_unaligned_le32(body + 4) & 1) || body[9] ||
-	    memcmp(body + 12, peer, 6))
-		return false;
-	a = get_unaligned_le32(body + 0x9c);
-	b = get_unaligned_le32(body + 0xa0);
-	c = get_unaligned_le32(body + 0xa4);
-	if (((a >> 12) & 15) >= 5)
-		return false; /* TX HE GI/DCM/allocation fields not qualified by this reply. */
-	/* Normalize the independently qualified TX words to the shared fields. */
-	rxv = (c & 127) | (((c >> 8) & 7) << 7) |
-		(((a >> 8) & 7) << 12) | (((b >> 26) & 3) << 15) |
-		(((a >> 6) & 3) << 22) | (((a >> 12) & 15) << 24);
-	return mt7932_rx_rate(rxv, max_nss, rate);
-}
 #endif
