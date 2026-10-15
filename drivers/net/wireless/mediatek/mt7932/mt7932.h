@@ -114,6 +114,11 @@ struct mt7932 {
 	bool interface_registered, interface_up;
 	u32 reg_generation, reg_attempted;
 	struct mt7932_reg_snapshot reg_desired;
+	/* A relaxation kept from the firmware while associated; applied by the
+	 * next pass once the connection has ended. Under response_lock.
+	 */
+	struct mt7932_reg_snapshot reg_deferred;
+	bool reg_deferral;
 	/* Channels the applied country package leaves out; under RTNL. */
 	DECLARE_BITMAP(policy_disabled, MT7932_CHANNELS);
 	struct net_device *netdev;
@@ -187,6 +192,7 @@ struct mt7932 {
 
 bool mt_rf_allowed(struct mt7932 *m);
 void mt_retry_missing_policy(struct mt7932 *m);
+void mt_reg_apply_deferred_locked(struct mt7932 *m);
 int mt_net_open(struct net_device *netdev);
 int mt_request_input(struct mt7932 *m, const struct firmware **fw, const char *name);
 /* response_lock held; closes RF admission and reports terminal host state. */
