@@ -2924,7 +2924,7 @@ mod tests {
     #[test]
     fn the_top_of_the_volume_range_is_the_amplifier_full_scale() {
         assert_eq!(
-            SPKR_VOLUME_Q31[SPKR_VOLUME_MAX as usize] as i64,
+            i64::from(SPKR_VOLUME_Q31[SPKR_VOLUME_MAX as usize]),
             SPKR_CEILING_Q31
         );
         assert_eq!(SPKR_CEILING_Q31, 1 << 30);
@@ -2935,7 +2935,10 @@ mod tests {
     fn the_volume_table_falls_in_half_db_steps_to_mute() {
         assert_eq!(SPKR_VOLUME_Q31[0], 0);
         for i in 2..=SPKR_VOLUME_MAX as usize {
-            let (lo, hi) = (SPKR_VOLUME_Q31[i - 1] as u128, SPKR_VOLUME_Q31[i] as u128);
+            let (lo, hi) = (
+                u128::from(SPKR_VOLUME_Q31[i - 1]),
+                u128::from(SPKR_VOLUME_Q31[i]),
+            );
             assert!(hi > lo);
             // hi / lo == 10^(0.5/20) to within the table's rounding
             let expect = lo * HALF_DB_PPB / 1_000_000_000;
@@ -2945,7 +2948,7 @@ mod tests {
 
     #[test]
     fn the_locked_level_is_20_db_below_full_scale() {
-        let locked = SPKR_VOLUME_Q31[LOCKED_VOLUME] as i64;
+        let locked = i64::from(SPKR_VOLUME_Q31[LOCKED_VOLUME]);
         // 10 * locked == ceiling to within the table's rounding (0.1 ppm)
         assert!((10 * locked - SPKR_CEILING_Q31).abs() <= 10);
     }
