@@ -68,9 +68,11 @@ use kernel::{
     sync::{
         aref::ARef,
         atomic::{
+            Acquire,
             Atomic,
             AtomicFlag,
-            Relaxed, //
+            Relaxed,
+            Release, //
         },
         Arc,
         ArcBorrow,
@@ -457,6 +459,10 @@ struct SndSocT8140AopData {
     /// The low-power microphone stream is triggered (set and cleared under
     /// the ALSA stream lock, read by the report path).
     running: AtomicFlag,
+    /// The low-power microphone's hardware pointer.  Stored with release
+    /// after the frames before it are in the ALSA buffer, loaded with acquire
+    /// by the .pointer callback, which ALSA calls without the stream state's
+    /// lock (a status or HWSYNC on another CPU).
     hw_ptr_frames: Atomic<u32>,
     /// One warning per producer-report fault class and driver instance.
     report_warnings: [AtomicFlag; 5],
@@ -1180,7 +1186,7 @@ impl ReportListener for SndSocT8140AopData {
         st.copied = Some(absolute);
         st.period_acc += delta;
         self.hw_ptr_frames
-            .store((new_ptr / LPAI_FRAME_BYTES) as u32, Relaxed);
+            .store((new_ptr / LPAI_FRAME_BYTES) as u32, Release);
         if st.period_acc >= LPAI_PERIOD_BYTES {
             st.period_acc %= LPAI_PERIOD_BYTES;
             // SAFETY: the substream is valid while it is registered in
@@ -1244,7 +1250,7 @@ unsafe extern "C" fn lpai_pcm_open(substream: *mut bindings::snd_pcm_substream) 
     st.copied = None;
     st.hw_ptr_bytes = 0;
     st.period_acc = 0;
-    data.hw_ptr_frames.store(0, Relaxed);
+    data.hw_ptr_frames.store(0, Release);
     0
 }
 
@@ -1285,7 +1291,7 @@ unsafe extern "C" fn lpai_pcm_prepare(substream: *mut bindings::snd_pcm_substrea
         st.hw_ptr_bytes = 0;
         st.period_acc = 0;
         st.copied = None;
-        data.hw_ptr_frames.store(0, Relaxed);
+        data.hw_ptr_frames.store(0, Release);
     }
     if !data.powered.load(Relaxed) {
         if let Err(e) = data.lpai_run_get() {
@@ -1350,7 +1356,7 @@ unsafe extern "C" fn lpai_pcm_pointer(
 ) -> bindings::snd_pcm_uframes_t {
     // SAFETY: ALSA calls this op with a live substream of the LPAI PCM.
     let data = unsafe { pcm_data(substream) };
-    data.hw_ptr_frames.load(Relaxed) as bindings::snd_pcm_uframes_t
+    data.hw_ptr_frames.load(Acquire) as bindings::snd_pcm_uframes_t
 }
 
 /// The microphone array's capture: the LEAP produces float32 into the ADMAC
