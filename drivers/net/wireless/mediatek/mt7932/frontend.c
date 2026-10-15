@@ -89,7 +89,7 @@ void mt_scan_event(struct mt7932 *m, const struct mt7932_event *event)
 	if (m->stopping)
 		return;
 	/* Abort completes userspace locally, not by an invented cancel ACK.
-	 * Keep the sequence reserved until an actual old-campaign done arrives.
+	 * Keep the sequence reserved until the old scan's own done event arrives.
 	 */
 	if (event->length >= 37 && m->retired_scan_seq &&
 	    event->packet[36] == m->retired_scan_seq) {
@@ -127,7 +127,7 @@ void mt_abort_scan(struct wiphy *wiphy, struct wireless_dev *wdev)
 }
 
 /* No command/response lock held. The caller closes new scan admission first.
- * Natural EID0d completion fences the campaign; a local cancel alone does not.
+ * Natural EID0d completion fences the scan; a local cancel alone does not.
  */
 int mt_scan_quiesce(struct mt7932 *m)
 {

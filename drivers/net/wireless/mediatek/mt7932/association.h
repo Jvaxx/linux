@@ -91,8 +91,8 @@ static inline int mt7932_assoc_capabilities(u8 *out, size_t capacity,
 }
 
 /* Original25G83 pure WPA2 binary-key result: structured type6, not a string.
- * NEO_TYPE6_BINARY_PMK_NATIVE_CONTRACT: standard nl80211 PMK maps directly;
- * no passphrase API, key derivation, duplicate independent PMK or extra flags.
+ * The standard nl80211 PMK maps directly; no passphrase API, key derivation,
+ * duplicate independent PMK or extra flags.
  */
 static inline int mt7932_connect_binary_pmk(u8 *body, size_t capacity,
 					 const u8 *pmk, size_t length)
@@ -111,8 +111,8 @@ static inline int mt7932_connect_binary_pmk(u8 *body, size_t capacity,
 }
 
 /* Explicit OPEN or PMK-only WPA2/CCMP; never an automatic security fallback.
- * Caller owns identities/resources and validated BSS state.
- * NEO_WPA2_FULLMAC_ASSOCIATION_AND_ETHERNET_CONTRACT. Never log this body.
+ * Caller owns identities/resources and validated BSS state. Never log this
+ * body: it carries the PMK.
  */
 static inline int mt7932_connect_body(u8 *body, size_t capacity, const u8 *ssid,
 				      size_t ssid_length, const u8 pmk[32], const u8 bssid[6],
@@ -141,7 +141,6 @@ static inline int mt7932_connect_body(u8 *body, size_t capacity, const u8 *ssid,
 	/* NORMAL25G83 original strict keyless OPEN branch, without optional
 	 * automatic-authentication policy. Keep this coherent version/auth/
 	 * policy tuple together; no dummy keys or stale security state.
-	 * NEO_NORMAL_STRICT_OPEN_PRODUCER_CONTRACT.
 	 */
 	if (open) {
 		body[1] = 1;

@@ -125,7 +125,7 @@ int mt_function_reset(struct mt7932 *m)
 	if (!peer)
 		return mt_function_reset_locked(m);
 	/* The radio functions may share state beyond PCI's advertised FLR scope.
-	 * No qualified contract permits resetting Wi-Fi while Bluetooth is live.
+	 * Resetting Wi-Fi while Bluetooth is live has never been tested.
 	 * Trylock avoids inversion with a concurrent sibling probe/remove; hold
 	 * it across FLR to prevent Bluetooth starting after the admission check.
 	 */

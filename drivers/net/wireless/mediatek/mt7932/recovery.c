@@ -6,9 +6,6 @@ static int mt_runtime_scheduler(struct mt7932 *m, bool publish);
 static int mt_runtime_rebuild(struct mt7932 *m);
 static void mt_runtime_publish(struct mt7932 *m);
 static int mt_runtime_ack(struct mt7932 *m, u32 bit);
-/* First runtime epoch only. Contracts: NEO_IRQ_SELECTION_AND_RUNTIME_HANDSHAKE
- * and NEO_RUNTIME_RING_REBUILD_AND_OBSERVED_PRECAL.
- */
 
 static int mt_tx_retire(struct mt7932 *m)
 {
@@ -179,7 +176,7 @@ static int mt_runtime_ack(struct mt7932 *m, u32 bit)
 int mt_recovery_gate(struct mt7932 *m)
 {
 	/* Original observed 25F84 CID6b bodies, not PL country tables.
-	 * Explicit experiment; first two action2 field meanings remain opaque.
+	 * The meaning of the first two action2 fields is unknown.
 	 */
 	static const u8 queue_config[3][32] = {
 		{0x10,0x11,2,0,3,0,7,0,0x2f,0,2},
@@ -191,7 +188,10 @@ int mt_recovery_gate(struct mt7932 *m)
 	unsigned int i, phase = 0;
 	int ret;
 
-	/* mt_runtime_start() completed configuration before entering this stage. */
+	/*
+	 * mt_runtime_start() completed configuration before entering this stage,
+	 * which switches to the runtime ring layout once per firmware boot.
+	 */
 	if (m->runtime_epoch)
 		return -EINVAL;
 	for (i = 0; i < ARRAY_SIZE(queue_config); i++) {

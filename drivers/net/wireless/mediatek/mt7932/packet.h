@@ -14,8 +14,8 @@ struct mt7932_rx_frame {
 	bool translated, group4, signal_valid, rate_valid, unicast;
 };
 
-/* NEO_PACKET_RX_GROUPS_AND_DATA_TXP_CONTRACT. Strict non-monitor subset;
- * descriptor groups are ordered4,1,2,3,5, not by numerical group identifier.
+/* Strict non-monitor subset of the RX descriptor; its groups are ordered
+ * 4, 1, 2, 3, 5, not by numerical group identifier.
  */
 static inline int mt7932_rx_frame(const u8 *packet, size_t size, struct mt7932_rx_frame *out)
 {
