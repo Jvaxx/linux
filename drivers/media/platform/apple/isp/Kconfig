@@ -27,3 +27,13 @@ config VIDEO_APPLE_ISP_KUNIT_TEST
 	  overflow, alignment and overlap with the channel table or other rings.
 	  These tests run without starting or accessing the ISP and do not
 	  require a supported Apple device or the ISP driver itself.
+	bool "KUnit tests for the Apple ISP driver" if !KUNIT_ALL_TESTS
+	depends on VIDEO_APPLE_ISP && KUNIT
+	depends on KUNIT=y || VIDEO_APPLE_ISP=m
+	default KUNIT_ALL_TESTS
+	help
+	  Builds unit tests for the videobuf2 queue set-up of the Apple ISP
+	  driver into the driver. They need no hardware. Only useful for
+	  kernel developers running KUnit.
+
+	  If unsure, say N.
