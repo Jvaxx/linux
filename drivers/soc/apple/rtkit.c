@@ -743,6 +743,18 @@ int apple_rtkit_poll(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_poll);
 
+void apple_rtkit_hold_rx(struct apple_rtkit *rtk)
+{
+	apple_mbox_hold_rx(rtk->mbox);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_hold_rx);
+
+void apple_rtkit_resume_rx(struct apple_rtkit *rtk)
+{
+	apple_mbox_release_rx(rtk->mbox);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_resume_rx);
+
 bool apple_rtkit_has_endpoint(struct apple_rtkit *rtk, u8 ep)
 {
 	return test_bit(ep, rtk->endpoints);
