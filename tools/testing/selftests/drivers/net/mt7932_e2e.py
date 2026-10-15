@@ -25,6 +25,12 @@ fault = re.compile(r'translation fault|stale exception latched|Kernel panic|Inte
                    r'SCAN_INTERFACE_SETUP_FAILED|RF_FAILED|recovery-required=1|WARNING:|'
                    r'UBSAN:|hung_task|blocked for more than|WIFI_FLR_REFUSED_OR_FAILED', re.I)
 
+# Both radio drivers report progress at debug level, so a message of theirs at
+# info or notice level during scans, association or traffic is log spam.
+driver_message = re.compile(r'^\[\s*(\d+\.\d+)\] (?:mt7932-fullmac|mt7932_bt_pcie) '
+                            r'[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]: ', re.M)
+log_stamp = re.compile(r'^\[\s*(\d+\.\d+)\]', re.M)
+
 
 def run(argv, timeout=30):
     return subprocess.run(argv, text=True, stdout=subprocess.PIPE,
@@ -40,6 +46,17 @@ def kernel_ok():
     p = run(['dmesg'])
     require(p.returncode == 0 and not fault.search(p.stdout), 'Kernel or driver fault')
     return p.stdout
+
+
+def last_log_time(log):
+    """Timestamp of the newest kernel log message, or 0.0 if there is none."""
+    stamps = log_stamp.findall(log)
+    return float(stamps[-1]) if stamps else 0.0
+
+
+def driver_info_messages(log, since):
+    """Radio driver messages in a ``dmesg --level=notice,info`` log after @since."""
+    return [m.group(0) for m in driver_message.finditer(log) if float(m.group(1)) > since]
 
 
 def dns_name(packet, offset):
@@ -178,8 +195,9 @@ def main():
     compatible = Path('/sys/firmware/devicetree/base/compatible').read_bytes().split(b'\0')
     require(b'apple,j700' in compatible and b'apple,t8140' in compatible, 'Wrong device')
     out.mkdir(mode=0o700)
+    started = None
     try:
-        kernel_ok()
+        started = last_log_time(kernel_ok())
         profile = run(['nmcli', '-g', 'connection.uuid', 'connection', 'show', 'id', args.profile])
         profile_uuid = profile.stdout.strip()
         require(profile.returncode == 0 and re.fullmatch(r'[0-9a-f-]{36}', profile_uuid),
@@ -272,6 +290,13 @@ def main():
                 final_log.returncode != 0 or result['kernel_faults']):
             result['result'] = 'WIFI_NETWORK_E2E_FAILED'
             result['error'] = 'Final kernel log unavailable or contains a driver fault'
+        info_log = run(['dmesg', '--level=notice,info'])
+        if started is not None and info_log.returncode == 0:
+            result['driver_info_messages'] = len(driver_info_messages(info_log.stdout, started))
+        if result['result'] in ('WIFI_SCAN_OBSERVED', 'WIFI_PHYSICAL_NETWORK_E2E_PASS') and (
+                info_log.returncode != 0 or result.get('driver_info_messages')):
+            result['result'] = 'WIFI_NETWORK_E2E_FAILED'
+            result['error'] = 'Radio drivers logged routine events at info level'
         (out / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
         print(json.dumps(result, indent=2))
         print('ARTIFACT=' + str(out / 'result.json'))
