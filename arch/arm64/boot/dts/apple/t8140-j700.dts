@@ -424,16 +424,12 @@
 
 &pmc {
 	/*
-	 * System power above DCS state 0 at each DCS state, measured with
-	 * glmark2's terrain scene, GPU-bound, on the J700.
+	 * System power above DCS state 0 at each DCS state, GPU-bound.
 	 *
-	 * No thermal zone limits the DCS rail. The PMP already drops its
-	 * DCS vote when the GPU idles, and under load the rail must stay
-	 * where the PMP puts it: a power allocator zone on Tp0t at 95 C
-	 * stepped the limit between states 1 and 4 every 1-2 s in
-	 * Minecraft, swinging the game's GPU submission rate about 2.5x.
-	 * With the limit lifted the rate held within 8% and Tp0t settled
-	 * near 100 C, under the 110 C critical trips of the CPU zones.
+	 * No thermal zone limits the DCS rail: the PMP drops its DCS vote
+	 * when the GPU idles, and a power allocator zone on Tp0t made the
+	 * limit oscillate between states 1 and 4 under GPU load. Without
+	 * it Tp0t stays below the 110 C critical trips of the CPU zones.
 	 */
 	apple,dcs-power-microwatt = <0 919000 1453000 2058000 2407000>;
 	status = "okay";
@@ -1826,7 +1822,7 @@
 #include "hwmon-laptop.dtsi"
 
 &pcie0 {
-	/* Experiment: guard stays closed until the retained bootstrap succeeds. */
+	/* The PIODMA guard stays closed until the retained bootstrap succeeds. */
 	apple,piodma = <&pcie0_piodma_diag>;
 	iommu-map = <0x100 &pcie0_dart 1 2>;
 	iommu-map-mask = <0xffff>;
@@ -1848,7 +1844,7 @@
 	};
 };
 
-/* Experimental SID17 bootstrap; arena ownership lasts until full reset. */
+/* SID17 bootstrap; the arena stays owned until a full reset. */
 &pcie0_dart {
 	status = "okay";
 	apple,dma-range = /bits/ 64 <0 0x1000000000>;
