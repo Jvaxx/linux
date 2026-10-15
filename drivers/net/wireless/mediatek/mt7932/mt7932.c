@@ -781,7 +781,6 @@ static int mt_config_gate(struct mt7932 *m)
 	return -ETIMEDOUT;
 }
 
-
 static int mt_board_gate(struct mt7932 *m)
 {
 	const u32 addresses[] = {0x70, 0x160};
@@ -1051,7 +1050,6 @@ void mt_transport_snapshot(struct mt7932 *m)
 				le32_to_cpu(READ_ONCE(rx->desc[rx->tail].control)));
 	}
 }
-
 
 static int mt_initialize(struct mt7932 *m)
 {

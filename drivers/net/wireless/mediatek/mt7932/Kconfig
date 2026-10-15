@@ -1,25 +1,26 @@
 # SPDX-License-Identifier: GPL-2.0-only
 config MT7932_FULLMAC
-	tristate "Experimental J700 MT7932 fullmac wireless support"
-	depends on PCI && OF && ARM64 && ARCH_APPLE && IOMMU_DMA
+	tristate "MediaTek MT7932 Wi-Fi on the Apple MacBook Neo (J700)"
+	depends on PCI && OF && ARM64 && IOMMU_DMA
 	depends on PCIE_APPLE_PIODMA_DIAG && CFG80211
 	select FW_LOADER
 	help
-	  Native support for the built-in J700 Wi-Fi endpoint: managed
-	  open-network or WPA2-CCMP station operation on 2.4 GHz at 20 MHz and channels 36..48
-	  at 20/40/80 MHz, with a software bandwidth limit of 80 MHz.
-	  Requires original firmware, own calibration and original-derived
-	  country policy packages in addition to the cfg80211 regulatory database.
-	  The device is probed before the root filesystem is mounted, so say M
-	  unless those files are in the initramfs.
-	  Requires a trained retained PCI link and a translated SID1 DMA domain.
-	  Firmware, runtime DMA and calibration negotiation start automatically;
-	  cfg80211 and userspace select the country and network.
-	  Once DMA pointers are published the module is pinned until hardware
-	  reset. Normal unload is refused, including with active Bluetooth.
-	  A failed probe reset retains the binding and DMA; a successful checked
-	  reset retires ownership before releasing probe resources.
-	  Other MediaTek devices and other machines are not matched.
+	  Support for the Wi-Fi function of the MediaTek MT7932 radio in the
+	  Apple MacBook Neo (J700). The firmware runs association and the
+	  WPA2-PSK handshake; the driver is a cfg80211 station on 2.4 GHz and
+	  on the 5 GHz UNII-1, -2, -2e and -3 channels that the regulatory
+	  domain permits. Radar (DFS) channels are scanned passively but not
+	  joined. Other MediaTek devices and other machines are not matched.
+
+	  The driver needs the original firmware, the unit's own calibration
+	  and the country policy packages under mediatek/mt7932/, besides the
+	  cfg80211 regulatory database. The device is probed before the root
+	  filesystem is mounted, so say M unless those files are in the
+	  initramfs.
+
+	  Once the device has been given DMA addresses, the module cannot be
+	  unloaded. A function that fails to initialize and cannot be reset
+	  stays bound and keeps its DMA memory.
 
 config MT7932_RF_KUNIT_TEST
 	bool "KUnit tests for MT7932 terminal RF failure" if !KUNIT_ALL_TESTS

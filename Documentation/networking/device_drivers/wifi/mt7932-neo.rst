@@ -1,6 +1,6 @@
 .. SPDX-License-Identifier: GPL-2.0-only
 
-MT7932 radio bring-up on the MacBook Neo
+MediaTek MT7932 radio on the MacBook Neo
 ========================================
 
 J700 MT7932 Wi-Fi uses cfg80211 and NetworkManager with firmware-managed
@@ -64,10 +64,9 @@ disables ASPM on the shared link. Like the Wi-Fi driver, it reads its firmware
 while probing, so build it as a module. The tested Wi-Fi driver owns function
 0 and Bluetooth owns function 1.
 
-Use a saved NetworkManager open or WPA2 profile matching the current interface.
-Audio in the desktop session requires BlueZ, PipeWire, its PulseAudio
-compatibility service, WirePlumber and Bluetooth audio plugins in the logged-in
-user's session.
+Use a saved NetworkManager WPA2 profile matching the current interface.
+KDE audio requires BlueZ, PipeWire, its PulseAudio compatibility service,
+WirePlumber and Bluetooth audio plugins in the logged-in user's session.
 
 Local firmware inputs
 ---------------------
@@ -85,70 +84,31 @@ Wi-Fi requests the following files under ``mediatek/mt7932/``:
   its original BLOB container.
 * ``config-original.bin``: the bounded J7CF package with the original 64 or
   65 configuration records, including all required keys.
-* ``policy/world-XZ.bin`` for cfg80211 country 00, or ``policy/<CC>.bin`` for
-  the matching explicit uppercase country code: J7RP containers with
-  original-derived modes and power tables. A country package is mandatory
-  whenever that country is set; there is no fallback to the world package.
-  Relabeling a different country's payload is unsupported.
+* ``policy/world-XZ.bin`` and, when available, the matching country package
+  under ``policy/``: J7RP containers with original-derived modes and power
+  tables. Relabeling a different country's payload is unsupported.
 
 Bluetooth requests these files under ``mediatek/``:
 
 * ``MT7932B1_OS_TypeB_2.0.177.0_260706180356.bin`` or the supported fallback
-  ``MT7932B1_OS_TypeB_0.1.133.0_260128190103.bin`` for ROM1. The fallback is
-  tried only when the preferred file is absent. ROM0 instead requests
-  ``MT7932B0_OS_TypeB_0.1.44.0_241001003711.bin``; admitting that variant in
-  software does not qualify it on physical Neo hardware;
-* ``j700-mt7932-btcal.bin`` (the measured input is 388 bytes; the driver accepts
-  nonempty inputs up to 65535 bytes and relies on HCI setup acceptance);
+  ``MT7932B1_OS_TypeB_0.1.133.0_260128190103.bin``;
+* ``j700-mt7932-btcal.bin`` (388 bytes);
 * ``MT7932_PTB_IzubaA_0.1.0.0_20251021141303.ptx`` (198 bytes);
-* ``j700-mt7932-bdaddr.bin`` (the unit's six-byte Bluetooth address,
-  most-significant byte first; the driver converts it to HCI byte order).
+* ``j700-mt7932-bdaddr.bin`` (the unit's six-byte Bluetooth address).
 
 Extraction and packaging require the original local assets. Keep these
 assets and unit identities out of commits and public test reports.
 
-Keep the installed calibration inputs stable while the Wi-Fi driver is bound:
-it requests ``oca2.bin`` again for runtime D7 requests and each association.
-``config-original.bin`` and country policies require J7CF/J7RP packaging; copying
-unconverted source files to those names does not satisfy the format checks.
-If loading Wi-Fi in the initramfs, include every fixed input and the selected
-country package there explicitly. Firmware metadata includes a country-file
-pattern, but an initramfs builder's glob handling may select only one match;
-inspect the resulting image rather than assuming every country is included.
-
-Load the radio drivers after these inputs are available on the real root.
-Wi-Fi reports these distinct failure classes:
-
-* An initialization probe failure can occur after DMA is published but before
-  an interface is registered. Only ``initialization failed; DMA retired``
-  confirms that the checked reset completed and the unbound driver may be
-  loaded again. A failed
-  reset retains the binding and DMA; do not reprobe it.
-* ``REGULATORY_BLOCKED`` with ``error=-2`` and ``recovery-required=0`` means
-  the requested policy file is absent before policy submission. Install that
-  exact file and bring the interface up or retry a scan/connection. An identical
-  ``iw reg set`` request alone does not trigger a retry in cfg80211.
-* A malformed country package reports ``error=-22`` before submission and
-  is not retried on interface up/scan/connect. Replace the exact named package
-  with a valid one, then shut down and start again. An unchanged
-  ``iw reg set`` request is ignored by cfg80211. If ``recovery-required=1``
-  is also present, use the external-reset recovery below instead.
-* ``recovery-required=1`` or ``RF_FAILED`` is a latched startup/calibration
-  failure. Installing a file does not clear it in the bound epoch. A full
-  external reset is required after a failed or uncertain admission.
-
 Repeatable physical network test
 --------------------------------
 
-The manual test activates a saved profile and checks scan, open or WPA2
-authentication, DHCP, gateway replies, DNS, HTTPS and kernel diagnostics.
-For a desktop session using Hyprland, use ``--desktop none`` for this network test.
-The helper restores the profile's original band even after a failure. It is
-not run automatically. Run as root, with a fresh attempt name::
+The manual test activates a saved profile and checks scan, WPA2, DHCP,
+gateway replies, DNS, HTTPS, KDE and kernel diagnostics. It is not run
+automatically. Run as root, with a fresh attempt name::
 
   python3 tools/testing/selftests/drivers/net/mt7932_e2e.py \
     --expected-release "$(uname -r)" --profile "YOUR SAVED PROFILE" \
-    --connect --band a --attempt five-ghz --desktop none
+    --connect --band a --attempt five-ghz
 
 Use ``--band bg`` for 2.4 GHz. Require ``WIFI_PHYSICAL_NETWORK_E2E_PASS`` in
 the JSON artifact printed on completion. The artifact records three traffic
