@@ -52,6 +52,23 @@ void *sep_store_open(const char *path)
 }
 
 /*
+ * As sep_store_open(), but reports whether this call created the file, so that
+ * only a new file is ever initialised. Returns an error pointer on failure.
+ */
+void *sep_store_open_host(const char *path, bool *created)
+{
+	struct file *f;
+
+	*created = false;
+	f = open_as_kernel(path, O_RDWR | O_CREAT | O_EXCL | O_LARGEFILE, 0600);
+	if (PTR_ERR_OR_ZERO(f) == -EEXIST)
+		return open_as_kernel(path, O_RDWR | O_LARGEFILE, 0);
+	if (!IS_ERR(f))
+		*created = true;
+	return f;
+}
+
+/*
  * Opens truncated to empty, for callers that rewrite the whole file each time,
  * so a shorter record cannot leave stale trailing bytes from a larger one.
  */
