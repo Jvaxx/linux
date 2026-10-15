@@ -102,6 +102,9 @@ struct usb_hub {
  * @usb3_lpm_u2_permit: whether USB3 U2 LPM is permitted.
  * @early_stop: whether port initialization will be stopped earlier.
  * @ignore_event: whether events of the port are ignored.
+ * @disabled: switched off through the "disable" attribute
+ * @held_off: switched off by usb_hub_port_power_off(), which holds the port
+ *	runtime-active until usb_hub_port_power_on()
  */
 struct usb_port {
 	struct usb_device *child;
@@ -123,6 +126,8 @@ struct usb_port {
 	unsigned int is_superspeed:1;
 	unsigned int usb3_lpm_u1_permit:1;
 	unsigned int usb3_lpm_u2_permit:1;
+	bool disabled;
+	bool held_off;
 };
 
 #define to_usb_port(_dev) \
