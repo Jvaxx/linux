@@ -268,7 +268,8 @@ struct afk_qe {
 
 static inline bool afk_ring_payload_fits(u32 ptr, u32 bytes, size_t bufsz)
 {
-	return ptr + bytes + sizeof(struct afk_qe) <= bufsz;
+	return ptr <= bufsz && sizeof(struct afk_qe) <= bufsz - ptr &&
+	       bytes <= bufsz - ptr - sizeof(struct afk_qe);
 }
 
 struct epic_hdr {
