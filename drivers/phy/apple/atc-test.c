@@ -116,11 +116,79 @@ static void atcphy_test_noop_needs_work(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, atcphy_mux_is_noop(atcphy, APPLE_ATCPHY_MODE_USB3_DP));
 }
 
+/*
+ * A J700-style PHY behind a fixed hub, in DisplayPort + USB3 with the PIPE on
+ * USB3 for a running host, but without a device tree node. A mux update that
+ * goes for the USB3 root hub then fails with -ENODEV at the controller lookup,
+ * before any register access, which tells the two paths apart.
+ */
+static struct apple_atcphy *atcphy_test_alloc_fixed_hub(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_dev(test, true);
+
+	atcphy->hw = &atcphy_hw_t8140;
+	mutex_init(&atcphy->lock);
+
+	return atcphy;
+}
+
+static const struct typec_altmode atcphy_test_dp = { .svid = USB_TYPEC_DP_SID };
+
+static int atcphy_test_update_dp(struct apple_atcphy *atcphy, unsigned long pin)
+{
+	struct typec_mux_state state = {
+		.alt = (struct typec_altmode *)&atcphy_test_dp,
+		.mode = pin,
+	};
+
+	return atcphy_mux_update(atcphy, &state);
+}
+
+static void atcphy_test_update_skips_usb(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_fixed_hub(test);
+
+	/* An HPD or status update with the same pin assignment */
+	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_D), 0);
+	KUNIT_EXPECT_EQ(test, atcphy->mode, APPLE_ATCPHY_MODE_USB3_DP);
+	KUNIT_EXPECT_FALSE(test, atcphy->mode_dirty);
+
+	/* The orientation the lanes already use */
+	KUNIT_EXPECT_EQ(test, atcphy_set_orientation(atcphy, TYPEC_ORIENTATION_NORMAL), 0);
+	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_D), 0);
+}
+
+static void atcphy_test_update_takes_usb(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_fixed_hub(test);
+
+	/* A new pin assignment */
+	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_C), -ENODEV);
+	KUNIT_EXPECT_EQ(test, atcphy->mode, APPLE_ATCPHY_MODE_USB3_DP);
+
+	/* A PIPE handoff that has not completed */
+	atcphy->pipe_pending = true;
+	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_D), -ENODEV);
+	atcphy->pipe_pending = false;
+
+	/* A running host whose PIPE is not on the USB3 backend */
+	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
+	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_D), -ENODEV);
+	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_USB3;
+
+	/* A cable flip moves the USB3 and DisplayPort lanes */
+	KUNIT_EXPECT_EQ(test, atcphy_set_orientation(atcphy, TYPEC_ORIENTATION_REVERSE), 0);
+	KUNIT_EXPECT_TRUE(test, atcphy->mode_dirty);
+	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_D), -ENODEV);
+}
+
 static struct kunit_case atcphy_mux_test_cases[] = {
 	KUNIT_CASE(atcphy_test_target_mode),
 	KUNIT_CASE(atcphy_test_target_mode_fixed_hub),
 	KUNIT_CASE(atcphy_test_noop_same_mode),
 	KUNIT_CASE(atcphy_test_noop_needs_work),
+	KUNIT_CASE(atcphy_test_update_skips_usb),
+	KUNIT_CASE(atcphy_test_update_takes_usb),
 	{}
 };
 
