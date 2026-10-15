@@ -90,6 +90,43 @@ impl Ring {
         }
         Ok(())
     }
+
+    /// Places an entry of `len` bytes after its header, given the read and
+    /// write pointers. It goes at `wptr`, or at the top of the ring when it
+    /// does not fit before the end (its header at `wptr` then tells the
+    /// consumer to wrap). It never runs into the unread entries from `rptr`
+    /// on, and never ends on `rptr`, where a full ring would read as empty.
+    /// Returns where the entry goes and the write pointer after it.
+    pub(super) fn write_entry(
+        &self,
+        rptr: usize,
+        wptr: usize,
+        len: usize,
+    ) -> Result<(usize, usize)> {
+        self.check_ptr(rptr)?;
+        self.check_ptr(wptr)?;
+        // Reject an entry the whole ring cannot take before even writing
+        // the wrap header.
+        let head_next = self.end(0, len)?;
+        let ptr = if len > self.size - wptr - QEH_SIZE {
+            0
+        } else {
+            wptr
+        };
+        let next = if ptr == 0 {
+            head_next
+        } else {
+            self.end(ptr, len)?
+        };
+        if head_next == 0
+            || next == rptr
+            || (wptr < rptr && (ptr == 0 || next == 0 || next > rptr))
+            || (ptr < wptr && (rptr == 0 || next > rptr))
+        {
+            return Err(ENOSPC);
+        }
+        Ok((ptr, next))
+    }
 }
 
 #[kunit_tests(apple_aop_ring)]
@@ -159,6 +196,8 @@ mod tests {
                 })
                 .is_err());
             assert_eq!(reads, 0);
+            assert!(ring.write_entry(ptr, 0, 1).is_err());
+            assert!(ring.write_entry(0, ptr, 1).is_err());
         }
         Ok(())
     }
@@ -216,6 +255,65 @@ mod tests {
             wptr = (wptr + BLOCK) % BUF;
         }
         assert_eq!(taken, 64);
+        Ok(())
+    }
+
+    #[test]
+    fn transmit_wrap_checks_whole_entry_and_free_space() -> Result {
+        let ring = Ring::new(256, 64)?;
+        assert!(ring.write_entry(128, 192, 256).is_err());
+        assert!(ring.write_entry(128, 192, usize::MAX).is_err());
+        assert_eq!(ring.write_entry(192, 192, 64)?, (0, 128));
+        Ok(())
+    }
+
+    #[test]
+    fn transmit_cannot_catch_read_pointer() -> Result {
+        let ring = Ring::new(256, 64)?;
+        assert!(ring.write_entry(64, 192, 64).is_err());
+        assert!(ring.write_entry(128, 64, 64).is_err());
+        assert!(ring.write_entry(0, 192, 48).is_err());
+        assert!(ring.write_entry(192, 64, 176).is_err());
+        assert!(ring.write_entry(192, 192, 240).is_err());
+        assert_eq!(ring.write_entry(192, 64, 48)?, (64, 128));
+        Ok(())
+    }
+
+    #[test]
+    fn an_entry_that_fits_goes_at_the_write_pointer() -> Result {
+        let ring = Ring::new(BUF, BLOCK)?;
+        assert_eq!(ring.write_entry(0, 0, 0x100 - QEH_SIZE)?.0, 0);
+        assert_eq!(ring.write_entry(0x200, 0x100, 0x80 - QEH_SIZE)?.0, 0x100);
+        assert_eq!(ring.write_entry(0x40, 0xf00, 0x100 - QEH_SIZE)?, (0xf00, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn a_wrapping_entry_goes_to_the_top_when_there_is_room() -> Result {
+        let ring = Ring::new(BUF, BLOCK)?;
+        assert_eq!(
+            ring.write_entry(0x200, 0xfc0, 0x100 - QEH_SIZE)?,
+            (0, 0x100)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_wrapping_entry_never_overruns_unread_entries() -> Result {
+        let ring = Ring::new(BUF, BLOCK)?;
+        // the unread entries start at 0x80; the wrapped entry would cover them
+        assert!(ring.write_entry(0x80, 0xfc0, 0x100 - QEH_SIZE).is_err());
+        assert!(ring.write_entry(0, 0xfc0, 0x100 - QEH_SIZE).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn an_entry_never_reaches_the_read_pointer() -> Result {
+        let ring = Ring::new(BUF, BLOCK)?;
+        // ending on rptr would make a full ring read as empty
+        assert!(ring.write_entry(0x200, 0x100, 0x100 - QEH_SIZE).is_err());
+        assert!(ring.write_entry(0x200, 0x100, 0x110 - QEH_SIZE).is_err());
+        assert!(ring.write_entry(0, 0xf00, 0x100 - QEH_SIZE).is_err());
         Ok(())
     }
 }

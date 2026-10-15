@@ -184,10 +184,6 @@ const ALS_CALIBRATION_LEN: usize = 80;
 const ALS_CALIBRATION_OPERATION: u64 = 0x0746_b8d6_6515_2e31;
 const ALS_CALIBRATION_BODY_LEN: u64 = 56;
 
-fn align_up(v: usize, a: usize) -> usize {
-    (v + a - 1) & !(a - 1)
-}
-
 mod aop_ring;
 
 /// Index into the AFK endpoint tables for RTKit endpoint `ep`, if it is one
@@ -832,29 +828,39 @@ impl AFKEndpoint {
         let base = buf_offset + block_size * 3;
         mem_sync();
         let rptr = self.iomem_read32(buf_offset + block_size)? as usize;
-        let mut wptr = self.iomem_read32(buf_offset + block_size * 2)? as usize;
-        if wptr < rptr && wptr + QEH_SIZE >= rptr {
-            dev_err!(client.dev, "Tx buffer full at endpoint {}", self.index);
+        let wptr = self.iomem_read32(buf_offset + block_size * 2)? as usize;
+        let ring = aop_ring::Ring::new(buf_size, block_size)?;
+        if ring.check_ptr(rptr).is_err() || ring.check_ptr(wptr).is_err() {
+            dev_err!(
+                client.dev,
+                "Tx ring pointers out of range at endpoint {}: rptr {:#x} wptr {:#x}",
+                self.index,
+                rptr,
+                wptr
+            );
             return Err(EIO);
         }
-        let payload_len = header.len() + data.len();
+        let payload_len = header.len().checked_add(data.len()).ok_or(EIO)?;
+        let Ok((entry, next)) = ring.write_entry(rptr, wptr, payload_len) else {
+            dev_err!(client.dev, "Tx buffer full at endpoint {}", self.index);
+            return Err(EIO);
+        };
         let qeh = QEHeader {
             magic: QE_MAGIC1,
-            size: payload_len as u32,
+            size: u32::try_from(payload_len).map_err(|_| EIO)?,
             channel,
             ty,
         };
         let qeh_bytes = qeh.to_bytes();
-        self.memcpy_to_iomem(base + wptr, &qeh_bytes)?;
-        if payload_len > buf_size.checked_sub(wptr + QEH_SIZE).ok_or(EIO)? {
-            wptr = 0;
+        if entry != wptr {
             self.memcpy_to_iomem(base + wptr, &qeh_bytes)?;
         }
-        self.memcpy_to_iomem(base + wptr + QEH_SIZE, header)?;
-        self.memcpy_to_iomem(base + wptr + QEH_SIZE + header.len(), data)?;
-        wptr = align_up(wptr + QEH_SIZE + payload_len, block_size) % buf_size;
-        self.iomem_write32(buf_offset + block_size * 2, wptr as u32)?;
-        Ok(wptr as u64 | (AFK_OPC_SEND << 48))
+        self.memcpy_to_iomem(base + entry, &qeh_bytes)?;
+        self.memcpy_to_iomem(base + entry + QEH_SIZE, header)?;
+        self.memcpy_to_iomem(base + entry + QEH_SIZE + header.len(), data)?;
+        mem_sync();
+        self.iomem_write32(buf_offset + block_size * 2, next as u32)?;
+        Ok(next as u64 | (AFK_OPC_SEND << 48))
     }
     fn epic_notify(
         &mut self,
