@@ -165,3 +165,16 @@ config USB_DEFAULT_AUTHORIZATION_MODE
 	  ACPI selecting value 2 is analogous to selecting value 0.
 
 	  If unsure, keep the default value.
+
+config USB_PORT_POWER_KUNIT_TEST
+	tristate "KUnit tests for switching hub port power" if !KUNIT_ALL_TESTS
+	depends on USB && KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Test that a port powered off with usb_hub_port_power_off() stays
+	  off until usb_hub_port_power_on(), whatever port runtime PM and
+	  the port's "disable" attribute do in between. The tests run the
+	  hub driver on the root hubs of a software host controller and
+	  need no USB hardware.
+
+	  If unsure, say N.
