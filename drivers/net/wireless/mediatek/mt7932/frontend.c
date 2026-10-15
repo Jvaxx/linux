@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+// SPDX-License-Identifier: GPL-2.0-only
 #include "mt7932.h"
 
 static void mt_scan_finish_work(struct work_struct *work);
@@ -14,9 +14,6 @@ struct mt7932 *mt_from_wiphy(struct wiphy *wiphy)
 {
 	return *(struct mt7932 **)wiphy_priv(wiphy);
 }
-
-
-
 
 static void mt_scan_finish_work(struct work_struct *work)
 {

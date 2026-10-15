@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-only */
+// SPDX-License-Identifier: GPL-2.0-only
 #include "mt7932.h"
 
 static int mt_peer_reserve(struct mt7932 *m);
