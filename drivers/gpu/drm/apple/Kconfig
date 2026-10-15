@@ -42,7 +42,8 @@ config DRM_APPLE_KUNIT_TEST
 	  larger rings, as well as malformed ring size combinations.
 	  This option is intended for developer test kernels.
 	  Also test the Type-C modeset, hotplug and service ownership state,
-	  and the system resume of a CRTC whose mode is no longer admissible.
+	  the system resume of a CRTC whose mode is no longer admissible, and
+	  when an external display is ready to be reported to userspace.
 
 config DRM_APPLE_PARSER_KUNIT_TEST
 	bool "KUnit tests for Apple firmware message parsers" if !KUNIT_ALL_TESTS
