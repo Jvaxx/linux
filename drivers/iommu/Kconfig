@@ -317,7 +317,7 @@ config APPLE_DART
 	  Say Y here if you are using an Apple SoC.
 
 config APPLE_DART_KUNIT_TEST
-	bool "KUnit tests for Apple DART locked domains" if !KUNIT_ALL_TESTS
+	bool "KUnit tests for Apple DART domains and commands" if !KUNIT_ALL_TESTS
 	depends on APPLE_DART=y && KUNIT=y
 	default KUNIT_ALL_TESTS
 	help
@@ -325,6 +325,8 @@ config APPLE_DART_KUNIT_TEST
 	  handoff without accessing physical DART hardware. Verify that
 	  legacy display roots can be replaced while newer firmware-owned
 	  roots retain their mappings and reject conflicting host entries.
+	  Verify that unmapping an IOVA maintains independent remap targets.
+	  That case requires kernel pages of at least 16 KiB.
 
 config S390_IOMMU
 	def_bool y if S390 && PCI

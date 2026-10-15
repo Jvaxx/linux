@@ -41,6 +41,10 @@
 
 #include "dma-iommu.h"
 
+#if IS_ENABLED(CONFIG_APPLE_DART_KUNIT_TEST)
+#include <kunit/static_stub.h>
+#endif
+
 #if IS_ENABLED(CONFIG_KUNIT) && !defined(MODULE)
 #include <kunit/test.h>
 #endif
@@ -331,6 +335,9 @@ struct apple_dart {
 static inline void apple_dart_writel(struct apple_dart *dart, u32 value,
 				    u32 offset)
 {
+#if IS_ENABLED(CONFIG_APPLE_DART_KUNIT_TEST)
+	KUNIT_STATIC_STUB_REDIRECT(apple_dart_writel, dart, value, offset);
+#endif
 	writel(value, dart->regs + offset);
 	if (unlikely(dart->tunneled)) {
 		mb();
@@ -990,6 +997,7 @@ apple_dart_t8110_hw_tlb_command_range(struct apple_dart_stream_map *stream_map,
 		spin_unlock_irqrestore(&dart->lock, flags);
 		return -EHOSTDOWN;
 	}
+	/* A domain bitmap can contain independent remap targets. */
 	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
 		u32 val = FIELD_PREP(DART_T8110_TLB_CMD_OP, command) |
 			  FIELD_PREP(DART_T8110_TLB_CMD_STREAM, sid);
@@ -1017,9 +1025,6 @@ apple_dart_t8110_hw_tlb_command_range(struct apple_dart_stream_map *stream_map,
 			DART_T8110_FLUSH_BUSY_TIMEOUT, false, dart,
 			DART_T8110_TLB_CMD);
 		if (ret)
-			break;
-		/* Since remap is used only the first sid needs to be invalidated. */
-		if (apple_dart_remaps_streams(dart))
 			break;
 	}
 	spin_unlock_irqrestore(&dart->lock, flags);
