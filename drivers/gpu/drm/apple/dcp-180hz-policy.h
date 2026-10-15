@@ -6,7 +6,7 @@
 #include <linux/string.h>
 #include <drm/drm_modes.h>
 
-/* Only this qualified uncompressed configuration is admitted. */
+/* Only this verified uncompressed configuration is admitted. */
 static inline bool dcp_180hz_payload(u32 rate, u32 lanes, u32 clock)
 {
 	return rate == 0x1e && lanes == 2 && clock == 414090 &&

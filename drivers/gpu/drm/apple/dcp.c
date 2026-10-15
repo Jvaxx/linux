@@ -4444,7 +4444,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 			set_bit(surf, dcp->iomfb_surfaces);
 		surf++;
 	}
-	/* The qualified J700 loader names surface zero rather than enabling it. */
+	/* The J700 loader names surface zero rather than enabling it. */
 	if (of_machine_is_compatible("apple,j700") &&
 	    of_device_is_compatible(dev->of_node, "apple,t8140-dcp") &&
 	    num_surfs == 1 &&
@@ -4583,7 +4583,7 @@ static void dcp_platform_shutdown(struct platform_device *pdev)
 	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
 		/*
 		 * This firmware keeps scanning across soft DPMS and has no
-		 * qualified stop sequence. Component unbind releases the RTKit
+		 * known stop sequence. Component unbind releases the RTKit
 		 * devres group and the piodma domain while firmware may still
 		 * access them. Stop host submissions but keep the component and
 		 * its DMA resources alive until the system resets.
@@ -4753,7 +4753,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8112 = {
 	.num_dptx_ports = 2,
 };
 
-/* The internal T8140 endpoint uses the measured H17P method profile. */
+/* The internal T8140 endpoint uses the H17P method profile. */
 static const struct resource t8140_firmware_clock =
 	DEFINE_RES_MEM(0x302800000, 0xbc000);
 
