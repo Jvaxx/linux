@@ -258,7 +258,7 @@ impl platform::Driver for AsahiDriver {
         // Register the sysfs file on the platform device. Must happen after
         // the DRM device is registered so the device is fully bound.
         let raw_dev = pdev.as_ref().as_raw();
-        let stats = (*drm).gpu.stats_snapshot();
+        let stats = drm.gpu.stats_snapshot();
         let snapshot = stats.as_ref().map_or(core::ptr::null(), Arc::as_ptr);
         let raw_stats = crate::sysfs_exports::register(
             raw_dev,
@@ -266,7 +266,12 @@ impl platform::Driver for AsahiDriver {
             stats.is_some() && *module_parameters::stats_export.value() != 0,
         )?;
 
-        Ok(Self { drm, raw_dev, raw_stats, stats })
+        Ok(Self {
+            drm,
+            raw_dev,
+            raw_stats,
+            stats,
+        })
     }
 }
 
@@ -296,16 +301,19 @@ impl AsahiDriver {
         }
         // G17's firmware channel format has no supported stats decoder yet.
         let raw_dev = pdev.as_ref().as_raw();
-        let raw_stats = match crate::sysfs_exports::register(
-            raw_dev, core::ptr::null(), false,
-        ) {
+        let raw_stats = match crate::sysfs_exports::register(raw_dev, core::ptr::null(), false) {
             Ok(handle) => handle,
             Err(error) => {
                 gpu.shutdown();
                 return Err(error);
             }
         };
-        Ok(Self { drm, raw_dev, raw_stats, stats: None })
+        Ok(Self {
+            drm,
+            raw_dev,
+            raw_stats,
+            stats: None,
+        })
     }
 }
 
