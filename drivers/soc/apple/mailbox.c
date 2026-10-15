@@ -70,9 +70,8 @@ static_assert(APPLE_ASCWRAP_V6_MBOX_OFFSET + APPLE_ASC_MBOX_I2A_RECV0 ==
 	      0x8830);
 
 /*
- * The T8140 AOP "setup port" (ADT aop-exclave-mailbox): the second mailbox
- * the J700 AOP firmware boots through.  Layout measured on hardware by the
- * native m1n1 microphone host (artifacts/j700-native-lpmic-20260906).
+ * The T8140 AOP "setup port": a second, smaller mailbox the AOP firmware
+ * uses during its boot.
  */
 #define APPLE_T8140_AOP_SETUP_A2I_CONTROL 0x000
 #define APPLE_T8140_AOP_SETUP_I2A_CONTROL 0x004
@@ -227,11 +226,7 @@ int apple_mbox_ascwrap_v6_start_cpu(struct apple_mbox *mbox)
 
 	ret = pm_runtime_resume_and_get(mbox->dev);
 	if (ret) {
-		dev_err(mbox->dev,
-			"ASC CPU start: runtime resume failed: %d (active=%d status=%d disable_depth=%d runtime_error=%d)\n",
-			ret, mbox->active, mbox->dev->power.runtime_status,
-			mbox->dev->power.disable_depth,
-			mbox->dev->power.runtime_error);
+		dev_err(mbox->dev, "ASC CPU start: runtime resume failed: %d\n", ret);
 		apple_mbox_clear_resume_error(mbox);
 		goto out_unlock;
 	}
@@ -455,11 +450,7 @@ int apple_mbox_start(struct apple_mbox *mbox)
 
 	ret = pm_runtime_resume_and_get(mbox->dev);
 	if (ret) {
-		dev_err(mbox->dev,
-			"mailbox start: runtime resume failed: %d (active=%d status=%d disable_depth=%d runtime_error=%d)\n",
-			ret, mbox->active, mbox->dev->power.runtime_status,
-			mbox->dev->power.disable_depth,
-			mbox->dev->power.runtime_error);
+		dev_err(mbox->dev, "mailbox start: runtime resume failed: %d\n", ret);
 		apple_mbox_clear_resume_error(mbox);
 		goto out_unlock;
 	}
@@ -698,7 +689,7 @@ static int apple_mbox_probe(struct platform_device *pdev)
 		mbox->ascwrap_v6.wrapper_size = resource_size(res);
 		mbox->ascwrap_v6.iop_vbar_start = iop_vbar_res->start;
 		mbox->ascwrap_v6.iop_vbar_size = resource_size(iop_vbar_res);
-		/* resetState() is software-only; the matching stop lives above. */
+		/* T8140 implements both the CPU start and the CPU stop. */
 		mbox->ascwrap_v6.missing = 0;
 
 		mbox->wrapper_regs =
