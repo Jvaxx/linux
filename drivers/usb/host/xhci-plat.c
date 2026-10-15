@@ -490,14 +490,28 @@ void xhci_plat_remove(struct platform_device *dev)
 }
 EXPORT_SYMBOL_GPL(xhci_plat_remove);
 
+/* A runtime suspended controller is halted: bring it back before system sleep. */
+VISIBLE_IF_KUNIT int xhci_plat_resume_from_runtime(struct device *dev)
+{
+	int ret;
+
+	if (!pm_runtime_suspended(dev))
+		return 0;
+
+	ret = pm_runtime_resume(dev);
+	return ret < 0 ? ret : 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(xhci_plat_resume_from_runtime);
+
 static int xhci_plat_suspend_common(struct device *dev)
 {
 	struct usb_hcd	*hcd = dev_get_drvdata(dev);
 	struct xhci_hcd	*xhci = hcd_to_xhci(hcd);
 	int ret;
 
-	if (pm_runtime_suspended(dev))
-		pm_runtime_resume(dev);
+	ret = xhci_plat_resume_from_runtime(dev);
+	if (ret)
+		return ret;
 
 	ret = xhci_priv_suspend_quirk(hcd);
 	if (ret)
@@ -562,9 +576,10 @@ static int xhci_plat_suspend(struct device *dev)
 	}
 
 	if (xhci_plat_run_in_s2idle(dev)) {
-		/* A runtime suspended controller is halted, start it again. */
-		if (pm_runtime_suspended(dev))
-			pm_runtime_resume(dev);
+		int ret = xhci_plat_resume_from_runtime(dev);
+
+		if (ret)
+			return ret;
 		priv->running_in_s2idle = 1;
 		dev_dbg(dev, "wakeup enabled, keep running in suspend-to-idle.\n");
 		return 0;
