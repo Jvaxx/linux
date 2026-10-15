@@ -5,34 +5,28 @@
  * On macOS the CLPC raises the floor of the memory controller (DCS) and the
  * SoC fabric while the CPU clusters or the GPU are busy, through its own
  * voter agent in the PMC. This driver keeps that agent's floor in step with
- * Linux CPU load and, optionally, GPU activity:
+ * Linux CPU load:
  *
  *  - every sampling period, each cpufreq policy reports how busy its
  *    busiest CPU was and how fast the policy runs relative to its maximum;
  *    a busy policy requests a DCS and fabric state from a table indexed by
  *    that frequency quartile;
- *  - while the GPU's PMGR power state reports the GPU as actually powered,
- *    a fixed GPU floor is requested;
  *  - each rail keeps its last request for a hold time after demand stops,
  *    then drops back to 0, so idle releases the floor.
  *
- * The native mapping from CPU and GPU demand to DCS and fabric states has
- * not been decoded. The default tables are measured policy, not a copy of
- * macOS, and can be changed with module parameters.
+ * The native mapping from CPU demand to DCS and fabric states is not known.
+ * The tables below are measured policy, not a copy of macOS.
  *
  * Copyright The Asahi Linux Contributors
  */
 
-#include <linux/bitfield.h>
 #include <linux/cpufreq.h>
 #include <linux/debugfs.h>
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
-#include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
-#include <linux/regmap.h>
 #include <linux/seq_file.h>
 #include <linux/soc/apple/pmc.h>
 #include <linux/workqueue.h>
@@ -40,52 +34,28 @@
 #define APPLE_CLPC_MAX_CLUSTERS	8
 #define APPLE_CLPC_LEVELS	4
 
-/* PMGR power state: ACTUAL is bits [7:4]; 0xf means powered on. */
-#define APPLE_PMGR_PS_ACTUAL	GENMASK(7, 4)
-#define APPLE_PMGR_PS_ACTIVE	0xf
-
 enum apple_clpc_rail {
 	APPLE_CLPC_DCS,
 	APPLE_CLPC_SOC,
 	APPLE_CLPC_RAILS,
 };
 
-static unsigned int sample_ms = 4;
-module_param(sample_ms, uint, 0444);
-MODULE_PARM_DESC(sample_ms, "Sampling period in ms");
-
-static unsigned int busy_pct = 50;
-module_param(busy_pct, uint, 0444);
-MODULE_PARM_DESC(busy_pct, "Busy threshold of a CPU cluster, percent of the sampling period");
-
-static unsigned int hold_ms = 32;
-module_param(hold_ms, uint, 0444);
-MODULE_PARM_DESC(hold_ms, "Time a rail keeps its last request after demand stops, ms");
-
-static char *dcs_map = "1,2,3,4";
-module_param(dcs_map, charp, 0444);
-MODULE_PARM_DESC(dcs_map, "DCS state for a busy cluster below 25, 50, 75 and 100 percent of its maximum frequency");
-
-static char *soc_map = "0,0,0,0";
-module_param(soc_map, charp, 0444);
-MODULE_PARM_DESC(soc_map, "Fabric state for a busy cluster below 25, 50, 75 and 100 percent of its maximum frequency");
-
-static unsigned int gpu_dcs;
-module_param(gpu_dcs, uint, 0444);
-MODULE_PARM_DESC(gpu_dcs, "DCS state while the GPU is powered (0: none)");
-
-static unsigned int gpu_soc;
-module_param(gpu_soc, uint, 0444);
-MODULE_PARM_DESC(gpu_soc, "Fabric state while the GPU is powered (0: none)");
+/* Sampling period */
+#define APPLE_CLPC_SAMPLE_MS	4
+/* Busy threshold of a CPU cluster, percent of the sampling period */
+#define APPLE_CLPC_BUSY_PCT	50
+/* Time a rail keeps its last request after demand stops */
+#define APPLE_CLPC_HOLD_MS	32
 
 /**
  * struct apple_clpc_hw - per-SoC CLPC parameters
  * @rail: PMC rail of the DCS and of the fabric
- * @max_state: highest state of the DCS and of the fabric
+ * @map: state of each rail for a busy cluster below 25, 50, 75 and 100
+ *	percent of its maximum frequency
  */
 struct apple_clpc_hw {
 	unsigned int rail[APPLE_CLPC_RAILS];
-	unsigned int max_state[APPLE_CLPC_RAILS];
+	u8 map[APPLE_CLPC_RAILS][APPLE_CLPC_LEVELS];
 };
 
 struct apple_clpc_cluster {
@@ -106,8 +76,6 @@ struct apple_clpc {
 	struct device *pmc;
 	const struct apple_clpc_hw *hw;
 	unsigned int agent;
-	struct regmap *gpu_regmap;
-	u32 gpu_offset;
 	/* Samples while a vote is held; idle_work defers to busy CPUs. */
 	struct delayed_work work;
 	struct delayed_work idle_work;
@@ -118,33 +86,13 @@ struct apple_clpc {
 	unsigned long next_scan;
 	u64 *idle;
 	u64 *wall;
-	u8 map[APPLE_CLPC_RAILS][APPLE_CLPC_LEVELS];
-	unsigned int gpu_state[APPLE_CLPC_RAILS];
 	struct apple_clpc_vote vote[APPLE_CLPC_RAILS];
 	u32 mask;
 	u32 saved_floor;
-	bool gpu_on;
 	unsigned long samples;
 	unsigned long update_errors;
 	struct dentry *debugfs;
 };
-
-static int apple_clpc_parse_map(struct apple_clpc *clpc, const char *s,
-				enum apple_clpc_rail rail)
-{
-	unsigned int v[APPLE_CLPC_LEVELS];
-	unsigned int i;
-
-	if (sscanf(s, "%u,%u,%u,%u", &v[0], &v[1], &v[2], &v[3]) != 4)
-		return -EINVAL;
-	for (i = 0; i < APPLE_CLPC_LEVELS; i++) {
-		if (v[i] > clpc->hw->max_state[rail])
-			return -EINVAL;
-		clpc->map[rail][i] = v[i];
-	}
-
-	return 0;
-}
 
 /* cpufreq policies can appear after probe; pick up new ones as they do. */
 static void apple_clpc_find_clusters(struct apple_clpc *clpc)
@@ -220,21 +168,8 @@ static void apple_clpc_sample_cluster(struct apple_clpc *clpc,
 	q = min_t(unsigned int, cl->level / (100 / APPLE_CLPC_LEVELS),
 		  APPLE_CLPC_LEVELS - 1);
 	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
-		cl->request[rail] = busy >= busy_pct ? clpc->map[rail][q] : 0;
-}
-
-static bool apple_clpc_gpu_powered(struct apple_clpc *clpc)
-{
-	u32 ps;
-
-	/*
-	 * Hardware auto-gating powers the GPU down while the requested state
-	 * stays on, so only the actual state says whether the GPU runs.
-	 */
-	if (regmap_read(clpc->gpu_regmap, clpc->gpu_offset, &ps))
-		return false;
-
-	return FIELD_GET(APPLE_PMGR_PS_ACTUAL, ps) == APPLE_PMGR_PS_ACTIVE;
+		cl->request[rail] = busy >= APPLE_CLPC_BUSY_PCT ?
+				   clpc->hw->map[rail][q] : 0;
 }
 
 static unsigned int apple_clpc_vote(struct apple_clpc_vote *vote,
@@ -244,7 +179,7 @@ static unsigned int apple_clpc_vote(struct apple_clpc_vote *vote,
 		vote->last_demand = now;
 		vote->state = demand;
 	} else if (time_after_eq(now, vote->last_demand +
-					      msecs_to_jiffies(hold_ms))) {
+					      msecs_to_jiffies(APPLE_CLPC_HOLD_MS))) {
 		vote->state = 0;
 	}
 
@@ -275,7 +210,7 @@ static void apple_clpc_queue(struct apple_clpc *clpc, bool idle)
 	 */
 	queue_delayed_work(system_freezable_power_efficient_wq,
 			   idle ? &clpc->idle_work : &clpc->work,
-			   msecs_to_jiffies(sample_ms));
+			   msecs_to_jiffies(APPLE_CLPC_SAMPLE_MS));
 }
 
 static void apple_clpc_sample(struct apple_clpc *clpc)
@@ -300,16 +235,9 @@ static void apple_clpc_sample(struct apple_clpc *clpc)
 			demand[rail] = max(demand[rail], cl->request[rail]);
 	}
 
-	clpc->gpu_on = clpc->gpu_regmap &&
-		       (clpc->gpu_state[APPLE_CLPC_DCS] ||
-			clpc->gpu_state[APPLE_CLPC_SOC]) &&
-		       apple_clpc_gpu_powered(clpc);
-	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++) {
-		if (clpc->gpu_on)
-			demand[rail] = max(demand[rail], clpc->gpu_state[rail]);
+	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
 		state[rail] = apple_clpc_vote(&clpc->vote[rail], demand[rail],
 					      now);
-	}
 
 	if (apple_pmc_floor_update(clpc->pmc, clpc->agent, clpc->mask,
 				   apple_clpc_floor(clpc, state)))
@@ -339,18 +267,13 @@ static int apple_clpc_status_show(struct seq_file *s, void *unused)
 		   apple_pmc_floor_read(clpc->pmc, clpc->agent),
 		   clpc->saved_floor);
 	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
-		seq_printf(s, "%s: rail %u state %u enabled %u map %u,%u,%u,%u gpu %u\n",
+		seq_printf(s, "%s: rail %u state %u enabled %u map %u,%u,%u,%u\n",
 			   rail == APPLE_CLPC_DCS ? "dcs" : "soc",
 			   clpc->hw->rail[rail], clpc->vote[rail].state,
 			   apple_pmc_voter_enabled(clpc->pmc, clpc->agent,
 						   clpc->hw->rail[rail]),
-			   clpc->map[rail][0],
-			   clpc->map[rail][1], clpc->map[rail][2],
-			   clpc->map[rail][3], clpc->gpu_state[rail]);
-	seq_printf(s, "gpu: %s\n", !clpc->gpu_regmap ? "no input" :
-		   !clpc->gpu_state[APPLE_CLPC_DCS] &&
-		   !clpc->gpu_state[APPLE_CLPC_SOC] ? "no floor" :
-		   clpc->gpu_on ? "powered" : "off");
+			   clpc->hw->map[rail][0], clpc->hw->map[rail][1],
+			   clpc->hw->map[rail][2], clpc->hw->map[rail][3]);
 	seq_printf(s, "samples: %lu update errors: %lu\n", clpc->samples,
 		   clpc->update_errors);
 	for (i = 0; i < clpc->nr_clusters; i++)
@@ -363,34 +286,6 @@ static int apple_clpc_status_show(struct seq_file *s, void *unused)
 	return 0;
 }
 DEFINE_SHOW_ATTRIBUTE(apple_clpc_status);
-
-static int apple_clpc_gpu_input(struct apple_clpc *clpc)
-{
-	struct device_node *ps, *pmgr;
-	int ret;
-
-	ps = of_parse_phandle(clpc->dev->of_node, "apple,gpu-power-state", 0);
-	if (!ps)
-		return 0;
-
-	ret = of_property_read_u32(ps, "reg", &clpc->gpu_offset);
-	pmgr = of_get_parent(ps);
-	of_node_put(ps);
-	if (ret) {
-		of_node_put(pmgr);
-		return ret;
-	}
-
-	clpc->gpu_regmap = syscon_node_to_regmap(pmgr);
-	of_node_put(pmgr);
-	if (IS_ERR(clpc->gpu_regmap)) {
-		ret = PTR_ERR(clpc->gpu_regmap);
-		clpc->gpu_regmap = NULL;
-		return ret;
-	}
-
-	return 0;
-}
 
 static void apple_clpc_free_clusters(struct apple_clpc *clpc)
 {
@@ -457,20 +352,6 @@ static int apple_clpc_probe(struct platform_device *pdev)
 			return -EINVAL;
 		clpc->mask |= APPLE_PMC_RAIL_MASK(clpc->hw->rail[rail]);
 	}
-
-	ret = apple_clpc_parse_map(clpc, dcs_map, APPLE_CLPC_DCS) ?:
-	      apple_clpc_parse_map(clpc, soc_map, APPLE_CLPC_SOC);
-	if (ret)
-		return dev_err_probe(dev, ret, "invalid state map\n");
-	if (gpu_dcs > clpc->hw->max_state[APPLE_CLPC_DCS] ||
-	    gpu_soc > clpc->hw->max_state[APPLE_CLPC_SOC])
-		return dev_err_probe(dev, -EINVAL, "invalid GPU state\n");
-	clpc->gpu_state[APPLE_CLPC_DCS] = gpu_dcs;
-	clpc->gpu_state[APPLE_CLPC_SOC] = gpu_soc;
-
-	ret = apple_clpc_gpu_input(clpc);
-	if (ret)
-		return dev_err_probe(dev, ret, "invalid GPU power state\n");
 
 	clpc->idle = devm_kcalloc(dev, nr_cpu_ids, sizeof(*clpc->idle),
 				  GFP_KERNEL);
@@ -542,10 +423,17 @@ static int apple_clpc_resume(struct device *dev)
 static DEFINE_SIMPLE_DEV_PM_OPS(apple_clpc_pm_ops, apple_clpc_suspend,
 				apple_clpc_resume);
 
-/* T8140: DCS states 0-4 on rail 0, fabric states 0-3 on rail 1. */
+/*
+ * T8140: DCS states 0-4 on rail 0, fabric states 0-3 on rail 1. A busy
+ * cluster raises the DCS one state per frequency quartile and leaves the
+ * fabric alone.
+ */
 static const struct apple_clpc_hw apple_clpc_hw_t8140 = {
 	.rail = { [APPLE_CLPC_DCS] = 0, [APPLE_CLPC_SOC] = 1 },
-	.max_state = { [APPLE_CLPC_DCS] = 4, [APPLE_CLPC_SOC] = 3 },
+	.map = {
+		[APPLE_CLPC_DCS] = { 1, 2, 3, 4 },
+		[APPLE_CLPC_SOC] = { 0, 0, 0, 0 },
+	},
 };
 
 static const struct of_device_id apple_clpc_of_match[] = {
