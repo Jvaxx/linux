@@ -1978,6 +1978,21 @@ static void dcp_firmware_metadata_present_locked(struct apple_dcp *dcp)
 }
 
 /*
+ * A fact a held connection waits for has changed: evaluate it again.  The
+ * unlocked checks may miss a hold that has just started; such a hold ends at
+ * its timeout instead.  A stopped announcement is evaluated again when its
+ * work is enabled; teardown quiesces the callers before draining the worker.
+ */
+static void dcp_announce_kick(struct apple_dcp *dcp)
+{
+	struct apple_connector *con = READ_ONCE(dcp->connector);
+
+	if (READ_ONCE(dcp->announce.holding) && !READ_ONCE(dcp->announce.stopped) && con &&
+	    READ_ONCE(con->dcp) == to_platform_device(dcp->dev))
+		schedule_work(&con->hotplug_wq);
+}
+
+/*
  * While its pipe is stopped an external display reports no hotplug to DRM
  * (see dcp_external_hotplug()). When the firmware announces the display
  * there, as when the link returns from system sleep with the CRTC off, the
@@ -1997,6 +2012,7 @@ void dcp_firmware_metadata_announced(struct apple_dcp *dcp)
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
 	dcp_firmware_metadata_present_locked(dcp);
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+	dcp_announce_kick(dcp);
 }
 
 void dcp_firmware_metadata_hotplug(struct apple_dcp *dcp, bool connected)
@@ -2984,6 +3000,9 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
 		dcp->typec_reconnect_tries = 0;
 		return;
 	}
+	/* A display held for this link will not get ready. */
+	if (READ_ONCE(dcp->external_error))
+		dcp_announce_kick(dcp);
 
 	if (++dcp->typec_reconnect_tries <
 	    (dcp_is_usb4_output(dcp) && apple_dp_tunnel_t602x() ?
@@ -2995,6 +3014,43 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
 
 	dev_err(dcp->dev, "Type-C DPTX reconnect failed after %u retries: %d\n",
 		dcp->typec_reconnect_tries, ret);
+}
+
+/**
+ * dcp_hold_resume_event - hold the resume hotplug event of an external display
+ * @pdev: the DCP of a CRTC resumed disabled
+ *
+ * System sleep releases the link of an external H17P display, and with it
+ * the proof of modes such as 1080p at 180 Hz, so apple_drm_drop_stale_crtcs()
+ * resumes the CRTC of such a mode disabled with its link marked bad.  A
+ * hotplug event then has userspace set the mode again.  Sent at once, it has
+ * userspace probe before the link is back, pick a fallback mode, and set its
+ * own mode again once that is offered: two mode sets the monitor has to
+ * resynchronize to.
+ *
+ * Hold that event, not the connection, until the display's modes are in for
+ * the new cable generation, or for DCP_ANNOUNCE_RESUME_TIMEOUT_MS after the
+ * link work can run again, then send it once from the hotplug worker.  No
+ * lock is held while waiting; a probe in the meantime reports the display
+ * connected with the modes it has.
+ *
+ * Returns false if the caller must send the event itself.
+ */
+bool dcp_hold_resume_event(struct platform_device *pdev)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	struct apple_connector *con = READ_ONCE(dcp->connector);
+
+	if (!dcp_is_external_h17p(dcp) || !con || READ_ONCE(con->dcp) != pdev)
+		return false;
+
+	guard(mutex)(&dcp->hpd_mutex);
+	if (!READ_ONCE(con->connected) || !dcp->typec_cable_connected ||
+	    !dcp_announce_hold(&dcp->announce, dcp->typec_generation))
+		return false;
+	/* Freezable, like the link work: the timeout starts after thaw. */
+	dcp_announce_arm(dcp);
+	return true;
 }
 
 static void disconnected_hpd_event(struct apple_connector *con)
