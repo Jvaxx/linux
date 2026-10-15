@@ -118,6 +118,8 @@ config APPLE_SEP
 	depends on ARCH_APPLE
 	depends on PM
 	depends on RUST
+	depends on OF_DYNAMIC
+	depends on SPI
 	depends on RUST_APPLE_MAILBOX
 	depends on HW_RANDOM
 	depends on TRUSTED_KEYS
