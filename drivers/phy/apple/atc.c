@@ -3702,6 +3702,22 @@ static enum atcphy_mode atcphy_typec_target_mode(struct apple_atcphy *atcphy,
 	return target_mode;
 }
 
+/*
+ * Whether a mux update leaves both the lanes and the PIPE as they are. That is
+ * the case when the mode does not change and no earlier PIPE handoff to a
+ * running controller behind a fixed hub is still outstanding. A DisplayPort
+ * HPD or status update with an unchanged pin assignment is one of these.
+ */
+static bool atcphy_mux_is_noop(const struct apple_atcphy *atcphy, enum atcphy_mode target_mode)
+{
+	if (atcphy->mode != target_mode || atcphy->mode_dirty)
+		return false;
+
+	return !(atcphy->fixed_usb2 && atcphy->host_active &&
+		 (atcphy->pipe_state != atcphy_modes[target_mode].pipehandler_state ||
+		  atcphy->pipe_pending));
+}
+
 static int atcphy_mux_set_locked(struct apple_atcphy *atcphy, enum atcphy_mode target_mode)
 {
 	int ret;
@@ -3793,8 +3809,17 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
 	enum atcphy_mode target_mode;
 	int ret;
 
-	scoped_guard(mutex, &atcphy->lock)
+	scoped_guard(mutex, &atcphy->lock) {
 		target_mode = atcphy_typec_target_mode(atcphy, state);
+		/*
+		 * Only a lane or PIPE change needs the USB3 root hub below.
+		 * Taking it means waiting for the hub's ongoing work, which
+		 * includes a whole enumeration with its timeouts, and would
+		 * hold up a DisplayPort update that changes neither.
+		 */
+		if (atcphy_mux_is_noop(atcphy, target_mode))
+			return 0;
+	}
 
 	ret = atcphy_usb3_pm_get(atcphy, &pm);
 	if (ret)
