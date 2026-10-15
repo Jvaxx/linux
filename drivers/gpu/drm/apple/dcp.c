@@ -104,7 +104,7 @@ static int dcp_pin_live_session(struct apple_dcp *dcp)
 	mutex_lock(&dcp_retained_sessions_lock);
 	list_add_tail(&session->link, &dcp_retained_sessions);
 	mutex_unlock(&dcp_retained_sessions_lock);
-	dev_info(dcp->dev, "live H17P DMA resources retained until reboot; rebind unsupported\n");
+	dev_dbg(dcp->dev, "live H17P DMA resources retained until reboot\n");
 	return 0;
 }
 
@@ -3112,22 +3112,11 @@ int dcp_start(struct platform_device *pdev)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	int ret;
 
-	if (!dcp->rtk)
+	/* A failed component bind leaves no RTKit instance to start. */
+	if (IS_ERR_OR_NULL(dcp->rtk))
 		return -ENODEV;
 
 	init_completion(&dcp->start_done);
-
-	/*
-	 * The coprocessor start can fail (or be recovered from) without tearing
-	 * the DRM side down, so this can be reached with no RTKit instance at
-	 * all.  Starting an endpoint then dereferences NULL inside
-	 * apple_rtkit_start_ep() and takes the machine with it.
-	 */
-	if (!dcp->rtk || IS_ERR(dcp->rtk)) {
-		dev_err(dcp->dev,
-			"cannot start endpoints: RTKit is not initialised\n");
-		return -ENODEV;
-	}
 
 	/* Make the H17P allocator available before external service discovery. */
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL) {
@@ -4198,7 +4187,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 		goto err_piodma;
 
 	if (dcp->hw.adopt_live_session)
-		dev_info(dev, "negotiating RTKit with the running DCP\n");
+		dev_dbg(dev, "negotiating RTKit with the running DCP\n");
 
 	/* Announce host readiness before awaiting external IOP readiness. */
 	if (dcp->hw.iomfb_method_profile ==
