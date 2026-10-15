@@ -412,6 +412,96 @@ static void mt_late_association_channel_preserves_terminal_test(struct kunit *te
 	}
 }
 
+struct mt_scan_retire_test_context {
+	struct delayed_work retire;
+	struct mt7932 *m;
+	bool late;
+};
+
+static struct mt_scan_retire_test_context *mt_scan_retire_ctx;
+
+/* The firmware reports the end of the cancelled batch a little later. */
+static void mt_scan_retire_test_late(struct work_struct *work)
+{
+	struct mt_scan_retire_test_context *ctx =
+		container_of(to_delayed_work(work), struct mt_scan_retire_test_context, retire);
+	struct mt7932 *m = ctx->m;
+	unsigned long flags;
+
+	spin_lock_irqsave(&m->response_lock, flags);
+	m->retired_scan_seq = 0;
+	complete(&m->scan_done);
+	spin_unlock_irqrestore(&m->response_lock, flags);
+}
+
+/*
+ * The scan completion work had already submitted the next batch when the
+ * abort arrived: the abort cancels it, and its end is still to come.
+ */
+static void mt_scan_retire_test_finish(struct work_struct *work)
+{
+	struct mt_scan_retire_test_context *ctx = mt_scan_retire_ctx;
+	struct mt7932 *m = ctx->m;
+	unsigned long flags;
+
+	spin_lock_irqsave(&m->response_lock, flags);
+	if (m->scan_request && m->scan_aborted) {
+		m->scan_request = NULL;
+		m->retired_scan_seq = 8;
+	}
+	spin_unlock_irqrestore(&m->response_lock, flags);
+	if (ctx->late)
+		schedule_delayed_work(&ctx->retire, msecs_to_jiffies(300));
+}
+
+static void mt_scan_quiesce_retirement_test(struct kunit *test)
+{
+	static const struct cfg80211_ops ops = {};
+	struct mt_scan_retire_test_context ctx = {};
+	struct cfg80211_scan_request *scan;
+	struct mt7932 *m = test->priv;
+	unsigned long start;
+	unsigned int round;
+
+	scan = kunit_kzalloc(test, sizeof(*scan), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, scan);
+	m->wiphy = wiphy_new(&ops, sizeof(m));
+	KUNIT_ASSERT_NOT_NULL(test, m->wiphy);
+	*(struct mt7932 **)wiphy_priv(m->wiphy) = m;
+	init_completion(&m->scan_done);
+	INIT_WORK(&m->scan_finish_work, mt_scan_retire_test_finish);
+	INIT_DELAYED_WORK(&ctx.retire, mt_scan_retire_test_late);
+	ctx.m = m;
+	mt_scan_retire_ctx = &ctx;
+	for (round = 0; round < 2; round++) {
+		ctx.late = !round;
+		reinit_completion(&m->scan_done);
+		m->scan_request = scan;
+		scan->wdev = &m->wdev;
+		m->scan_aborted = false;
+		m->retired_scan_seq = 0;
+		/* The batch the quiesce waits for has just finished. */
+		complete(&m->scan_done);
+		start = jiffies;
+		if (ctx.late) {
+			/* A late but genuine end retires the scan: no failure. */
+			KUNIT_EXPECT_EQ(test, mt_scan_quiesce(m), 0);
+			KUNIT_EXPECT_EQ(test, m->retired_scan_seq, 0);
+		} else {
+			/* A batch the firmware never ends still fails, after the bound. */
+			KUNIT_EXPECT_EQ(test, mt_scan_quiesce(m), -EBUSY);
+			KUNIT_EXPECT_EQ(test, m->retired_scan_seq, 8);
+			KUNIT_EXPECT_GE(test, jiffies - start, msecs_to_jiffies(1900));
+			KUNIT_EXPECT_LE(test, jiffies - start, msecs_to_jiffies(3000));
+		}
+		cancel_delayed_work_sync(&ctx.retire);
+		flush_work(&m->scan_finish_work);
+	}
+	mt_scan_retire_ctx = NULL;
+	wiphy_free(m->wiphy);
+	m->wiphy = NULL;
+}
+
 static struct kunit_case mt_rf_test_cases[] = {
 	KUNIT_CASE(mt_invalid_association_channel_wakes_both_test),
 	KUNIT_CASE(mt_valid_repeated_association_start_test),
@@ -422,6 +512,7 @@ static struct kunit_case mt_rf_test_cases[] = {
 	KUNIT_CASE(mt_rf_failure_wakes_association_test),
 	KUNIT_CASE(mt_rf_failure_blocks_startup_test),
 	KUNIT_CASE(mt_rf_failure_preserves_first_error_test),
+	KUNIT_CASE(mt_scan_quiesce_retirement_test),
 	{}
 };
 
