@@ -846,7 +846,11 @@ impl SndSocT8140AopData {
         }
         let ret = f();
         if let Err(e) = self.lpai_run_put() {
-            dev_warn!(self.dev, "lpai: unable to idle after raising the fabric: {:?}\n", e);
+            dev_warn!(
+                self.dev,
+                "lpai: unable to idle after raising the fabric: {:?}\n",
+                e
+            );
         }
         ret
     }
@@ -1907,8 +1911,8 @@ fn f32_bits_of_q31(v: i32) -> u32 {
     }
     let sign = if v < 0 { 1u32 << 31 } else { 0 };
     let m = v.unsigned_abs();
-    let p = 31 - m.leading_zeros(); // position of the leading one, 0..=31
-                                    // value = m * 2^-31 = 1.f * 2^(p - 31)
+    // The position of the leading one, 0..=31: |v| / 2^31 = 1.f * 2^(p - 31).
+    let p = 31 - m.leading_zeros();
     let exp = (p as i32 - 31 + 127) as u32;
     let mant = if p >= 23 {
         (m >> (p - 23)) & 0x7f_ffff
