@@ -453,7 +453,7 @@ static bool trampoline_provider_property_h17p(struct apple_dcp *dcp, int tag,
 		memset(reply, 0, sizeof(*reply));
 		memcpy(reply->data, property->legacy_data, property->length);
 		reply->length = cpu_to_le32(property->length);
-		dev_warn_once(dcp->dev,
+		dev_info_once(dcp->dev,
 			      "missing provider property %s (%u bytes); using the J700 defaults\n",
 			      property->dt_name, property->length);
 		return true;
