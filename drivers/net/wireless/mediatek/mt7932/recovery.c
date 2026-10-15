@@ -274,7 +274,7 @@ out:
 			mt_read(m, m->tx[17].reg + 12));
 	} else {
 		WRITE_ONCE(m->running, true);
-		dev_info(&m->pdev->dev, "RUNTIME_DMA_READY: full RX epoch, TX17 reset, firmware NORMAL_STATE\n");
+		dev_dbg(&m->pdev->dev, "RUNTIME_DMA_READY: full RX epoch, TX17 reset, firmware NORMAL_STATE\n");
 	}
 	enable_irq(pci_irq_vector(m->pdev, 0));
 	if (!ret) {
@@ -284,8 +284,8 @@ out:
 		    mt7932_capabilities(m->reply + 36, m->reply_length - 36) < 0))
 			ret = -EPROTO;
 		if (!ret)
-			dev_info(&m->pdev->dev, "RUNTIME_QUERY_OK: TX17 capability response, IRQ=%llu\n",
-				 m->interrupts);
+			dev_dbg(&m->pdev->dev, "RUNTIME_QUERY_OK: TX17 capability response, IRQ=%llu\n",
+				m->interrupts);
 	}
 	return ret;
 }
