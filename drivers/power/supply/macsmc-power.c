@@ -22,6 +22,8 @@
 #include <linux/reboot.h>
 #include <linux/workqueue.h>
 
+#include <kunit/static_stub.h>
+
 #define MAX_STRING_LENGTH 256
 
 /*
@@ -316,6 +318,14 @@ static int macsmc_battery_get_status(struct macsmc_power *power)
 	return macsmc_battery_charging_status(power);
 }
 
+static int macsmc_power_read_chte(struct macsmc_power *power, u8 *buf)
+{
+	if (IS_ENABLED(CONFIG_MACSMC_POWER_KUNIT_TEST))
+		KUNIT_STATIC_STUB_REDIRECT(macsmc_power_read_chte, power, buf);
+
+	return apple_smc_read(power->smc, SMC_KEY(CHTE), buf, 4);
+}
+
 static int macsmc_battery_get_charge_behaviour(struct macsmc_power *power)
 {
 	int ret;
@@ -331,7 +341,7 @@ static int macsmc_battery_get_charge_behaviour(struct macsmc_power *power)
 	}
 
 	if (power->has_chte) {
-		ret = apple_smc_read(power->smc, SMC_KEY(CHTE), chte_buf, 4);
+		ret = macsmc_power_read_chte(power, chte_buf);
 		if (ret < 0)
 			return ret;
 		if (ret != sizeof(chte_buf)) {
@@ -1123,3 +1133,7 @@ MODULE_LICENSE("Dual MIT/GPL");
 MODULE_DESCRIPTION("Apple SMC battery and power management driver");
 MODULE_AUTHOR("Hector Martin <marcan@marcan.st>");
 MODULE_AUTHOR("Michael Reeves <michael.reeves077@gmail.com>");
+
+#if IS_ENABLED(CONFIG_MACSMC_POWER_KUNIT_TEST)
+#include "macsmc-power-test.c"
+#endif
