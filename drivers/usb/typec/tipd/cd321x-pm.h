@@ -2,6 +2,8 @@
 #ifndef __CD321X_PM_H__
 #define __CD321X_PM_H__
 
+#include <linux/errno.h>
+
 #include <linux/types.h>
 
 #define CD321X_RESUME_ATTEMPTS 3
@@ -138,6 +140,17 @@ static inline void cd321x_pm_remove(struct cd321x_pm_state *pm)
 {
 	pm->phase = CD321X_PM_REMOVED;
 	pm->attempts_left = 0;
+}
+
+/*
+ * A display mux reports -ENOSPC when every display pipeline is driving
+ * another port.  That lasts until the other display goes away, so the port's
+ * USB path is set up without the display and nothing is retried.  Any other
+ * error, such as -EBUSY from a PHY in the middle of a transition, is retried.
+ */
+static inline bool cd321x_display_taken(int ret)
+{
+	return ret == -ENOSPC;
 }
 
 #endif /* __CD321X_PM_H__ */
