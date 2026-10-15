@@ -182,5 +182,27 @@ class QualificationTest(unittest.TestCase):
                 self.assertIsNotNone(e2e.fault.search(message))
 
 
+class DriverLogTest(unittest.TestCase):
+    LOG = ('[   10.000001] mt7932-fullmac 0000:01:00.0: probe message\n'
+           '[   20.500000] usb 1-1: new high-speed USB device\n'
+           '[   21.000000] mt7932-fullmac 0000:01:00.0: SCAN_REQUEST: channels=38\n'
+           '[   21.250000] mt7932_bt_pcie 0000:01:00.1: controller recovered\n'
+           '[   22.000000] Bluetooth: hci0: unrelated core message\n')
+
+    def test_last_log_time(self):
+        self.assertEqual(e2e.last_log_time(self.LOG), 22.0)
+        self.assertEqual(e2e.last_log_time(''), 0.0)
+
+    def test_only_radio_messages_after_start_count(self):
+        self.assertEqual(len(e2e.driver_info_messages(self.LOG, 0.0)), 3)
+        self.assertEqual(e2e.driver_info_messages(self.LOG, 20.5),
+                         ['[   21.000000] mt7932-fullmac 0000:01:00.0: ',
+                          '[   21.250000] mt7932_bt_pcie 0000:01:00.1: '])
+        self.assertEqual(e2e.driver_info_messages(self.LOG, 22.0), [])
+
+    def test_quiet_log_has_no_driver_messages(self):
+        self.assertEqual(e2e.driver_info_messages('[    1.000000] usb 1-1: reset\n', 0.0), [])
+
+
 if __name__ == '__main__':
     unittest.main()
