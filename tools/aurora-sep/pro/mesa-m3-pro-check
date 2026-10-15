@@ -10,7 +10,8 @@ kernel_profile=$(cat "$marker" 2>/dev/null) || exit 1
 case "$kernel_profile" in
 't6030-perf-v1
 source=d49021440d8ca02bbc8ecc17c19ce76c048b6236'|'t6030-perf-v1
-source=6f63677751854d57bcfac172314957bc2197c05f') ;;
+source=6f63677751854d57bcfac172314957bc2197c05f'|'t6030-perf-v1
+source=5ec1028c81526e1ed31db2b97e47edf8663e83cb') ;;
 *) exit 1 ;;
 esac
 [ "$(cat /opt/mesa-m3/native-pro/share/mesa-m3/profile 2>/dev/null)" = t6030-native-gl-legacy-hal ] || exit 1

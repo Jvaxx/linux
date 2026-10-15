@@ -95,9 +95,10 @@ class ProProfile(unittest.TestCase):
                 self.assertEqual(run.returncode, 0)
                 self.assertEqual((self.root / 'sys/module/asahi/parameters/m3_mixed_batch').read_text(), '0')
 
-    def test_release16_and_release18_kernels_admitted_others_refused(self):
+    def test_release16_18_and_19_kernels_admitted_others_refused(self):
         for source, admitted in (('d49021440d8ca02bbc8ecc17c19ce76c048b6236', True),
                                  ('6f63677751854d57bcfac172314957bc2197c05f', True),
+                                 ('5ec1028c81526e1ed31db2b97e47edf8663e83cb', True),
                                  ('f240960cc84cfda6f73e188050ccadb9435e938f', False),
                                  ('0000000000000000000000000000000000000000', False)):
             with self.subTest(source=source):

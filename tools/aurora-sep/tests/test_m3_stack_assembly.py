@@ -148,7 +148,7 @@ class Assembly(unittest.TestCase):
                      'NEO_TUNNEL_LIVE_FW_ROOT_PAIR', 'NEO_NIC_LIVE_FW_ROOT_PAIR',
                      'NEO_DISPLAY_READY_LIVE_FW_ROOT_PAIR', 'NEO_RELEASE14_LIVE_FW_ROOT_PAIR',
                      'NEO_RELEASE15_LIVE_FW_ROOT_PAIR', 'NEO_RELEASE16_LIVE_FW_ROOT_PAIR',
-                     'NEO_RELEASE18_LIVE_FW_ROOT_PAIR'):
+                     'NEO_RELEASE18_LIVE_FW_ROOT_PAIR', 'NEO_RELEASE19_LIVE_FW_ROOT_PAIR'):
             changed=dict(pair,kernel=getattr(mod,name)['kernel'])
             patch=mock.patch.object(mod,name,changed);patch.start();self.addCleanup(patch.stop)
         self.manifest['legacy_gpu_boards']=['j613','j615']

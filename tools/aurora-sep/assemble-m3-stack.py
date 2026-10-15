@@ -27,7 +27,8 @@ NEO_KERNELS = (NEO_KERNEL, 'a6a62e586021d9f786d6a96b4ded6b0ad3b613fa',
                '7cae5a72ccc6690a710e199c853f8e1c97a3d86c',
                'f240960cc84cfda6f73e188050ccadb9435e938f',
                'd49021440d8ca02bbc8ecc17c19ce76c048b6236',
-               '6f63677751854d57bcfac172314957bc2197c05f')
+               '6f63677751854d57bcfac172314957bc2197c05f',
+               '5ec1028c81526e1ed31db2b97e47edf8663e83cb')
 # J615 native25 requires exact kernel, boot source and packaged binary bindings.
 J615_NATIVE25_PAIR = {
     'kernel': '9189760ca2222ba57d802d65ff3a0ebb2ca985ab',
@@ -66,6 +67,7 @@ J615_RELEASE15_NATIVE25_PAIR = {
 }
 J615_RELEASE16_NATIVE25_PAIR = dict(J615_RELEASE15_NATIVE25_PAIR, kernel='d49021440d8ca02bbc8ecc17c19ce76c048b6236')
 J615_RELEASE18_NATIVE25_PAIR = dict(J615_RELEASE15_NATIVE25_PAIR, kernel='6f63677751854d57bcfac172314957bc2197c05f')
+J615_RELEASE19_NATIVE25_PAIR = dict(J615_RELEASE15_NATIVE25_PAIR, kernel='5ec1028c81526e1ed31db2b97e47edf8663e83cb')
 # Reserved firmware DART tables require the matched Neo ESP producer.
 NEO_PREVIOUS_FW_ROOT_PAIR = {
     'kernel': '9b96a8f6a29ceb3f645ed75e220a71c10e7d8e1f',
@@ -120,6 +122,7 @@ NEO_RELEASE15_LIVE_FW_ROOT_PAIR = {
 }
 NEO_RELEASE16_LIVE_FW_ROOT_PAIR = dict(NEO_RELEASE15_LIVE_FW_ROOT_PAIR, kernel='d49021440d8ca02bbc8ecc17c19ce76c048b6236')
 NEO_RELEASE18_LIVE_FW_ROOT_PAIR = dict(NEO_RELEASE15_LIVE_FW_ROOT_PAIR, kernel='6f63677751854d57bcfac172314957bc2197c05f')
+NEO_RELEASE19_LIVE_FW_ROOT_PAIR = dict(NEO_RELEASE15_LIVE_FW_ROOT_PAIR, kernel='5ec1028c81526e1ed31db2b97e47edf8663e83cb')
 STANDARD_M1N1_SOURCE = "d05ba17dfb771871d608225be42968bbb1e75a18"
 PREVIOUS_STANDARD_M1N1_SOURCE = "31501778e863feb5d2afe77be3a1edc588c98119"
 J615_LEGACY_M1N1_SOURCES = ("74ba6bea52d1f865d204bb3f8168705a148fd5c5",
@@ -168,6 +171,8 @@ def check_j615_native25(sources, binary_sha, mesa):
         pair = J615_RELEASE16_NATIVE25_PAIR
     if sources['kernel'] == J615_RELEASE18_NATIVE25_PAIR['kernel']:
         pair = J615_RELEASE18_NATIVE25_PAIR
+    if sources['kernel'] == J615_RELEASE19_NATIVE25_PAIR['kernel']:
+        pair = J615_RELEASE19_NATIVE25_PAIR
     if not isinstance(pair, dict) or set(pair) != {'kernel', 'm1n1', 'm1n1_bin_sha256'}:
         raise ValueError('J615 native25 requires the recorded J615 boot/kernel pair (J615_NATIVE25_PAIR)')
     if sources['kernel'] != pair['kernel']: raise ValueError('J615 native25 requires the matched J615 kernel')
@@ -186,7 +191,7 @@ def check_neo_firmware_tables(kernel, sources, binary_sha):
                         NEO_NIC_LIVE_FW_ROOT_PAIR, NEO_DISPLAY_READY_LIVE_FW_ROOT_PAIR,
                         NEO_RELEASE14_LIVE_FW_ROOT_PAIR,
                         NEO_RELEASE15_LIVE_FW_ROOT_PAIR, NEO_RELEASE16_LIVE_FW_ROOT_PAIR,
-                        NEO_RELEASE18_LIVE_FW_ROOT_PAIR) if kernel == p['kernel']]
+                        NEO_RELEASE18_LIVE_FW_ROOT_PAIR, NEO_RELEASE19_LIVE_FW_ROOT_PAIR) if kernel == p['kernel']]
     if not pairs:
         return
     if any(not re.fullmatch(r'[0-9a-f]{40}', p.get('m1n1') or '') for p in pairs):
@@ -290,7 +295,7 @@ def pro_data(manifest, directory):
         return {}
     if pro.get('profile') != 't6030-g15s-legacy-hal':
         raise ValueError('Pro performance profile differs')
-    if manifest['source_commits']['kernel'] != '6f63677751854d57bcfac172314957bc2197c05f':
+    if manifest['source_commits']['kernel'] != '5ec1028c81526e1ed31db2b97e47edf8663e83cb':
         raise ValueError('Pro performance kernel differs')
     expected = {'native': ('mesa-m3-native-pro', 'opt/mesa-m3/native-pro', 'd616d0650d6fa80f72a750a0121442ab917ed6cf', b't6030-native-gl-legacy-hal\n'),
                 'vulkan': ('mesa-m3-pro-vulkan', 'opt/mesa-m3/pro-vulkan', 'b0f56952b7f06955b143fbfa90c07de4c5864964', b't6030-pro-vulkan-legacy-hal\n')}
@@ -299,7 +304,7 @@ def pro_data(manifest, directory):
     kernel_path = directory / manifest['packages']['kernel']['file']
     listing = subprocess.check_output(['bsdtar', '-tf', str(kernel_path)], text=True).splitlines()
     markers = [name for name in listing if re.fullmatch(r'usr/lib/modules/[^/]+/aurora-m3pro-profile', name)]
-    if len(markers) != 1 or member(kernel_path, markers[0]) != b't6030-perf-v1\nsource=6f63677751854d57bcfac172314957bc2197c05f\n':
+    if len(markers) != 1 or member(kernel_path, markers[0]) != b't6030-perf-v1\nsource=5ec1028c81526e1ed31db2b97e47edf8663e83cb\n':
         raise ValueError('Pro kernel performance marker differs')
     pins = {}
     for role, (name, prefix, source, marker) in expected.items():

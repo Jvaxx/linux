@@ -8,8 +8,8 @@ are recorded in each release's `mesa-matched-stack.json`.
 |---|---|---|---|---|
 | `mesa-m3`, `/opt/mesa-m3` | M3 Pro fallback, M3 Air legacy profile | `m3/legacy` | `7ff89a4da387` | `mesa-m3/` |
 | `mesa-m3`, `/opt/mesa-m3/25g83` | M3 Air on 26.6.2, OpenGL only | `m3/air-hal200` | `78908f4d18af` | `mesa-m3/` |
-| `mesa-m3-native-pro`, `/opt/mesa-m3/native-pro` | M3 Pro desktop OpenGL | `fix/native-index-offset-integrated-20261013` | `d616d0650d6f` | `release18/native-pro/` |
-| `mesa-m3-pro-vulkan`, `/opt/mesa-m3/pro-vulkan` | M3 Pro Vulkan | `review/aurora-mesa-foundation-20261012` | `b0f56952b7f0` | `release18/pro-vulkan/` |
+| `mesa-m3-native-pro`, `/opt/mesa-m3/native-pro` | M3 Pro desktop OpenGL | `fix/native-index-offset-integrated-20261013` | `d616d0650d6f` | `release19/native-pro/` |
+| `mesa-m3-pro-vulkan`, `/opt/mesa-m3/pro-vulkan` | M3 Pro Vulkan | `review/aurora-mesa-foundation-20261012` | `b0f56952b7f0` | `release19/pro-vulkan/` |
 | `mesa-m3-g15c`, `/opt/mesa-m3-g15c` | M3 Max (T6031) test kit | `m3max/g15c` | `ff120e88cfc0` | `mesa-m3-g15c/` |
 
 `mesa-m3` builds two trees into one package: the legacy tree and the HAL200 tree. The
