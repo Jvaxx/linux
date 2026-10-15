@@ -162,9 +162,6 @@ struct mt7932 {
 	struct rate_info station_rx_rate;
 	unsigned long station_rx_rate_time;
 	bool station_rx_rate_valid;
-	struct rate_info station_tx_rate;
-	unsigned long station_tx_rate_time, station_rate_query_time;
-	bool station_tx_rate_valid, station_rate_query_failed;
 	/* Connection quality monitor, protected by response_lock. */
 	struct ewma_mt7932_signal cqm_signal;
 	unsigned long cqm_sample_time;
@@ -252,6 +249,5 @@ int mt_set_power_mgmt(struct wiphy *wiphy, struct net_device *netdev,
 		      bool enabled, int timeout);
 void mt_power_work(struct work_struct *work);
 int mt_power_init(struct mt7932 *m);
-void mt_station_update_rate(struct mt7932 *m, const u8 *mac);
 
 #endif
