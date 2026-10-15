@@ -502,8 +502,8 @@ static void isp_write_bootargs_h16(struct apple_isp *isp, void *virt,
 
 static int isp_firmware_boot_stage2(struct apple_isp *isp)
 {
-	bool h16 = isp->hw->fw_abi == ISP_FW_ABI_H17;
-	size_t args_size = h16 ? sizeof(struct isp_firmware_bootargs_h16) :
+	bool h17 = isp->hw->fw_abi == ISP_FW_ABI_H17;
+	size_t args_size = h17 ? sizeof(struct isp_firmware_bootargs_h16) :
 				 sizeof(struct isp_firmware_bootargs);
 	size_t cmd_size = ISP_CMD_AREA_SIZE(isp_num_capmeta(isp));
 	dma_addr_t args_iova, cmd_iova;
@@ -526,7 +526,7 @@ static int isp_firmware_boot_stage2(struct apple_isp *isp)
 			 num_ipc_chans);
 
 	/* Only hand the H16 descriptor to firmware that asks for it. */
-	if (h16 && !(desc_flags & ISP_GPIO2_H16_DESCRIPTOR)) {
+	if (h17 && !(desc_flags & ISP_GPIO2_H16_DESCRIPTOR)) {
 		dev_err(isp->dev,
 			"firmware did not request the H16 boot descriptor (0x%x)\n",
 			desc_flags);
@@ -562,7 +562,7 @@ static int isp_firmware_boot_stage2(struct apple_isp *isp)
 	isp->cmd_iova = cmd_iova;
 	isp->cmd_virt = cmd_virt;
 
-	if (h16)
+	if (h17)
 		isp_write_bootargs_h16(isp, args_virt, args_offset);
 	else
 		isp_write_bootargs(isp, args_virt, args_iova);
