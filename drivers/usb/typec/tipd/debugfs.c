@@ -122,10 +122,10 @@ static int tipd_debugfs_command_release(struct inode *inode, struct file *file)
 	 * may be gone. tipd_debugfs_unregister() has then left "DBMa" itself.
 	 */
 	if (f->holds_dbma && !debugfs_file_get(dentry)) {
-		mutex_lock(&tps->lock);
-		if (!--tps->debugfs->dbma_holders)
-			tipd_debugfs_leave_dbma(tps);
-		mutex_unlock(&tps->lock);
+		scoped_guard(mutex, &tps->lock) {
+			if (!--tps->debugfs->dbma_holders)
+				tipd_debugfs_leave_dbma(tps);
+		}
 		debugfs_file_put(dentry);
 	}
 
@@ -166,17 +166,15 @@ static ssize_t tipd_debugfs_command_write(struct file *file,
 	if (!memcmp(cmd->cmd, "DBMa", 4) && buf[4] > 1)
 		return -EINVAL;
 
-	mutex_lock(&tps->lock);
+	guard(mutex)(&tps->lock);
 
 	/* Preserve inherited mode and the leases held by other open files. */
 	if ((!memcmp(cmd->cmd, "DBMa", 4) && !buf[4] &&
 	     (tps->dbma_at_probe ||
 	      tps->debugfs->dbma_holders > (unsigned int)f->holds_dbma)) ||
 	    (!memcmp(cmd->cmd, "LOCK", 4) && !memchr_inv(buf + 4, 0, 4) &&
-	     (tps->dbma_at_probe || tps->debugfs->dbma_holders))) {
-		ret = -EBUSY;
-		goto out;
-	}
+	     (tps->dbma_at_probe || tps->debugfs->dbma_holders)))
+		return -EBUSY;
 
 	ret = tps6598x_exec_cmd_tmo(tps, cmd->cmd, len, len ? &buf[4] : NULL,
 				    sizeof(out), out, cmd->timeout_ms, 0);
@@ -198,27 +196,20 @@ static ssize_t tipd_debugfs_command_write(struct file *file,
 		}
 	}
 
-out:
-	mutex_unlock(&tps->lock);
-
-	return ret ? ret : count;
+	return ret ?: count;
 }
 
 static ssize_t tipd_debugfs_command_read(struct file *file, char __user *ubuf,
 					 size_t count, loff_t *ppos)
 {
 	struct tipd_debugfs_file *f = file->private_data;
-	ssize_t ret;
 
-	mutex_lock(&f->tps->lock);
+	guard(mutex)(&f->tps->lock);
 	if (!f->have_result)
-		ret = -ENODATA;
-	else
-		ret = simple_read_from_buffer(ubuf, count, ppos, f->result,
-					      sizeof(f->result));
-	mutex_unlock(&f->tps->lock);
+		return -ENODATA;
 
-	return ret;
+	return simple_read_from_buffer(ubuf, count, ppos, f->result,
+				       sizeof(f->result));
 }
 
 static const struct file_operations tipd_debugfs_command_fops = {
@@ -244,9 +235,8 @@ static ssize_t tipd_debugfs_regs_read(struct file *file, char __user *ubuf,
 	if (count > sizeof(buf))
 		return -EINVAL;
 
-	mutex_lock(&tps->lock);
-	ret = tps6598x_block_read(tps, *ppos, buf, count);
-	mutex_unlock(&tps->lock);
+	scoped_guard(mutex, &tps->lock)
+		ret = tps6598x_block_read(tps, *ppos, buf, count);
 	if (ret)
 		return ret;
 
@@ -268,10 +258,10 @@ void tipd_debugfs_register(struct tps6598x *tps)
 {
 	struct tipd_debugfs *dbg;
 
-	mutex_lock(&tipd_debugfs_root_lock);
-	if (!tipd_debugfs_root)
-		tipd_debugfs_root = debugfs_create_dir("tipd", usb_debug_root);
-	mutex_unlock(&tipd_debugfs_root_lock);
+	scoped_guard(mutex, &tipd_debugfs_root_lock) {
+		if (!tipd_debugfs_root)
+			tipd_debugfs_root = debugfs_create_dir("tipd", usb_debug_root);
+	}
 
 	dbg = kzalloc_obj(*dbg);
 	if (!dbg)
@@ -295,11 +285,11 @@ void tipd_debugfs_unregister(struct tps6598x *tps)
 	/* Waits for running file operations, later ones fail with -EIO */
 	debugfs_remove_recursive(dbg->dentry);
 
-	mutex_lock(&tps->lock);
-	if (dbg->dbma_holders)
-		tipd_debugfs_leave_dbma(tps);
-	tps->debugfs = NULL;
-	mutex_unlock(&tps->lock);
+	scoped_guard(mutex, &tps->lock) {
+		if (dbg->dbma_holders)
+			tipd_debugfs_leave_dbma(tps);
+		tps->debugfs = NULL;
+	}
 
 	kfree(dbg);
 }
