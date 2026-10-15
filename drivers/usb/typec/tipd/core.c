@@ -1539,7 +1539,7 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 	cd321x->tbt_switch = fwnode_typec_thunderbolt_switch_get(fwnode);
 	if (IS_ERR(cd321x->tbt_switch)) {
 		ret = PTR_ERR(cd321x->tbt_switch);
-		goto err_unregister_mux;
+		goto err_put_mux;
 	}
 
 	cd321x->state.alt = NULL;
@@ -1569,7 +1569,7 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 err_put_switch:
 	typec_thunderbolt_switch_put(cd321x->tbt_switch);
 	cd321x->tbt_switch = NULL;
-err_unregister_mux:
+err_put_mux:
 	fwnode_handle_put(cd321x->connector_fwnode);
 	cd321x->connector_fwnode = NULL;
 	typec_mux_put(cd321x->mux);
