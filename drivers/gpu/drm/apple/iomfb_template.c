@@ -912,8 +912,8 @@ dcpep_cb_read_edt_data(struct apple_dcp *dcp, struct dcp_read_edt_data_req *req)
 {
 	/* Observe boot-property requests without inventing firmware timings. */
 	if (dcp->fixed_connector_type != DRM_MODE_CONNECTOR_eDP)
-		dev_info(dcp->dev,
-			 "read_edt_data key=%.*s count=%u default0=%#x ret=0\n",
+		dev_dbg(dcp->dev,
+			"read_edt_data key=%.*s count=%u default0=%#x ret=0\n",
 			 (int)sizeof(req->key), req->key, req->count,
 			 req->value[0]);
 
@@ -1097,8 +1097,8 @@ static u8 dcpep_cb_prop_end(struct apple_dcp *dcp,
 			 resp, dcp->nr_modes);
 
 	if (dcp->fixed_connector_type != DRM_MODE_CONNECTOR_eDP)
-		dev_info(dcp->dev,
-			 "DCP property key=%.*s bytes=%zu accepted=%u nr_modes=%u\n",
+		dev_dbg(dcp->dev,
+			"DCP property key=%.*s bytes=%zu accepted=%u nr_modes=%u\n",
 			 (int)sizeof(req->key), req->key, dcp->chunks.length,
 			 resp, dcp->nr_modes);
 

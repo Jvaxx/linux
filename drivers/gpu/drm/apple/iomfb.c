@@ -1454,13 +1454,14 @@ int dcp_get_modes(struct drm_connector *connector)
 		dcp_consume_edid_invalidation(apple_connector);
 		if (IS_ERR_OR_NULL(edid)) {
 			/*
-			 * An internal panel has no AV service and so no EDID;
+			 * There is no AV service for an internal panel, nor
+			 * for an external display while its link is down;
 			 * do not report that on every mode probe.
 			 */
-			if (dcp_has_panel(dcp) && PTR_ERR(edid) == -ENODEV)
-				dev_dbg(dcp->dev, "no EDID source for the panel\n");
+			if (PTR_ERR(edid) == -ENODEV)
+				dev_dbg(dcp->dev, "no EDID source\n");
 			else
-				dev_info(dcp->dev, "copy_edid failed: %pe\n", edid);
+				dev_warn(dcp->dev, "copy_edid failed: %pe\n", edid);
 		} else {
 			drm_edid_free(apple_connector->drm_edid);
 			apple_connector->drm_edid = edid;
@@ -1482,7 +1483,7 @@ int dcp_get_modes(struct drm_connector *connector)
 		int update = drm_edid_connector_update(connector, apple_connector->drm_edid);
 
 		if (update) {
-			dev_info(dcp->dev, "raw EDID publication failed: %d\n", update);
+			dev_warn(dcp->dev, "raw EDID publication failed: %d\n", update);
 			dcp_clear_connector_edid(apple_connector);
 		} else {
 			apple_connector->drm_edid_firmware_derived = false;
