@@ -182,6 +182,39 @@ static void atcphy_test_update_takes_usb(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atcphy_test_update_dp(atcphy, TYPEC_DP_STATE_D), -ENODEV);
 }
 
+/* USB shutdown can turn the lanes off before the SAFE mux request arrives. */
+static struct apple_atcphy *atcphy_test_alloc_powered_off(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_dev(test, false);
+
+	atcphy->hw = &atcphy_hw_t8103;
+	atcphy->mode = APPLE_ATCPHY_MODE_OFF;
+	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
+	atcphy->typec_mode = APPLE_ATCPHY_MODE_USB3;
+	mutex_init(&atcphy->lock);
+
+	return atcphy;
+}
+
+static void atcphy_test_safe_after_poweroff(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_powered_off(test);
+	struct typec_mux_state safe = { .mode = TYPEC_STATE_SAFE };
+
+	KUNIT_EXPECT_EQ(test, atcphy_mux_update(atcphy, &safe), 0);
+	KUNIT_EXPECT_EQ(test, atcphy->typec_mode, APPLE_ATCPHY_MODE_OFF);
+	KUNIT_EXPECT_EQ(test, atcphy->pipe_state, ATCPHY_PIPEHANDLER_STATE_DUMMY);
+}
+
+/* The locked recheck must also record SAFE if shutdown raced the mode lookup. */
+static void atcphy_test_locked_safe_after_poweroff(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_powered_off(test);
+
+	KUNIT_EXPECT_EQ(test, atcphy_mux_set_locked(atcphy, APPLE_ATCPHY_MODE_OFF), 0);
+	KUNIT_EXPECT_EQ(test, atcphy->typec_mode, APPLE_ATCPHY_MODE_OFF);
+}
+
 struct atcphy_test_configure {
 	unsigned int calls;
 	unsigned int lane_requests;
@@ -220,6 +253,26 @@ static void atcphy_test_safe_live_pipe(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atcphy->pipe_state, ATCPHY_PIPEHANDLER_STATE_USB3);
 }
 
+static void atcphy_test_usb2_init_after_safe(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_powered_off(test);
+	struct typec_mux_state safe = { .mode = TYPEC_STATE_SAFE };
+	struct atcphy_test_configure config = {};
+	struct phy *phy;
+
+	phy = kunit_kzalloc(test, sizeof(*phy), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, phy);
+	phy_set_drvdata(phy, atcphy);
+	test->priv = &config;
+	kunit_activate_static_stub(test, atcphy_configure, atcphy_test_configure_stub);
+
+	KUNIT_ASSERT_EQ(test, atcphy_mux_update(atcphy, &safe), 0);
+	KUNIT_EXPECT_EQ(test, atcphy_usb2_init(phy), 0);
+	KUNIT_EXPECT_EQ(test, config.calls, 1U);
+	KUNIT_EXPECT_EQ(test, config.lane_requests, 0U);
+	KUNIT_EXPECT_EQ(test, atcphy->mode, APPLE_ATCPHY_MODE_OFF);
+}
+
 static struct kunit_case atcphy_mux_test_cases[] = {
 	KUNIT_CASE(atcphy_test_target_mode),
 	KUNIT_CASE(atcphy_test_target_mode_fixed_hub),
@@ -227,7 +280,10 @@ static struct kunit_case atcphy_mux_test_cases[] = {
 	KUNIT_CASE(atcphy_test_noop_needs_work),
 	KUNIT_CASE(atcphy_test_update_skips_usb),
 	KUNIT_CASE(atcphy_test_update_takes_usb),
+	KUNIT_CASE(atcphy_test_safe_after_poweroff),
+	KUNIT_CASE(atcphy_test_locked_safe_after_poweroff),
 	KUNIT_CASE(atcphy_test_safe_live_pipe),
+	KUNIT_CASE(atcphy_test_usb2_init_after_safe),
 	{}
 };
 
