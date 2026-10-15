@@ -422,6 +422,14 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 		if (apple_rtkit_common_rx_get_buffer(rtk, &rtk->crashlog_buffer,
 						     APPLE_RTKIT_EP_CRASHLOG, msg))
 			goto unmapped;
+		/*
+		 * In a session that went through the handshake, the first
+		 * message on this endpoint is the buffer request. Firmware may
+		 * place that buffer in memory which still holds the log of an
+		 * earlier crash, so only look for one in an inherited session.
+		 */
+		if (!rtk->crashlog_inherited)
+			return;
 		if (rtk->crashlog_buffer.size < sizeof(header))
 			goto unmapped;
 
