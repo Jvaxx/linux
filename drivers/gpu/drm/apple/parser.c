@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Copyright 2021 Alyssa Rosenzweig */
 
+#include <kunit/visibility.h>
 #include <linux/kernel.h>
 #include <linux/err.h>
 #include <linux/limits.h>
@@ -811,9 +812,6 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		out->automatic_rgb8_quirk = handle->automatic_1080p180_rgb8;
 	}
 
-	if (is_preferred)
-		*score |= (1L << 32);
-
 	if (out->sdr_rgb.score >= 0)
 		best_color_mode = out->sdr_rgb.id;
 	else if (out->sdr_444.score >= 0)
@@ -902,6 +900,7 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 
 	out->timing_mode_id = id;
 	out->color_mode_id = best_color_mode;
+	out->preferred = is_preferred;
 
 	trace_iomfb_timing_mode(handle->dcp, id, *score, horiz.active,
 				vert.active, vert.precise_sync_rate,
@@ -1008,6 +1007,19 @@ static bool dcp_180hz_ids_current(struct dcp_parse_ctx handle,
 	return matches == 1;
 }
 
+/*
+ * A timing mode that the firmware marks as preferred ranks above every mode
+ * that it does not mark; the firmware score orders the modes of each group.
+ */
+VISIBLE_IF_KUNIT bool dcp_mode_ranks_above(bool preferred, s64 score,
+					   bool best_preferred, s64 best_score)
+{
+	if (preferred != best_preferred)
+		return preferred;
+
+	return score > best_score;
+}
+
 struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 					 unsigned int *count, int width_mm,
 					 int height_mm, unsigned notch_height,
@@ -1019,6 +1031,7 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 	struct dcp_display_mode *mode, *modes;
 	struct dcp_display_mode *best_mode = NULL;
 	s64 score, best_score = -1;
+	bool best_preferred = false;
 
 	ret = iterator_begin(handle, &it, false);
 
@@ -1054,8 +1067,11 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 		/* Process a successful mode */
 		(*count)++;
 
-		if (!mode->automatic_rgb8_quirk && score > best_score) {
+		if (!mode->automatic_rgb8_quirk &&
+		    dcp_mode_ranks_above(mode->preferred, score, best_preferred,
+					 best_score)) {
 			best_score = score;
+			best_preferred = mode->preferred;
 			best_mode = mode;
 		}
 	}
