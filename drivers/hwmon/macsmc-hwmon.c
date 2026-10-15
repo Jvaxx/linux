@@ -436,6 +436,10 @@ static umode_t macsmc_hwmon_is_visible(const void *data,
 		return 0;
 	}
 
+	/* A sensor without a key could not be set up; see macsmc_hwmon_add_temp_channel(). */
+	if (!sensor->macsmc_key)
+		return 0;
+
 	/* Sensors only register ro attributes */
 	if (sensor->attrs & BIT(attr))
 		return 0444;
@@ -501,19 +505,28 @@ static int macsmc_hwmon_create_sensor(struct device *dev, struct apple_smc *smc,
 	return 0;
 }
 
-/* Account for the temperature sensor just set up at the end of @temp. */
+/*
+ * Account for the temperature sensor just set up at the end of @temp.
+ *
+ * Thermal zones refer to a temperature channel by the index of its node
+ * among the temperature-* nodes, so every node takes a channel. A sensor
+ * that could not be set up keeps its channel with no key, which hides it:
+ * hwmon creates no attributes and no thermal sensor for it, and only the
+ * zones that use it fail to register, instead of every later channel
+ * moving onto the wrong sensor.
+ */
 static void macsmc_hwmon_add_temp_channel(struct macsmc_hwmon_sensors *temp,
 					  int create_ret)
 {
-	struct macsmc_hwmon_sensor *sensor = &temp->sensors[temp->count];
+	struct macsmc_hwmon_sensor *sensor = &temp->sensors[temp->count++];
 
 	if (create_ret)
-		return;
+		memset(sensor, 0, sizeof(*sensor));
 
+	/* A zero entry would end the list of channels here. */
 	sensor->attrs = HWMON_T_INPUT;
 	if (*sensor->label)
 		sensor->attrs |= HWMON_T_LABEL;
-	temp->count++;
 }
 
 /* Discover reporting-only temperatures without a board-specific key table. */
@@ -731,6 +744,9 @@ static int macsmc_hwmon_populate_sensors(struct macsmc_hwmon *hwmon,
 			sensor = &hwmon->temp.sensors[hwmon->temp.count];
 			ret = macsmc_hwmon_create_sensor(hwmon->dev, hwmon->smc,
 							 key_node, sensor);
+			if (ret)
+				dev_warn(hwmon->dev, "%pOFn unavailable (%d), temp%u hidden\n",
+					 key_node, ret, hwmon->temp.count + 1);
 			macsmc_hwmon_add_temp_channel(&hwmon->temp, ret);
 		}
 	}
@@ -931,6 +947,10 @@ static struct platform_driver macsmc_hwmon_driver = {
 	},
 };
 module_platform_driver(macsmc_hwmon_driver);
+
+#if IS_ENABLED(CONFIG_SENSORS_MACSMC_HWMON_KUNIT_TEST)
+#include "macsmc-hwmon-test.c"
+#endif
 
 MODULE_DESCRIPTION("Apple Silicon SMC hwmon driver");
 MODULE_AUTHOR("James Calligeros <jcalligeros99@gmail.com>");
