@@ -19,6 +19,7 @@ TARGETS += devices/probe
 TARGETS += dmabuf-heaps
 TARGETS += drivers/apple
 TARGETS += drivers/dma-buf
+TARGETS += drivers/gpu/apple-dcp
 TARGETS += drivers/ntsync
 TARGETS += drivers/s390x/uvdevice
 TARGETS += drivers/net
