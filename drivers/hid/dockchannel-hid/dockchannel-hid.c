@@ -245,8 +245,11 @@ dchid_get_interface(struct dockchannel_hid *dchid, int index, const char *name)
 		firmware_managed_reset =
 			of_property_read_bool(of_node, "apple,firmware-managed-reset");
 		if (firmware_managed_reset &&
-		    (strcmp(name, "multi-touch") || power_method != DCHID_POWER_METHOD_2))
+		    (strcmp(name, "multi-touch") || power_method != DCHID_POWER_METHOD_2)) {
+			dev_err(dchid->dev, "Firmware-managed reset is not supported for %s\n",
+				name);
 			goto err_put_node;
+		}
 		if (power_method != DCHID_POWER_METHOD_1 &&
 		    power_method != DCHID_POWER_METHOD_2) {
 			dev_err(dchid->dev, "Unsupported power method %u for %s\n",
@@ -548,8 +551,8 @@ static int dchid_request_gpio(struct dchid_iface *iface)
 	if (iface->gpio)
 		return 0;
 
-	dev_info(iface->dchid->dev, "Requesting GPIO %s#%d: %s\n",
-		 iface->name, iface->gpio_id, iface->gpio_name);
+	dev_dbg(iface->dchid->dev, "Requesting GPIO %s#%d: %s\n",
+		iface->name, iface->gpio_id, iface->gpio_name);
 
 	/* A power method 2 interface holds its reset line from probe on. */
 	if (iface->power_method == DCHID_POWER_METHOD_2 &&
@@ -584,7 +587,7 @@ static int dchid_start_interface(struct dchid_iface *iface)
 		return -EINPROGRESS;
 	}
 
-	dev_info(iface->dchid->dev, "Starting interface %s\n", iface->name);
+	dev_dbg(iface->dchid->dev, "Starting interface %s\n", iface->name);
 
 	iface->starting = true;
 
@@ -604,7 +607,7 @@ static int dchid_start_interface(struct dchid_iface *iface)
 	if (fw && size) {
 
 		/* Send firmware to the device */
-		dev_info(iface->dchid->dev, "Sending firmware for %s\n", iface->name);
+		dev_dbg(iface->dchid->dev, "Sending firmware for %s\n", iface->name);
 		ret = dchid_send_firmware(iface, fw, size);
 		if (ret < 0) {
 			dev_err(iface->dchid->dev, "Failed to send %s firmware\n", iface->name);
@@ -612,7 +615,7 @@ static int dchid_start_interface(struct dchid_iface *iface)
 		}
 
 		/* After loading firmware, multi-touch needs a reset */
-		dev_info(iface->dchid->dev, "Resetting %s\n", iface->name);
+		dev_dbg(iface->dchid->dev, "Resetting %s\n", iface->name);
 		if (iface->power_method == DCHID_POWER_METHOD_2) {
 			ret = dchid_pm2_set_power(iface, DCHID_POWER_STATE_OFF);
 			if (ret < 0)
@@ -749,7 +752,7 @@ static void dchid_create_interface_work(struct work_struct *ws)
 		return;
 	}
 
-	dev_info(dchid->dev, "New interface %s\n", iface->name);
+	dev_dbg(dchid->dev, "New interface %s\n", iface->name);
 
 	/* Start the interface. This is not the entire init process, as firmware is loaded later on device open. */
 	ret = dchid_enable_interface(iface);
@@ -951,8 +954,8 @@ static void dchid_handle_init(struct dockchannel_hid *dchid, void *data, size_t 
 				dev_warn(dchid->dev, "Unterminated product name for %s\n",
 					 iface->name);
 			} else {
-				dev_info(dchid->dev, "Product name for %s: %s\n",
-					 iface->name, product);
+				dev_dbg(dchid->dev, "Product name for %s: %s\n",
+					iface->name, product);
 			}
 			break;
 		}
@@ -1011,7 +1014,7 @@ static void dchid_handle_gpio(struct dockchannel_hid *dchid, void *data, size_t 
 		goto err;
 	}
 
-	dev_info(dchid->dev, "GPIO command: %s#%d: %d\n", iface->name, cmd->gpio, cmd->cmd);
+	dev_dbg(dchid->dev, "GPIO command: %s#%d: %d\n", iface->name, cmd->gpio, cmd->cmd);
 
 	switch (cmd->cmd) {
 	case 3:
@@ -1393,7 +1396,7 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 		return -EIO;
 	}
 
-	dev_info(dchid->dev, "Initialized, awaiting packets\n");
+	dev_dbg(dchid->dev, "Initialized, awaiting packets\n");
 	platform_set_drvdata(pdev, dchid);
 	dockchannel_await(dchid->dc, dchid_handle_packet, dchid, sizeof(struct dchid_hdr));
 
