@@ -1040,11 +1040,15 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 
 	/*
 	 * Start with a worst case allocation. The count comes from firmware:
-	 * every entry needs at least a tag in what is left of the blob, and a
-	 * catalog too large to allocate fails like any other malformed one.
+	 * every entry needs at least a tag in what is left of the blob, and no
+	 * display has more timings than DCP_MAX_TIMING_MODES. The catalog is
+	 * retained once published, so reject anything larger before
+	 * allocating for it.
 	 */
 	if (it.len > (handle->len - handle->pos) / sizeof(struct dcp_parse_tag))
 		return ERR_PTR(-EINVAL);
+	if (it.len > DCP_MAX_TIMING_MODES)
+		return ERR_PTR(-E2BIG);
 	modes = kcalloc(it.len, sizeof(*modes), GFP_KERNEL | __GFP_NOWARN);
 	*count = 0;
 
