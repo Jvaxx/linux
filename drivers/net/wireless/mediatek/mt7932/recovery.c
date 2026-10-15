@@ -192,7 +192,7 @@ int mt_recovery_gate(struct mt7932 *m)
 	int ret;
 
 	/* mt_runtime_start() completed configuration before entering this stage. */
-	if (mt_transport_polled() || m->runtime_epoch)
+	if (m->runtime_epoch)
 		return -EINVAL;
 	for (i = 0; i < ARRAY_SIZE(queue_config); i++) {
 		ret = mt_request(m, 0x6b, true, true, false, queue_config[i], 32);

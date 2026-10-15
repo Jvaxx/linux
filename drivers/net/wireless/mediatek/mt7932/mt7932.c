@@ -41,22 +41,6 @@ static int mt_initialize(struct mt7932 *m);
 static int mt_probe(struct pci_dev *pdev, const struct pci_device_id *id);
 static void mt_shutdown(struct pci_dev *pdev);
 
-static bool legacy_irq_test;
-module_param(legacy_irq_test, bool, 0444);
-MODULE_PARM_DESC(legacy_irq_test, "Explicit diagnostic use of standard PCI INTx instead of MSI");
-static bool poll_test;
-module_param(poll_test, bool, 0444);
-MODULE_PARM_DESC(poll_test, "Diagnostic ROM/firmware polling with endpoint IRQ generation masked");
-static bool reset_test;
-module_param(reset_test, bool, 0444);
-MODULE_PARM_DESC(reset_test, "Qualify one FLR and fresh firmware epoch before publishing an interface, retaining old DMA");
-
-bool mt_transport_polled(void)
-{
-	return poll_test;
-}
-
-
 bool mt_rf_allowed(struct mt7932 *m)
 {
 	return !READ_ONCE(m->stopping) && READ_ONCE(m->rf_ready) && !READ_ONCE(m->reg_pending) &&
@@ -313,7 +297,7 @@ static void mt_service(struct mt7932 *m)
 	for (i = 0; i < ARRAY_SIZE(m->rx); i++)
 		if (m->rx[i].count)
 			mt_rx_drain(m, &m->rx[i]);
-	if (READ_ONCE(m->running) && !poll_test)
+	if (READ_ONCE(m->running))
 		mt_write(m, W + 0x204, m->irq_mask);
 }
 
@@ -395,22 +379,9 @@ int mt_request_ext(struct mt7932 *m, u8 cid, u8 ext, bool runtime, bool set, boo
 	m->reply_length = 0;
 	spin_unlock_irqrestore(&m->response_lock, flags);
 	ret = mt_submit(m, q, ret);
-	if (!ret && wait) {
-		if (poll_test) {
-			unsigned long deadline = jiffies + msecs_to_jiffies(5000);
-
-			do {
-				mt_service(m);
-				if (completion_done(&m->response))
-					break;
-				usleep_range(100, 200);
-			} while (time_before(jiffies, deadline));
-			if (!completion_done(&m->response))
-				ret = -ETIMEDOUT;
-		} else if (!wait_for_completion_timeout(&m->response, msecs_to_jiffies(5000))) {
-			ret = -ETIMEDOUT;
-		}
-	}
+	if (!ret && wait &&
+	    !wait_for_completion_timeout(&m->response, msecs_to_jiffies(5000)))
+		ret = -ETIMEDOUT;
 	if (READ_ONCE(m->stopping))
 		ret = -ESHUTDOWN;
 	if (ret == -ETIMEDOUT) {
@@ -504,7 +475,7 @@ static int mt_dma_setup(struct mt7932 *m)
 	u32 glo;
 
 	mt_write(m, W + 0x204, 0);
-	mt_write(m, 0x10188, poll_test ? 0 : 0xff);
+	mt_write(m, 0x10188, 0xff);
 	mt_rmw(m, W + 0x208, BIT(0) | BIT(2) | BIT(15) | BIT(21) | BIT(27) | BIT(28), 0);
 	ret = mt_poll(m, W + 0x208, BIT(1) | BIT(3), 0, 100000);
 	if (ret)
@@ -598,7 +569,7 @@ static int mt_dma_setup(struct mt7932 *m)
 	mt_write(m, W + 0x2f0, 0x8032800a);
 	mt_rmw(m, 0x2120, 0, BIT(1));
 	mt_write(m, W + 0x1f4, 0xffff);
-	mt_write(m, W + 0x204, poll_test ? 0 : IRQ_MASK);
+	mt_write(m, W + 0x204, IRQ_MASK);
 	dev_info(&m->pdev->dev, "DMA_PUBLISHED glo=%08x TX17=%pad RX0=%pad IPC=%pad\n",
 		 mt_read(m, W + 0x208), &m->tx[17].dma, &m->rx[0].dma, &m->ipc_dma);
 	return 0;
@@ -636,8 +607,8 @@ static int mt_rom_gate(struct mt7932 *m)
 		dev_info(&m->pdev->dev, "ROM_READ_OK %08x=%08x seq=%u IRQ=%llu\n",
 			 addresses[i], get_unaligned_le32(m->reply + 36), m->seq, m->interrupts);
 	}
-	dev_info(&m->pdev->dev, "ROM_TRANSPORT_OK mode=%s IRQ=%llu (no firmware download or RF yet)\n",
-		 poll_test ? "polled-test" : "interrupt", m->interrupts);
+	dev_info(&m->pdev->dev, "ROM_TRANSPORT_OK IRQ=%llu (no firmware download or RF yet)\n",
+		 m->interrupts);
 	return 0;
 }
 
@@ -1113,63 +1084,6 @@ static int mt_initialize(struct mt7932 *m)
 	return ret;
 }
 
-static int mt_reset_retained(struct mt7932 **epoch)
-{
-	struct mt7932 *old = *epoch, *fresh;
-	struct pci_dev *pdev = old->pdev;
-	int irq = pci_irq_vector(pdev, 0), ret;
-
-	/* No interface/work producers have been published at this test gate. */
-	WRITE_ONCE(old->running, false);
-	mt_write(old, W + 0x204, 0);
-	devm_free_irq(&pdev->dev, irq, old);
-	old->irq_requested = false;
-	ret = mt_ownership(old);
-	if (!ret)
-		ret = mt_dma_stop(old);
-	if (!ret)
-		ret = mt_function_reset(old);
-	if (ret)
-		return ret;
-	old->dma_owned = false;
-	if (old->module_pinned) {
-		old->module_pinned = false;
-		module_put(THIS_MODULE);
-	}
-	dev_info(&pdev->dev, "RESET_TEST: function reset complete; retaining old DMA\n");
-	fresh = devm_kzalloc(&pdev->dev, sizeof(*fresh), GFP_KERNEL);
-	if (!fresh)
-		return -ENOMEM;
-	fresh->pdev = pdev;
-	fresh->bar = old->bar;
-	fresh->irq_mask = IRQ_MASK;
-	fresh->vectors_allocated = true;
-	ether_addr_copy(fresh->mac, old->mac);
-	init_completion(&fresh->response);
-	init_completion(&fresh->cal_response);
-	init_completion(&fresh->reset_retry);
-	mutex_init(&fresh->command_mutex);
-	spin_lock_init(&fresh->response_lock);
-	*epoch = fresh;
-	pci_set_drvdata(pdev, fresh);
-	ret = mt_ownership(fresh);
-	if (ret)
-		return ret;
-	ret = mt_poll(fresh, 0xf0140, BIT(4), BIT(4), 200000);
-	if (ret)
-		return ret;
-	mt_write(fresh, W + 0x204, 0);
-	ret = devm_request_threaded_irq(&pdev->dev, irq, mt_irq, mt_irq_thread,
-					IRQF_ONESHOT | IRQF_SHARED, "mt7932", fresh);
-	if (ret)
-		return ret;
-	fresh->irq_requested = true;
-	ret = mt_initialize(fresh);
-	if (!ret)
-		dev_info(&pdev->dev, "RESET_TEST: fresh ROM and firmware gates passed\n");
-	return ret;
-}
-
 /* A failed PCI reset cannot be turned into successful removal: devres would
  * free still-owned DMA. Keep the remove callback (and therefore its device,
  * mappings and module text) alive. This explicit retry does not run hardware
@@ -1307,7 +1221,7 @@ static int mt_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (ret)
 		goto retain;
 	mt_write(m, W + 0x204, 0);
-	ret = pci_alloc_irq_vectors(pdev, 1, 1, legacy_irq_test ? PCI_IRQ_INTX : PCI_IRQ_ALL_TYPES);
+	ret = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_ALL_TYPES);
 	if (ret < 0)
 		goto retain;
 	m->vectors_allocated = true;
@@ -1338,8 +1252,6 @@ static int mt_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 				 irq->chip->name, irq->hwirq);
 	}
 	ret = mt_initialize(m);
-	if (!ret && reset_test)
-		ret = mt_reset_retained(&m);
 	if (!ret)
 		ret = mt_register_regulatory_gate(m);
 	if (!ret)
