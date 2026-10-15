@@ -563,7 +563,8 @@ apple_cio_pcie_tunnel_is_preinitialized(struct device_node *parent)
 					  &status) && status == 1)
 			return true;
 		/* t8103 brings the port up itself. */
-		if (of_property_read_bool(child, "apple,pciec-kernel-init"))
+		if (of_device_is_compatible(child, "apple,t8103-pciec") &&
+		    of_property_read_bool(child, "apple,pciec-kernel-init"))
 			return true;
 		/* T600x/T602x without a handoff, when opted in. */
 		return apple_pcie_tunnel_needs_cold_init(child);
