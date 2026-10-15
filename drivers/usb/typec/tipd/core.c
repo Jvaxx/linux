@@ -1037,7 +1037,7 @@ retry:
 	cd321x_retry_revalidation(cd321x, true);
 }
 
-static void cd321x_suspend_prepare(struct tps6598x *tps)
+static void cd321x_prepare(struct tps6598x *tps)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
 
@@ -1050,7 +1050,7 @@ static void cd321x_suspend_prepare(struct tps6598x *tps)
 	cancel_delayed_work_sync(&cd321x->update_work);
 }
 
-static void cd321x_resume_reverify(struct tps6598x *tps)
+static void cd321x_complete(struct tps6598x *tps)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
 
@@ -2300,8 +2300,8 @@ int tipd_prepare(struct device *dev)
 {
 	struct tps6598x *tps = dev_get_drvdata(dev);
 
-	if (tps->data->suspend_prepare)
-		tps->data->suspend_prepare(tps);
+	if (tps->data->prepare)
+		tps->data->prepare(tps);
 
 	return 0;
 }
@@ -2312,8 +2312,8 @@ void tipd_complete(struct device *dev)
 {
 	struct tps6598x *tps = dev_get_drvdata(dev);
 
-	if (tps->data->resume_reverify)
-		tps->data->resume_reverify(tps);
+	if (tps->data->complete)
+		tps->data->complete(tps);
 }
 EXPORT_SYMBOL_GPL(tipd_complete);
 
@@ -2335,8 +2335,8 @@ static const struct tipd_data tipd_cd321x_data = {
 	.reset = cd321x_reset,
 	.switch_power_state = cd321x_switch_power_state,
 	.connect = cd321x_connect,
-	.suspend_prepare = cd321x_suspend_prepare,
-	.resume_reverify = cd321x_resume_reverify,
+	.prepare = cd321x_prepare,
+	.complete = cd321x_complete,
 };
 
 static const struct tipd_data tipd_tps6598x_data = {
@@ -2393,8 +2393,8 @@ static const struct tipd_data tipd_sn201202x_data = {
 	.reset = cd321x_reset,
 	.switch_power_state = cd321x_switch_power_state,
 	.connect = cd321x_connect,
-	.suspend_prepare = cd321x_suspend_prepare,
-	.resume_reverify = cd321x_resume_reverify,
+	.prepare = cd321x_prepare,
+	.complete = cd321x_complete,
 };
 
 const struct tipd_data *tipd_hw_variants[] = {

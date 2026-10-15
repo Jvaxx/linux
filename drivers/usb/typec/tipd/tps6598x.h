@@ -319,8 +319,8 @@ struct tipd_data {
 	bool (*read_data_status)(struct tps6598x *tps);
 	int (*reset)(struct tps6598x *tps);
 	int (*connect)(struct tps6598x *tps, u32 status);
-	void (*suspend_prepare)(struct tps6598x *tps);
-	void (*resume_reverify)(struct tps6598x *tps);
+	void (*prepare)(struct tps6598x *tps);
+	void (*complete)(struct tps6598x *tps);
 };
 
 struct tps6598x {
