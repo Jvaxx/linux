@@ -71,11 +71,17 @@ void mt_rf_fail_locked(struct mt7932 *m, int error)
 		complete_all(&m->assoc_done);
 		complete_all(&m->discovery_done);
 	} else if (m->connected) {
-		/* Hardware ownership is uncertain: report failure, retain the peer. */
+		/* Hardware ownership is uncertain: report failure, retain the peer.
+		 * A connect worker still publishing the connection reports this
+		 * after it, so that cfg80211 sees the two in order.
+		 */
 		m->connected = false;
 		m->disconnecting = true;
-		cfg80211_disconnected(m->netdev, WLAN_REASON_UNSPECIFIED,
-				      NULL, 0, true, GFP_ATOMIC);
+		if (m->connect_publishing)
+			m->connect_lost = true;
+		else
+			cfg80211_disconnected(m->netdev, WLAN_REASON_UNSPECIFIED,
+					      NULL, 0, true, GFP_ATOMIC);
 	}
 	if (m->scan_request) {
 		m->scan_aborted = true;
@@ -390,7 +396,8 @@ void mt_connect_work(struct work_struct *work)
 	struct cfg80211_connect_resp_params response = {};
 	u8 *body, mac[8] = {}, queue[32];
 	unsigned long flags;
-	bool submitted = false, peer_owned = false;
+	bool submitted = false, peer_owned = false, cancelled;
+	u16 reason;
 	int ret;
 
 	mutex_lock(&m->command_mutex);
@@ -506,7 +513,10 @@ report:
 	}
 	/* Serialize the final outcome with cancellation. In particular, a late
 	 * firmware success must not publish carrier/authorization after .deauth.
-	 * cfg80211 queues these notifications; GFP_ATOMIC keeps this IRQ-safe.
+	 * The cfg80211 calls may take bottom-half locks, so they are made after
+	 * response_lock is dropped. command_mutex keeps the disconnect worker,
+	 * which retires the connection before reporting its end, behind them;
+	 * an RF failure in the meantime leaves its report to this worker.
 	 */
 	spin_lock_irqsave(&m->response_lock, flags);
 	if (!ret && (m->connect_error || !mt_rf_allowed(m))) {
@@ -546,33 +556,49 @@ report:
 	}
 	m->connected = !ret;
 	m->disconnecting = false;
-	if (m->connect_cancelled) {
-		if (response.links[0].bss)
-			cfg80211_put_bss(m->wiphy, response.links[0].bss);
-		cfg80211_disconnected(m->netdev, m->disconnect_reason, NULL, 0, true, GFP_ATOMIC);
-	} else {
-		cfg80211_connect_done(m->netdev, &response, GFP_ATOMIC);
-	}
+	cancelled = m->connect_cancelled;
+	reason = m->disconnect_reason;
+	m->connect_publishing = true;
 	if (!ret) {
 		schedule_work(&m->power_work);
 		if (READ_ONCE(m->data_ready)) {
 			netif_carrier_on(m->netdev);
 			netif_wake_queue(m->netdev);
 		}
-		if (m->connect_open) {
-			dev_dbg(&m->pdev->dev,
-				"OPEN_CONNECTED: owned peer, firmware completion; Ethernet=%u\n",
-				m->data_ready);
-		} else {
-			cfg80211_port_authorized(m->netdev, m->connect_bssid, NULL, 0, GFP_ATOMIC);
-			dev_dbg(&m->pdev->dev,
-				"WPA2_AUTHORIZED: firmware handshake complete; Ethernet=%u\n",
-				m->data_ready);
-		}
-	} else {
-		dev_err(&m->pdev->dev, "CONNECT_FAILED: %d; recovery-required=%u\n", ret, m->link_failed);
 	}
 	spin_unlock_irqrestore(&m->response_lock, flags);
+
+	if (cancelled) {
+		if (response.links[0].bss)
+			cfg80211_put_bss(m->wiphy, response.links[0].bss);
+		cfg80211_disconnected(m->netdev, reason, NULL, 0, true, GFP_KERNEL);
+	} else {
+		cfg80211_connect_done(m->netdev, &response, GFP_KERNEL);
+	}
+	if (!ret && !m->connect_open)
+		cfg80211_port_authorized(m->netdev, m->connect_bssid, NULL, 0, GFP_KERNEL);
+
+	spin_lock_irqsave(&m->response_lock, flags);
+	m->connect_publishing = false;
+	if (m->connect_lost) {
+		m->connect_lost = false;
+		cfg80211_disconnected(m->netdev, WLAN_REASON_UNSPECIFIED,
+				      NULL, 0, true, GFP_ATOMIC);
+	}
+	spin_unlock_irqrestore(&m->response_lock, flags);
+	if (!ret && m->connect_open)
+		dev_dbg(&m->pdev->dev,
+			"OPEN_CONNECTED: owned peer, firmware completion; Ethernet=%u\n",
+			READ_ONCE(m->data_ready));
+	else if (!ret)
+		dev_dbg(&m->pdev->dev,
+			"WPA2_AUTHORIZED: firmware handshake complete; Ethernet=%u\n",
+			READ_ONCE(m->data_ready));
+	else if (cancelled)
+		dev_dbg(&m->pdev->dev, "CONNECT_CANCELLED: %d\n", ret);
+	else
+		dev_err(&m->pdev->dev, "CONNECT_FAILED: %d; recovery-required=%u\n",
+			ret, READ_ONCE(m->link_failed));
 	mutex_unlock(&m->command_mutex);
 }
 
