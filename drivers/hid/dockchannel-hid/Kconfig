@@ -16,7 +16,7 @@ config HID_DOCKCHANNEL
 
 config HID_DOCKCHANNEL_KUNIT_TEST
 	tristate "KUnit tests for the DockChannel HID protocol helpers" if !KUNIT_ALL_TESTS
-	depends on KUNIT && APPLE_DOCKCHANNEL
+	depends on KUNIT && HID_DOCKCHANNEL
 	default KUNIT_ALL_TESTS
 	help
 	  Build the KUnit tests for the DockChannel HID protocol helpers,
