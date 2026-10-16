@@ -191,6 +191,7 @@ int dptxport_set_hpd_timeout(struct apple_epic_service *service, bool hpd,
 			     unsigned int timeout_ms)
 {
 	struct dcpdptx_hotplug_cmd cmd, resp;
+	size_t received;
 	int ret;
 
 	memset(&cmd, 0, sizeof(cmd));
@@ -198,10 +199,18 @@ int dptxport_set_hpd_timeout(struct apple_epic_service *service, bool hpd,
 	if (hpd)
 		cmd.unk = cpu_to_le32(1);
 
-	ret = afk_service_call_timeout(service, 8, 8, &cmd, sizeof(cmd), 12,
-				       &resp, sizeof(resp), 12, timeout_ms);
+	ret = afk_service_call_timeout_len(service, 8, 8, &cmd, sizeof(cmd), 12,
+					   &resp, sizeof(resp), 12, timeout_ms,
+					   &received);
 	if (ret)
 		return ret;
+	/* Past the end of a short reply there is only zero fill, not an echo. */
+	if (received < sizeof(resp)) {
+		dev_warn(service->ep->dcp->dev,
+			 "set_hpd: short reply, %zu of %zu bytes (sent hpd=%d)\n",
+			 received, sizeof(resp), hpd);
+		return -EPROTO;
+	}
 	if (le32_to_cpu(resp.unk) != hpd) {
 		dev_warn(service->ep->dcp->dev,
 			 "set_hpd: unk reply 0x%x (sent hpd=%d)\n",

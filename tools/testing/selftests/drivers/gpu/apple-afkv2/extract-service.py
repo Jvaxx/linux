@@ -6,7 +6,7 @@ import re
 import sys
 
 source = pathlib.Path(sys.argv[1]).read_text()
-match = re.search(r"static int afk_service_call_timeout_len\([^;]*?\)\n\{", source)
+match = re.search(r"^int afk_service_call_timeout_len\([^;]*?\)\n\{", source, re.M)
 if not match:
     raise RuntimeError("production service-call definition not found")
 start = match.start()
@@ -25,6 +25,7 @@ prefix = r'''
 #define kzalloc(n,f) calloc(1,n)
 #define kfree(p) free(p)
 #define max(a,b) ((a)>(b)?(a):(b))
+#define min(a,b) ((a)<(b)?(a):(b))
 #define cpu_to_le16(x) (x)
 #define cpu_to_le32(x) (x)
 #define le16_to_cpu(x) (x)

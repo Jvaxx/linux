@@ -1827,12 +1827,6 @@ int afk_service_call(struct apple_epic_service *service, u16 group, u32 command,
 					output_pad, MSEC_PER_SEC);
 }
 
-static int afk_service_call_timeout_len(struct apple_epic_service *service, u16 group,
-					u32 command, const void *data, size_t data_len,
-					size_t data_pad, void *output, size_t output_len,
-					size_t output_pad, unsigned int timeout_ms,
-					size_t *received);
-
 int afk_service_call_len(struct apple_epic_service *service, u16 group,
 			 u32 command, const void *data, size_t data_len,
 			 size_t data_pad, void *output, size_t output_len,
@@ -1853,11 +1847,11 @@ int afk_service_call_timeout(struct apple_epic_service *service, u16 group,
 					    timeout_ms, NULL);
 }
 
-static int afk_service_call_timeout_len(struct apple_epic_service *service, u16 group,
-					u32 command, const void *data, size_t data_len,
-					size_t data_pad, void *output, size_t output_len,
-					size_t output_pad, unsigned int timeout_ms,
-					size_t *received)
+int afk_service_call_timeout_len(struct apple_epic_service *service, u16 group,
+				 u32 command, const void *data, size_t data_len,
+				 size_t data_pad, void *output, size_t output_len,
+				 size_t output_pad, unsigned int timeout_ms,
+				 size_t *received)
 {
 	struct epic_service_call *call;
 	size_t wire_received = 0, result_size;
@@ -1910,11 +1904,12 @@ static int afk_service_call_timeout_len(struct apple_epic_service *service, u16 
 		goto out;
 	}
 	if (received) {
+		/* The reply may use the padding reserved after the output. */
 		ret = afkv2_service_reply_size(bfr, wire_received, group, command,
-					       output_len, &result_size);
+					       output_len + output_pad, &result_size);
 		if (ret)
 			goto out;
-		*received = result_size;
+		*received = min(result_size, output_len);
 	}
 	if (le32_to_cpu(call->magic) != EPIC_SERVICE_CALL_MAGIC ||
 	    le16_to_cpu(call->group) != group ||
