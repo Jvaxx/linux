@@ -2415,8 +2415,6 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 
 	/* Released by apple_nvme_free_ctrl(), including asynchronous users. */
 	kref_get(&anv->ref);
-	if (anv->hw->has_lsq_nvmmu)
-		anv->ctrl.crypto_profile = &anv->crypto_profile;
 
 	if (anv->hw->has_lsq_nvmmu)
 		anv->ctrl.crypto_profile = &anv->crypto_profile;

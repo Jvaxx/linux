@@ -50,8 +50,6 @@ properties:
       Channels are reporting-only; their indices depend on the firmware and
       must not be used by a static thermal policy.
 
-  apple,cpu-thermal-policy:
-    type: boolean
   "#thermal-sensor-cells":
     const: 1
     description:
@@ -88,7 +86,6 @@ patternProperties:
         pattern: "^[A-Za-z0-9]{4}$"
         description: Writeable key to enable/disable manual fan control
 
-
   "^power-[A-Za-z0-9]{4}$":
     $ref: "#/$defs/sensor"
     unevaluatedProperties: false
@@ -106,8 +103,6 @@ allOf:
       required:
         - apple,discover-temperatures
     then:
-      properties:
-        apple,cpu-thermal-policy: false
       patternProperties:
         "^temperature-": false
 

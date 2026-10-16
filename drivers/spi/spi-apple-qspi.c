@@ -7,11 +7,15 @@
  * command FIFO. This driver intentionally implements the PIO spi-mem path
  * only; that is sufficient for SPI NOR discovery and access.
  *
- * The boot NOR also holds iBoot and the system configuration, so the driver
- * starts read-only: only identification, status and read opcodes reach the
- * controller unless root explicitly clears read_only at runtime. Even then, only
- * bounded J613 NVRAM page programs and 4 KiB erases are admitted.
- * A power loss can interrupt a NOR update within the admitted range.
+ * On T8122 and T8132 the boot NOR also holds iBoot and the system
+ * configuration, so those controllers start read-only: only identification,
+ * status and read opcodes reach the controller unless root explicitly clears
+ * read_only at runtime. Even then, only bounded J613 NVRAM page programs and
+ * 4 KiB erases are admitted. A power loss can interrupt a NOR update within
+ * the admitted range.
+ *
+ * T8140 keeps unrestricted spi-mem access with dual and quad transfers; the
+ * read_only policy does not apply to it.
  */
 
 #include <linux/bitfield.h>
@@ -25,6 +29,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/of_device.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/spi/spi.h>
@@ -128,7 +133,7 @@ static const struct kernel_param_ops apple_qspi_read_only_ops = {
 	.get = apple_qspi_get_read_only,
 };
 module_param_cb(read_only, &apple_qspi_read_only_ops, &read_only, 0644);
-MODULE_PARM_DESC(read_only, "Default true; root runtime opt-in for bounded J613 NVRAM writes");
+MODULE_PARM_DESC(read_only, "Default true; root runtime opt-in for bounded J613 NVRAM writes (T8122/T8132 only)");
 
 static bool apple_qspi_opcode_is_read(u8 opcode)
 {
@@ -151,7 +156,47 @@ static bool apple_qspi_opcode_is_read(u8 opcode)
 	}
 }
 
+/* Per-compatible controller behaviour. */
+struct apple_qspi_hw {
+	/*
+	 * Gate requests through the read_only/J613 NVRAM write policy. Without
+	 * it, every supported spi-mem operation reaches the controller.
+	 */
+	bool nvram_policy;
+	/*
+	 * Send TX-only operations as one payload stream: zero header counts and
+	 * a length word that covers opcode, address and data. Otherwise the
+	 * length word carries only the data length and the descriptor counts the
+	 * opcode and address bytes.
+	 */
+	bool tx_single_stream;
+	/* Advertise dual and quad transfers to spi-mem. */
+	bool multi_io;
+	/*
+	 * Service the FIFOs by microsecond polling instead of once per jiffy
+	 * while waiting for a transfer to complete.
+	 */
+	bool us_poll;
+	/* Refuse a requested clock below the divider range instead of clamping. */
+	bool exact_clock;
+	/* Report the controller at probe at debug level only. */
+	bool quiet_probe;
+};
+
+static const struct apple_qspi_hw apple_qspi_t8122_hw = {
+	.nvram_policy = true,
+	.tx_single_stream = true,
+};
+
+static const struct apple_qspi_hw apple_qspi_t8140_hw = {
+	.multi_io = true,
+	.us_poll = true,
+	.exact_clock = true,
+	.quiet_probe = true,
+};
+
 struct apple_qspi {
+	const struct apple_qspi_hw *hw;
 	/* Only the pinned J613 controller/partition may opt in. */
 	bool nvram_write_candidate;
 	bool write_fault;
@@ -424,10 +469,14 @@ static int apple_qspi_set_frequency(struct apple_qspi *qspi,
 		return -EINVAL;
 
 	divisor = DIV_ROUND_UP(input, requested);
-	/* Never exceed the requested clock when it is below our range. */
-	if (divisor > 256)
-		return -EINVAL;
-	divisor = max_t(u32, divisor, 2);
+	if (qspi->hw->exact_clock) {
+		/* Never exceed the requested clock when it is below our range. */
+		if (divisor > 256)
+			return -EINVAL;
+		divisor = max_t(u32, divisor, 2);
+	} else {
+		divisor = clamp_t(u32, divisor, 2, 256);
+	}
 	apple_qspi_c_write(qspi, APPLE_QSPI_C_CLKDIV, divisor - 1);
 	return 0;
 }
@@ -452,9 +501,55 @@ static bool apple_qspi_poll_complete(struct apple_qspi *qspi)
 	       try_wait_for_completion(&qspi->done);
 }
 
+static bool apple_qspi_wait_complete_tick(struct apple_qspi *qspi)
+{
+	unsigned long deadline = jiffies +
+		msecs_to_jiffies(APPLE_QSPI_TIMEOUT_MS);
+	unsigned long flags;
+	u32 p_status, c_status;
+
+	do {
+		if (try_wait_for_completion(&qspi->done))
+			return true;
+
+		/*
+		 * TX-only commands do not reliably raise the wired interrupt on
+		 * T8140, although the completion bit is latched in the controller.
+		 * Poll both status banks as a fallback and service the FIFOs so a
+		 * page program larger than the TX FIFO can continue making progress.
+		 */
+		p_status = apple_qspi_p_read(qspi, APPLE_QSPI_P_IRQ_STATUS);
+		c_status = apple_qspi_c_read(qspi, APPLE_QSPI_C_IRQ_STATUS);
+		if (p_status)
+			apple_qspi_p_write(qspi, APPLE_QSPI_P_IRQ_STATUS, p_status);
+		if (c_status)
+			apple_qspi_c_write(qspi, APPLE_QSPI_C_IRQ_STATUS, c_status);
+
+		spin_lock_irqsave(&qspi->lock, flags);
+		if (qspi->active) {
+			apple_qspi_drain_rx(qspi);
+			apple_qspi_fill_tx(qspi);
+		}
+		spin_unlock_irqrestore(&qspi->lock, flags);
+
+		if (c_status & APPLE_QSPI_C_IRQ_COMPLETE)
+			return true;
+		if (time_after_eq(jiffies, deadline))
+			break;
+
+		if (wait_for_completion_timeout(&qspi->done, 1))
+			return true;
+	} while (time_before(jiffies, deadline));
+
+	return false;
+}
+
 static bool apple_qspi_wait_complete(struct apple_qspi *qspi)
 {
 	bool finished;
+
+	if (!qspi->hw->us_poll)
+		return apple_qspi_wait_complete_tick(qspi);
 
 	/*
 	 * T8140 can latch completion without delivering the wired IRQ, and
@@ -480,7 +575,7 @@ static int apple_qspi_transfer_op(struct spi_mem *mem,
 	u32 descriptor, mode;
 	u32 p_status, c_status;
 	int ret, retries;
-	bool complete;
+	bool complete, tx_stream;
 
 	ret = apple_qspi_shape_op(op, &shape);
 	if (ret)
@@ -517,10 +612,13 @@ static int apple_qspi_transfer_op(struct spi_mem *mem,
 	mode = apple_qspi_width_mode(shape.width);
 	if (op->data.dir == SPI_MEM_DATA_IN)
 		mode |= APPLE_QSPI_CMD_RX;
-	/* TX-only transfers contain the opcode, address and payload in one
-	 * byte stream. RX transfers keep the read header separate from data.
+	/* On tx_single_stream controllers, TX-only transfers contain the
+	 * opcode, address and payload in one byte stream. RX transfers keep the
+	 * read header separate from data.
 	 */
-	if (op->data.dir != SPI_MEM_DATA_IN) {
+	tx_stream = qspi->hw->tx_single_stream &&
+		    op->data.dir != SPI_MEM_DATA_IN;
+	if (tx_stream) {
 		shape.shared_count = 0;
 		shape.multi_count = 0;
 	}
@@ -548,7 +646,7 @@ static int apple_qspi_transfer_op(struct spi_mem *mem,
 	qspi->active = true;
 	apple_qspi_p_write(qspi, APPLE_QSPI_P_TXFIFO, descriptor);
 	apple_qspi_p_write(qspi, APPLE_QSPI_P_TXFIFO,
-			   op->data.dir == SPI_MEM_DATA_IN ? op->data.nbytes : tx_len);
+			   tx_stream ? tx_len : op->data.nbytes);
 	apple_qspi_fill_tx(qspi);
 	spin_unlock_irqrestore(&qspi->lock, flags);
 
@@ -802,10 +900,20 @@ out:
 	return ret;
 }
 
+/* Controllers without the NVRAM policy pass every supported request through. */
+static int apple_qspi_mem_exec_op(struct spi_mem *mem, const struct spi_mem_op *op)
+{
+	struct apple_qspi *qspi = spi_controller_get_devdata(mem->spi->controller);
+
+	if (!qspi->hw->nvram_policy)
+		return apple_qspi_transfer_op(mem, op);
+	return apple_qspi_exec_op(mem, op);
+}
+
 static const struct spi_controller_mem_ops apple_qspi_mem_ops = {
 	.adjust_op_size = apple_qspi_adjust_op_size,
 	.supports_op = apple_qspi_supports_op,
-	.exec_op = apple_qspi_exec_op,
+	.exec_op = apple_qspi_mem_exec_op,
 };
 
 /* Require the pinned partition, aperture and single physical chip select. */
@@ -858,6 +966,9 @@ static int apple_qspi_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	qspi = spi_controller_get_devdata(ctlr);
+	qspi->hw = of_device_get_match_data(dev);
+	if (!qspi->hw)
+		return -ENODEV;
 	qspi->nvram_write_candidate = of_device_is_compatible(dev->of_node, "apple,t8122-qspi");
 	if (qspi->nvram_write_candidate && !of_machine_is_compatible("apple,j613"))
 		return -ENODEV;
@@ -871,7 +982,9 @@ static int apple_qspi_probe(struct platform_device *pdev)
 
 	qspi->nvram_write_candidate &= res->start == 0x2a1118000ULL &&
 		apple_qspi_nvram_layout(dev->of_node);
-	dev_info(dev, "NVRAM layout candidate: %u\n", qspi->nvram_write_candidate);
+	if (qspi->hw->nvram_policy)
+		dev_info(dev, "NVRAM layout candidate: %u\n",
+			 qspi->nvram_write_candidate);
 	qspi->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(qspi->base))
 		return PTR_ERR(qspi->base);
@@ -905,10 +1018,16 @@ static int apple_qspi_probe(struct platform_device *pdev)
 				     qspi->tx_depth, qspi->rx_depth);
 	apple_qspi_init_config(qspi);
 
-	/* Keep QE and every other flash configuration bit untouched. */
+	/*
+	 * Without multi_io, single-wire modes keep QE and every other flash
+	 * configuration bit untouched.
+	 */
 	ctlr->num_chipselect = 1;
 	ctlr->max_native_cs = 1;
 	ctlr->mode_bits = SPI_CPHA | SPI_CPOL;
+	if (qspi->hw->multi_io)
+		ctlr->mode_bits |= SPI_RX_DUAL | SPI_RX_QUAD |
+				   SPI_TX_DUAL | SPI_TX_QUAD;
 	ctlr->bits_per_word_mask = SPI_BPW_MASK(8);
 	ctlr->mem_ops = &apple_qspi_mem_ops;
 
@@ -922,9 +1041,14 @@ static int apple_qspi_probe(struct platform_device *pdev)
 	runtime_ready = true;
 	mutex_unlock(&apple_qspi_policy_lock);
 	version = apple_qspi_p_read(qspi, APPLE_QSPI_P_VERSION);
-	dev_info(dev, "QSPIMC version %#x, %lu Hz clock, txq=%u rxq=%u%s\n",
-		 version, clk_get_rate(qspi->clk), qspi->tx_depth,
-		 qspi->rx_depth, read_only ? ", read-only" : "");
+	if (qspi->hw->quiet_probe)
+		dev_dbg(dev, "QSPIMC version %#x, %lu Hz clock, txq=%u rxq=%u\n",
+			version, clk_get_rate(qspi->clk), qspi->tx_depth,
+			qspi->rx_depth);
+	else
+		dev_info(dev, "QSPIMC version %#x, %lu Hz clock, txq=%u rxq=%u%s\n",
+			 version, clk_get_rate(qspi->clk), qspi->tx_depth,
+			 qspi->rx_depth, read_only ? ", read-only" : "");
 	return 0;
 }
 
@@ -984,9 +1108,9 @@ static struct attribute *apple_qspi_attrs[] = {
 ATTRIBUTE_GROUPS(apple_qspi);
 
 static const struct of_device_id apple_qspi_of_match[] = {
-	{ .compatible = "apple,t8122-qspi" },
-	{ .compatible = "apple,t8132-qspi" },
-	{ .compatible = "apple,t8140-qspi" },
+	{ .compatible = "apple,t8122-qspi", .data = &apple_qspi_t8122_hw },
+	{ .compatible = "apple,t8132-qspi", .data = &apple_qspi_t8122_hw },
+	{ .compatible = "apple,t8140-qspi", .data = &apple_qspi_t8140_hw },
 	{}
 };
 MODULE_DEVICE_TABLE(of, apple_qspi_of_match);
