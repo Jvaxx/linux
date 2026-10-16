@@ -157,13 +157,9 @@ static ssize_t disable_store(struct device *dev, struct device_attribute *attr,
 	 * in transition. Keeping it off takes the port over from the driver,
 	 * which then leaves it off.
 	 */
-	if (port_dev->held_off) {
-		if (!disabled) {
-			rc = -EBUSY;
-			goto out_hdev_lock;
-		}
-		port_dev->held_off = false;
-		pm_runtime_put(&port_dev->dev);
+	if (port_dev->held_off && !disabled) {
+		rc = -EBUSY;
+		goto out_hdev_lock;
 	}
 
 	if (disabled && port_dev->child)
@@ -180,6 +176,10 @@ static ssize_t disable_store(struct device *dev, struct device_attribute *attr,
 
 	if (!rc) {
 		port_dev->disabled = disabled;
+		if (port_dev->held_off) {
+			port_dev->held_off = false;
+			pm_runtime_put(&port_dev->dev);
+		}
 		rc = count;
 	}
 
