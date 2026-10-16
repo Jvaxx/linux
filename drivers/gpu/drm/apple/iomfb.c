@@ -19,6 +19,7 @@
 #include <linux/soc/apple/rtkit.h>
 #include <linux/unaligned.h>
 
+#include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_drv.h>
 #include <drm/drm_edid.h>
@@ -623,6 +624,14 @@ void dcp_push(struct apple_dcp *dcp, bool oob, const struct dcp_method_entry *ca
 {
 	struct dcp_method_entry resolved = *call;
 
+#if IS_ENABLED(CONFIG_DRM_APPLE_KUNIT_TEST)
+	/* A KUnit test answers for the firmware. */
+	if (dcp->test_push) {
+		dcp->test_push(dcp, call, cb, cookie);
+		return;
+	}
+#endif
+
 	/* Reply chains stay on the serialized receiver; callers enqueue copies. */
 	if (iomfb_uses_queue(dcp) && READ_ONCE(dcp->iomfb.owner) != current) {
 		if (iomfb_queue_command(dcp, oob, call, in_len, out_len,
@@ -838,6 +847,7 @@ dcp_announce_eval(struct apple_dcp *dcp, struct apple_connector *connector,
 		.connected = READ_ONCE(connector->connected),
 		.present = !READ_ONCE(dcp->external_physically_absent),
 		.failed = READ_ONCE(dcp->external_error) || READ_ONCE(dcp->crashed),
+		.lost = dcp_announce_lost(a, dcp->typec_generation),
 	};
 	enum dcp_announce_status status;
 	unsigned long now = jiffies;
@@ -913,12 +923,174 @@ bool dcp_connector_connected(struct apple_connector *connector)
 	return dcp->announce.announced;
 }
 
+/* The CRTC userspace keeps active on @connector while its link is down. */
+static struct drm_crtc *dcp_external_unlinked_crtc(struct apple_dcp *dcp,
+						   struct apple_connector *connector)
+{
+	struct drm_connector_state *conn_state = connector->base.state;
+	struct drm_crtc *crtc = conn_state ? conn_state->crtc : NULL;
+
+	drm_modeset_lock_assert_held(&connector->base.dev->mode_config.connection_mutex);
+	if (!crtc || !crtc->state || !crtc->state->active ||
+	    READ_ONCE(dcp->mode_state.valid))
+		return NULL;
+	return crtc;
+}
+
+static bool dcp_external_needs_relink(struct apple_dcp *dcp,
+				      struct apple_connector *connector)
+{
+	struct drm_device *dev = connector->base.dev;
+	struct drm_modeset_acquire_ctx ctx;
+	bool unlinked = false;
+	int ret;
+
+	DRM_MODESET_LOCK_ALL_BEGIN(dev, ctx, 0, ret);
+	unlinked = !!dcp_external_unlinked_crtc(dcp, connector);
+	DRM_MODESET_LOCK_ALL_END(dev, ctx, ret);
+
+	return unlinked;
+}
+
+/* Commit @crtc with its mode set again and the link of @connector good. */
+static int dcp_external_commit_relink(struct apple_connector *connector,
+				      struct drm_crtc *crtc,
+				      struct drm_modeset_acquire_ctx *ctx)
+{
+	struct drm_connector_state *conn_state;
+	struct drm_crtc_state *crtc_state;
+	struct drm_atomic_commit *state;
+	int ret;
+
+	state = drm_atomic_commit_alloc(crtc->dev);
+	if (!state)
+		return -ENOMEM;
+	state->acquire_ctx = ctx;
+	crtc_state = drm_atomic_get_crtc_state(state, crtc);
+	if (IS_ERR(crtc_state)) {
+		ret = PTR_ERR(crtc_state);
+		goto out;
+	}
+	conn_state = drm_atomic_get_connector_state(state, &connector->base);
+	if (IS_ERR(conn_state)) {
+		ret = PTR_ERR(conn_state);
+		goto out;
+	}
+	crtc_state->connectors_changed = true;
+	conn_state->link_status = DRM_LINK_STATUS_GOOD;
+	ret = drm_atomic_commit(state);
+out:
+	drm_atomic_commit_put(state);
+
+	return ret;
+}
+
+/*
+ * Set the mode of the CRTC userspace keeps active on @connector again.  If
+ * that fails, or leaves the link down, mark the link bad and lose the
+ * connection of cable generation @generation.  Both are decided under the
+ * modeset locks, so a CRTC that userspace switches off is either switched
+ * off first and left alone, or found lost by dcp_external_crtc_released().
+ *
+ * Returns the error that lost the connection, or 0.
+ */
+static int dcp_external_reset_crtc(struct apple_dcp *dcp,
+				   struct apple_connector *connector, u64 generation)
+{
+	struct drm_device *dev = connector->base.dev;
+	struct drm_modeset_acquire_ctx ctx;
+	struct drm_crtc *crtc;
+	int ret, err = 0;
+
+	DRM_MODESET_LOCK_ALL_BEGIN(dev, ctx, 0, ret);
+
+	err = 0;
+	crtc = dcp_external_unlinked_crtc(dcp, connector);
+	if (!crtc)
+		goto unlock;
+	ret = dcp_external_commit_relink(connector, crtc, &ctx);
+	if (ret == -EDEADLK)
+		goto unlock;
+	if (!ret && READ_ONCE(dcp->mode_state.valid))
+		goto unlock;
+
+	err = ret ?: -EIO;
+	ret = 0;
+	scoped_guard(mutex, &dcp->hpd_mutex) {
+		if (generation == dcp->typec_generation) {
+			connector->base.state->link_status = DRM_LINK_STATUS_BAD;
+			dcp_announce_lose(&dcp->announce, generation);
+			/* The caller's event is the one this owes. */
+			dcp_announce_notify(&dcp->announce,
+					    dcp_announce_eval(dcp, connector, false));
+		} else {
+			/* A newer connection gets a link of its own. */
+			err = 0;
+		}
+	}
+unlock:
+	DRM_MODESET_LOCK_ALL_END(dev, ctx, ret);
+
+	return ret ?: err;
+}
+
+/*
+ * The link of an external display came back, or was disturbed, under a CRTC
+ * that userspace keeps active.  Userspace sees the display it had and need
+ * not set its mode again, so set it here.  A mode that needs its link
+ * proven, such as the 180 Hz exception mode, is admitted only against the
+ * EDID a probe read for the current cable generation (see
+ * dcp_180hz_mode_current()), so probe first, as userspace would.
+ *
+ * A link that cannot be set up again is marked bad, and the connection is
+ * lost: reported gone until userspace releases the CRTC, see
+ * dcp-announce.h.  The caller sends the hotplug event.
+ */
+static void dcp_external_relink(struct apple_dcp *dcp,
+				struct apple_connector *connector)
+{
+	struct drm_device *dev = connector->base.dev;
+	u64 generation;
+	int ret;
+
+	if (!dcp_external_needs_relink(dcp, connector))
+		return;
+
+	scoped_guard(mutex, &dcp->hpd_mutex)
+		generation = dcp->typec_generation;
+	scoped_guard(mutex, &dev->mode_config.mutex)
+		connector->base.funcs->fill_modes(&connector->base,
+						  dev->mode_config.max_width,
+						  dev->mode_config.max_height);
+
+	ret = dcp_external_reset_crtc(dcp, connector, generation);
+	if (ret)
+		dev_warn(dcp->dev, "display link not restored (%d), reporting it disconnected\n",
+			 ret);
+}
+
+/*
+ * The CRTC of the external display was switched off.  If its connection was
+ * lost, report the display again, as a new connection, once per cable
+ * generation (see dcp_announce_retry()).
+ */
+void dcp_external_crtc_released(struct apple_dcp *dcp)
+{
+	struct apple_connector *con = READ_ONCE(dcp->connector);
+
+	guard(mutex)(&dcp->hpd_mutex);
+	if (dcp_announce_retry(&dcp->announce, dcp->typec_generation) &&
+	    !dcp->announce.stopped && con &&
+	    READ_ONCE(con->dcp) == to_platform_device(dcp->dev))
+		schedule_work(&con->hotplug_wq);
+}
+
 void dcp_hotplug(struct work_struct *work)
 {
 	struct apple_connector *connector;
 	struct platform_device *pdev;
 	struct apple_dcp *dcp;
-	bool connected;
+	bool connected, gated;
 	int ret;
 
 	connector = container_of(work, struct apple_connector, hotplug_wq);
@@ -947,7 +1119,8 @@ void dcp_hotplug(struct work_struct *work)
 			dcp_clear_connector_edid(connector);
 	}
 
-	if (dcp_announce_gated(dcp, connector)) {
+	gated = dcp_announce_gated(dcp, connector);
+	if (gated) {
 		enum dcp_announce_status status;
 		bool notify;
 
@@ -968,8 +1141,11 @@ void dcp_hotplug(struct work_struct *work)
 	 * display modes from atomic_flush, so userspace needs to trigger a
 	 * flush, or the CRTC gets no signal.
 	 */
-	if (connector->base.state && !READ_ONCE(dcp->mode_state.valid) && connected &&
-	    !(dcp_is_usb4_output(dcp) && apple_dp_tunnel_t602x())) {
+	if (gated) {
+		if (connector->base.state && !READ_ONCE(dcp->mode_state.valid) && connected)
+			dcp_external_relink(dcp, connector);
+	} else if (connector->base.state && !READ_ONCE(dcp->mode_state.valid) && connected &&
+		   !(dcp_is_usb4_output(dcp) && apple_dp_tunnel_t602x())) {
 		drm_connector_set_link_status_property(&connector->base,
 						       DRM_MODE_LINK_STATUS_BAD);
 
@@ -987,6 +1163,7 @@ void dcp_hotplug(struct work_struct *work)
 				 ret);
 	}
 
+	dcp_test_point(dcp, DCP_TEST_HOTPLUG_EVENT);
 	drm_kms_helper_connector_hotplug_event(&connector->base);
 }
 
@@ -1499,8 +1676,19 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	guard(mutex)(&dcp->external_lock);
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL &&
 	    (!dcp->external_running || dcp->external_error || READ_ONCE(dcp->quiescing) ||
-	     READ_ONCE(dcp->crashed) || READ_ONCE(dcp->iomfb.presentation_paused)))
+	     READ_ONCE(dcp->crashed) || READ_ONCE(dcp->iomfb.presentation_paused))) {
+		/*
+		 * The pipe of this CRTC did not start, so it has no link and its
+		 * old mode is gone with it: the hotplug worker sets it up again
+		 * or reports the display lost.  A pipe that runs with its
+		 * presentation paused on purpose keeps its mode.
+		 */
+		if (!dcp->external_running || dcp->external_error) {
+			dcp_mode_invalidate(&dcp->mode_state);
+			dcp_handle_hotplug_actions(dcp, DCP_HOTPLUG_NOTIFY);
+		}
 		return -EPIPE;
+	}
 
 	crtc_state = drm_atomic_get_new_crtc_state(commit, crtc);
 	if (!crtc_state)
@@ -1538,6 +1726,9 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 
 	action = dcp_mode_finish(&dcp->mode_state, !ret, dcp->connector ?
 				&dcp->connector->connected : NULL);
+	/* An external mode set that failed leaves the CRTC without a link too. */
+	if (ret && dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL)
+		action |= DCP_HOTPLUG_NOTIFY;
 	dcp_handle_hotplug_actions(dcp, action);
 
 	return ret;

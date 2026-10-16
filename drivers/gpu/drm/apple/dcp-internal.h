@@ -36,6 +36,7 @@
 
 struct apple_dcp;
 struct apple_dcp_afkep;
+struct dcp_method_entry;
 
 /* Snapshot of a completed present, independent of the latest DRM state. */
 struct iomfb_scanout_h17p {
@@ -210,6 +211,7 @@ struct apple_dcp_hw_data {
 enum dcp_test_point {
 	DCP_TEST_ANNOUNCE_TIMER_DONE,		/* past hpd_mutex in the timeout work */
 	DCP_TEST_UNBIND_ANNOUNCE_STOPPED,	/* unbind drained the timeout work */
+	DCP_TEST_HOTPLUG_EVENT,			/* the hotplug worker sends its event */
 };
 
 /* TODO: move IOMFB members to its own struct */
@@ -455,6 +457,9 @@ struct apple_dcp {
 #if IS_ENABLED(CONFIG_DRM_APPLE_KUNIT_TEST)
 	/* Lets a test stop work where it races, see dcp_test_point(). */
 	void (*test_point)(struct apple_dcp *dcp, enum dcp_test_point point);
+	/* Lets a test answer IOMFB method calls in place of the firmware. */
+	void (*test_push)(struct apple_dcp *dcp, const struct dcp_method_entry *call,
+			  dcp_callback_t cb, void *cookie);
 #endif
 
 	struct gpio_desc *hdmi_hpd;
@@ -550,6 +555,7 @@ void dcp_handle_hotplug_actions(struct apple_dcp *dcp, unsigned int action);
 bool dcp_external_hotplug(struct apple_dcp *dcp, bool connected);
 void dcp_announce_arm(struct apple_dcp *dcp);
 void dcp_announce_work(struct work_struct *work);
+void dcp_external_crtc_released(struct apple_dcp *dcp);
 
 /* A KUnit test can wait here for the work it races with. */
 static inline void dcp_test_point(struct apple_dcp *dcp, enum dcp_test_point point)
