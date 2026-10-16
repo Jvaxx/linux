@@ -2277,13 +2277,17 @@ static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *dcp, u8 endpoint)
  * not asserted HPD yet. Userspace would then wait for the flip until the
  * commit times out, stalling every output it drives. Complete the flip,
  * mark the mode invalid so later commits do not wait for DCP, and let the
- * hotplug worker re-apply the active CRTC.
+ * hotplug worker re-apply the active CRTC.  On H17P the dropped present is
+ * also retired, so that the commands queued behind it can run.
  */
-static void dcp_swap_watchdog(struct work_struct *work)
+VISIBLE_IF_KUNIT void dcp_swap_watchdog(struct work_struct *work)
 {
 	struct apple_dcp *dcp =
 		container_of(to_delayed_work(work), struct apple_dcp,
 			     swap_watchdog_wq);
+
+	if (!iomfb_retire_dropped_present_h17p(dcp))
+		return;
 
 	dev_warn(dcp->dev, "swap not completed, retraining the display\n");
 	dcp_mode_invalidate(&dcp->mode_state);
@@ -2295,9 +2299,12 @@ static void dcp_swap_watchdog(struct work_struct *work)
 
 void dcp_swap_watchdog_arm(struct apple_dcp *dcp)
 {
-	if (dcp_is_typec_output(dcp))
+	if (dcp_is_typec_output(dcp)) {
+		dcp->swap_watchdog_deadline = jiffies +
+			msecs_to_jiffies(DCP_SWAP_WATCHDOG_MS);
 		mod_delayed_work(system_wq, &dcp->swap_watchdog_wq,
 				 msecs_to_jiffies(DCP_SWAP_WATCHDOG_MS));
+	}
 }
 
 void dcp_swap_watchdog_complete(struct apple_dcp *dcp)

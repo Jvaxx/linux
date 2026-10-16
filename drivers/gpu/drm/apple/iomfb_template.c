@@ -265,6 +265,18 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 					     resp->swap_id);
 			return;
 		}
+		/*
+		 * The swap watchdog retired it: its framebuffers stay
+		 * referenced until a later present completes, and a present
+		 * in flight now is a different one.
+		 */
+		if (dcp_present_was_retired_h17p(&dcp->present_state_h17p,
+						 resp->swap_id)) {
+			dev_warn_ratelimited(dcp->dev,
+					     "completion for retired present %u ignored\n",
+					     resp->swap_id);
+			return;
+		}
 		dev_err(dcp->dev, "unexpected present completion %u\n", resp->swap_id);
 		dcp->crashed = true;
 		return;

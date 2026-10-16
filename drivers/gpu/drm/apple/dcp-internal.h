@@ -40,6 +40,8 @@ struct dcp_method_entry;
 struct iomfb_scanout_h17p {
 	struct dcp_swap_submit_req_h17p request;
 	struct drm_framebuffer *fb[SWAP_SURFACES];
+	/* On iomfb.dropped while the firmware may still read a dropped present. */
+	struct list_head link;
 };
 
 /* One operation, including all of its nested replies and present completion. */
@@ -386,6 +388,8 @@ struct apple_dcp {
 	/* Completes a Type-C swap that DCP dropped, and recovers the pipe. */
 	struct delayed_work swap_watchdog_wq;
 	unsigned int swap_watchdog_retrains;
+	/* When the latest arm expires, in jiffies. */
+	unsigned long swap_watchdog_deadline;
 
 	/* List of referenced framebuffers pending a completed replacement swap.
 	 * The commit and RTKit work queues share it under this lock.
@@ -518,6 +522,11 @@ struct apple_dcp {
 		atomic_t opaque_x_state;
 		struct iomfb_scanout_h17p *scanout;
 		struct iomfb_scanout_h17p *next_scanout;
+		/*
+		 * Presents the firmware dropped, until it completes a later one:
+		 * at most one per present retired in present_state_h17p.
+		 */
+		struct list_head dropped;
 	} iomfb;
 };
 
@@ -536,6 +545,7 @@ void iomfb_present_backlight_h17p(struct apple_dcp *dcp);
 bool iomfb_present_brightness_only_h17p(struct apple_dcp *dcp);
 bool iomfb_present_complete_h17p(struct apple_dcp *dcp);
 void iomfb_present_failed_h17p(struct apple_dcp *dcp);
+bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp);
 bool iomfb_apply_backlight_h17p(struct apple_dcp *dcp,
 				const struct dcp_swap_submit_req_h17p *request,
 				struct dcp_present_h17p *wire);
@@ -578,6 +588,8 @@ void dcp_comp_unbind(struct device *dev, struct device *main, void *data);
 void dcp_platform_shutdown(struct platform_device *pdev);
 void dcp_disable_typec_work(struct apple_dcp *dcp, bool release_cable);
 void dcp_enable_typec_work(struct apple_dcp *dcp);
+void dcp_swap_watchdog(struct work_struct *work);
+void iomfb_scanout_put_h17p(struct apple_dcp *dcp, struct iomfb_scanout_h17p *scanout);
 #endif
 
 int dcp_backlight_init(struct apple_dcp *dcp, struct device *dev);
