@@ -690,6 +690,74 @@ static int macsmc_hwmon_create_sensor(struct device *dev, struct apple_smc *smc,
 }
 
 /*
+ * A SoC die temperature sensor: a readable float temperature key, labelled
+ * "SoC die <key>".
+ */
+static int macsmc_hwmon_create_die_sensor(struct macsmc_hwmon *hwmon, const char *key,
+					  struct macsmc_hwmon_sensor *sensor)
+{
+	int ret;
+
+	ret = macsmc_hwmon_parse_key(hwmon->dev, hwmon->smc, sensor, key);
+	if (ret)
+		return ret;
+	if (!(sensor->info.flags & APPLE_SMC_READABLE) ||
+	    sensor->info.type_code != __SMC_KEY('f', 'l', 't', ' ') ||
+	    sensor->info.size != sizeof(u32)) {
+		dev_info(hwmon->dev, "SoC die key %s is not a readable float; ignored\n", key);
+		return -EINVAL;
+	}
+	snprintf(sensor->label, sizeof(sensor->label), "SoC die %s", key);
+	sensor->attrs = HWMON_T_INPUT | HWMON_T_LABEL;
+	sensor->die = true;
+	return 0;
+}
+
+static int macsmc_hwmon_create_pressure(struct macsmc_hwmon *hwmon,
+					struct device_node *hwmon_node)
+{
+	struct macsmc_hwmon_sensor pressure = {};
+	const char *key;
+	s32 val;
+	int ret;
+
+	ret = of_property_read_string(hwmon_node, "apple,thermal-pressure-key",
+				      &key);
+	if (ret == -EINVAL) {
+		const struct macsmc_hwmon_board *board = macsmc_hwmon_board();
+
+		if (!board || !board->pressure_key)
+			return 0;
+		key = board->pressure_key;
+	} else if (ret) {
+		return ret;
+	}
+
+	ret = macsmc_hwmon_parse_key(hwmon->dev, hwmon->smc, &pressure, key);
+	if (ret)
+		goto invalid;
+
+	if (pressure.info.size != sizeof(s32) ||
+	    pressure.info.type_code != __SMC_KEY('s', 'i', '3', '2') ||
+	    !(pressure.info.flags & APPLE_SMC_READABLE)) {
+		ret = -EINVAL;
+		goto invalid;
+	}
+
+	ret = apple_smc_read_s32(hwmon->smc, pressure.macsmc_key, &val);
+	if (ret)
+		goto invalid;
+
+	hwmon->pressure = pressure;
+	return 0;
+
+invalid:
+	dev_warn(hwmon->dev, "Ignoring invalid thermal pressure key %s (%d)\n",
+		 key, ret);
+	return 0;
+}
+
+/*
  * Account for the temperature sensor just set up at the end of @temp.
  *
  * Thermal zones refer to a temperature channel by the index of its node
@@ -773,74 +841,6 @@ static int macsmc_hwmon_discover_temperatures(struct macsmc_hwmon *hwmon)
 }
 
 /*
- * A SoC die temperature sensor: a readable float temperature key, labelled
- * "SoC die <key>".
- */
-static int macsmc_hwmon_create_die_sensor(struct macsmc_hwmon *hwmon, const char *key,
-					  struct macsmc_hwmon_sensor *sensor)
-{
-	int ret;
-
-	ret = macsmc_hwmon_parse_key(hwmon->dev, hwmon->smc, sensor, key);
-	if (ret)
-		return ret;
-	if (!(sensor->info.flags & APPLE_SMC_READABLE) ||
-	    sensor->info.type_code != __SMC_KEY('f', 'l', 't', ' ') ||
-	    sensor->info.size != sizeof(u32)) {
-		dev_info(hwmon->dev, "SoC die key %s is not a readable float; ignored\n", key);
-		return -EINVAL;
-	}
-	snprintf(sensor->label, sizeof(sensor->label), "SoC die %s", key);
-	sensor->attrs = HWMON_T_INPUT | HWMON_T_LABEL;
-	sensor->die = true;
-	return 0;
-}
-
-static int macsmc_hwmon_create_pressure(struct macsmc_hwmon *hwmon,
-					struct device_node *hwmon_node)
-{
-	struct macsmc_hwmon_sensor pressure = {};
-	const char *key;
-	s32 val;
-	int ret;
-
-	ret = of_property_read_string(hwmon_node, "apple,thermal-pressure-key",
-				      &key);
-	if (ret == -EINVAL) {
-		const struct macsmc_hwmon_board *board = macsmc_hwmon_board();
-
-		if (!board || !board->pressure_key)
-			return 0;
-		key = board->pressure_key;
-	} else if (ret) {
-		return ret;
-	}
-
-	ret = macsmc_hwmon_parse_key(hwmon->dev, hwmon->smc, &pressure, key);
-	if (ret)
-		goto invalid;
-
-	if (pressure.info.size != sizeof(s32) ||
-	    pressure.info.type_code != __SMC_KEY('s', 'i', '3', '2') ||
-	    !(pressure.info.flags & APPLE_SMC_READABLE)) {
-		ret = -EINVAL;
-		goto invalid;
-	}
-
-	ret = apple_smc_read_s32(hwmon->smc, pressure.macsmc_key, &val);
-	if (ret)
-		goto invalid;
-
-	hwmon->pressure = pressure;
-	return 0;
-
-invalid:
-	dev_warn(hwmon->dev, "Ignoring invalid thermal pressure key %s (%d)\n",
-		 key, ret);
-	return 0;
-}
-
-/*
  * Fan data is exposed by the SMC as multiple sensors.
  *
  * The devicetree schema reuses apple,key-id for the actual fan speed sensor.
@@ -919,6 +919,7 @@ static int macsmc_hwmon_populate_sensors(struct macsmc_hwmon *hwmon,
 	u32 n_current = 0, n_fan = 0, n_power = 0, n_temperature = 0, n_voltage = 0;
 	const char *die_keys = macsmc_hwmon_die_key_list(), *list;
 	char key[5];
+	bool indexed;
 	int ret;
 
 	for_each_child_of_node_with_prefix(hwmon_node, key_node, "current-") {
@@ -996,10 +997,18 @@ static int macsmc_hwmon_populate_sensors(struct macsmc_hwmon *hwmon,
 		if (!hwmon->temp.sensors)
 			return -ENOMEM;
 
+		/*
+		 * Only a node that is a thermal sensor provider (T8140) has zones
+		 * referring to its temperature channels by index: there a node
+		 * that fails to set up keeps its channel. Elsewhere it is skipped.
+		 */
+		indexed = of_property_present(hwmon_node, "#thermal-sensor-cells");
 		for_each_child_of_node_with_prefix(hwmon_node, key_node, "temperature-") {
 			sensor = &hwmon->temp.sensors[hwmon->temp.count];
 			ret = macsmc_hwmon_create_sensor(hwmon->dev, hwmon->smc,
 							 key_node, sensor);
+			if (ret && !indexed)
+				continue;
 			if (ret)
 				dev_warn(hwmon->dev, "%pOFn unavailable (%d), temp%u hidden\n",
 					 key_node, ret, hwmon->temp.count + 1);
@@ -1341,15 +1350,15 @@ static int macsmc_hwmon_probe(struct platform_device *pdev)
 		return ret;
 	}
 
-	ret = macsmc_hwmon_discover_temperatures(hwmon);
-	if (ret)
-		return dev_err_probe(hwmon->dev, ret, "Temperature discovery failed\n");
-
 	if (macsmc_hwmon_is_m3()) {
 		ret = macsmc_hwmon_create_pressure(hwmon, hwmon->dev->of_node);
 		if (ret)
 			return ret;
 	}
+
+	ret = macsmc_hwmon_discover_temperatures(hwmon);
+	if (ret)
+		return dev_err_probe(hwmon->dev, ret, "Temperature discovery failed\n");
 
 	if (!hwmon->curr.count && !hwmon->fan.count &&
 	    !hwmon->power.count && !hwmon->temp.count &&
