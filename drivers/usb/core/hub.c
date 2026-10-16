@@ -3476,8 +3476,9 @@ EXPORT_SYMBOL_GPL(usb_wakeup_enabled_descendants);
  * suspended it: resume signalling, or for a hub, a connect, disconnect or
  * over-current change on one of its ports. A hub passes on the remote wakeup
  * of a device below it whatever its own wakeup setting (USB 2.0, section
- * 7.1.7.7). A hub with USB_QUIRK_HUB_NO_SUSPENDED_WAKEUP does not while it is
- * suspended, but still signals its own; a hub kept awake does both.
+ * 7.1.7.7). While it is suspended, a hub with USB_QUIRK_HUB_NO_SUSPENDED_WAKEUP
+ * does not, and one with USB_QUIRK_HUB_NO_SUSPENDED_PORT_WAKEUP does not signal
+ * its own; a hub kept awake does both.
  *
  * Context: System sleep, once the devices below @hdev are suspended, so that
  * neither they nor their wakeup settings change. Takes no locks.
@@ -3493,7 +3494,8 @@ bool usb_wakeup_reaches(struct usb_device *hdev)
 		/* A hub kept awake reports any change on its status endpoint */
 		u32 quirks = child->awake_in_sleep ? 0 : child->quirks;
 
-		if (child->do_remote_wakeup)
+		if (child->do_remote_wakeup &&
+		    !(quirks & USB_QUIRK_HUB_NO_SUSPENDED_PORT_WAKEUP))
 			return true;
 		if (!(quirks & USB_QUIRK_HUB_NO_SUSPENDED_WAKEUP) &&
 		    usb_wakeup_reaches(child))
