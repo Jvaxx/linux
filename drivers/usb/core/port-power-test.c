@@ -541,6 +541,29 @@ static void port_power_test_removed_held(struct kunit *test)
 	usb_unlock_device(t->ss_root);
 }
 
+/* Review: admin-disabled SS port must stay off while the mux changes lanes. */
+static void port_power_review_disabled_peer_resume(struct kunit *test)
+{
+	struct port_power_test *t = test->priv;
+
+	KUNIT_ASSERT_EQ(test, port_power_test_write(test, t->ss_port, "disable", "1"), 0);
+	port_power_test_allow_power_off(test);
+	KUNIT_ASSERT_GE(test, pm_runtime_suspend(t->hs_port), 0);
+	KUNIT_ASSERT_GE(test, pm_runtime_suspend(t->ss_port), 0);
+	KUNIT_ASSERT_TRUE(test, pm_runtime_suspended(t->ss_port));
+	KUNIT_ASSERT_FALSE(test, port_power_test_powered(t->shared_hcd));
+
+	/* The same root-hub lock the mux holds over the PIPE/lane change. */
+	usb_lock_device(t->ss_root);
+	KUNIT_EXPECT_EQ(test, usb_hub_port_power_off(t->ss_root, 1), 1);
+	KUNIT_EXPECT_FALSE(test, port_power_test_powered(t->shared_hcd));
+	/* A peer resume is not excluded by that root-hub lock. */
+	KUNIT_ASSERT_GE(test, pm_runtime_resume_and_get(t->hs_port), 0);
+	KUNIT_EXPECT_FALSE(test, port_power_test_powered(t->shared_hcd));
+	usb_unlock_device(t->ss_root);
+	pm_runtime_put(t->hs_port);
+}
+
 /* Review: a failed takeover request must not consume the driver's PM hold. */
 static void port_power_review_failed_takeover(struct kunit *test)
 {
@@ -563,6 +586,69 @@ static void port_power_review_failed_takeover(struct kunit *test)
 	usb_unlock_device(t->ss_root);
 }
 
+/* A previously repowered administrative port must be off before moving lanes. */
+static void port_power_test_disabled_repowered(struct kunit *test)
+{
+	struct port_power_test *t = test->priv;
+	struct port_power_test_hc *hc = port_power_test_hc(t->shared_hcd);
+	int usage = port_power_test_usage(t->ss_port);
+
+	KUNIT_ASSERT_EQ(test, port_power_test_write(test, t->ss_port, "disable", "1"), 0);
+	/* Model power restored behind usbcore's back, with disable still set. */
+	scoped_guard(spinlock_irqsave, &hc->lock)
+		port_power_test_set_power(t->shared_hcd, true);
+
+	usb_lock_device(t->ss_root);
+	KUNIT_EXPECT_EQ(test, usb_hub_port_power_off(t->ss_root, 1), 1);
+	KUNIT_EXPECT_FALSE(test, port_power_test_powered(t->shared_hcd));
+	KUNIT_EXPECT_EQ(test, usb_hub_port_power_on(t->ss_root, 1), 1);
+	KUNIT_EXPECT_FALSE(test, port_power_test_powered(t->shared_hcd));
+
+	/* A failed reassertion must not permit the lane change. */
+	scoped_guard(spinlock_irqsave, &hc->lock) {
+		port_power_test_set_power(t->shared_hcd, true);
+		hc->fail_power_off = true;
+	}
+	KUNIT_EXPECT_EQ(test, usb_hub_port_power_off(t->ss_root, 1), -ENOMEM);
+	KUNIT_EXPECT_TRUE(test, port_power_test_powered(t->shared_hcd));
+	KUNIT_EXPECT_EQ(test, usb_hub_port_power_off(t->ss_root, 1), 1);
+	KUNIT_EXPECT_FALSE(test, port_power_test_powered(t->shared_hcd));
+	KUNIT_EXPECT_EQ(test, usb_hub_port_power_on(t->ss_root, 1), 1);
+	KUNIT_EXPECT_FALSE(test, port_power_test_powered(t->shared_hcd));
+	usb_unlock_device(t->ss_root);
+	KUNIT_EXPECT_EQ(test, port_power_test_usage(t->ss_port), usage);
+
+	/* Ending the handover leaves ownership with sysfs. */
+	KUNIT_EXPECT_EQ(test, port_power_test_write(test, t->ss_port, "disable", "0"), 0);
+	KUNIT_EXPECT_TRUE(test, port_power_test_powered(t->shared_hcd));
+}
+
+/* An unpowered port without an administrative owner still needs a PM hold. */
+static void port_power_test_unowned_off(struct kunit *test)
+{
+	struct port_power_test *t = test->priv;
+	int usage;
+
+	port_power_test_allow_power_off(test);
+	KUNIT_ASSERT_GE(test, pm_runtime_suspend(t->hs_port), 0);
+	KUNIT_ASSERT_GE(test, pm_runtime_suspend(t->ss_port), 0);
+	KUNIT_ASSERT_FALSE(test, port_power_test_powered(t->shared_hcd));
+	/* Model an active port whose PM is unavailable and PP is still off. */
+	pm_runtime_disable(t->ss_port);
+	KUNIT_EXPECT_EQ(test, pm_runtime_set_active(t->ss_port), 0);
+	usage = port_power_test_usage(t->ss_port);
+
+	usb_lock_device(t->ss_root);
+	KUNIT_EXPECT_EQ(test, usb_hub_port_power_off(t->ss_root, 1), 0);
+	KUNIT_EXPECT_EQ(test, port_power_test_usage(t->ss_port), usage + 1);
+	KUNIT_EXPECT_FALSE(test, port_power_test_powered(t->shared_hcd));
+	KUNIT_EXPECT_EQ(test, usb_hub_port_power_on(t->ss_root, 1), 0);
+	KUNIT_EXPECT_TRUE(test, port_power_test_powered(t->shared_hcd));
+	KUNIT_EXPECT_EQ(test, port_power_test_usage(t->ss_port), usage);
+	usb_unlock_device(t->ss_root);
+	pm_runtime_enable(t->ss_port);
+}
+
 static struct kunit_case port_power_test_cases[] = {
 	KUNIT_CASE(port_power_test_hold),
 	KUNIT_CASE(port_power_test_runtime_pm),
@@ -570,6 +656,9 @@ static struct kunit_case port_power_test_cases[] = {
 	KUNIT_CASE(port_power_test_disable),
 	KUNIT_CASE(port_power_test_disabled_suspended),
 	KUNIT_CASE(port_power_test_removed_held),
+	KUNIT_CASE(port_power_review_disabled_peer_resume),
+	KUNIT_CASE(port_power_test_disabled_repowered),
+	KUNIT_CASE(port_power_test_unowned_off),
 	KUNIT_CASE(port_power_review_failed_takeover),
 	{}
 };
