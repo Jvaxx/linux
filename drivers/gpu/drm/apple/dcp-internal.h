@@ -61,6 +61,8 @@ void dcp_swap_watchdog_arm(struct apple_dcp *dcp);
 void dcp_swap_watchdog_complete(struct apple_dcp *dcp);
 void dcp_retry_placeholder_edid(struct apple_dcp *dcp,
 				const struct drm_edid *drm_edid);
+bool dcp_typec_relink(struct apple_dcp *dcp);
+bool dcp_typec_sink_relink(struct apple_dcp *dcp);
 
 struct dcpav_service_epic;
 
@@ -380,6 +382,12 @@ struct apple_dcp {
 	u64 crtc_unplugs;
 	u64 placeholder_generation;
 	struct delayed_work placeholder_edid_wq;
+	/* replugs replayed for a Type-C sink that lost its link */
+	u32 relink_tries;
+	bool relink_active;
+	unsigned long relink_done;
+	u64 relink_generation;
+	struct delayed_work typec_relink_wq;
 	bool use_timestamps;
 	bool vrr_enabled;
 	struct dcp_set_digital_out_mode_req mode;
@@ -524,6 +532,8 @@ struct apple_dcp {
 	bool typec_follow_start;
 	bool typec_follow_retiring;
 	u64 typec_follow_gen;
+	/* dcp_poweron() reconnects DPTX; its own modeset follows the HPD */
+	bool typec_poweron_hpd;
 	/* IOMFB reports its video interface ready after DPTX link training. */
 	struct completion typec_iomfb_hpd_ready;
 	struct delayed_work typec_reconnect_wq;

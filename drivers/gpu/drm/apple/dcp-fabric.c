@@ -1438,7 +1438,8 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 	 * without a word, so a nominated route might never be called at all --
 	 * and the port would then never be routed.
 	 */
-	if (port->applied_valid && port->applied_alt == state->alt &&
+	if (port->applied_valid && !(dp_status & DP_STATUS_IRQ_HPD) &&
+	    port->applied_alt == state->alt &&
 	    port->applied_mode == state->mode &&
 	    port->applied_status == dp_status && port->applied_conf == dp_conf)
 		return 0;
@@ -1571,13 +1572,15 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 			dcp_retrain_oob(dcp->typec_connector);
 		else if (dcp->typec_connector && dcp->external_native)
 			dcp_external_sink_irq(dcp);
-		else if (dcp->typec_connector &&
-			 !READ_ONCE(dcp->typec_connector->connected)) {
-			ret = dcp_dptx_recover_irq(dcp);
-			if (ret)
-				return ret;
-		} else if (dcp->typec_connector)
-			dcp_retrain_oob(dcp->typec_connector);
+		else if (dcp->typec_connector && !dcp_typec_sink_relink(dcp)) {
+			if (!READ_ONCE(dcp->typec_connector->connected)) {
+				ret = dcp_dptx_recover_irq(dcp);
+				if (ret)
+					return ret;
+			} else {
+				dcp_retrain_oob(dcp->typec_connector);
+			}
+		}
 	}
 	port->hpd = hpd;
 	port->applied_valid = true;
