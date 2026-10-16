@@ -820,7 +820,7 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 		if (ret)
 			goto out;
 		ret = cd321x_mux_set(cd321x, held);
-		*display_busy = cd321x_display_taken(ret);
+		*display_busy = cd321x_display_taken(ret, tps->h17_display);
 		if (!ret) {
 			cd321x->dp_status = dp_data.status;
 			cd321x->dp_conf = dp_data.conf;
@@ -2844,6 +2844,9 @@ EXPORT_SYMBOL_GPL(tipd_suspend);
 int tipd_resume(struct tps6598x *tps)
 {
 	int ret;
+
+	tps->h17_display = of_machine_is_compatible("apple,t8140") ||
+			   of_machine_is_compatible("apple,t8142");
 
 	ret = tps6598x_check_mode(tps);
 	if (ret < 0)
