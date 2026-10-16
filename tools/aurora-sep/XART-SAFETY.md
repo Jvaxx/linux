@@ -46,6 +46,33 @@ Two cases need a decision on an M1, M2 or M3 Mac:
   guarded boot refuses them too. A Mac that already used Touch ID with the
   guard off needs `xart_guard=0` to keep using those records.
 
+## Cold-boot SEP Macs rewrite a pre-Linux record (2026-10-16)
+
+On Macs where the driver cold-boots the SEP, creating Linux's identity
+keybag reaches beyond Linux's own records. This was observed on an M1 Pro
+(T6000, J316s), with the macOS 13.5 sepOS loaded by the driver.
+
+Creating the keybag makes the enclave do three things:
+
+- write one new session record;
+- rewrite a shared root record;
+- rewrite one session record that existed before Linux ever ran.
+
+The rewritten record is one of the four session records the enclave reads at
+every attach, and it grows by 71 bytes per keybag created. It is not tied to
+the OS identity, so giving Linux its own identity does not keep this write
+away from records macOS also reads. A driver that refuses to rewrite records
+Linux did not create cannot create a keybag on these Macs.
+
+Warm-attach Macs behave differently. On an M2 (T8112, J413), keybag creation
+made no xART writes at all. On the J700, the macOS-era records stayed
+byte-identical through Linux enrolment.
+
+On a T600x Mac where Linux has created its keybag, treat macOS Touch ID as
+unverified until macOS Touch ID unlock and keychain access have been checked
+there. The other cold-boot SoCs (T8103, T6001, T6002) probably behave the
+same way; that is untested.
+
 ## Earlier deployment policy
 
 The iBoot APFS container and its XART `.gl` file are shared with macOS. The
