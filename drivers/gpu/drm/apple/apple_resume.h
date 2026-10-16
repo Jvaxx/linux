@@ -8,6 +8,6 @@
 
 struct drm_atomic_state;
 
-bool apple_drm_drop_stale_crtcs(struct drm_atomic_state *state);
+u32 apple_drm_drop_stale_crtcs(struct drm_atomic_state *state);
 
 #endif /* __APPLE_RESUME_H__ */

@@ -146,39 +146,104 @@ void dcp_180hz_notify(struct apple_dcp *dcp)
 		schedule_work(&con->hotplug_wq);
 }
 
+/*
+ * Everything the exception mode needs except the EDID, which only the next
+ * probe reads: a catalogue received for the current cable and connection,
+ * the AV service of that receipt, an announced display and the configured
+ * link rate and lane count.
+ */
+static bool dcp_180hz_link_current(struct apple_dcp *dcp, const struct dcp_display_mode *mode)
+{
+	struct apple_connector *con = dcp->connector;
+
+	lockdep_assert_held(&dcp->hpd_mutex);
+	lockdep_assert_held(&dcp->dcpavserv.lock);
+	lockdep_assert_held(&dcp->metadata.lock);
+	return con && dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL &&
+	       dcp_180hz_direct_port(dcp->dptxport[0].service) &&
+	       mode->unsafe_rgb8_ticket.associated &&
+	       mode->unsafe_rgb8_ticket.generation == dcp->typec_generation &&
+	       mode->automatic_connection_sequence == dcp->rate_proof.connection_sequence &&
+	       mode->automatic_catalog_sequence == dcp->rate_proof.catalog_sequence &&
+	       dcp->metadata.epoch.connected && dcp->typec_cable_connected && !dcp->quiescing &&
+	       READ_ONCE(con->dcp) == to_platform_device(dcp->dev) &&
+	       dcp_180hz_timing_epoch(mode, dcp->dcpavserv.epoch) &&
+	       dcp->dptxport[0].connected && dcp->dptxport[0].enabled && !dcp->dptxport[0].closed &&
+	       dcp_180hz_fact_current(dcp, &dcp->rate_proof.rate) &&
+	       dcp_180hz_fact_current(dcp, &dcp->rate_proof.lanes) &&
+	       dcp_180hz_payload(dcp->rate_proof.rate.value, dcp->rate_proof.lanes.value,
+				 mode->mode.clock) &&
+	       mode->sdr_rgb.depth == 8 && mode->sdr_rgb.format == DCP_COLOR_FORMAT_RGB &&
+	       mode->sdr_rgb.range == DCP_COLOR_YCBCR_RANGE_FULL &&
+	       mode->sdr_rgb.eotf == DCP_EOTF_SDR_GAMMA &&
+	       mode->sdr_rgb.colorimetry == DCP_COLORIMETRY_SRGB;
+}
+
 bool dcp_180hz_mode_current(struct apple_dcp *dcp, const struct dcp_display_mode *mode)
 {
 	struct apple_connector *con = dcp->connector;
 	const struct edid *raw;
 
-	lockdep_assert_held(&dcp->hpd_mutex);
-	lockdep_assert_held(&dcp->dcpavserv.lock);
-	lockdep_assert_held(&dcp->metadata.lock);
-	if (!con || dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17P_EXTERNAL ||
-	    !dcp_180hz_direct_port(dcp->dptxport[0].service) ||
-	    !mode->unsafe_rgb8_ticket.associated ||
-	    mode->unsafe_rgb8_ticket.generation != dcp->typec_generation ||
-	    mode->automatic_connection_sequence != dcp->rate_proof.connection_sequence ||
-	    mode->automatic_catalog_sequence != dcp->rate_proof.catalog_sequence ||
-	    !dcp->metadata.epoch.connected || !dcp->typec_cable_connected || dcp->quiescing ||
-	    READ_ONCE(con->dcp) != to_platform_device(dcp->dev) ||
+	if (!dcp_180hz_link_current(dcp, mode) ||
 	    !dcpavserv_edid_service_current(dcp, con->drm_edid_service_epoch) ||
-	    !dcp_180hz_timing_epoch(mode, dcp->dcpavserv.epoch) ||
 	    !con->drm_edid || con->drm_edid_firmware_derived ||
 	    READ_ONCE(con->edid_invalidation_pending) ||
-	    con->drm_edid_generation != dcp->typec_generation ||
-	    !dcp->dptxport[0].connected || !dcp->dptxport[0].enabled || dcp->dptxport[0].closed ||
-	    !dcp_180hz_fact_current(dcp, &dcp->rate_proof.rate) ||
-	    !dcp_180hz_fact_current(dcp, &dcp->rate_proof.lanes) ||
-	    !dcp_180hz_payload(dcp->rate_proof.rate.value, dcp->rate_proof.lanes.value, mode->mode.clock) ||
-	    mode->sdr_rgb.depth != 8 || mode->sdr_rgb.format != DCP_COLOR_FORMAT_RGB ||
-	    mode->sdr_rgb.range != DCP_COLOR_YCBCR_RANGE_FULL ||
-	    mode->sdr_rgb.eotf != DCP_EOTF_SDR_GAMMA || mode->sdr_rgb.colorimetry != DCP_COLORIMETRY_SRGB)
+	    con->drm_edid_generation != dcp->typec_generation)
 		return false;
 	raw = drm_edid_raw(con->drm_edid);
 	/* The transport validates extent/checksums; this quirk accepts only its 256-byte form. */
 	return raw && raw->extensions == 1 &&
 		dcp_180hz_edid((const u8 *)raw, 256, &mode->mode);
+}
+
+/* Caller holds metadata.lock. */
+static bool dcp_catalog_current(struct apple_dcp *dcp)
+{
+	const struct dcp_metadata_ticket *ticket = &dcp->metadata.catalog_ticket;
+
+	return ticket->associated && dcp->nr_modes &&
+	       ticket->generation == dcp->typec_generation &&
+	       ticket->generation == dcp->metadata.epoch.generation &&
+	       dcp->metadata.catalog_connection_sequence == dcp->rate_proof.connection_sequence;
+}
+
+/**
+ * dcp_external_modes_ready - whether a probe would list the current modes
+ * @dcp: an external H17P DCP
+ *
+ * The modes of an external display arrive in pieces, in no fixed order: the
+ * TimingElements catalogue, the AV service the EDID is read from, the
+ * firmware's announcement and the link configuration.  A connection is
+ * ready once the catalogue is the current cable's, its EDID service is up
+ * and, if the catalogue holds an exception mode, that mode passes every
+ * check of dcp_180hz_mode_current() but the EDID the probe will read.  A
+ * catalogue retained from an earlier connection never counts.
+ *
+ * Caller holds hpd_mutex.
+ */
+bool dcp_external_modes_ready(struct apple_dcp *dcp)
+{
+	bool ready, exception = false, proven = false;
+	unsigned long flags;
+	unsigned int i;
+
+	lockdep_assert_held(&dcp->hpd_mutex);
+	guard(mutex)(&dcp->dcpavserv.lock);
+	if (!dcpavserv_edid_current(dcp, dcp->typec_generation) ||
+	    !dcpavserv_edid_service_current(dcp, dcp->dcpavserv.epoch))
+		return false;
+
+	spin_lock_irqsave(&dcp->metadata.lock, flags);
+	ready = dcp_catalog_current(dcp);
+	for (i = 0; ready && i < dcp->nr_modes; i++) {
+		if (!dcp->modes[i].automatic_rgb8_quirk)
+			continue;
+		exception = true;
+		proven |= dcp_180hz_link_current(dcp, &dcp->modes[i]);
+	}
+	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+
+	return ready && (!exception || proven);
 }
 
 bool dcp_180hz_pending(struct apple_dcp *dcp, const struct dcp_display_mode *mode)

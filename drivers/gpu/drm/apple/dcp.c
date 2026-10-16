@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Copyright 2021 Alyssa Rosenzweig */
 
+#include <kunit/visibility.h>
 #include <linux/align.h>
 #include <linux/bitmap.h>
 #include <linux/clk.h>
@@ -1963,6 +1964,57 @@ void dcp_firmware_metadata_connection(struct apple_dcp *dcp, u64 generation, boo
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 }
 
+static void dcp_firmware_metadata_present_locked(struct apple_dcp *dcp)
+{
+	lockdep_assert_held(&dcp->metadata.lock);
+	dcp->metadata.hpd_seen = true;
+	/*
+	 * Fresh proof may precede HPD assertion after a same-cable loss.
+	 * Keep invalidated firmware metadata and old receipt tickets revoked.
+	 */
+	if (READ_ONCE(dcp->typec_cable_connected) &&
+	    dcp->metadata.epoch.generation == READ_ONCE(dcp->typec_generation))
+		dcp->metadata.epoch.connected = true;
+}
+
+/*
+ * A fact a held connection waits for has changed: evaluate it again.  The
+ * unlocked checks may miss a hold that has just started; such a hold ends at
+ * its timeout instead.  A stopped announcement is evaluated again when its
+ * work is enabled; teardown quiesces the callers before draining the worker.
+ */
+static void dcp_announce_kick(struct apple_dcp *dcp)
+{
+	struct apple_connector *con = READ_ONCE(dcp->connector);
+
+	if (READ_ONCE(dcp->announce.holding) && !READ_ONCE(dcp->announce.stopped) && con &&
+	    READ_ONCE(con->dcp) == to_platform_device(dcp->dev))
+		schedule_work(&con->hotplug_wq);
+}
+
+/*
+ * While its pipe is stopped an external display reports no hotplug to DRM
+ * (see dcp_external_hotplug()). When the firmware announces the display
+ * there, as when the link returns from system sleep with the CRTC off, the
+ * announcement still holds for the modes that need it, so record it. The
+ * connector is not notified, just as for an announcement on DPMS wake.
+ *
+ * Only a link requested for the current cable generation can be announced:
+ * a callback that arrives before that belongs to a link already released.
+ */
+void dcp_firmware_metadata_announced(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+
+	if (!dcp_firmware_metadata_enabled(dcp) ||
+	    !READ_ONCE(dcp->dptxport[0].connected))
+		return;
+	spin_lock_irqsave(&dcp->metadata.lock, flags);
+	dcp_firmware_metadata_present_locked(dcp);
+	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+	dcp_announce_kick(dcp);
+}
+
 void dcp_firmware_metadata_hotplug(struct apple_dcp *dcp, bool connected)
 {
 	struct apple_connector *con = READ_ONCE(dcp->connector);
@@ -1972,14 +2024,7 @@ void dcp_firmware_metadata_hotplug(struct apple_dcp *dcp, bool connected)
 		return;
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
 	if (connected) {
-		dcp->metadata.hpd_seen = true;
-		/*
-		 * Fresh proof may precede HPD assertion after a same-cable loss.
-		 * Keep invalidated firmware metadata and old receipt tickets revoked.
-		 */
-		if (READ_ONCE(dcp->typec_cable_connected) &&
-		    dcp->metadata.epoch.generation == READ_ONCE(dcp->typec_generation))
-			dcp->metadata.epoch.connected = true;
+		dcp_firmware_metadata_present_locked(dcp);
 	} else if (dcp->metadata.hpd_seen) {
 		dcp->metadata.hpd_seen = false;
 		dcp->rate_proof.connection_sequence++;
@@ -2232,13 +2277,17 @@ static struct apple_dcp_afkep *dcp_afkep(struct apple_dcp *dcp, u8 endpoint)
  * not asserted HPD yet. Userspace would then wait for the flip until the
  * commit times out, stalling every output it drives. Complete the flip,
  * mark the mode invalid so later commits do not wait for DCP, and let the
- * hotplug worker re-apply the active CRTC.
+ * hotplug worker re-apply the active CRTC.  On H17P the dropped present is
+ * also retired, so that the commands queued behind it can run.
  */
-static void dcp_swap_watchdog(struct work_struct *work)
+VISIBLE_IF_KUNIT void dcp_swap_watchdog(struct work_struct *work)
 {
 	struct apple_dcp *dcp =
 		container_of(to_delayed_work(work), struct apple_dcp,
 			     swap_watchdog_wq);
+
+	if (!iomfb_retire_dropped_present_h17p(dcp))
+		return;
 
 	dev_warn(dcp->dev, "swap not completed, retraining the display\n");
 	dcp_mode_invalidate(&dcp->mode_state);
@@ -2250,15 +2299,34 @@ static void dcp_swap_watchdog(struct work_struct *work)
 
 void dcp_swap_watchdog_arm(struct apple_dcp *dcp)
 {
-	if (dcp_is_typec_output(dcp))
+	if (dcp_is_typec_output(dcp)) {
+		dcp->swap_watchdog_deadline = jiffies +
+			msecs_to_jiffies(DCP_SWAP_WATCHDOG_MS);
 		mod_delayed_work(system_wq, &dcp->swap_watchdog_wq,
 				 msecs_to_jiffies(DCP_SWAP_WATCHDOG_MS));
+	}
 }
 
 void dcp_swap_watchdog_complete(struct apple_dcp *dcp)
 {
 	cancel_delayed_work(&dcp->swap_watchdog_wq);
 	dcp->swap_watchdog_retrains = 0;
+}
+
+/*
+ * The firmware reports that the DisplayPort sink stopped answering, or that
+ * the link did not start.  On the external H17P display, the mode set
+ * before, or being set, has no link any more: drop it, also across a mode
+ * set in flight, and have the hotplug worker set the mode of the CRTC again
+ * or report the display lost (dcp_external_relink()).  A mode set still in
+ * flight reports this itself when it finishes, and before any mode was set
+ * there is nothing to recover.
+ */
+void dcp_external_link_fault(struct apple_dcp *dcp)
+{
+	dcp_180hz_invalidate(dcp);
+	if (dcp_is_external_h17p(dcp) && dcp_mode_invalidate(&dcp->mode_state))
+		dcp_handle_hotplug_actions(dcp, DCP_HOTPLUG_NOTIFY);
 }
 
 static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
@@ -2488,13 +2556,19 @@ bool dcp_has_typec_routes(struct platform_device *pdev)
 #define DPTX_RECONNECT_DELAY msecs_to_jiffies(1000)
 #define DPTX_RECONNECT_RETRIES 5
 
-static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *waiting_service)
+/*
+ * Connect DPTX port @port. On failure, @retryable (if given) tells whether
+ * the attempt left nothing outstanding in the firmware, so that a later
+ * connection may simply try again: the service was not published yet, or a
+ * link that never came up was withdrawn and the firmware acknowledged that.
+ */
+static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable)
 {
 	unsigned long timeout;
-	int ret = 0;
+	int ret = 0, err;
 
-	if (waiting_service)
-		*waiting_service = false;
+	if (retryable)
+		*retryable = false;
 	if (!dcp->phy) {
 		dev_warn(dcp->dev, "dcp_dptx_connect: missing phy\n");
 		return -ENODEV;
@@ -2511,8 +2585,8 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *waiting_s
 		dev_warn(dcp->dev, "dcp_dptx_connect: dptx service for port %d not enabled\n", port);
 		ret = -ENODEV;
 		/* No firmware request has been made; the first publication can retry. */
-		if (waiting_service && !READ_ONCE(dcp->dptxport[port].closed)) {
-			*waiting_service = true;
+		if (retryable && !READ_ONCE(dcp->dptxport[port].closed)) {
+			*retryable = true;
 			ret = -EAGAIN;
 		}
 		goto out_unlock;
@@ -2577,7 +2651,7 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *waiting_s
 			"dcp_dptx_connect: timed out waiting for port %u link configuration\n",
 			port);
 		ret = -ETIMEDOUT;
-		goto out_disconnect;
+		goto out_withdraw;
 	}
 
 	dev_dbg(dcp->dev, "dcp_dptx_connect: waited %d ms for link\n",
@@ -2593,9 +2667,39 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *waiting_s
 
 	return 0;
 
-out_disconnect:
+out_withdraw:
 	mutex_lock(&dcp->hpd_mutex);
+	if (!dcp_is_external_h17p(dcp)) {
+		dcp->dptxport[port].connected = false;
+		goto out_release;
+	}
+	/*
+	 * No link configuration arrived, typically because the sink went away
+	 * while the firmware trained it.  Withdraw the request the way a
+	 * disconnect does, HPD first.  Only once the firmware has acknowledged
+	 * both is nothing of this attempt outstanding; until then the port
+	 * stays held.
+	 */
+	err = -ENODEV;
+	if (dptx_service_available(&dcp->dptxport[port])) {
+		err = dcp_is_typec_output(dcp) ?
+		      dptxport_set_hpd(dcp->dptxport[port].service, false) : 0;
+		if (!err)
+			err = dptxport_release_display(dcp->dptxport[port].service);
+	}
+	if (err) {
+		dev_err(dcp->dev,
+			"dcp_dptx_connect: port %u not withdrawn, still held: %d\n",
+			port, err);
+		goto out_unlock;
+	}
+	dev_info(dcp->dev, "dcp_dptx_connect: port %u withdrawn, the next connection retries\n",
+		 port);
 	dcp->dptxport[port].connected = false;
+	if (retryable)
+		*retryable = true;
+	goto out_unlock;
+
 out_release:
 	dptxport_release_display(dcp->dptxport[port].service);
 
@@ -2631,7 +2735,7 @@ static void dcp_external_publish_generation(struct apple_dcp *dcp)
 /* external_lock is never taken by the serialized IOMFB receive callbacks. */
 static int dcp_external_link_locked(struct apple_dcp *dcp)
 {
-	bool waiting_service;
+	bool retryable;
 	int ret;
 
 	lockdep_assert_held(&dcp->external_lock);
@@ -2641,8 +2745,8 @@ static int dcp_external_link_locked(struct apple_dcp *dcp)
 		return dcp->external_error;
 	if (!dcp->external_cable)
 		return -ENODEV;
-	ret = dcp_dptx_connect_raw(dcp, 0, &waiting_service);
-	if (ret && !waiting_service)
+	ret = dcp_dptx_connect_raw(dcp, 0, &retryable);
+	if (ret && !retryable)
 		dcp->external_error = ret;
 	return ret;
 }
@@ -2655,6 +2759,14 @@ static int dcp_external_start_locked(struct apple_dcp *dcp)
 	ret = dcp_external_link_locked(dcp);
 	if (ret || dcp->external_running)
 		return ret;
+	/* A deferred stop sent nothing: the pipe is still powered. */
+	if (dcp->external_stop_deferred) {
+		dcp->external_stop_deferred = false;
+		dcp->external_stop_retries = 0;
+		dcp->external_running = true;
+		iomfb_pause_presentation(dcp, false);
+		return 0;
+	}
 	iomfb_pause_presentation(dcp, true);
 	/* Even a timed-out first activation can have changed firmware state. */
 	dcp->external_power_attempted = true;
@@ -2679,9 +2791,12 @@ static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 	return dcp_external_link_locked(dcp);
 }
 
+#define DCP_EXTERNAL_STOP_RETRIES	3
+
 /* The generation token belongs to the CRTC that was actually enabled. */
 static int dcp_external_stop_locked(struct apple_dcp *dcp, u64 generation)
 {
+	const char *step;
 	int ret;
 
 	lockdep_assert_held(&dcp->external_lock);
@@ -2696,11 +2811,31 @@ static int dcp_external_stop_locked(struct apple_dcp *dcp, u64 generation)
 	/* Route setup can call this before IOMFB or its shared memory exists. */
 	if (dcp->external_stopped || !dcp->external_power_attempted)
 		goto release_link;
+	step = "settling the queue";
 	ret = iomfb_queue_settle(dcp, msecs_to_jiffies(500));
-	if (!ret)
+	if (ret == -ETIMEDOUT) {
+		/*
+		 * Nothing was sent, so no late reply can race a retry.  The
+		 * session stays owned, but not latched: a SAFE transition, the
+		 * retry work or the next enable of the CRTC takes it from here.
+		 */
+		dev_warn(dcp->dev, "external display stop deferred: IOMFB queue busy\n");
+		dcp->external_stop_deferred = true;
+		if (dcp->external_stop_retries++ < DCP_EXTERNAL_STOP_RETRIES)
+			mod_delayed_work(system_wq, &dcp->external_stop_retry_wq,
+					 msecs_to_jiffies(DCP_SWAP_WATCHDOG_MS));
+		return ret;
+	}
+	dcp->external_stop_deferred = false;
+	dcp->external_stop_retries = 0;
+	if (!ret) {
+		step = "powering the pipe off";
 		ret = iomfb_external_power_h17p(dcp, false);
-	if (!ret)
+	}
+	if (!ret) {
+		step = "settling the queue after power-off";
 		ret = iomfb_queue_settle(dcp, msecs_to_jiffies(500));
+	}
 	if (ret)
 		goto failed;
 	/* This is a transport acknowledgment, not permission to free scanout. */
@@ -2708,6 +2843,7 @@ static int dcp_external_stop_locked(struct apple_dcp *dcp, u64 generation)
 release_link:
 	scoped_guard(mutex, &dcp->hpd_mutex) {
 		if (dcp->dptxport[0].connected) {
+			step = "withdrawing the DPTX link";
 			if (!dptx_service_available(&dcp->dptxport[0])) {
 				ret = -ENODEV;
 				goto failed;
@@ -2727,6 +2863,7 @@ release_link:
 	return 0;
 failed:
 	/* A retry could race a late reply. Keep this session blocked and owned. */
+	dev_err(dcp->dev, "external display stop failed %s, session held: %d\n", step, ret);
 	dcp->external_error = ret;
 	return ret;
 }
@@ -2745,6 +2882,7 @@ static int dcp_external_disconnect(struct apple_dcp *dcp, bool physical)
 			WRITE_ONCE(dcp->typec_cable_connected, false);
 			dcp->typec_generation++;
 			dcp_firmware_metadata_connection(dcp, dcp->typec_generation, false);
+			dcp_announce_end(&dcp->announce);
 		}
 		/* HPD is fenced; retire the AV owner after releasing hpd_mutex. */
 		dpavservep_detach(dcp);
@@ -2758,6 +2896,17 @@ static int dcp_external_disconnect(struct apple_dcp *dcp, bool physical)
 		dcp_external_report_disconnected(dcp);
 	}
 	return ret;
+}
+
+/* Stop a deferred session again once the swap watchdog had its turn. */
+static void dcp_external_stop_retry(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(to_delayed_work(work), struct apple_dcp,
+					     external_stop_retry_wq);
+
+	guard(mutex)(&dcp->external_lock);
+	if (dcp->external_stop_deferred)
+		dcp_external_stop_locked(dcp, dcp->external_generation);
 }
 
 static void dcp_external_stop_work(struct work_struct *work)
@@ -2790,6 +2939,8 @@ bool dcp_external_hotplug(struct apple_dcp *dcp, bool connected)
 	if (dcp->iomfb.presentation_paused) {
 		dcp->external_hotplug_pending = true;
 		dcp->external_hotplug_connected = connected;
+		if (connected)
+			dcp_firmware_metadata_announced(dcp);
 		/* Publish initial/new-cable discovery, never same-cable DPMS wake. */
 		if (connected && READ_ONCE(dcp->external_cable) &&
 		    !READ_ONCE(dcp->external_error) &&
@@ -2908,6 +3059,9 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
 		dcp->typec_reconnect_tries = 0;
 		return;
 	}
+	/* A display held for this link will not get ready. */
+	if (READ_ONCE(dcp->external_error))
+		dcp_announce_kick(dcp);
 
 	if (++dcp->typec_reconnect_tries <
 	    (dcp_is_usb4_output(dcp) && apple_dp_tunnel_t602x() ?
@@ -2919,6 +3073,43 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
 
 	dev_err(dcp->dev, "Type-C DPTX reconnect failed after %u retries: %d\n",
 		dcp->typec_reconnect_tries, ret);
+}
+
+/**
+ * dcp_hold_resume_event - hold the resume hotplug event of an external display
+ * @pdev: the DCP of a CRTC resumed disabled
+ *
+ * System sleep releases the link of an external H17P display, and with it
+ * the proof of modes such as 1080p at 180 Hz, so apple_drm_drop_stale_crtcs()
+ * resumes the CRTC of such a mode disabled with its link marked bad.  A
+ * hotplug event then has userspace set the mode again.  Sent at once, it has
+ * userspace probe before the link is back, pick a fallback mode, and set its
+ * own mode again once that is offered: two mode sets the monitor has to
+ * resynchronize to.
+ *
+ * Hold that event, not the connection, until the display's modes are in for
+ * the new cable generation, or for DCP_ANNOUNCE_RESUME_TIMEOUT_MS after the
+ * link work can run again, then send it once from the hotplug worker.  No
+ * lock is held while waiting; a probe in the meantime reports the display
+ * connected with the modes it has.
+ *
+ * Returns false if the caller must send the event itself.
+ */
+bool dcp_hold_resume_event(struct platform_device *pdev)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	struct apple_connector *con = READ_ONCE(dcp->connector);
+
+	if (!dcp_is_external_h17p(dcp) || !con || READ_ONCE(con->dcp) != pdev)
+		return false;
+
+	guard(mutex)(&dcp->hpd_mutex);
+	if (!READ_ONCE(con->connected) || !dcp->typec_cable_connected ||
+	    !dcp_announce_hold(&dcp->announce, dcp->typec_generation))
+		return false;
+	/* Freezable, like the link work: the timeout starts after thaw. */
+	dcp_announce_arm(dcp);
+	return true;
 }
 
 static void disconnected_hpd_event(struct apple_connector *con)
@@ -2960,6 +3151,7 @@ int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
 		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
 		cancel_work_sync(&dcp->external_stop_work);
+		cancel_delayed_work_sync(&dcp->external_stop_retry_wq);
 		guard(mutex)(&dcp->external_lock);
 		new_cable = !dcp->external_cable;
 		if (new_cable)
@@ -2972,6 +3164,7 @@ int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 			if (new_cable) {
 				dcp->typec_generation++;
 				dcp_firmware_metadata_connection(dcp, dcp->typec_generation, true);
+				dcp_announce_end(&dcp->announce);
 			}
 			dcp->placeholder_retried = false;
 		}
@@ -3313,6 +3506,7 @@ void dcp_poweron(struct platform_device *pdev)
 		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
 		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
 		cancel_work_sync(&dcp->external_stop_work);
+		cancel_delayed_work_sync(&dcp->external_stop_retry_wq);
 		guard(mutex)(&dcp->external_lock);
 		ret = dcp_external_start_locked(dcp);
 		if (!ret)
@@ -3415,8 +3609,9 @@ void dcp_poweroff(struct platform_device *pdev)
 		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
 		guard(mutex)(&dcp->external_lock);
 		ret = dcp_external_stop_locked(dcp, dcp->external_crtc_generation);
-		if (ret)
+		if (ret && !dcp->external_stop_deferred)
 			dev_err(dcp->dev, "external display stop failed: %d\n", ret);
+		dcp_external_crtc_released(dcp);
 		return;
 	}
 
@@ -3959,29 +4154,46 @@ static int dcp_connector_type_from_dt(struct device_node *np)
 	return DRM_MODE_CONNECTOR_Unknown;
 }
 
-static void dcp_disable_typec_work(struct apple_dcp *dcp, bool release_cable)
+VISIBLE_IF_KUNIT void dcp_disable_typec_work(struct apple_dcp *dcp, bool release_cable)
 {
 	scoped_guard(mutex, &dcp->hpd_mutex) {
 		if (release_cable)
 			WRITE_ONCE(dcp->typec_cable_connected, false);
 		dcp->typec_generation++;
 		dcp_firmware_metadata_connection(dcp, dcp->typec_generation, false);
+		/* Nothing arms the timeout work past its drain below. */
+		dcp->announce.stopped = true;
 	}
 	if (release_cable && dcp_is_external_h17p(dcp))
 		dpavservep_detach(dcp);
 	/* Block new enqueues as well as draining users of the AFK endpoints. */
 	disable_delayed_work_sync(&dcp->typec_reconnect_wq);
 	disable_delayed_work_sync(&dcp->placeholder_edid_wq);
+	disable_delayed_work_sync(&dcp->announce_wq);
 	cancel_work_sync(&dcp->external_stop_work);
+	cancel_delayed_work_sync(&dcp->external_stop_retry_wq);
 }
 
-static void dcp_enable_typec_work(struct apple_dcp *dcp)
+VISIBLE_IF_KUNIT void dcp_enable_typec_work(struct apple_dcp *dcp)
 {
 	enable_delayed_work(&dcp->typec_reconnect_wq);
 	enable_delayed_work(&dcp->placeholder_edid_wq);
+	enable_delayed_work(&dcp->announce_wq);
 	/* A cable can be routed before the DRM component binds. */
 	if (READ_ONCE(dcp->typec_cable_connected))
 		mod_delayed_work(system_freezable_wq, &dcp->typec_reconnect_wq, 0);
+	if (dcp_is_external_h17p(dcp)) {
+		struct apple_connector *con = READ_ONCE(dcp->connector);
+
+		guard(mutex)(&dcp->hpd_mutex);
+		dcp->announce.stopped = false;
+		/* A hold that crossed system sleep waits for the new link from now. */
+		dcp_announce_arm(dcp);
+		/* Send an event that came due while stopped. */
+		if (dcp_announce_owed(&dcp->announce) && con &&
+		    READ_ONCE(con->dcp) == to_platform_device(dcp->dev))
+			schedule_work(&con->hotplug_wq);
+	}
 }
 
 static bool dcp_external_is_idle(struct apple_dcp *dcp)
@@ -4199,7 +4411,7 @@ err_piodma:
  * We need to shutdown DCP before tearing down the display subsystem. Otherwise
  * the DCP will crash and briefly flash a green screen of death.
  */
-static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
+VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
@@ -4211,6 +4423,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 		scoped_guard(mutex, &dcp->iomfb.lock)
 			WRITE_ONCE(dcp->quiescing, true);
 		cancel_work_sync(&dcp->external_stop_work);
+		cancel_delayed_work_sync(&dcp->external_stop_retry_wq);
 		if (dcp->crtc && !dcp->drm_retained) {
 			drm_dev_get(dcp->crtc->base.dev);
 			dcp->drm_retained = true;
@@ -4229,6 +4442,14 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 			cancel_work_sync(&dcp->bl_update_wq);
 		}
 		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
+		/*
+		 * Stop the announcement before draining the hotplug work: that
+		 * work arms the timeout work, which in turn queues it.
+		 */
+		scoped_guard(mutex, &dcp->hpd_mutex)
+			dcp->announce.stopped = true;
+		disable_delayed_work_sync(&dcp->announce_wq);
+		dcp_test_point(dcp, DCP_TEST_UNBIND_ANNOUNCE_STOPPED);
 		cancel_work_sync(&dcp->vblank_wq);
 		if (dcp->connector)
 			cancel_work_sync(&dcp->connector->hotplug_wq);
@@ -4358,6 +4579,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	mutex_init(&dcp->hpd_mutex);
 	mutex_init(&dcp->external_lock);
 	INIT_WORK(&dcp->external_stop_work, dcp_external_stop_work);
+	INIT_DELAYED_WORK(&dcp->external_stop_retry_wq, dcp_external_stop_retry);
 	mutex_init(&dcp->tb_lock);
 	spin_lock_init(&dcp->mode_state.lock);
 	spin_lock_init(&dcp->metadata.lock);
@@ -4393,10 +4615,13 @@ static int dcp_platform_probe(struct platform_device *pdev)
 			  dcp_typec_reconnect_work);
 	INIT_DELAYED_WORK(&dcp->placeholder_edid_wq,
 			  dcp_placeholder_edid_work);
+	INIT_DELAYED_WORK(&dcp->announce_wq, dcp_announce_work);
 	INIT_DELAYED_WORK(&dcp->bl_fallback_wq, dcp_work_backlight_fallback);
 	/* Balanced by enable at successful component bind. */
 	disable_delayed_work(&dcp->typec_reconnect_wq);
 	disable_delayed_work(&dcp->placeholder_edid_wq);
+	disable_delayed_work(&dcp->announce_wq);
+	dcp->announce.stopped = true;
 
 	platform_set_drvdata(pdev, dcp);
 
@@ -4556,7 +4781,7 @@ static void dcp_platform_remove(struct platform_device *pdev)
 	component_del(&pdev->dev, &dcp_comp_ops);
 }
 
-static void dcp_platform_shutdown(struct platform_device *pdev)
+VISIBLE_IF_KUNIT void dcp_platform_shutdown(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 

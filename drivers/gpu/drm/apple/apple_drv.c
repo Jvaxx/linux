@@ -122,8 +122,8 @@ apple_connector_detect(struct drm_connector *connector, bool force)
 {
 	struct apple_connector *apple_connector = to_apple_connector(connector);
 
-	return apple_connector->connected ? connector_status_connected :
-						  connector_status_disconnected;
+	return dcp_connector_connected(apple_connector) ?
+		connector_status_connected : connector_status_disconnected;
 }
 
 static void apple_connector_oob_hotplug(struct drm_connector *connector,
@@ -928,16 +928,35 @@ static int apple_platform_suspend(struct device *dev)
 	return 0;
 }
 
+/*
+ * The DCP of an external display sends the hotplug event for its CRTC
+ * itself, once the modes of the new link are in; see dcp_hold_resume_event().
+ * Returns false if any of @crtcs needs the event now.
+ */
+static bool apple_drm_hold_resume_events(struct apple_drm_private *apple, u32 crtcs)
+{
+	struct drm_crtc *crtc;
+	bool held = true;
+
+	drm_for_each_crtc(crtc, &apple->drm) {
+		if (crtcs & drm_crtc_mask(crtc))
+			held &= dcp_hold_resume_event(to_apple_crtc(crtc)->dcp);
+	}
+	return held;
+}
+
 static int apple_platform_resume(struct device *dev)
 {
 	struct apple_drm_private *apple = dev_get_drvdata(dev);
-	bool dropped = false;
+	u32 dropped = 0;
 
 	if (apple) {
 		if (apple->drm.mode_config.suspend_state)
 			dropped = apple_drm_drop_stale_crtcs(apple->drm.mode_config.suspend_state);
-		drm_mode_config_helper_resume(&apple->drm);
 		/* Have userspace set the mode of a CRTC resumed disabled again. */
+		if (dropped && apple_drm_hold_resume_events(apple, dropped))
+			dropped = 0;
+		drm_mode_config_helper_resume(&apple->drm);
 		if (dropped)
 			drm_kms_helper_hotplug_event(&apple->drm);
 	}

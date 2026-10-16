@@ -44,6 +44,7 @@ struct dcp_wait_cookie {
 	struct kref refcount;
 	struct completion done;
 	u32 status;
+	bool replied;
 };
 
 static void release_wait_cookie(struct kref *ref)
@@ -262,6 +263,18 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 						 resp->swap_id)) {
 			dev_warn_ratelimited(dcp->dev,
 					     "completion for aborted present %u ignored\n",
+					     resp->swap_id);
+			return;
+		}
+		/*
+		 * The swap watchdog retired it: its framebuffers stay
+		 * referenced until a later present completes, and a present
+		 * in flight now is a different one.
+		 */
+		if (dcp_present_was_retired_h17p(&dcp->present_state_h17p,
+						 resp->swap_id)) {
+			dev_warn_ratelimited(dcp->dev,
+					     "completion for retired present %u ignored\n",
 					     resp->swap_id);
 			return;
 		}
@@ -1021,6 +1034,7 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 
 			spin_lock_irqsave(&dcp->metadata.lock, flags);
 			dcp->rate_proof.catalog_sequence++;
+			dcp->metadata.catalog_ticket.associated = false;
 			spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 			dcp_180hz_catalog_changed(dcp);
 		}
@@ -1069,6 +1083,11 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 				modes[i].automatic_catalog_sequence = dcp->rate_proof.catalog_sequence;
 		dcp->modes = modes;
 		dcp->nr_modes = nr_modes;
+		/* Only a complete receipt for a current cable is that cable's catalogue. */
+		dcp->metadata.catalog_ticket = rate_ticket;
+		dcp->metadata.catalog_ticket.associated &= nr_modes > 0;
+		dcp->metadata.catalog_connection_sequence =
+			dcp->chunks.automatic_connection_sequence;
 		spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 		/* Notify removals as well as newly eligible modes, outside the lock. */
 		dcp_180hz_catalog_changed(dcp);
@@ -2207,6 +2226,10 @@ static void complete_set_digital_out_mode(struct apple_dcp *dcp, void *data,
 	struct dcp_wait_cookie *wait = cookie;
 
 	if (wait) {
+		if (data) {
+			WRITE_ONCE(wait->status, *(u32 *)data);
+			WRITE_ONCE(wait->replied, true);
+		}
 		complete(&wait->done);
 		kref_put(&wait->refcount, release_wait_cookie);
 	}
@@ -2334,6 +2357,23 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		dev_dbg(dcp->dev,
 			"set_digital_out_mode finished with %d to spare\n",
 			jiffies_to_msecs(ret));
+	}
+	/*
+	 * The external H17P display reports a link that does not come up
+	 * through its DPTX fault callbacks.  What the 32-bit result of the
+	 * mode set means is not established: a nonzero one is seen both for
+	 * a mode set that failed and for one repeating the current mode.  Log
+	 * it, and fail only a mode set that got no reply at all.
+	 */
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL) {
+		if (!READ_ONCE(cookie->replied)) {
+			dev_err(dcp->dev, "set_digital_out_mode got no reply\n");
+			kref_put(&cookie->refcount, release_wait_cookie);
+			return -EIO;
+		}
+		if (READ_ONCE(cookie->status))
+			dev_info(dcp->dev, "set_digital_out_mode returned %#x\n",
+				 READ_ONCE(cookie->status));
 	}
 	kref_put(&cookie->refcount, release_wait_cookie);
 	dcp->vrr_enabled = mode->vrr && crtc_state->vrr_enabled;

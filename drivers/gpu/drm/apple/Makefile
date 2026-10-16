@@ -13,6 +13,11 @@ appledrm-y += iomfb_v13_3.o
 appledrm-y += iomfb_h17p.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += iomfb_h17p_test.o
 appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += apple_resume_test.o
+appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_external_resume_test.o
+appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_external_ready_test.o
+appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_external_announce_test.o
+appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_external_relink_test.o
+appledrm-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_dropped_swap_test.o
 appledrm-y += epic/dpavservep.o
 appledrm-y += plane.o
 
@@ -22,5 +27,6 @@ appledrm-$(CONFIG_TRACING) += trace.o
 obj-$(CONFIG_DRM_APPLE) += appledrm.o
 obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += afk_test.o
 obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp_backlight_test.o
+obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += dcp-announce-test.o
 
 obj-$(CONFIG_DRM_APPLE_KUNIT_TEST) += afk-service-test.o

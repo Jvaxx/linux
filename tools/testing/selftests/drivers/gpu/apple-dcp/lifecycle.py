@@ -84,7 +84,9 @@ typedef uint32_t u32; typedef uint64_t u64;
 #define DCP_HOTPLUG_NOTIFY 1
 struct work_struct { bool pending; };
 struct delayed_work { struct work_struct work; };
-static int system_freezable_wq;
+static int system_freezable_wq, system_wq;
+#define DCP_SWAP_WATCHDOG_MS 1000
+#define DCP_EXTERNAL_STOP_RETRIES 3
 static int schedule_work(struct work_struct *w) { w->pending = true; return 1; }
 static void cancel_work_sync(struct work_struct *w) { w->pending = false; }
 static void cancel_delayed_work_sync(struct delayed_work *w) { w->work.pending = false; }
@@ -92,6 +94,7 @@ static void cancel_delayed_work_sync(struct delayed_work *w) { w->work.pending =
 static void mod_delayed_work(int q, struct delayed_work *w, int t)
 { (void)q; (void)t; w->work.pending = true; }
 struct apple_connector { bool connected, edid_invalidation_pending; };
+struct dcp_announce { int ends; };
 struct apple_dcp {
  int external_lock, hpd_mutex;
  struct { int lock; bool presentation_paused; } iomfb;
@@ -100,6 +103,8 @@ struct apple_dcp {
  struct delayed_work typec_reconnect_wq, placeholder_edid_wq;
  struct work_struct external_stop_work;
  bool external_running, external_stopped, external_power_attempted;
+ bool external_stop_deferred; unsigned int external_stop_retries;
+ struct delayed_work external_stop_retry_wq;
  bool external_cable, typec_cable_connected, typec_crtc_off, pipe_enabled_h17p;
  bool external_physically_absent, external_prepared, placeholder_retried;
  int typec_reconnect_tries;
@@ -107,6 +112,7 @@ struct apple_dcp {
  u64 external_generation, external_rx_generation, external_crtc_generation;
  u64 external_stop_generation, typec_generation;
  int external_error, mode_state; void *avep;
+ struct dcp_announce announce;
 };
 struct platform_device { struct apple_dcp *data; };
 static struct apple_dcp *platform_get_drvdata(struct platform_device *p) { return p->data; }
@@ -139,6 +145,8 @@ static void dpavservep_detach(struct apple_dcp *d) { (void)d; detaches++; }
 static void dcp_firmware_metadata_hotplug(struct apple_dcp *d, bool c) { (void)d; (void)c; }
 static void dcp_firmware_metadata_connection(struct apple_dcp *d, u64 g, bool c)
 { (void)d; (void)g; (void)c; }
+static void dcp_firmware_metadata_announced(struct apple_dcp *d) { (void)d; }
+static void dcp_announce_end(struct dcp_announce *a) { a->ends++; }
 static int dcp_external_disconnect(struct apple_dcp *, bool);
 static struct apple_dcp display;
 static void drm_connector_oob_hotplug_event(void *node, int status)
@@ -365,6 +373,365 @@ int main(void)
 '''
     source = prefix + pm + shim + funcs + tests
     return source
+
+def bounce(root):
+    """Fast dock replug: the sink vanishes while the DPTX link trains.
+
+    The physical-disconnect fixture with the actual dcp_dptx_connect_raw()
+    and a firmware model whose link configuration may never arrive and
+    whose requests may fail, be refused or go unanswered.
+    """
+    unit = disconnect(root)
+    dcp = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
+    m = re.search(r'^static int dcp_dptx_connect_raw\(', dcp, re.M)
+    assert m, 'dcp_dptx_connect_raw'
+    raw = block(dcp, m.start())
+
+    def swap(old, new):
+        nonlocal unit
+        assert unit.count(old) == 1, old
+        unit = unit.replace(old, new)
+
+    swap(' struct { bool connected; void *service; } dptxport[1];',
+         ' struct { bool connected, closed; void *service, *atcphy; int linkcfg_completion; } dptxport[1];\n'
+         ' void *phy, *dev, *active_typec_route;\n'
+         ' int dptx_die, dptx_phy, dptx_dfp_port, connector_type;')
+    old_raw = unit[unit.index('static int dcp_dptx_connect_raw('):]
+    old_raw = old_raw[:old_raw.index('return raw_error; }') + len('return raw_error; }')]
+    swap(old_raw, 'static int dcp_dptx_connect_raw(struct apple_dcp *, u32, bool *);')
+    swap('static int dptxport_set_hpd(void *p, bool on)\n{ (void)p; assert(!on); return hpd_error; }',
+         'static bool fw_hpd, fw_display, link_trains;\n'
+         'static int hpd_drops, connects, release_error_once, assert_error;\n'
+         '/* A request that times out may still be carried out; a refused one is not. */\n'
+         'static int dptxport_set_hpd(void *p, bool on)\n'
+         '{ (void)p; if (on) { fw_hpd |= assert_error != -EINVAL; return assert_error; }\n'
+         ' hpd_drops++; if (hpd_error) return hpd_error; fw_hpd = false; return 0; }')
+    swap('static int dptxport_release_display(void *p)\n{ (void)p; releases++; return release_error; }',
+         'static int dptxport_release_display(void *p)\n'
+         '{ (void)p; releases++; if (release_error) return release_error;\n'
+         ' if (release_error_once) { int r = release_error_once; release_error_once = 0; return r; }\n'
+         ' fw_display = false; return 0; }')
+    swap('int main(void)\n{', 'static int __attribute__((unused)) prior_main(void)\n{')
+    firmware = r'''
+typedef uint8_t u8;
+#define dev_dbg(...) ((void)0)
+#define dev_info(...) ((void)0)
+#define DRM_MODE_CONNECTOR_DisplayPort 10
+#define DPTX_CONNECT_TIMEOUT 2000
+#define DPTX_TUNNEL_CONNECT_TIMEOUT 8000
+static void mutex_lock(int *m) { (void)m; }
+static void mutex_unlock(int *m) { (void)m; }
+static bool dcp_is_usb4_output(struct apple_dcp *d) { (void)d; return false; }
+static bool apple_dp_tunnel_t602x(void) { return false; }
+static void reinit_completion(int *c) { *c = 0; }
+/* The firmware configures the link only while a sink answers it. */
+static unsigned long wait_for_completion_timeout(int *c, unsigned long t)
+{ if (link_trains) *c = 1; return *c ? t : 0; }
+static unsigned jiffies_to_msecs(unsigned long t) { return t; }
+static void usleep_range(int a, int b) { (void)a; (void)b; }
+static void av_service_connect(struct apple_dcp *d) { (void)d; }
+static int validate_error, connect_error, request_error;
+static int dptxport_validate_connection(void *s, int core, int atc, int die)
+{ (void)s; (void)core; (void)atc; (void)die; return validate_error; }
+static int dptxport_connect(void *s, int core, int atc, int die, bool typec)
+{ (void)s; (void)core; (void)atc; (void)die; (void)typec; connects++; return connect_error; }
+static int dptxport_request_display(void *s)
+{ (void)s; fw_display |= request_error != -EINVAL; return request_error; }
+static int dptxport_set_hpd_timeout(void *s, bool on, int t) { (void)t; return dptxport_set_hpd(s, on); }
+'''
+    tests = r'''
+static struct platform_device device = { .data = &display };
+/* The session the dock leaves behind after its plug-time route bounce. */
+static void bounced(void)
+{
+ init(); display.phy = (void *)1; fw_hpd = fw_display = true;
+ release_error_once = 0; link_trains = true;
+ CHECK(dcp_external_disconnect(&display, true) == 0);
+ CHECK(display.external_stopped && !display.dptxport[0].connected && !display.external_error);
+ connects = hpd_drops = 0;
+ validate_error = connect_error = request_error = assert_error = 0;
+}
+/* The failure stays latched across the unplug, and the next plug is refused. */
+static void stays_latched(int error)
+{
+ int before;
+
+ validate_error = connect_error = request_error = assert_error = 0;
+ hpd_error = release_error = 0;
+ CHECK(display.external_error == error);
+ CHECK(dcp_external_disconnect(&display, true) == error);
+ CHECK(display.external_error == error);
+ before = connects; link_trains = true;
+ CHECK(dcp_dptx_connect_oob(&device, 0) == error && connects == before);
+}
+int main(void)
+{
+ /* The route comes back while the sink no longer answers: withdrawn, not latched. */
+ bounced(); link_trains = false;
+ CHECK(dcp_dptx_connect_oob(&device, 0) == -ETIMEDOUT);
+ CHECK(!display.external_error && !display.dptxport[0].connected);
+ CHECK(!fw_hpd && !fw_display && hpd_drops == 1);
+ /* tipd's own OOB connect after the mux tries again rather than refusing. */
+ CHECK(dcp_dptx_connect_oob(&device, 0) == -ETIMEDOUT && connects == 2);
+ /* The unplug's teardown (OOB disconnect, then SAFE) succeeds. */
+ CHECK(dcp_external_disconnect(&display, true) == 0 && !display.external_error);
+ /* The next plug connects: the display recovers without a reboot. */
+ link_trains = true;
+ CHECK(dcp_dptx_connect_oob(&device, 0) == 0);
+ CHECK(display.dptxport[0].connected && fw_hpd && fw_display && connects == 3);
+ printf("case withdrawn-link complete\n");
+
+ /*
+  * The firmware does not acknowledge the withdrawal: HPD low or the release
+  * times out, or HPD low gets an incomplete reply.  The session stays held.
+  */
+ for (int which = 0; which < 3; which++) {
+  bounced(); link_trains = false;
+  if (which == 0) hpd_error = -ETIMEDOUT;
+  if (which == 1) release_error_once = -ETIMEDOUT;
+  if (which == 2) hpd_error = -EPROTO;
+  CHECK(dcp_dptx_connect_oob(&device, 0) == -ETIMEDOUT);
+  CHECK(display.external_error == -ETIMEDOUT && display.dptxport[0].connected);
+  stays_latched(-ETIMEDOUT);
+ }
+ printf("case unacknowledged-withdrawal complete\n");
+
+ /*
+  * A request goes unanswered, so the firmware may still carry it out, with
+  * its cleanup failing as well or not, on a session that never powered its
+  * pipe or that stopped it before.  A port no longer marked connected is no
+  * proof that the firmware let go of it: the failure stays latched.
+  */
+ for (int fault = 0; fault < 4; fault++)
+  for (int cleanup = 0; cleanup < 2; cleanup++)
+   for (int stopped = 0; stopped < 2; stopped++) {
+    bounced();
+    if (!stopped)
+     display.external_power_attempted = display.external_stopped = false;
+    if (fault == 0) validate_error = -ETIMEDOUT;
+    if (fault == 1) connect_error = -ETIMEDOUT;
+    if (fault == 2) request_error = -ETIMEDOUT;
+    if (fault == 3) assert_error = -ETIMEDOUT;
+    if (cleanup) release_error = -ETIMEDOUT;
+    CHECK(dcp_dptx_connect_oob(&device, 0) == -ETIMEDOUT);
+    stays_latched(-ETIMEDOUT);
+   }
+ printf("case unanswered-request complete\n");
+
+ /* A request the firmware refuses is latched as before, released display or not. */
+ for (int fault = 0; fault < 2; fault++) {
+  bounced();
+  if (fault == 0) request_error = -EINVAL;
+  if (fault == 1) assert_error = -EINVAL;
+  CHECK(dcp_dptx_connect_oob(&device, 0) == -EINVAL);
+  CHECK(!display.dptxport[0].connected);
+  stays_latched(-EINVAL);
+ }
+ printf("case refused-request complete\n");
+
+ /* A live failure (powered pipe never acknowledged off) still holds everything. */
+ init(); display.phy = (void *)1; power_error = -ETIMEDOUT; connects = 0;
+ CHECK(dcp_external_disconnect(&display, true) == -ETIMEDOUT);
+ power_error = 0;
+ CHECK(dcp_external_disconnect(&display, true) == -ETIMEDOUT);
+ CHECK(display.external_error == -ETIMEDOUT && display.pipe_enabled_h17p);
+ CHECK(dcp_dptx_connect_oob(&device, 0) == -ETIMEDOUT && connects == 0);
+ printf("case live-failure complete\n");
+
+ printf("%d assertions, %d failures\n", checks, failures); return !!failures;
+}
+'''
+    return unit + firmware + raw + '\n' + tests
+
+def dropped(root):
+    """A dock leaves during the first mode set, and the next swap is dropped.
+
+    The physical-disconnect fixture with tipd's actual update and retry work
+    and the actual external stop, against an IOMFB queue that a dropped
+    present keeps busy until the swap watchdog retires it, or until the
+    transaction timeout declares the coprocessor crashed.  Time is the
+    queue's own clock, advanced by the waits of the stop and of tipd.
+    """
+    unit = disconnect(root)
+    dcp = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
+    extra = block(dcp, dcp.index('static int dcp_external_start_locked('))
+    # Without a retry of its own, a deferred stop of a CRTC that is off waits.
+    retry = 'static void dcp_external_stop_retry('
+    extra += '\n' + (block(dcp, dcp.index(retry)) if retry in dcp else
+                      retry + 'struct work_struct *work) { (void)work; }')
+
+    def swap(old, new):
+        nonlocal unit
+        assert unit.count(old) == 1, old
+        unit = unit.replace(old, new)
+
+    swap('static int iomfb_queue_settle(struct apple_dcp *d, int t)\n'
+         '{ (void)d; (void)t; settles++; return settle_error; }',
+         '/* Milliseconds since the firmware accepted the dropped present. */\n'
+         'static int now, retire_at, crash_at, after_power_error;\n'
+         'static bool pending, crashed, powered;\n'
+         'static int iomfb_queue_settle(struct apple_dcp *d, int t)\n'
+         '{ (void)d; settles++; if (settle_error) return settle_error;\n'
+         ' if (powered) { powered = false; if (after_power_error) return after_power_error; }\n'
+         ' if (pending && retire_at >= 0 && now + t >= retire_at) {\n'
+         '  if (now < retire_at) now = retire_at; pending = false; }\n'
+         ' if (pending && now + t >= crash_at) { if (now < crash_at) now = crash_at; crashed = true; }\n'
+         ' if (crashed) return -EIO;\n'
+         ' if (pending) { now += t; return -ETIMEDOUT; }\n'
+         ' return 0; }')
+    swap('static int iomfb_external_power_h17p(struct apple_dcp *d, bool on)\n'
+         '{ (void)d; assert(!on); powers++; return power_error; }',
+         'static int iomfb_external_power_h17p(struct apple_dcp *d, bool on)\n'
+         '{ (void)d; if (on) { power_ons++; return 0; }\n'
+         ' assert(!pending); powers++; powered = !power_error; return power_error; }')
+    swap('static int settle_error,', 'static int power_ons, settle_error,')
+    # The H17P branch of dcp_typec_route_prepare(), which quiesce-before-safe
+    # runs for real inside typec_mux_set().
+    swap('static int typec_set_mode(void *p, int s)\n'
+         '{ (void)p; assert(s == TYPEC_STATE_SAFE); safes++; return safe_error; }',
+         'static int phy_safes;\n'
+         'static int typec_set_mode(void *p, int s)\n'
+         '{ int r; (void)p; assert(s == TYPEC_STATE_SAFE); safes++;\n'
+         ' if (display.external_error) return display.external_error;\n'
+         ' if (display.external_cable || !display.external_stopped || display.dptxport[0].connected) {\n'
+         '  r = dcp_external_disconnect(&display, true); if (r) return r; }\n'
+         ' phy_safes++; return 0; }')
+    swap('int main(void)\n{', 'static int __attribute__((unused)) prior_main(void)\n{')
+    tests = r'''
+static struct platform_device device = { .data = &display };
+/* The dock has left; the firmware accepted a present it will not complete. */
+static void left(int retire)
+{
+ init(); now = 0; retire_at = retire; crash_at = 10000; after_power_error = 0;
+ pending = true; crashed = powered = false; phy_safes = power_ons = 0;
+}
+/* tipd's revalidation of the cable after its debounce, as resume_work. */
+static bool revalidate(void)
+{
+ now += CD321X_DEBOUNCE_DELAY_MS;
+ if (!cd321x_pm_begin_read(&port.pm)) return false;
+ cd321x_pm_snapshot_ready(&port.pm); cd321x_update_work(&port.update_work.work);
+ return true;
+}
+/* Nothing of the session has been released, and nothing was sent. */
+static void owned(void)
+{
+ CHECK(!display.external_stopped && display.dptxport[0].connected);
+ CHECK(display.pipe_enabled_h17p && !display.typec_crtc_off);
+ CHECK(display.iomfb.presentation_paused && !display.external_running);
+ CHECK(powers == 0 && releases == 0 && phy_safes == 0);
+}
+int main(void)
+{
+ /*
+  * The capture: tipd's out-of-band disconnect and then its SAFE stop the
+  * session while the dropped present is in flight.  Each settle times out
+  * after 500 ms, before the power-off is sent: not latched.  The watchdog
+  * retires the present, and tipd's next revalidation stops the session and
+  * reaches the PHY.
+  */
+ left(1500);
+ cd321x_update_work(&port.update_work.work);
+ CHECK(safes == 1 && settles == 2 && now == 1000);
+ CHECK(!display.external_error && !display.external_cable && !sink.connected);
+ owned();
+ CHECK(port.pm.phase == CD321X_PM_REVALIDATE && !port.state_valid);
+ CHECK(revalidate());
+ CHECK(safes == 2 && phy_safes == 1 && powers == 1 && releases == 1);
+ CHECK(!display.external_error && display.external_stopped);
+ CHECK(!display.dptxport[0].connected && !display.pipe_enabled_h17p && display.typec_crtc_off);
+ CHECK(port.state_valid && port.pm.phase == CD321X_PM_RUNNING);
+ /* The next plug connects. */
+ CHECK(dcp_dptx_connect_oob(&device, 0) == 0);
+ CHECK(display.dptxport[0].connected && display.external_cable && !display.external_error);
+ printf("case captured complete\n");
+
+ /* The watchdog retires the present during the retry's settle. */
+ left(1900);
+ cd321x_update_work(&port.update_work.work);
+ CHECK(!display.external_error); owned();
+ CHECK(revalidate() && phy_safes == 1 && display.external_stopped && now == 1900);
+ printf("case retired-during-retry complete\n");
+
+ /*
+  * Nothing retires the present.  The stop is retried within tipd's budget
+  * and the session stays owned throughout; once the transaction timeout
+  * declares the coprocessor crashed, the stop latches and the next plug is
+  * refused: the protected case.
+  */
+ left(-1);
+ cd321x_update_work(&port.update_work.work);
+ while (revalidate())
+  ;
+ CHECK(safes == 1 + CD321X_RESUME_ATTEMPTS && port.pm.phase == CD321X_PM_STALE);
+ CHECK(!display.external_error); owned();
+ now = 12000;
+ CHECK(cd321x_pm_event(&port.pm) && revalidate());
+ CHECK(display.external_error == -EIO); owned();
+ CHECK(dcp_dptx_connect_oob(&device, 0) == -EIO && raw_links == 0);
+ printf("case never-retired complete\n");
+
+ /* A settle after the power-off was sent still latches and holds. */
+ left(0); pending = false; after_power_error = -ETIMEDOUT;
+ cd321x_update_work(&port.update_work.work);
+ CHECK(powers == 1 && display.external_error == -ETIMEDOUT);
+ CHECK(display.dptxport[0].connected && display.pipe_enabled_h17p && !display.external_stopped);
+ CHECK(revalidate() && phy_safes == 0 && powers == 1 && releases == 0);
+ printf("case after-power-off complete\n");
+
+ /* A crashed or stopped queue is no proof that DMA stopped: latched. */
+ left(1000); settle_error = -EIO;
+ cd321x_update_work(&port.update_work.work);
+ CHECK(display.external_error == -EIO); settle_error = 0;
+ CHECK(revalidate() && phy_safes == 0 && powers == 0);
+ printf("case crashed-queue complete\n");
+
+ /* The same deferral for a CRTC switched off on the same cable. */
+ left(1000);
+ CHECK(dcp_external_disconnect(&display, false) == -ETIMEDOUT);
+ CHECK(!display.external_error && display.external_cable); owned();
+ now = 1000;
+ CHECK(dcp_external_disconnect(&display, false) == 0 && display.external_stopped && powers == 1);
+ printf("case crtc-off complete\n");
+
+ /* Nothing else retries a CRTC that is off: the stop retries itself, bounded. */
+ left(1000);
+ CHECK(dcp_external_disconnect(&display, false) == -ETIMEDOUT);
+ CHECK(display.external_stop_deferred && display.external_stop_retry_wq.work.pending);
+ now = 1000; display.external_stop_retry_wq.work.pending = false;
+ dcp_external_stop_retry(&display.external_stop_retry_wq.work);
+ CHECK(display.external_stopped && !display.external_stop_deferred && powers == 1);
+ CHECK(!display.external_stop_retry_wq.work.pending && !display.external_stop_retries);
+ left(-1); crash_at = 1 << 30;
+ for (int i = 0; i <= DCP_EXTERNAL_STOP_RETRIES; i++) {
+  display.external_stop_retry_wq.work.pending = false;
+  dcp_external_stop_retry(&display.external_stop_retry_wq.work);
+  if (!i) CHECK(dcp_external_disconnect(&display, false) == -ETIMEDOUT);
+ }
+ CHECK(!display.external_stop_retry_wq.work.pending && !display.external_error); owned();
+ printf("case stop-retry complete\n");
+
+ /*
+  * The CRTC is enabled again on the same cable before any stop went
+  * through: the pipe was never powered off, so it is resumed, not powered
+  * on a second time.
+  */
+ left(1000);
+ CHECK(dcp_external_disconnect(&display, false) == -ETIMEDOUT); owned();
+ CHECK(dcp_external_start_locked(&display) == 0);
+ CHECK(power_ons == 0 && powers == 0 && display.external_running);
+ CHECK(!display.iomfb.presentation_paused && !display.external_stop_deferred);
+ CHECK(display.pipe_enabled_h17p && display.dptxport[0].connected);
+ /* Once the cable is gone, the deferred session is not resumed. */
+ left(1000);
+ CHECK(dcp_external_disconnect(&display, true) == -ETIMEDOUT);
+ CHECK(dcp_external_start_locked(&display) == -ENODEV && power_ons == 0); owned();
+ printf("case enable-after-deferral complete\n");
+
+ printf("%d assertions, %d failures\n", checks, failures); return !!failures;
+}
+'''
+    return unit + extra + '\n' + tests
 
 def teardown(root):
 
