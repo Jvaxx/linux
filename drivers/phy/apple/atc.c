@@ -22,6 +22,8 @@
  * Author: Sven Peter <sven@kernel.org>
  */
 
+#include <kunit/static_stub.h>
+
 #include <dt-bindings/phy/phy.h>
 #include <linux/bitfield.h>
 #include <linux/cleanup.h>
@@ -2787,6 +2789,9 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 	int ret = 0;
 	u32 reg;
 
+	if (IS_ENABLED(CONFIG_PHY_APPLE_ATC_KUNIT_TEST))
+		KUNIT_STATIC_STUB_REDIRECT(atcphy_configure, atcphy, mode);
+
 	lockdep_assert_held(&atcphy->lock);
 	if (atcphy->pipe_pending)
 		return -EBUSY;
@@ -3700,6 +3705,7 @@ static int atcphy_mux_set_locked(struct apple_atcphy *atcphy, enum atcphy_mode t
 		atcphy->mode, atcphy->mode_dirty);
 
 	if (atcphy->mode == target_mode && !atcphy->mode_dirty) {
+		atcphy->typec_mode = target_mode;
 		/* Retry a failed PIPE setup without disturbing the configured lanes. */
 		if (atcphy->fixed_usb2 && atcphy->host_active &&
 		    (atcphy->pipe_state != atcphy_modes[target_mode].pipehandler_state ||
@@ -3713,6 +3719,11 @@ static int atcphy_mux_set_locked(struct apple_atcphy *atcphy, enum atcphy_mode t
 		}
 		return 0;
 	}
+
+	/* A re-probe after failed role shutdown must leave the live PIPE alone. */
+	if (!atcphy->fixed_usb2 && target_mode == APPLE_ATCPHY_MODE_OFF &&
+	    atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY)
+		return -EBUSY;
 
 	switch (target_mode) {
 	case APPLE_ATCPHY_MODE_TBT:
@@ -3795,8 +3806,11 @@ static int atcphy_mux_update(struct apple_atcphy *atcphy, const struct typec_mux
 		 * includes a whole enumeration with its timeouts, and would
 		 * hold up a DisplayPort update that changes neither.
 		 */
-		if (atcphy_mux_is_noop(atcphy, target_mode))
+		if (atcphy_mux_is_noop(atcphy, target_mode)) {
+			/* Record matching requests for the next PHY init to restore. */
+			atcphy->typec_mode = target_mode;
 			return 0;
+		}
 	}
 
 	ret = atcphy_usb3_pm_get(atcphy, &pm);
@@ -3824,6 +3838,7 @@ static int atcphy_probe_mux(struct apple_atcphy *atcphy)
 		.drvdata = atcphy,
 		.fwnode = atcphy->dev->fwnode,
 		.set = atcphy_mux_set,
+		.safe_after_role = !atcphy->fixed_usb2,
 	};
 
 	mux = typec_mux_register(atcphy->dev, &mux_desc);

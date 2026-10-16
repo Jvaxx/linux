@@ -75,6 +75,8 @@ struct mt7932 {
 	unsigned int cal_request_head, cal_request_count;
 	spinlock_t response_lock;
 	u8 seq, waiting;
+	/* Event that answers the waiting command; see mt7932_reply_eid(). */
+	int waiting_eid;
 	u8 mac[ETH_ALEN];
 	u8 reply[MT7932_RX_CAPACITY];
 	size_t reply_length;
@@ -112,6 +114,11 @@ struct mt7932 {
 	bool interface_registered, interface_up;
 	u32 reg_generation, reg_attempted;
 	struct mt7932_reg_snapshot reg_desired;
+	/* A relaxation kept from the firmware while associated; applied by the
+	 * next pass once the connection has ended. Under response_lock.
+	 */
+	struct mt7932_reg_snapshot reg_deferred;
+	bool reg_deferral;
 	/* Channels the applied country package leaves out; under RTNL. */
 	DECLARE_BITMAP(policy_disabled, MT7932_CHANNELS);
 	struct net_device *netdev;
@@ -145,6 +152,10 @@ struct mt7932 {
 	u8 connect_ssid_length, connect_channel, peer_wtbl;
 	bool connecting, connected, peer_valid, link_failed, connect_open;
 	bool disconnecting, disconnect_seen, disconnect_event_received, disconnect_local;
+	/* The connect worker is reporting its outcome; an RF failure meanwhile
+	 * sets connect_lost for the worker to report. Under response_lock.
+	 */
+	bool connect_publishing, connect_lost;
 	u16 disconnect_reason;
 	int connect_error;
 	u32 event_cipher;
@@ -181,6 +192,7 @@ struct mt7932 {
 
 bool mt_rf_allowed(struct mt7932 *m);
 void mt_retry_missing_policy(struct mt7932 *m);
+void mt_reg_apply_deferred_locked(struct mt7932 *m);
 int mt_net_open(struct net_device *netdev);
 int mt_request_input(struct mt7932 *m, const struct firmware **fw, const char *name);
 /* response_lock held; closes RF admission and reports terminal host state. */

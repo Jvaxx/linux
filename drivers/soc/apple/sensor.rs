@@ -5,6 +5,7 @@
 //! The fingerprint sensor over SPI.
 
 use kernel::prelude::*;
+use kernel::sync::atomic::{Atomic, Relaxed};
 use kernel::time::delay::fsleep;
 use kernel::time::Delta;
 
@@ -118,6 +119,7 @@ const CMD_START_CAPTURE: [u8; CMD_LEN] = [0x80, 0x40, 0x00, 0x07, 0x00, 0x00, 0x
 // Precedes the patch blob.
 const CMD_SETUP_PATCH_ENABLE: [u8; CMD_LEN] = [0x80, 0x60, 0x00, 0x07, 0x00, 0x00, 0x00];
 const CMD_GET_SENSOR_SERIAL: [u8; CMD_LEN] = [0x80, 0x70, 0x00, 0x07, 0x00, 0x00, 0x00];
+const CMD_GET_NONCE: [u8; CMD_LEN] = [0x80, 0x35, 0x00, 0x07, 0x00, 0x00, 0x00];
 
 const READ_CMD_LEN: usize = 11;
 const CMD_READ_PREFIX: [u8; CMD_LEN] = [0x80, 0x13, 0x00, 0x0b, 0x00, 0x00, 0x00];
@@ -475,25 +477,17 @@ fn poll_until_ready_any(accepted: &[usize]) -> Result<usize> {
 }
 
 pub(crate) fn send_session_share(share: &[u8; SESSION_SHARE_LEN]) -> Result<()> {
+    drain_stale_frames()?;
     send_framed(TYPE_SESSION, share)
 }
 
 pub(crate) fn send_challenge(challenge: &[u8; CHALLENGE_LEN]) -> Result<()> {
+    drain_stale_frames()?;
     send_framed(TYPE_SEQUENCE, challenge)
 }
 
 static_assert!(FRAME_HEADER + SESSION_SHARE_LEN == 0x2f);
 static_assert!(FRAME_HEADER + CHALLENGE_LEN == 0x47);
-
-fn read_framed(total: usize, at: usize, out: &mut [u8]) -> Result<()> {
-    let mut buf = [0xffu8; MAX_REPLY];
-    read_reply(total, &mut buf)?;
-    if at + out.len() > total {
-        return Err(EINVAL);
-    }
-    out.copy_from_slice(&buf[at..at + out.len()]);
-    Ok(())
-}
 
 fn poll_until_ready(expected: usize) -> Result<()> {
     for _ in 0..READ_POLL_ATTEMPTS {
@@ -510,11 +504,6 @@ fn poll_until_ready(expected: usize) -> Result<()> {
 
 const READ_POLL_MS: i64 = 5;
 const READ_POLL_ATTEMPTS: usize = 200;
-
-fn read_reply(total: usize, buf: &mut [u8; MAX_REPLY]) -> Result<()> {
-    poll_until_ready(total)?;
-    read_reply_ready(total, buf)
-}
 
 fn read_reply_ready(total: usize, buf: &mut [u8; MAX_REPLY]) -> Result<()> {
     if total > MAX_REPLY {
@@ -538,22 +527,99 @@ fn read_reply_ready(total: usize, buf: &mut [u8; MAX_REPLY]) -> Result<()> {
     })
 }
 
-fn read_framed_verified(total: usize, at: usize, out: &mut [u8]) -> Result<()> {
-    if total < CRC_LEN || at + out.len() > total - CRC_LEN {
+/// Frames the sensor still offered after the read that should have taken
+/// them, and stale frames found on offer before a command. Both mean an
+/// exchange went wrong on the bus; the caller reports them.
+static REREADS: Atomic<u32> = Atomic::new(0);
+static DRAINED: Atomic<u32> = Atomic::new(0);
+
+/// Takes the counts of re-read and drained frames since the last call.
+pub(crate) fn take_recoveries() -> (u32, u32) {
+    (REREADS.xchg(0, Relaxed), DRAINED.xchg(0, Relaxed))
+}
+
+// A garbled read the sensor did not take is read once more, twice at most.
+const FRAME_READS: usize = 3;
+// Stale frames taken before a command; the sensor queues at most a couple.
+const DRAIN_FRAMES: usize = 2;
+
+/// A reply buffer, wiped however the read that fills it ends.
+struct FrameBuf([u8; MAX_REPLY]);
+
+impl FrameBuf {
+    fn new() -> Self {
+        FrameBuf([0xff; MAX_REPLY])
+    }
+}
+
+impl Drop for FrameBuf {
+    fn drop(&mut self) {
+        for b in self.0.iter_mut() {
+            // SAFETY: a valid, uniquely borrowed byte.
+            unsafe { core::ptr::write_volatile(b, 0) };
+        }
+    }
+}
+
+fn frame_crc_valid(frame: &[u8]) -> bool {
+    let split = frame.len() - CRC_LEN;
+    u16::from_le_bytes([frame[split], frame[split + 1]]) == crc16_ansi(&frame[..split])
+}
+
+/// Takes any frame the sensor still offers before a new command, so the
+/// reply to that command is not mistaken for, or queued behind, a stale one.
+/// Fails if the sensor still offers a frame once the budget is spent: a
+/// read is no proof the sensor took the frame.
+fn drain_stale_frames() -> Result<()> {
+    for _ in 0..DRAIN_FRAMES {
+        let Some(count) = status()?.available().filter(|n| *n != 0) else {
+            return Ok(());
+        };
+        let count = count as usize;
+        if count > MAX_REPLY {
+            return Err(EIO);
+        }
+        let mut buf = FrameBuf::new();
+        read_reply_ready(count, &mut buf.0)?;
+        DRAINED.fetch_add(1, Relaxed);
+    }
+    match status()?.available() {
+        None | Some(0) => Ok(()),
+        Some(_) => Err(EBUSY),
+    }
+}
+
+/// Sends `cmd` and reads its `total`-byte reply, checking the reply's CRC.
+fn command_frame(cmd: &[u8; CMD_LEN], total: usize, at: usize, out: &mut [u8]) -> Result<()> {
+    drain_stale_frames()?;
+    command(cmd)?;
+    read_frame(total, at, out)
+}
+
+/// Reads a `total`-byte reply once the sensor offers it and checks its CRC.
+/// A read the sensor did not take leaves the frame on offer at the same
+/// length: only then is it read again.
+fn read_frame(total: usize, at: usize, out: &mut [u8]) -> Result<()> {
+    if total < CRC_LEN || total > MAX_REPLY || at + out.len() > total - CRC_LEN {
         return Err(EINVAL);
     }
-    let mut buf = [0xffu8; MAX_REPLY];
-    read_reply(total, &mut buf)?;
+    poll_until_ready(total)?;
 
-    let split = total - CRC_LEN;
-    let expected = u16::from_le_bytes([buf[split], buf[split + 1]]);
-    let computed = crc16_ansi(&buf[..split]);
-    if expected != computed {
-        return Err(EIO);
+    let mut buf = FrameBuf::new();
+    for attempt in 0..FRAME_READS {
+        if attempt > 0 {
+            if status()?.available() != Some(total as u32) {
+                break;
+            }
+            REREADS.fetch_add(1, Relaxed);
+        }
+        read_reply_ready(total, &mut buf.0)?;
+        if frame_crc_valid(&buf.0[..total]) {
+            out.copy_from_slice(&buf.0[at..at + out.len()]);
+            return Ok(());
+        }
     }
-
-    out.copy_from_slice(&buf[at..at + out.len()]);
-    Ok(())
+    Err(EIO)
 }
 
 const MAX_REPLY: usize = 0x4f;
@@ -576,17 +642,15 @@ impl SensorSerial {
 }
 
 pub(crate) fn read_sensor_serial() -> Result<SensorSerial> {
-    command(&CMD_GET_SENSOR_SERIAL)?;
     let mut serial = [0u8; SENSOR_SERIAL_LEN];
-    read_framed_verified(SENSOR_SERIAL_REPLY_LEN, SENSOR_SERIAL_AT, &mut serial)?;
+    command_frame(&CMD_GET_SENSOR_SERIAL, SENSOR_SERIAL_REPLY_LEN, SENSOR_SERIAL_AT, &mut serial)?;
     Ok(SensorSerial(serial))
 }
 
 /// Read the nonce as one frame; a separate acknowledgment would consume it.
 pub(crate) fn session_nonce() -> Result<[u8; 32]> {
-    command(&[0x80, 0x35, 0, 7, 0, 0, 0])?;
     let mut value = [0; 32];
-    read_framed_verified(9 + value.len() + CRC_LEN, 9, &mut value)?;
+    command_frame(&CMD_GET_NONCE, 9 + value.len() + CRC_LEN, 9, &mut value)?;
     if value.iter().all(|byte| *byte == 0) {
         return Err(EIO);
     }
@@ -595,13 +659,13 @@ pub(crate) fn session_nonce() -> Result<[u8; 32]> {
 
 pub(crate) fn read_session_reply() -> Result<[u8; SESSION_SHARE_LEN]> {
     let mut share = [0u8; SESSION_SHARE_LEN];
-    read_framed(SESSION_REPLY_LEN, SESSION_REPLY_AT, &mut share)?;
+    read_frame(SESSION_REPLY_LEN, SESSION_REPLY_AT, &mut share)?;
     Ok(share)
 }
 
 pub(crate) fn read_challenge_reply() -> Result<[u8; CHALLENGE_LEN]> {
     let mut reply = [0u8; CHALLENGE_LEN];
-    read_framed(CHALLENGE_REPLY_LEN, CHALLENGE_REPLY_AT, &mut reply)?;
+    read_frame(CHALLENGE_REPLY_LEN, CHALLENGE_REPLY_AT, &mut reply)?;
     Ok(reply)
 }
 
@@ -635,6 +699,14 @@ impl Identifier {
 }
 
 impl Status {
+    /// The length of the frame the sensor offers, if it offers one.
+    pub(crate) fn available(&self) -> Option<u32> {
+        match self.offset12() {
+            Offset12::Available(n) => Some(n),
+            _ => None,
+        }
+    }
+
     pub(crate) fn offset12(&self) -> Offset12 {
         match self.state {
             STATE_IDLE => Offset12::Identifier(u16::from_le_bytes([

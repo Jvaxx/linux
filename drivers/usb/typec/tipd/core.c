@@ -6,6 +6,8 @@
  * Author: Heikki Krogerus <heikki.krogerus@linux.intel.com>
  */
 
+#include <kunit/static_stub.h>
+#include <kunit/visibility.h>
 #include <linux/i2c.h>
 #include <linux/acpi.h>
 #include <linux/gpio/consumer.h>
@@ -226,7 +228,9 @@ static int tps6598x_set_data_role(struct tps6598x *tps,
 		role_val = USB_ROLE_NONE;
 
 	ret = usb_role_switch_set_role(tps->role_sw, role_val);
-	if (ret)
+	/* An unregistered role switch has already stopped its controller. */
+	if (ret && (connected || ret != -EOPNOTSUPP ||
+		    usb_role_switch_get_role(tps->role_sw) != USB_ROLE_NONE))
 		return ret;
 	typec_set_data_role(tps->port, role);
 	return 0;
@@ -288,6 +292,12 @@ static void tps6598x_drop_partner(struct tps6598x *tps, u32 status)
 	typec_set_vconn_role(tps->port, TPS_STATUS_TO_TYPEC_VCONN(status));
 }
 
+/* The mux provider knows whether this is a fixed host or a switched PHY. */
+static bool tps6598x_safe_after_role(struct tps6598x *tps)
+{
+	return tps->role_sw && typec_mux_safe_after_role(tps->mux);
+}
+
 static int tps6598x_disconnect(struct tps6598x *tps, u32 status)
 {
 	struct typec_mux_state safe = { .mode = TYPEC_STATE_SAFE };
@@ -301,13 +311,16 @@ static int tps6598x_disconnect(struct tps6598x *tps, u32 status)
 		ret = typec_mux_begin(tps->mux, &safe);
 		if (ret)
 			return ret;
-		/* Park while the host still supplies the PIPE backend clock. */
-		ret = typec_mux_apply(tps->mux);
-		if (ret)
-			return ret;
+		/* Leave shared PHY shutdown to its USB role consumer. */
+		if (!tps6598x_safe_after_role(tps)) {
+			ret = typec_mux_apply(tps->mux);
+			if (ret)
+				return ret;
+		}
 	}
 	ret = tps6598x_set_data_role(tps, TPS_STATUS_TO_TYPEC_DATAROLE(status), false);
 	if (ret) {
+		/* Keep recovery ownership; a live PHY must not receive SAFE. */
 		typec_mux_abort(tps->mux);
 		return ret;
 	}
@@ -1509,6 +1522,36 @@ static void cd321x_stop_work(struct cd321x *cd321x)
 	cancel_delayed_work_sync(&cd321x->update_work);
 }
 
+/* Separate so that the KUnit tests can choose the driver core's answer. */
+VISIBLE_IF_KUNIT bool cd321x_tbt_switch_keep_waiting(struct device *dev)
+{
+	KUNIT_STATIC_STUB_REDIRECT(cd321x_tbt_switch_keep_waiting, dev);
+
+	return driver_deferred_probe_check_state(dev) == -EPROBE_DEFER;
+}
+EXPORT_SYMBOL_IF_KUNIT(cd321x_tbt_switch_keep_waiting);
+
+/*
+ * The USB4/Thunderbolt router is only needed once a USB4 or Thunderbolt link
+ * comes up. If its driver is not built or never binds, do not leave power
+ * delivery, USB and DisplayPort on this port without a driver as well: stop
+ * waiting for the router when the driver core stops waiting for missing
+ * dependencies.
+ */
+VISIBLE_IF_KUNIT struct typec_thunderbolt_switch *
+cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode)
+{
+	struct typec_thunderbolt_switch *sw;
+
+	sw = fwnode_typec_thunderbolt_switch_get(fwnode);
+	if (sw != ERR_PTR(-EPROBE_DEFER) || cd321x_tbt_switch_keep_waiting(dev))
+		return sw;
+
+	dev_info(dev, "USB4/Thunderbolt router unavailable, continuing without it\n");
+	return NULL;
+}
+EXPORT_SYMBOL_IF_KUNIT(cd321x_tbt_switch_get);
+
 static int
 cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 {
@@ -1538,7 +1581,7 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 	if (IS_ERR(cd321x->connector_fwnode))
 		cd321x->connector_fwnode = NULL;
 
-	cd321x->tbt_switch = fwnode_typec_thunderbolt_switch_get(fwnode);
+	cd321x->tbt_switch = cd321x_tbt_switch_get(tps->dev, fwnode);
 	if (IS_ERR(cd321x->tbt_switch)) {
 		ret = PTR_ERR(cd321x->tbt_switch);
 		goto err_put_mux;
@@ -2046,12 +2089,21 @@ static int cd321x_remove(struct tps6598x *tps)
 	ret = typec_mux_begin(tps->mux, &safe);
 	if (ret)
 		return ret;
-	/* Park while the host still supplies the PIPE backend clock. */
-	ret = typec_mux_apply(tps->mux);
-	if (ret)
-		return ret;
+	/*
+	 * Ordinary PHYs need role shutdown before SAFE. A fixed host must park
+	 * now while its controller supplies the PIPE backend clock, even when
+	 * the firmware graph exposes a no-op role switch for that host.
+	 */
+	if (!tps6598x_safe_after_role(tps)) {
+		ret = typec_mux_apply(tps->mux);
+		if (ret)
+			return ret;
+	}
 	ret = usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
-	if (ret) {
+	/* An unregistered switch means the controller is already stopped. */
+	if (ret && (ret != -EOPNOTSUPP ||
+		    usb_role_switch_get_role(tps->role_sw) != USB_ROLE_NONE)) {
+		/* Keep recovery ownership; a live PHY must not receive SAFE. */
 		typec_mux_abort(tps->mux);
 		return ret;
 	}

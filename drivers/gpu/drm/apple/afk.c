@@ -13,6 +13,8 @@
 #include <linux/workqueue.h>
 #include <linux/soc/apple/rtkit.h>
 
+#include <kunit/visibility.h>
+
 #include "afk.h"
 #include "afkv2-codec.h"
 #include "trace.h"
@@ -66,6 +68,7 @@ void afk_service_retry(struct apple_dcp_afkep *ep)
 		queue_work(ep->wq, &ep->service_work);
 	spin_unlock_irqrestore(&ep->lock, flags);
 }
+EXPORT_SYMBOL_IF_KUNIT(afk_service_retry);
 
 static void afk_send(struct apple_dcp_afkep *ep, u64 message)
 {

@@ -125,6 +125,16 @@ systemctl daemon-reload
 systemctl restart fprintd.service
 ```
 
+Where SELinux is enforcing, as on Fedora, fprintd may not open `/dev/sep-bio`
+until it is labelled. Build and load the policy module (Fedora's
+`selinux-policy-devel` provides the Makefile), then label the device:
+
+```sh
+make -f /usr/share/selinux/devel/Makefile aurora_sep.pp
+semodule -i aurora_sep.pp
+restorecon /dev/sep-bio
+```
+
 On Omarchy, run `omarchy-apply-lock` once after enrollment. The Quickshell
 lock screen then selects `omarchy-lock-fingerprint` automatically and accepts
 Touch ID through fprintd. Hyprlock's separate fingerprint switch is not used
@@ -145,8 +155,30 @@ mkdir rpms
 podman run --rm -v "$PWD":/src:ro,z -v "$PWD/rpms":/out:z \
     registry.fedoraproject.org/fedora:45 \
     /src/tools/aurora-sep/packaging/fedora/build.sh /out
-sudo dnf install rpms/aurora-sep-1-*.noarch.rpm
+sudo dnf install rpms/aurora-sep-1-*.noarch.rpm rpms/aurora-sep-selinux-1-*.noarch.rpm
 ```
+
+`aurora-sep-selinux` holds the policy module above. `aurora-sep` requires it
+wherever the targeted policy is installed. Where SELinux is disabled, the
+module is installed but not loaded, and nothing is relabelled.
+
+**On Fedora, turn on fingerprint authentication yourself.** PAM decides what
+asks for a fingerprint, and the packages leave it alone. Fedora's authselect
+profiles keep fingerprints off until their `with-fingerprint` feature is
+selected. Until then sudo, polkit and the lock screen never ask, and GNOME
+Settings shows no Fingerprint Login row, even with a finger enrolled. Once a
+finger is enrolled:
+
+```sh
+sudo authselect enable-feature with-fingerprint
+```
+
+This adds `pam_fprintd` to the system and fingerprint PAM stacks. It also sets
+`org.gnome.login-screen enable-fingerprint-authentication`, which authselect
+otherwise locks to false. `sudo authselect disable-feature with-fingerprint`
+undoes both. While the feature is off, `aurora-sep-ready` logs this command
+once per boot. On Omarchy, `aurora-touchid-setup` makes the PAM changes after
+an enrolment.
 
 On Arch Linux and Arch Linux ARM, build `aurora-sep`:
 
@@ -216,8 +248,9 @@ install -Dm644 logind-aurora-sep.conf /etc/systemd/logind.conf.d/aurora-sep.conf
 
 GNOME Shell 51 offers fingerprint only on the lock screen, never on the
 login screen, and `org.gnome.login-screen enable-fingerprint-authentication`
-(true by default) cannot change that: the greeter connects its fingerprint
-reader only when it re-authenticates a running session. That is GNOME's
+(true in GNOME's defaults, false under authselect until `with-fingerprint` is
+on) cannot change that: the greeter connects its fingerprint reader only
+when it re-authenticates a running session. That is GNOME's
 choice, because a fingerprint cannot unlock the login keyring: after a
 fingerprint login, the first application that wants a stored secret asks
 for the password. `aurora-sep-greeter-fingerprint.service` lifts the

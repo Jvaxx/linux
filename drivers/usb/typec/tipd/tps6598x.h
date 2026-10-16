@@ -330,8 +330,8 @@ struct tps6598x {
 	struct typec_capability typec_cap;
 	struct typec_mux *mux;
 	/*
-	 * Set by ->remove() once it has parked the mux in SAFE, so that
-	 * tps6598x_disconnect() only ends that mux transaction.
+	 * Set by ->remove() while its SAFE transaction is still open, so that
+	 * tps6598x_disconnect() ends it after shutting down the USB role.
 	 */
 	bool remove_safe_prepared;
 
@@ -454,6 +454,12 @@ void tipd_debugfs_exit(void);
 static inline void tipd_debugfs_register(struct tps6598x *tps) { }
 static inline void tipd_debugfs_unregister(struct tps6598x *tps) { }
 static inline void tipd_debugfs_exit(void) { }
+#endif
+
+#if IS_ENABLED(CONFIG_KUNIT)
+bool cd321x_tbt_switch_keep_waiting(struct device *dev);
+struct typec_thunderbolt_switch *
+cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode);
 #endif
 
 #endif /* __TPS6598X_H__ */

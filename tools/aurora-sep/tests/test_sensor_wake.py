@@ -22,6 +22,15 @@ class SensorWakeTest(unittest.TestCase):
 #![allow(dead_code, unused_variables)]
 use std::cell::RefCell;
 macro_rules! dev_warn { ($($args:tt)*) => {} }
+macro_rules! dev_info { ($($args:tt)*) => {} }
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+mod shim { pub fn boottime_ns()->u64 {0} }
+mod module_parameters {
+ pub struct Param(u8);
+ impl Param { pub fn value(&self)->&u8 {&self.0} }
+ #[allow(non_upper_case_globals)] pub static sensor_trace: Param = Param(0);
+}
+struct Profile { nonce_session: bool }
 macro_rules! dev_err { ($($args:tt)*) => {} }
 mod kernel { pub mod time {
  pub struct Delta;
@@ -60,8 +69,10 @@ mod sensor {
   pub fn patch_ack(&self)->u8 {self.ack}
  }
 }
-struct Driver;
+struct Driver { profile: Profile, sensor_power_ns: AtomicU64 }
 impl Driver {
+ fn new()->Self { Driver { profile: Profile { nonce_session: false }, sensor_power_ns: AtomicU64::new(0) } }
+ fn sensor_ms(&self)->u64 {0}
  fn register_sensor(&self,_:&sensor::Identifier)->bool {
   MOCK.with(|m| {let mut m=m.borrow_mut();assert_eq!(m.reads,1);m.registered=true;}); true
  }
@@ -80,7 +91,7 @@ fn main() {
   (Some(sensor::Status{state:0,ack:0,silent:false}),true,Some(0)),
  ] {
   MOCK.with(|m| *m.borrow_mut()=Mock{next,..Mock::default()});
-  assert_eq!(Driver.wake_sensor().is_some(),ready);
+  assert_eq!(Driver::new().wake_sensor().is_some(),ready);
   MOCK.with(|m| {let m=m.borrow();assert_eq!(m.reads,2);assert!(m.registered);assert_eq!(m.patch,patch);});
  }
 }

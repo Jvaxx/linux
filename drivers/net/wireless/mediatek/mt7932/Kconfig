@@ -31,3 +31,14 @@ config MT7932_RF_KUNIT_TEST
 	  admission paths with synthetic devices, without radio hardware.
 	  Check association wakeups, retained peer ownership and refusal to
 	  reopen RF admission after a terminal calibration error.
+
+config MT7932_KUNIT_TEST
+	bool "KUnit tests for MT7932 firmware input validation" if !KUNIT_ALL_TESTS
+	depends on KUNIT=y && MT7932_FULLMAC
+	default KUNIT_ALL_TESTS
+	help
+	  Exercise the validation of what the firmware and the device hand
+	  to the driver, with synthetic, truncated and corrupted input and
+	  without radio hardware: receive descriptors, including frames the
+	  hardware did not decrypt, command replies, regulatory snapshots
+	  and country power packages.

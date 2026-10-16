@@ -234,6 +234,13 @@ void mt_data_receive(struct mt7932 *m, const struct mt7932_rx_frame *frame)
 		m->netdev->stats.rx_dropped++;
 		goto unlock;
 	}
+	if (!mt7932_rx_protection_ok(frame, m->connect_open)) {
+		m->netdev->stats.rx_dropped++;
+		dev_dbg_ratelimited(&m->pdev->dev,
+				    "RX_UNPROTECTED_DROPPED: cipher=%u mismatch=%u\n",
+				    frame->sec_mode, frame->cipher_mismatch);
+		goto unlock;
+	}
 	skb = netdev_alloc_skb_ip_align(m->netdev, frame->length);
 	if (!skb) {
 		m->netdev->stats.rx_dropped++;

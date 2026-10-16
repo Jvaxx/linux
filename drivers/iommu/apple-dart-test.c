@@ -397,6 +397,9 @@ static void apple_dart_test_gated_irq(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, readl(dart->regs + DART_TCR(dart, 0)), 0x1234U);
 	KUNIT_EXPECT_EQ(test, atomic_read(&dart->dev->power.usage_count), 0);
 
+	/* Drain the work queued by the successful IRQ's pm_runtime_put(). */
+	pm_runtime_barrier(dart->dev);
+
 	/* Failed runtime resume must not run the handler or leak its reference. */
 	writel(0, dart->regs + DART_TCR(dart, 0));
 	scoped_guard(spinlock_irqsave, &dart->dev->power.lock)
