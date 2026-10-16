@@ -144,7 +144,7 @@ neo_gpu_restore "$STATE/neo-transaction.json"
         (self.tmp / 'dev').mkdir(exist_ok=True)
         (self.tmp / 'dev/renderD128').touch()
         gpu = render.parent
-        driver = self.tmp / 'drivers/asahi_neo'
+        driver = self.tmp / 'drivers/asahi'
         driver.mkdir(parents=True, exist_ok=True)
         if not (gpu / 'driver').is_symlink():
             (gpu / 'driver').symlink_to(driver)
@@ -156,7 +156,7 @@ neo_gpu_restore "$STATE/neo-transaction.json"
             kms = self.tmp / 'sys/card2/device/of_node'
             kms.mkdir(parents=True, exist_ok=True)
             (kms / 'compatible').write_bytes(b'apple,t8140-display-subsystem\0')
-            dcp = self.tmp / 'drivers/apple-drm-neo'
+            dcp = self.tmp / 'drivers/apple-drm'
             dcp.mkdir(parents=True, exist_ok=True)
             if not (kms.parent / 'driver').is_symlink():
                 (kms.parent / 'driver').symlink_to(dcp)

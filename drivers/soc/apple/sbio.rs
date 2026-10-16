@@ -1166,6 +1166,7 @@ impl SepData {
             self.sensor_calibrated.store(true, Relaxed);
             if parameters.is_none() {
                 let Some(reloaded_patch) = self.wake_sensor() else {
+                    diag::sensor_brought_up(bind, false);
                     return false;
                 };
                 patch = reloaded_patch;
@@ -2080,31 +2081,40 @@ impl SepData {
                 return None;
             }
 
-            // Registration can reset the sensor session. Do not reuse the
-            // acknowledgement sampled before CLEAR_STATE and authentication.
-            let st = match sensor::status() {
-                Ok(st) if !st.is_silent() => st,
-                Ok(_) => {
-                    dev_warn!(
-                        self.dev,
-                        "sensor: status unavailable after registration: silent {} ms after power-on\n",
-                        self.sensor_ms()
-                    );
-                    return None;
+            if self.profile.nonce_session {
+                // Registration can reset the sensor session. Do not reuse the
+                // acknowledgement sampled before CLEAR_STATE and authentication.
+                let st = match sensor::status() {
+                    Ok(st) if !st.is_silent() => st,
+                    Ok(_) => {
+                        dev_warn!(
+                            self.dev,
+                            "sensor: status unavailable after registration: silent {} ms after power-on\n",
+                            self.sensor_ms()
+                        );
+                        return None;
+                    }
+                    Err(e) => {
+                        dev_warn!(
+                            self.dev,
+                            "sensor: status unavailable after registration: read failed ({:?}) {} ms after power-on\n",
+                            e,
+                            self.sensor_ms()
+                        );
+                        return None;
+                    }
+                };
+                if st.patch_ack() == sensor::PATCH_ACCEPTED
+                    && st.state != sensor::STATE_NEEDS_PATCH
+                {
+                    return Some(PatchLoaded(()));
                 }
-                Err(e) => {
-                    dev_warn!(
-                        self.dev,
-                        "sensor: status unavailable after registration: read failed ({:?}) {} ms after power-on\n",
-                        e,
-                        self.sensor_ms()
-                    );
-                    return None;
-                }
-            };
-            if st.patch_ack() == sensor::PATCH_ACCEPTED
-                && st.state != sensor::STATE_NEEDS_PATCH
-            {
+                return self.apply_sensor_patch(st.patch_ack());
+            }
+
+            // Nonce-free profiles keep the patch acknowledgement read before
+            // registration; their status[8], rather than state 9, decides.
+            if st.patch_ack() == sensor::PATCH_ACCEPTED {
                 return Some(PatchLoaded(()));
             }
             return self.apply_sensor_patch(st.patch_ack());
@@ -3367,7 +3377,9 @@ impl SepData {
         self.templates_restored.store(false, Relaxed);
         // The nonce path synced the view before COMPLETE_INIT to refresh SCRD.
         // Re-arm the final proof and its bounded retry on every cold restore.
-        self.device_view_synced.store(false, Relaxed);
+        if self.profile.nonce_session {
+            self.device_view_synced.store(false, Relaxed);
+        }
         if !candidate {
             dev_err!(
                 self.dev,
