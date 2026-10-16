@@ -151,6 +151,11 @@ static const struct apple_cio_hw apple_cio_t6030_hw = {
 	.dp = &apple_dpin_m3,
 };
 
+/* Type 7 uses its existing ready-state check and has no qualified DP route. */
+static const struct apple_cio_hw apple_cio_t8142_hw = {
+	.dp = &apple_dpin_disabled,
+};
+
 #define APPLE_CIO_NHI_HOP_COUNT 0x0
 #define APPLE_CIO_NHI_HOP_COUNT_MASK GENMASK(9, 0)
 
@@ -3324,7 +3329,7 @@ static void apple_cio_remove(struct platform_device *pdev)
 static const struct of_device_id apple_acio_match[] = {
 	{
 		.compatible = "apple,t8142-usb4-acio",
-		.data = &apple_cio_t8103_hw,
+		.data = &apple_cio_t8142_hw,
 	},
 	{
 		.compatible = "apple,t6030-usb4-acio",
