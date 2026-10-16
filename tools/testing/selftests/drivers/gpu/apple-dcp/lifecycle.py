@@ -366,6 +366,175 @@ int main(void)
     source = prefix + pm + shim + funcs + tests
     return source
 
+def bounce(root):
+    """Fast dock replug: the sink vanishes while the DPTX link trains.
+
+    The physical-disconnect fixture with the actual dcp_dptx_connect_raw()
+    and a firmware model whose link configuration may never arrive and
+    whose requests may fail, be refused or go unanswered.
+    """
+    unit = disconnect(root)
+    dcp = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
+    m = re.search(r'^static int dcp_dptx_connect_raw\(', dcp, re.M)
+    assert m, 'dcp_dptx_connect_raw'
+    raw = block(dcp, m.start())
+
+    def swap(old, new):
+        nonlocal unit
+        assert unit.count(old) == 1, old
+        unit = unit.replace(old, new)
+
+    swap(' struct { bool connected; void *service; } dptxport[1];',
+         ' struct { bool connected, closed; void *service, *atcphy; int linkcfg_completion; } dptxport[1];\n'
+         ' void *phy, *dev, *active_typec_route;\n'
+         ' int dptx_die, dptx_phy, dptx_dfp_port, connector_type;')
+    old_raw = unit[unit.index('static int dcp_dptx_connect_raw('):]
+    old_raw = old_raw[:old_raw.index('return raw_error; }') + len('return raw_error; }')]
+    swap(old_raw, 'static int dcp_dptx_connect_raw(struct apple_dcp *, u32, bool *);')
+    swap('static int dptxport_set_hpd(void *p, bool on)\n{ (void)p; assert(!on); return hpd_error; }',
+         'static bool fw_hpd, fw_display, link_trains;\n'
+         'static int hpd_drops, connects, release_error_once, assert_error;\n'
+         '/* A request that times out may still be carried out; a refused one is not. */\n'
+         'static int dptxport_set_hpd(void *p, bool on)\n'
+         '{ (void)p; if (on) { fw_hpd |= assert_error != -EINVAL; return assert_error; }\n'
+         ' hpd_drops++; if (hpd_error) return hpd_error; fw_hpd = false; return 0; }')
+    swap('static int dptxport_release_display(void *p)\n{ (void)p; releases++; return release_error; }',
+         'static int dptxport_release_display(void *p)\n'
+         '{ (void)p; releases++; if (release_error) return release_error;\n'
+         ' if (release_error_once) { int r = release_error_once; release_error_once = 0; return r; }\n'
+         ' fw_display = false; return 0; }')
+    swap('int main(void)\n{', 'static int __attribute__((unused)) prior_main(void)\n{')
+    firmware = r'''
+typedef uint8_t u8;
+#define dev_dbg(...) ((void)0)
+#define dev_info(...) ((void)0)
+#define DRM_MODE_CONNECTOR_DisplayPort 10
+#define DPTX_CONNECT_TIMEOUT 2000
+#define DPTX_TUNNEL_CONNECT_TIMEOUT 8000
+static void mutex_lock(int *m) { (void)m; }
+static void mutex_unlock(int *m) { (void)m; }
+static bool dcp_is_usb4_output(struct apple_dcp *d) { (void)d; return false; }
+static bool apple_dp_tunnel_t602x(void) { return false; }
+static void reinit_completion(int *c) { *c = 0; }
+/* The firmware configures the link only while a sink answers it. */
+static unsigned long wait_for_completion_timeout(int *c, unsigned long t)
+{ if (link_trains) *c = 1; return *c ? t : 0; }
+static unsigned jiffies_to_msecs(unsigned long t) { return t; }
+static void usleep_range(int a, int b) { (void)a; (void)b; }
+static void av_service_connect(struct apple_dcp *d) { (void)d; }
+static int validate_error, connect_error, request_error;
+static int dptxport_validate_connection(void *s, int core, int atc, int die)
+{ (void)s; (void)core; (void)atc; (void)die; return validate_error; }
+static int dptxport_connect(void *s, int core, int atc, int die, bool typec)
+{ (void)s; (void)core; (void)atc; (void)die; (void)typec; connects++; return connect_error; }
+static int dptxport_request_display(void *s)
+{ (void)s; fw_display |= request_error != -EINVAL; return request_error; }
+static int dptxport_set_hpd_timeout(void *s, bool on, int t) { (void)t; return dptxport_set_hpd(s, on); }
+'''
+    tests = r'''
+static struct platform_device device = { .data = &display };
+/* The session the dock leaves behind after its plug-time route bounce. */
+static void bounced(void)
+{
+ init(); display.phy = (void *)1; fw_hpd = fw_display = true;
+ release_error_once = 0; link_trains = true;
+ CHECK(dcp_external_disconnect(&display, true) == 0);
+ CHECK(display.external_stopped && !display.dptxport[0].connected && !display.external_error);
+ connects = hpd_drops = 0;
+ validate_error = connect_error = request_error = assert_error = 0;
+}
+/* The failure stays latched across the unplug, and the next plug is refused. */
+static void stays_latched(int error)
+{
+ int before;
+
+ validate_error = connect_error = request_error = assert_error = 0;
+ hpd_error = release_error = 0;
+ CHECK(display.external_error == error);
+ CHECK(dcp_external_disconnect(&display, true) == error);
+ CHECK(display.external_error == error);
+ before = connects; link_trains = true;
+ CHECK(dcp_dptx_connect_oob(&device, 0) == error && connects == before);
+}
+int main(void)
+{
+ /* The route comes back while the sink no longer answers: withdrawn, not latched. */
+ bounced(); link_trains = false;
+ CHECK(dcp_dptx_connect_oob(&device, 0) == -ETIMEDOUT);
+ CHECK(!display.external_error && !display.dptxport[0].connected);
+ CHECK(!fw_hpd && !fw_display && hpd_drops == 1);
+ /* tipd's own OOB connect after the mux tries again rather than refusing. */
+ CHECK(dcp_dptx_connect_oob(&device, 0) == -ETIMEDOUT && connects == 2);
+ /* The unplug's teardown (OOB disconnect, then SAFE) succeeds. */
+ CHECK(dcp_external_disconnect(&display, true) == 0 && !display.external_error);
+ /* The next plug connects: the display recovers without a reboot. */
+ link_trains = true;
+ CHECK(dcp_dptx_connect_oob(&device, 0) == 0);
+ CHECK(display.dptxport[0].connected && fw_hpd && fw_display && connects == 3);
+ printf("case withdrawn-link complete\n");
+
+ /*
+  * The firmware does not acknowledge the withdrawal: HPD low or the release
+  * times out, or HPD low gets an incomplete reply.  The session stays held.
+  */
+ for (int which = 0; which < 3; which++) {
+  bounced(); link_trains = false;
+  if (which == 0) hpd_error = -ETIMEDOUT;
+  if (which == 1) release_error_once = -ETIMEDOUT;
+  if (which == 2) hpd_error = -EPROTO;
+  CHECK(dcp_dptx_connect_oob(&device, 0) == -ETIMEDOUT);
+  CHECK(display.external_error == -ETIMEDOUT && display.dptxport[0].connected);
+  stays_latched(-ETIMEDOUT);
+ }
+ printf("case unacknowledged-withdrawal complete\n");
+
+ /*
+  * A request goes unanswered, so the firmware may still carry it out, with
+  * its cleanup failing as well or not, on a session that never powered its
+  * pipe or that stopped it before.  A port no longer marked connected is no
+  * proof that the firmware let go of it: the failure stays latched.
+  */
+ for (int fault = 0; fault < 4; fault++)
+  for (int cleanup = 0; cleanup < 2; cleanup++)
+   for (int stopped = 0; stopped < 2; stopped++) {
+    bounced();
+    if (!stopped)
+     display.external_power_attempted = display.external_stopped = false;
+    if (fault == 0) validate_error = -ETIMEDOUT;
+    if (fault == 1) connect_error = -ETIMEDOUT;
+    if (fault == 2) request_error = -ETIMEDOUT;
+    if (fault == 3) assert_error = -ETIMEDOUT;
+    if (cleanup) release_error = -ETIMEDOUT;
+    CHECK(dcp_dptx_connect_oob(&device, 0) == -ETIMEDOUT);
+    stays_latched(-ETIMEDOUT);
+   }
+ printf("case unanswered-request complete\n");
+
+ /* A request the firmware refuses is latched as before, released display or not. */
+ for (int fault = 0; fault < 2; fault++) {
+  bounced();
+  if (fault == 0) request_error = -EINVAL;
+  if (fault == 1) assert_error = -EINVAL;
+  CHECK(dcp_dptx_connect_oob(&device, 0) == -EINVAL);
+  CHECK(!display.dptxport[0].connected);
+  stays_latched(-EINVAL);
+ }
+ printf("case refused-request complete\n");
+
+ /* A live failure (powered pipe never acknowledged off) still holds everything. */
+ init(); display.phy = (void *)1; power_error = -ETIMEDOUT; connects = 0;
+ CHECK(dcp_external_disconnect(&display, true) == -ETIMEDOUT);
+ power_error = 0;
+ CHECK(dcp_external_disconnect(&display, true) == -ETIMEDOUT);
+ CHECK(display.external_error == -ETIMEDOUT && display.pipe_enabled_h17p);
+ CHECK(dcp_dptx_connect_oob(&device, 0) == -ETIMEDOUT && connects == 0);
+ printf("case live-failure complete\n");
+
+ printf("%d assertions, %d failures\n", checks, failures); return !!failures;
+}
+'''
+    return unit + firmware + raw + '\n' + tests
+
 def teardown(root):
 
     files = {n: (root / f).read_text() for n, f in {

@@ -257,6 +257,8 @@ int main(int argc,char **argv) {
  if(argv[1][0]=='m') {power_error=-EIO;assert(typec_mux_set(&mux,&safe)==-EIO&&phy_calls==0&&port.owner==&route);}
  if(argv[1][0]=='d') {assert(typec_mux_prepare(&mux,&safe)==0&&stops==1&&phy_calls==0&&port.owner==&route);assert(typec_mux_prepare(&mux,&safe)==0&&stops==1&&port.owner==&route);}
  if(argv[1][0]=='e') {display.external_error=-EIO;port.hpd=false;display.typec_cable_connected=false;connector.connected=false;assert(typec_mux_set(&mux,&safe)==-EIO&&phy_calls==0&&port.owner==&route);}
+ /* A latched failure is no less live once the port reads released: SAFE stays refused. */
+ if(argv[1][0]=='w') {display.external_error=-ETIMEDOUT;display.dptxport[0].connected=false;display.external_stopped=true;port.hpd=false;assert(typec_mux_set(&mux,&safe)==-ETIMEDOUT&&phy_calls==0&&port.owner==&route&&deactivate_calls==0);}
  if(argv[1][0]=='l') {display.external=false;assert(typec_mux_prepare(&mux,&safe)==0&&stops==1&&port.safe_pending&&port.owner==&route);}
  if(argv[1][0]=='f') {assert(typec_mux_prepare(&mux,&safe)==0&&port.safe_pending);dcp_typec_rebalance_locked(NULL,0);assert(port.owner==&route&&route.selected&&deactivate_calls==0);port.safe_pending=false;dcp_typec_rebalance_locked(NULL,0);assert(port.owner==NULL&&deactivate_calls==1);}
  if(argv[1][0]=='t') {route.tunnel=true;assert(typec_mux_prepare(&mux,&safe)==0&&stops==0&&port.dp_wanted);}
