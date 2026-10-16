@@ -293,9 +293,12 @@ static int __maybe_unused sn201202x_resume(struct device *dev)
 	int err;
 
 	err = sn201202x_wake(sn);
-	if (err)
-		return err;
-	return tipd_resume(tps);
+	if (!err)
+		err = tipd_resume(tps);
+	/* The resume revalidation acknowledges events latched while asleep. */
+	if (tps->irq)
+		enable_irq(tps->irq);
+	return err;
 }
 
 static int __maybe_unused sn201202x_suspend(struct device *dev)
@@ -304,9 +307,16 @@ static int __maybe_unused sn201202x_suspend(struct device *dev)
 	struct sn201202x *sn = tps_to_sn(tps);
 	int err;
 
+	/*
+	 * A sleeping controller cannot be read, so its events must not be
+	 * handled until it is awake again. An interrupt arriving meanwhile is
+	 * replayed when it is enabled.
+	 */
+	if (tps->irq)
+		disable_irq(tps->irq);
 	err = tipd_suspend(tps);
 	if (err)
-		return err;
+		goto out_enable;
 	reinit_completion(&sn->sleep_completion);
 	err = spmi_command_sleep(sn->sdev);
 	if (err)
@@ -320,6 +330,9 @@ static int __maybe_unused sn201202x_suspend(struct device *dev)
 
 out_resume:
 	tipd_resume(tps);
+out_enable:
+	if (tps->irq)
+		enable_irq(tps->irq);
 	return err;
 }
 
