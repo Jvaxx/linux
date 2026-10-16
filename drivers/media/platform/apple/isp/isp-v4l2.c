@@ -1165,6 +1165,6 @@ void apple_isp_free_video(struct apple_isp *isp)
 	isp_free_meta_surfaces(isp);
 }
 
-#if IS_ENABLED(CONFIG_VIDEO_APPLE_ISP_KUNIT_TEST)
+#if IS_ENABLED(CONFIG_VIDEO_APPLE_ISP_V4L2_KUNIT_TEST)
 #include "isp-v4l2-test.c"
 #endif

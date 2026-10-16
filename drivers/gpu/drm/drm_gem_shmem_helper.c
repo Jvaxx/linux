@@ -635,64 +635,6 @@ int drm_gem_shmem_release_idle_pages_locked(struct drm_gem_shmem_object *shmem)
 		drm_gem_shmem_put_cpu_pages_locked(shmem);
 	}
 
-static struct page *drm_gem_shmem_present_page(struct drm_gem_shmem_object *shmem,
-					       pgoff_t index)
-{
-	if (shmem->pages && shmem->pages[index])
-		return shmem->pages[index];
-	if (shmem->cpu_pages)
-		return shmem->cpu_pages[index];
-	return NULL;
-}
-
-bool drm_gem_shmem_idle_pages_releasable_locked(struct drm_gem_shmem_object *shmem)
-{
-	struct drm_gem_object *obj = &shmem->base;
-
-	dma_resv_assert_held(obj->resv);
-	return shmem->sgt && !drm_gem_is_imported(obj) && !obj->dma_buf &&
-		shmem->madv >= 0 && !refcount_read(&shmem->pages_pin_count) &&
-		!refcount_read(&shmem->vmap_use_count) &&
-		refcount_read(&shmem->pages_use_count) == 1 &&
-		dma_resv_test_signaled(obj->resv, DMA_RESV_USAGE_BOOKKEEP);
-}
-EXPORT_SYMBOL_GPL(drm_gem_shmem_idle_pages_releasable_locked);
-
-/**
- * drm_gem_shmem_release_idle_pages_locked - Release idle backing without purging
- * @shmem: shmem GEM object whose device mappings have been removed
- *
- * Drop the cached SG table and the page array of an object that no device
- * mapping, pin, vmap or SG-table borrower uses, so ordinary shmem reclaim can
- * swap its contents. Revocable CPU VMAs are zapped first and refault later.
- * The caller holds the reservation lock, has removed every device mapping
- * including cached translations, and excludes new device access. A later
- * drm_gem_shmem_get_pages_sgt() may return different DMA addresses.
- *
- * Returns: 0 on success, -EBUSY if backing is still in use, -EINVAL for an
- * imported, exported or purged object.
- */
-int drm_gem_shmem_release_idle_pages_locked(struct drm_gem_shmem_object *shmem)
-{
-	struct drm_gem_object *obj = &shmem->base;
-
-	dma_resv_assert_held(obj->resv);
-
-	if (drm_gem_is_imported(obj) || obj->dma_buf || shmem->madv < 0)
-		return -EINVAL;
-
-	if (refcount_read(&shmem->pages_pin_count) ||
-	    refcount_read(&shmem->vmap_use_count) ||
-	    refcount_read(&shmem->pages_use_count) != !!shmem->sgt ||
-	    !dma_resv_test_signaled(obj->resv, DMA_RESV_USAGE_BOOKKEEP))
-		return -EBUSY;
-
-	/* Zap revocable PFNs under resv so no fault can reinsert them. */
-	if (shmem->reclaimable_cpu_mappings && refcount_read(&shmem->cpu_vma_count)) {
-		drm_vma_node_unmap(&obj->vma_node, obj->dev->anon_inode->i_mapping);
-		drm_gem_shmem_put_cpu_pages_locked(shmem);
-	}
-
 	if (!shmem->sgt)
 		return 0;
 
@@ -714,8 +656,6 @@ void drm_gem_shmem_purge_locked(struct drm_gem_shmem_object *shmem)
 	struct drm_device *dev = obj->dev;
 
 	dma_resv_assert_held(shmem->base.resv);
-
-	drm_WARN_ON(obj->dev, !drm_gem_shmem_is_purgeable(shmem));
 
 	drm_WARN_ON(obj->dev, !drm_gem_shmem_is_purgeable(shmem));
 
@@ -783,14 +723,6 @@ EXPORT_SYMBOL_GPL(drm_gem_shmem_dumb_create);
 static pgoff_t drm_gem_shmem_object_offset(struct drm_gem_object *obj, pgoff_t pgoff)
 {
 	return pgoff - drm_vma_node_start(&obj->vma_node);
-/* GEM and PRIME add the object's fake offset; VMA splits retain it.
- * Direct helper callers may instead supply an object-relative offset.
- */
-static pgoff_t drm_gem_shmem_object_offset(struct drm_gem_object *obj, pgoff_t pgoff)
-{
-	pgoff_t base = drm_vma_node_start(&obj->vma_node);
-
-	return pgoff >= base ? pgoff - base : pgoff;
 }
 
 static void drm_gem_shmem_record_mkwrite(struct vm_fault *vmf)
@@ -1027,10 +959,6 @@ int drm_gem_shmem_mmap(struct drm_gem_shmem_object *shmem, struct vm_area_struct
 	if (is_cow_mapping(vma->vm_flags))
 		return -EINVAL;
 
-	/* Revocation zaps the device anon mapping only. */
-	if (shmem->reclaimable_cpu_mappings &&
-	    (!vma->vm_file || vma->vm_file->f_mapping != obj->dev->anon_inode->i_mapping))
-		return -EINVAL;
 	/* Validate bytes, including a partial native-page offset from PRIME. */
 	{
 		pgoff_t index = drm_gem_shmem_object_offset(obj, vma->vm_pgoff);

@@ -37,7 +37,8 @@
  * separate 16 KiB page at 0x350780000, so the register is 0x350780008. The
  * device tree describes that page as its own syscon. t8122 is unresolved.
  *
- * t8132 and t8142 use a different, per-port layout and are not supported.
+ * On t8142, selector 0x62 is a separate MMIO region at 0x380780000, using a
+ * per-port layout. The t8132 layout has not been decoded.
  *
  * Reference firmware polls the busy bits, stores the request, then polls
  * again, with a 192 ms budget. It discards the first poll's result. The
