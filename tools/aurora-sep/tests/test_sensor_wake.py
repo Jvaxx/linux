@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: MIT
-"""Execute the actual wake_sensor body with synthetic status/registration mocks."""
+"""Execute the actual wake_sensor body with synthetic status/registration mocks.
+
+The post-registration status read applies to nonce-session (J700) profiles;
+other profiles keep the patch decision on the status read before registration.
+"""
 from pathlib import Path
 import subprocess
 import tempfile
@@ -77,7 +81,7 @@ impl Driver {
   MOCK.with(|m| {let mut m=m.borrow_mut();assert_eq!(m.reads,1);m.registered=true;}); true
  }
  fn apply_sensor_patch(&self,ack:u8)->Option<PatchLoaded> {
-  MOCK.with(|m| {let mut m=m.borrow_mut();assert_eq!(m.reads,2);m.patch=Some(ack);});
+  MOCK.with(|m| {let mut m=m.borrow_mut();m.patch=Some(ack);});
   Some(PatchLoaded(()))
  }
 '''
@@ -91,9 +95,15 @@ fn main() {
   (Some(sensor::Status{state:0,ack:0,silent:false}),true,Some(0)),
  ] {
   MOCK.with(|m| *m.borrow_mut()=Mock{next,..Mock::default()});
-  assert_eq!(Driver::new().wake_sensor().is_some(),ready);
+  let driver = Driver { profile: Profile { nonce_session: true }, sensor_power_ns: AtomicU64::new(0) };
+  assert_eq!(driver.wake_sensor().is_some(),ready);
   MOCK.with(|m| {let m=m.borrow();assert_eq!(m.reads,2);assert!(m.registered);assert_eq!(m.patch,patch);});
  }
+ // Without a nonce session the pre-registration status decides, as before.
+ MOCK.with(|m| *m.borrow_mut()=Mock::default());
+ let driver = Driver::new();
+ assert!(driver.wake_sensor().is_some());
+ MOCK.with(|m| {let m=m.borrow();assert_eq!(m.reads,1);assert!(m.registered);assert_eq!(m.patch,None);});
 }
 '''
         with tempfile.TemporaryDirectory() as directory:

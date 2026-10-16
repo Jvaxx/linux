@@ -23,6 +23,20 @@ static SEP: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 extern "C" {
     fn sep_pm_register(event: unsafe extern "C" fn(bool) -> c_int) -> c_int;
     fn sep_pm_unregister();
+    fn sep_pm_keep_domains(dev: *mut c_void) -> c_int;
+}
+
+/// Attaches every power domain of a multi-domain SEP node and keeps them on
+/// across system sleep; see `pm_shim.c`. Must run before the enclave is first
+/// spoken to.
+pub(crate) fn keep_domains(dev: &kernel::device::Device) -> Result<()> {
+    // SAFETY: `dev` is the bound SEP device; the shim ties what it attaches to
+    // that device's lifetime through devres.
+    let rc = unsafe { sep_pm_keep_domains(dev.as_raw().cast()) };
+    if rc != 0 {
+        return Err(Error::from_errno(rc));
+    }
+    Ok(())
 }
 
 /// # Safety
@@ -46,40 +60,6 @@ unsafe extern "C" fn pm_event(entering: bool) -> c_int {
         sep.sleep_finished();
     }
     0
-    fn sep_pm_register(event: unsafe extern "C" fn(bool)) -> c_int;
-    fn sep_pm_unregister();
-    fn sep_pm_keep_domains(dev: *mut c_void) -> c_int;
-}
-
-/// Attaches every power domain of a multi-domain SEP node and keeps them on
-/// across system sleep; see `pm_shim.c`. Must run before the enclave is first
-/// spoken to.
-pub(crate) fn keep_domains(dev: &kernel::device::Device) -> Result<()> {
-    // SAFETY: `dev` is the bound SEP device; the shim ties what it attaches to
-    // that device's lifetime through devres.
-    let rc = unsafe { sep_pm_keep_domains(dev.as_raw().cast()) };
-    if rc != 0 {
-        return Err(Error::from_errno(rc));
-    }
-    Ok(())
-}
-
-/// # Safety
-/// Called by `pm_shim.c` from the PM notifier chain, in process context.
-unsafe extern "C" fn pm_event(entering: bool) {
-    let ptr = SEP.load(Ordering::Acquire);
-    if ptr.is_null() {
-        return;
-    }
-    // SAFETY: produced by `into_foreign` in `register`, and reclaimed by
-    // `unregister` only after `sep_pm_unregister` has waited out any running
-    // notifier call, so it is live for this borrow.
-    let sep = unsafe { <Arc<SepData> as ForeignOwnable>::borrow(ptr) };
-    if entering {
-        sep.sleep_prepare();
-    } else {
-        sep.sleep_finished();
-    }
 }
 
 pub(crate) fn register(sep: Arc<SepData>) -> Result<()> {

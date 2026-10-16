@@ -122,14 +122,6 @@ pub(crate) enum KeyStore {
     /// The 13.5 key store. Before any other request the endpoint is
     /// initialised with `0x4d`, then `set_env` carrying the ADT's `/defaults`
     /// `cpx-encryption-mode`.
-/// firmware hands the SEP, not the SoC alone: the T8103 stub boots macOS 13.5
-/// (22G74)'s sepOS, whose request shapes are those of the 13.5
-/// key store; the T6020 sepOS is newer.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum KeyStore {
-    /// macOS 13.5's key store. Before any other request the endpoint is
-    /// initialised with `0x4d`, then
-    /// `set_env` carrying the ADT's `/defaults` `cpx-encryption-mode`.
     Sepos13 { cpx_encryption_mode: u32 },
     /// The hardware-verified T6020 encoding (variant-5 create).
     Variant5,
@@ -194,18 +186,6 @@ const T8103: PlatformProfile = PlatformProfile {
         cpx_encryption_mode: 2,
     },
     persistent_enrol: true,
-    // macOS 13.5's AppleKeyStore::identity_create (0xfffffe000994b2d8):
-    // version 2, type 0x400000, parent -1 (it accepts only -1 or <= -10).
-    keybag_create: KeybagCreate {
-        variant: 2,
-        bag_type: 0x40_0000,
-        arg: -1,
-    },
-    // The j293 and j313 ADTs both carry `/defaults` `cpx-encryption-mode = 2`.
-    key_store: KeyStore::Sepos13 {
-        cpx_encryption_mode: 2,
-    },
-    persistent_enrol: true,
     nonce_session: false,
 };
 
@@ -242,10 +222,6 @@ const T6000: PlatformProfile = PlatformProfile {
     key_store: KeyStore::Sepos13 {
         cpx_encryption_mode: 2,
     },
-    // The J316s ADT carries `/defaults` `cpx-encryption-mode = 2`.
-    key_store: KeyStore::Sepos13 {
-        cpx_encryption_mode: 2,
-    },
     persistent_enrol: true,
     nonce_session: false,
 };
@@ -277,6 +253,7 @@ const T6020: PlatformProfile = PlatformProfile {
     },
     key_store: KeyStore::Variant5,
     persistent_enrol: true,
+    nonce_session: false,
 };
 
 /// M2 Pro/Max on system firmware before 26.3. Their enclave refuses the
@@ -295,7 +272,6 @@ const T6020_SEPOS13: PlatformProfile = PlatformProfile {
         cpx_encryption_mode: 2,
     },
     ..T6020
-    nonce_session: false,
 };
 
 /// MacBook Neo. The J700 ADT records a pre-booted SEP, a spi2 Mesa sensor
@@ -371,6 +347,7 @@ const T8112: PlatformProfile = PlatformProfile {
     },
     key_store: KeyStore::Variant5,
     persistent_enrol: true,
+    nonce_session: false,
 };
 
 /// MacBook Air M3 (J613, J615). The J613 and J615 ADTs (26.6.2, 25G83) are
@@ -394,37 +371,6 @@ const T8122: PlatformProfile = PlatformProfile {
     },
     wide_dma_mask: true,
     ..T8112
-/// warm-registration platforms (T6020, T8140).
-const T8112: PlatformProfile = PlatformProfile {
-    name: "T8112/J415",
-    shmem_capacity: 0x4_0000,
-    shmem_first_item: b"CINP",
-    bootstrap: Bootstrap::WarmRegister,
-    identity: IdentitySource::Chosen,
-    sensor: SensorProfile {
-        controller_base: 0x2_3510_8000,
-        chip_select: 0,
-        max_hz: 8_000_000,
-        cs_setup_ns: 20,
-        cs_hold_ns: 20,
-        mode: SpiMode::Mode1,
-        expected_id: 0x3352,
-        capture_qualified: false,
-    },
-    dart_range_required: true,
-    wide_dma_mask: false,
-    firmware_region: c"sepfw",
-    // J415 accepted the 13.5 GET_CAPABILITIES/SET_ENV init but refused the
-    // strict CREATE_KEYBAG (mailbox status -1, empty reply), as J700 did;
-    // use the T6020 form like the other warm-registration platforms.
-    keybag_create: KeybagCreate {
-        variant: 5,
-        bag_type: 0,
-        arg: -1,
-    },
-    key_store: KeyStore::Variant5,
-    persistent_enrol: true,
-    nonce_session: false,
 };
 
 static_assert!(T8103.shmem_capacity == 0x30000);
@@ -560,27 +506,6 @@ pub(crate) fn detect() -> Result<&'static PlatformProfile> {
     // to the M2 Max unchanged.
     if machine_has(b"apple,t6021") {
         return Ok(t6020_profile());
-    }
-    if machine_has(b"apple,t6000") {
-        return Ok(&T6000);
-    }
-    // t6000.dtsi is defined as a cut-down t6001: it includes t6001.dtsi and
-    // deletes the parts the smaller die lacks. Both pull in t600x-die0.dtsi,
-    // so the SEP, its mailbox, its DART and the SPI controller sit at the same
-    // addresses with the same interrupts on either part, and the T6000
-    // constants apply to the M1 Max unchanged. The Mac Studio (j375c) is also
-    // a t6001 but leaves the SEP disabled, so nothing binds there; apple,t6002
-    // (M1 Ultra, no built-in sensor) stays unmapped.
-    if machine_has(b"apple,t6001") {
-        return Ok(&T6000);
-    }
-    // t6020.dtsi is defined as a cut-down t6021: it includes t6021.dtsi and
-    // disables the parts the smaller die lacks. Both pull in t602x-die0.dtsi,
-    // so the SEP, its DART and the SPI controller sit at the same addresses
-    // with the same interrupts on either part, and the T6020 constants apply
-    // to the M2 Max unchanged.
-    if machine_has(b"apple,t6021") {
-        return Ok(&T6020);
     }
     if machine_has(b"apple,t6000") {
         return Ok(&T6000);

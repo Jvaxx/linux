@@ -566,8 +566,6 @@ struct SepData {
 
     #[pin]
     endpoints: Mutex<EndpointTable>,
-    #[pin]
-    trusted_ready: CondVar,
 
     #[pin]
     control: Mutex<control::ControlState>,
@@ -732,6 +730,7 @@ struct SepData {
     // deletion durable failed; the next deletion retries the save. Changed
     // only under `catacomb_writer`.
     deletion_unsaved: Atomic<bool>,
+
     // Signalled when an enrol or verify work item has stopped.
     #[pin]
     worker_gone: CondVar,
@@ -2023,46 +2022,6 @@ impl SepData {
         Self::arm_settle(this);
     }
 
-    // Publish completion under the same lock that trusted consumers wait on.
-    // PHASE_READY ends discovery/initialisation; it is not proof of success.
-    fn finish_bringup(&self) {
-        let _guard = self.endpoints.lock();
-        self.phase.store(PHASE_READY, Relaxed);
-        self.trusted_ready.notify_all();
-    }
-
-    /// Trusted-key callbacks can run as soon as probe publishes the source,
-    /// while endpoint discovery and key-store initialisation are still running.
-    /// Wait only in those consumers, leaving bringup free to establish the key.
-    pub(crate) fn wait_for_trusted_ready(&self) -> Result<()> {
-        let mut remaining = time::msecs_to_jiffies(EXCHANGE_TIMEOUT_MS);
-        let mut guard = self.endpoints.lock();
-        loop {
-            if self.shutting_down.load(Relaxed) {
-                return Err(ENODEV);
-            }
-            if self.phase.load(Relaxed) == PHASE_READY {
-                // A completed but failed attach must not look ready.
-                if !guard.eps.iter().any(|e| e.id == proto::EP_SKS) {
-                    return Err(ENODEV);
-                }
-                if !self.sks_initialized.load(Relaxed) {
-                    return Err(EIO);
-                }
-                return Ok(());
-            }
-            if remaining == 0 {
-                dev_err!(self.dev, "trusted-keys: key-store bringup timed out\n");
-                return Err(ETIMEDOUT);
-            }
-            match self.trusted_ready.wait_interruptible_timeout(&mut guard, remaining) {
-                CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
-                CondVarTimeoutResult::Signal { .. } => return Err(ERESTARTSYS),
-                CondVarTimeoutResult::Timeout => remaining = 0,
-            }
-        }
-    }
-
     fn endpoint_present(&self, id: u8) -> bool {
         self.endpoints.lock().eps.iter().any(|e| e.id == id)
     }
@@ -2145,7 +2104,6 @@ impl SepData {
         // Release any capture start still held for a resume that will not be
         // reported now.
         self.sleep_finished();
-        self.release_firmware_mapping();
         trusted::unregister();
         self.unregister_fv_kernel();
 
@@ -2331,8 +2289,14 @@ impl WorkItem<ENROL_WORK_ID> for SepData {
 
     fn run(this: Arc<SepData>) {
         let epoch = this.capture_epoch.load(Relaxed);
-        if !this.shutting_down.load(Relaxed) && this.capture_begin() {
-            this.run_enrolment();
+        {
+            // Taken before `capture_begin`, so the sleep drain never counts the
+            // wait for it.
+            let _writer = this.catacomb_writer.lock();
+            if !this.shutting_down.load(Relaxed) && this.capture_begin() {
+                this.run_enrolment();
+                this.capture_end();
+            }
         }
         this.capture_worker_stopped(epoch);
     }
@@ -2343,8 +2307,12 @@ impl WorkItem<VERIFY_WORK_ID> for SepData {
 
     fn run(this: Arc<SepData>) {
         let epoch = this.capture_epoch.load(Relaxed);
-        if !this.shutting_down.load(Relaxed) && this.capture_begin() {
-            this.run_verify();
+        {
+            let _writer = this.catacomb_writer.lock();
+            if !this.shutting_down.load(Relaxed) && this.capture_begin() {
+                this.run_verify();
+                this.capture_end();
+            }
         }
         this.capture_worker_stopped(epoch);
     }
@@ -2521,18 +2489,6 @@ module! {
         j414s_persistent_enrol: u8 {
             default: 0,
             description: "Opt-in J414s enrollment test: export owner from the fresh context, then save user before master at completion",
-        },
-        provision_keybag: u8 {
-            default: 0,
-            description: "Create the Linux identity keybag when none exists; requires xart_writes=1",
-        },
-        os_uuid_hi: u64 {
-            default: 0,
-            description: "High 64 bits of an explicit xART OS UUID",
-        },
-        os_uuid_lo: u64 {
-            default: 0,
-            description: "Low 64 bits of an explicit xART OS UUID",
         },
     },
 }

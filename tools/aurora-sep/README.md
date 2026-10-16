@@ -90,6 +90,10 @@ ninja -C build
 meson test -C build --print-errorlogs
 ```
 
+The aurora driver for libfprint is also maintained in
+https://github.com/aurora-silicon/aurora-sep-userspace, as source and as
+distribution packages.
+
 Adjust the patch path for your checkout. The patch includes a fix for an
 upstream Meson test loop when introspection is disabled. In the Aurora
 `linux-build` guest, the additional packages needed for this build are

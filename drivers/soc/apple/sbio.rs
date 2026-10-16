@@ -1046,6 +1046,12 @@ impl SepData {
         self.register_ool(&self.ool_sbio)?;
 
         self.sbio_ready.store(true, Relaxed);
+        // 22G74 AppleMesaSEPDriver::initSbioCommunication sends 0x73
+        // with u32(1) before its first ordinary SBIO transaction.
+        // Without it, J313 can complete sensor setup and authenticate
+        // its SCRD context but rejects BEGIN_ENROL. Buffer readiness is
+        // required by this transaction; revoke it if initialization fails.
+        // The J700 nonce-session protocol sends the same request with u32(6).
         let init_word = if self.profile.nonce_session {
             Some(6u32)
         } else if matches!(self.profile.key_store, profile::KeyStore::Sepos13 { .. }) {
@@ -1060,27 +1066,11 @@ impl SepData {
             match result {
                 Ok(done) if done.status.is_ok()
                     && (self.profile.nonce_session || done.payload.is_empty()) => {
-                    dev_info!(self.dev, "sbio: communication initialization accepted\n");
-                }
-                Ok(done) => {
-                    self.sbio_ready.store(false, Relaxed);
-                    dev_err!(self.dev, "sbio: communication init refused: status {}, {} bytes\n",
-                        done.status, done.payload.len());
-                    return Err(EIO);
-                }
-                Err(e) => {
-                    self.sbio_ready.store(false, Relaxed);
-                    dev_err!(self.dev, "sbio: communication init transport failed: {:?}\n", e);
-        if matches!(self.profile.key_store, profile::KeyStore::Sepos13 { .. }) {
-            // 22G74 AppleMesaSEPDriver::initSbioCommunication sends 0x73
-            // with u32(1) before its first ordinary SBIO transaction.
-            // Without it, J313 can complete sensor setup and authenticate
-            // its SCRD context but rejects BEGIN_ENROL. Buffer readiness is
-            // required by this transaction; revoke it if initialization fails.
-            let result = self.sbio_transfer_raw(0x73, c"INIT_SBIO_COMMUNICATION", &1u32.to_le_bytes());
-            match result {
-                Ok(done) if done.status.is_ok() && done.payload.is_empty() => {
-                    dev_info!(self.dev, "sbio: native 13.5 communication initialization accepted\n");
+                    if self.profile.nonce_session {
+                        dev_info!(self.dev, "sbio: communication initialization accepted\n");
+                    } else {
+                        dev_info!(self.dev, "sbio: native 13.5 communication initialization accepted\n");
+                    }
                 }
                 Ok(done) => {
                     self.sbio_ready.store(false, Relaxed);
@@ -1176,22 +1166,17 @@ impl SepData {
             self.sensor_calibrated.store(true, Relaxed);
             if parameters.is_none() {
                 let Some(reloaded_patch) = self.wake_sensor() else {
+                    diag::sensor_brought_up(bind, false);
                     return false;
                 };
                 patch = reloaded_patch;
             }
-            let Some(reloaded_patch) = self.wake_sensor() else {
-                diag::sensor_brought_up(bind, false);
-                return false;
-            };
-            patch = reloaded_patch;
         }
 
         let ok = match parameters {
             Some(parameters) => self.finish_sensor_setup(patch, parameters),
             None => self.complete_bringup(patch),
         };
-        let ok = self.complete_bringup(patch);
         diag::sensor_brought_up(bind, ok);
         // The sensor is patched and idle here -- the only safe moment to
         // configure the data-ready interrupt, which is then left alone for the
@@ -2077,18 +2062,26 @@ impl SepData {
                 return None;
             }
 
-            // Registration can reset the sensor session. Do not reuse the
-            // acknowledgement sampled before CLEAR_STATE and authentication.
-            let st = match sensor::status() {
-                Ok(st) if !st.is_silent() => st,
-                _ => {
-                    dev_warn!(self.dev, "sensor: status unavailable after registration\n");
-                    return None;
+            if self.profile.nonce_session {
+                // Registration can reset the sensor session. Do not reuse the
+                // acknowledgement sampled before CLEAR_STATE and authentication.
+                let st = match sensor::status() {
+                    Ok(st) if !st.is_silent() => st,
+                    _ => {
+                        dev_warn!(self.dev, "sensor: status unavailable after registration\n");
+                        return None;
+                    }
+                };
+                if st.patch_ack() == sensor::PATCH_ACCEPTED
+                    && st.state != sensor::STATE_NEEDS_PATCH
+                {
+                    return Some(PatchLoaded(()));
                 }
-            };
-            if st.patch_ack() == sensor::PATCH_ACCEPTED
-                && st.state != sensor::STATE_NEEDS_PATCH
-            {
+                return self.apply_sensor_patch(st.patch_ack());
+            }
+
+            // The patch decision is made on status[8], not on state 9.
+            if st.patch_ack() == sensor::PATCH_ACCEPTED {
                 return Some(PatchLoaded(()));
             }
             return self.apply_sensor_patch(st.patch_ack());
@@ -2158,7 +2151,13 @@ impl SepData {
                 return false;
             }
         };
-        if self
+        if self.profile.nonce_session {
+            if !self.sensor_session_request(request.opcode(), request.name(), request.payload()) {
+                dev_err!(self.dev, "sensor: calibration refused (source {}, {} bytes)\n",
+                    source, request.payload().len());
+                return false;
+            }
+        } else if self
             .sbio_transfer_raw(request.opcode(), request.name(), request.payload())
             .ok()
             .filter(|done| done.status.is_ok())
@@ -2515,7 +2514,7 @@ impl SepData {
             }
             CaptureWait::Abandon => {
                 // A cancelled enrolment also abandons; only a live one is a fault.
-                if bio::enrol_is_live(&self.bio_session.lock()) {
+                if bio::enrol_is_live(&self.bio_session.lock(), self.capture_epoch.load(Relaxed)) {
                     dev_err!(
                         self.dev,
                         "enrol: the sensor status became unreadable during capture {}\n",
@@ -3040,58 +3039,6 @@ impl SepData {
         self.captures_running.fetch_sub(1, Relaxed);
     }
 
-    /// The system is about to suspend. End any capture in progress, hold new
-    /// ones, and wait for the enrol or verify work to stop touching the sensor
-    /// before devices go down.
-    pub(crate) fn sleep_prepare(&self) {
-        let woke = {
-            let mut session = self.bio_session.lock();
-            self.suspending.store(true, Relaxed);
-            bio::abort_capture(&mut session)
-        };
-        if woke {
-            dev_info!(
-                self.dev,
-                "Touch ID: ending the capture in progress before sleep\n"
-            );
-            self.bio_wake();
-        }
-
-        let mut waited: u32 = 0;
-        while self.captures_running.load(Relaxed) != 0 {
-            if waited >= SLEEP_DRAIN_MS {
-                dev_warn!(
-                    self.dev,
-                    "Touch ID: a capture was still running {} ms after the system started to sleep; continuing\n",
-                    SLEEP_DRAIN_MS
-                );
-                return;
-            }
-            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(10));
-            waited += 10;
-        }
-    /// Called by the enrol and verify work items before they touch the sensor.
-    /// Returns false if the system is going to sleep; the session has then
-    /// been ended and the capture must not start. A true return must be
-    /// paired with [`Self::capture_end`].
-    pub(crate) fn capture_begin(&self) -> bool {
-        let mut session = self.bio_session.lock();
-        if self.suspending.load(Relaxed) {
-            let woke = bio::abort_capture(&mut session);
-            drop(session);
-            if woke {
-                self.bio_wake();
-            }
-            return false;
-        }
-        self.captures_running.fetch_add(1, Relaxed);
-        true
-    }
-
-    pub(crate) fn capture_end(&self) {
-        self.captures_running.fetch_sub(1, Relaxed);
-    }
-
     /// The enrol or verify work item `epoch` has stopped.
     pub(crate) fn capture_worker_stopped(&self, epoch: u64) {
         bio::worker_stopped(&mut self.bio_session.lock(), epoch);
@@ -3410,7 +3357,9 @@ impl SepData {
         self.templates_restored.store(false, Relaxed);
         // The nonce path synced the view before COMPLETE_INIT to refresh SCRD.
         // Re-arm the final proof and its bounded retry on every cold restore.
-        self.device_view_synced.store(false, Relaxed);
+        if self.profile.nonce_session {
+            self.device_view_synced.store(false, Relaxed);
+        }
         if !candidate {
             dev_err!(
                 self.dev,
@@ -4413,7 +4362,6 @@ impl IdentityV1 {
 pub(crate) struct MatchResult {
     user_id: i32,
     identity: [u8; IDENTITY_UUID_LEN],
-    flags: u32,
 }
 
 impl MatchResult {
@@ -4431,7 +4379,6 @@ impl MatchResult {
                 bytes[MR_USER_ID + 3],
             ]),
             identity,
-            flags: u32::from_le_bytes(bytes[MR_FLAGS..MR_FLAGS + 4].try_into().ok()?),
         })
     }
 
@@ -4440,7 +4387,7 @@ impl MatchResult {
     }
 
     pub(crate) fn matches(&self, user: UserId) -> bool {
-        self.flags & MR_FLAG_MATCH != 0 && self.user_id == user.value()
+        self.user_id == user.value()
     }
 }
 
