@@ -7,6 +7,7 @@
 #include <linux/delay.h>
 #include <linux/kthread.h>
 #include <linux/platform_device.h>
+#include <linux/string.h>
 #include <linux/workqueue.h>
 
 #include <drm/drm_atomic.h>
@@ -55,6 +56,7 @@ struct relink_test {
 	bool bounce_on_probe;	/* the route bounces again during a probe */
 	bool real_modeset;	/* atomic_enable is the real dcp_crtc_atomic_modeset() */
 	bool force_modeset;	/* a userspace commit changes the connectors */
+	bool fault_in_call;	/* the link faults before the firmware answers */
 	u32 reply;		/* what the firmware answers a call with */
 	int modeset_ret;	/* the result of the real mode set */
 	struct dcp_display_mode catalog;
@@ -129,7 +131,10 @@ static void relink_test_push(struct apple_dcp *dcp, const struct dcp_method_entr
 			     dcp_callback_t cb, void *cookie)
 {
 	struct relink_test *t = container_of(dcp, struct relink_test, dcp);
+	bool modeset = !strcmp(call->name, "dcpep_set_digital_out_mode");
 
+	if (modeset && t->fault_in_call)
+		dcp_external_link_fault(dcp);
 	cb(dcp, &t->reply, cookie);
 }
 
@@ -823,6 +828,64 @@ static void relink_lost_quiet_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, relink_test_connected(t));
 }
 
+/*
+ * The link faults while the recovery mode set waits for the firmware, which
+ * then answers: the mode set did not bring the link up.
+ */
+static void relink_fault_during_modeset_test(struct kunit *test)
+{
+	struct relink_test *t = relink_test_init(test);
+
+	relink_test_real(t);
+	t->fault_in_call = true;
+	relink_test_tear(t);
+	relink_test_reconnect(test, t);
+	KUNIT_EXPECT_FALSE(test, relink_test_link_up(t));
+	KUNIT_EXPECT_FALSE(test, relink_test_connected(t));
+	KUNIT_EXPECT_EQ(test, t->con.base.state->link_status, DRM_LINK_STATUS_BAD);
+}
+
+/*
+ * The link faults after a completed mode set, with no hotplug: the mode is
+ * gone at once, and the worker sets it again.
+ */
+static void relink_fault_after_modeset_test(struct kunit *test)
+{
+	struct relink_test *t = relink_test_init(test);
+	int modesets;
+
+	relink_test_real(t);
+	relink_test_tear(t);
+	relink_test_reconnect(test, t);
+	KUNIT_ASSERT_EQ(test, t->modeset_ret, 0);
+	KUNIT_ASSERT_TRUE(test, relink_test_link_up(t));
+	/* See the fault's effect before the worker it queues can run. */
+	disable_work_sync(&t->con.hotplug_wq);
+	modesets = atomic_read(&t->modesets);
+	dcp_external_link_fault(&t->dcp);
+	KUNIT_EXPECT_FALSE(test, relink_test_link_up(t));
+	KUNIT_EXPECT_TRUE(test, t->dcp.mode_state.invalidated);
+	enable_work(&t->con.hotplug_wq);
+	relink_test_hotplug(t);
+	relink_test_settle(test, t);
+	KUNIT_EXPECT_GT(test, atomic_read(&t->modesets), modesets);
+	KUNIT_EXPECT_TRUE(test, relink_test_link_up(t));
+	KUNIT_EXPECT_EQ(test, t->con.base.state->link_status, DRM_LINK_STATUS_GOOD);
+}
+
+/* A fault with no mode set queues nothing: there is nothing to recover. */
+static void relink_fault_inactive_test(struct kunit *test)
+{
+	struct relink_test *t = relink_test_init(test);
+
+	KUNIT_ASSERT_EQ(test, relink_test_commit(t, false, false), 0);
+	relink_test_settle(test, t);
+	disable_work_sync(&t->con.hotplug_wq);
+	dcp_external_link_fault(&t->dcp);
+	KUNIT_EXPECT_FALSE(test, work_pending(&t->con.hotplug_wq));
+	enable_work(&t->con.hotplug_wq);
+}
+
 static struct kunit_case relink_cases[] = {
 	KUNIT_CASE(relink_bounce_test),
 	KUNIT_CASE(relink_mode_gone_test),
@@ -838,6 +901,9 @@ static struct kunit_case relink_cases[] = {
 	KUNIT_CASE(relink_early_epipe_test),
 	KUNIT_CASE(relink_paused_kept_test),
 	KUNIT_CASE(relink_lost_quiet_test),
+	KUNIT_CASE(relink_fault_during_modeset_test),
+	KUNIT_CASE(relink_fault_after_modeset_test),
+	KUNIT_CASE(relink_fault_inactive_test),
 	{}
 };
 
