@@ -543,6 +543,196 @@ int main(void)
 '''
     return unit + firmware + raw + '\n' + tests
 
+def dropped(root):
+    """A dock leaves during the first mode set, and the next swap is dropped.
+
+    The physical-disconnect fixture with tipd's actual update and retry work
+    and the actual external stop, against an IOMFB queue that a dropped
+    present keeps busy until the swap watchdog retires it, or until the
+    transaction timeout declares the coprocessor crashed.  Time is the
+    queue's own clock, advanced by the waits of the stop and of tipd.
+    """
+    unit = disconnect(root)
+    dcp = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
+    extra = block(dcp, dcp.index('static int dcp_external_start_locked('))
+    # Without a retry of its own, a deferred stop of a CRTC that is off waits.
+    retry = 'static void dcp_external_stop_retry('
+    extra += '\n' + (block(dcp, dcp.index(retry)) if retry in dcp else
+                      retry + 'struct work_struct *work) { (void)work; }')
+
+    def swap(old, new):
+        nonlocal unit
+        assert unit.count(old) == 1, old
+        unit = unit.replace(old, new)
+
+    swap('static int iomfb_queue_settle(struct apple_dcp *d, int t)\n'
+         '{ (void)d; (void)t; settles++; return settle_error; }',
+         '/* Milliseconds since the firmware accepted the dropped present. */\n'
+         'static int now, retire_at, crash_at, after_power_error;\n'
+         'static bool pending, crashed, powered;\n'
+         'static int iomfb_queue_settle(struct apple_dcp *d, int t)\n'
+         '{ (void)d; settles++; if (settle_error) return settle_error;\n'
+         ' if (powered) { powered = false; if (after_power_error) return after_power_error; }\n'
+         ' if (pending && retire_at >= 0 && now + t >= retire_at) {\n'
+         '  if (now < retire_at) now = retire_at; pending = false; }\n'
+         ' if (pending && now + t >= crash_at) { if (now < crash_at) now = crash_at; crashed = true; }\n'
+         ' if (crashed) return -EIO;\n'
+         ' if (pending) { now += t; return -ETIMEDOUT; }\n'
+         ' return 0; }')
+    swap('static int iomfb_external_power_h17p(struct apple_dcp *d, bool on)\n'
+         '{ (void)d; assert(!on); powers++; return power_error; }',
+         'static int iomfb_external_power_h17p(struct apple_dcp *d, bool on)\n'
+         '{ (void)d; if (on) { power_ons++; return 0; }\n'
+         ' assert(!pending); powers++; powered = !power_error; return power_error; }')
+    swap('static int settle_error,', 'static int power_ons, settle_error,')
+    # The H17P branch of dcp_typec_route_prepare(), which quiesce-before-safe
+    # runs for real inside typec_mux_set().
+    swap('static int typec_set_mode(void *p, int s)\n'
+         '{ (void)p; assert(s == TYPEC_STATE_SAFE); safes++; return safe_error; }',
+         'static int phy_safes;\n'
+         'static int typec_set_mode(void *p, int s)\n'
+         '{ int r; (void)p; assert(s == TYPEC_STATE_SAFE); safes++;\n'
+         ' if (display.external_error) return display.external_error;\n'
+         ' if (display.external_cable || !display.external_stopped || display.dptxport[0].connected) {\n'
+         '  r = dcp_external_disconnect(&display, true); if (r) return r; }\n'
+         ' phy_safes++; return 0; }')
+    swap('int main(void)\n{', 'static int __attribute__((unused)) prior_main(void)\n{')
+    tests = r'''
+static struct platform_device device = { .data = &display };
+/* The dock has left; the firmware accepted a present it will not complete. */
+static void left(int retire)
+{
+ init(); now = 0; retire_at = retire; crash_at = 10000; after_power_error = 0;
+ pending = true; crashed = powered = false; phy_safes = power_ons = 0;
+}
+/* tipd's revalidation of the cable after its debounce, as resume_work. */
+static bool revalidate(void)
+{
+ now += CD321X_DEBOUNCE_DELAY_MS;
+ if (!cd321x_pm_begin_read(&port.pm)) return false;
+ cd321x_pm_snapshot_ready(&port.pm); cd321x_update_work(&port.update_work.work);
+ return true;
+}
+/* Nothing of the session has been released, and nothing was sent. */
+static void owned(void)
+{
+ CHECK(!display.external_stopped && display.dptxport[0].connected);
+ CHECK(display.pipe_enabled_h17p && !display.typec_crtc_off);
+ CHECK(display.iomfb.presentation_paused && !display.external_running);
+ CHECK(powers == 0 && releases == 0 && phy_safes == 0);
+}
+int main(void)
+{
+ /*
+  * The capture: tipd's out-of-band disconnect and then its SAFE stop the
+  * session while the dropped present is in flight.  Each settle times out
+  * after 500 ms, before the power-off is sent: not latched.  The watchdog
+  * retires the present, and tipd's next revalidation stops the session and
+  * reaches the PHY.
+  */
+ left(1500);
+ cd321x_update_work(&port.update_work.work);
+ CHECK(safes == 1 && settles == 2 && now == 1000);
+ CHECK(!display.external_error && !display.external_cable && !sink.connected);
+ owned();
+ CHECK(port.pm.phase == CD321X_PM_REVALIDATE && !port.state_valid);
+ CHECK(revalidate());
+ CHECK(safes == 2 && phy_safes == 1 && powers == 1 && releases == 1);
+ CHECK(!display.external_error && display.external_stopped);
+ CHECK(!display.dptxport[0].connected && !display.pipe_enabled_h17p && display.typec_crtc_off);
+ CHECK(port.state_valid && port.pm.phase == CD321X_PM_RUNNING);
+ /* The next plug connects. */
+ CHECK(dcp_dptx_connect_oob(&device, 0) == 0);
+ CHECK(display.dptxport[0].connected && display.external_cable && !display.external_error);
+ printf("case captured complete\n");
+
+ /* The watchdog retires the present during the retry's settle. */
+ left(1900);
+ cd321x_update_work(&port.update_work.work);
+ CHECK(!display.external_error); owned();
+ CHECK(revalidate() && phy_safes == 1 && display.external_stopped && now == 1900);
+ printf("case retired-during-retry complete\n");
+
+ /*
+  * Nothing retires the present.  The stop is retried within tipd's budget
+  * and the session stays owned throughout; once the transaction timeout
+  * declares the coprocessor crashed, the stop latches and the next plug is
+  * refused: the protected case.
+  */
+ left(-1);
+ cd321x_update_work(&port.update_work.work);
+ while (revalidate())
+  ;
+ CHECK(safes == 1 + CD321X_RESUME_ATTEMPTS && port.pm.phase == CD321X_PM_STALE);
+ CHECK(!display.external_error); owned();
+ now = 12000;
+ CHECK(cd321x_pm_event(&port.pm) && revalidate());
+ CHECK(display.external_error == -EIO); owned();
+ CHECK(dcp_dptx_connect_oob(&device, 0) == -EIO && raw_links == 0);
+ printf("case never-retired complete\n");
+
+ /* A settle after the power-off was sent still latches and holds. */
+ left(0); pending = false; after_power_error = -ETIMEDOUT;
+ cd321x_update_work(&port.update_work.work);
+ CHECK(powers == 1 && display.external_error == -ETIMEDOUT);
+ CHECK(display.dptxport[0].connected && display.pipe_enabled_h17p && !display.external_stopped);
+ CHECK(revalidate() && phy_safes == 0 && powers == 1 && releases == 0);
+ printf("case after-power-off complete\n");
+
+ /* A crashed or stopped queue is no proof that DMA stopped: latched. */
+ left(1000); settle_error = -EIO;
+ cd321x_update_work(&port.update_work.work);
+ CHECK(display.external_error == -EIO); settle_error = 0;
+ CHECK(revalidate() && phy_safes == 0 && powers == 0);
+ printf("case crashed-queue complete\n");
+
+ /* The same deferral for a CRTC switched off on the same cable. */
+ left(1000);
+ CHECK(dcp_external_disconnect(&display, false) == -ETIMEDOUT);
+ CHECK(!display.external_error && display.external_cable); owned();
+ now = 1000;
+ CHECK(dcp_external_disconnect(&display, false) == 0 && display.external_stopped && powers == 1);
+ printf("case crtc-off complete\n");
+
+ /* Nothing else retries a CRTC that is off: the stop retries itself, bounded. */
+ left(1000);
+ CHECK(dcp_external_disconnect(&display, false) == -ETIMEDOUT);
+ CHECK(display.external_stop_deferred && display.external_stop_retry_wq.work.pending);
+ now = 1000; display.external_stop_retry_wq.work.pending = false;
+ dcp_external_stop_retry(&display.external_stop_retry_wq.work);
+ CHECK(display.external_stopped && !display.external_stop_deferred && powers == 1);
+ CHECK(!display.external_stop_retry_wq.work.pending && !display.external_stop_retries);
+ left(-1); crash_at = 1 << 30;
+ for (int i = 0; i <= DCP_EXTERNAL_STOP_RETRIES; i++) {
+  display.external_stop_retry_wq.work.pending = false;
+  dcp_external_stop_retry(&display.external_stop_retry_wq.work);
+  if (!i) CHECK(dcp_external_disconnect(&display, false) == -ETIMEDOUT);
+ }
+ CHECK(!display.external_stop_retry_wq.work.pending && !display.external_error); owned();
+ printf("case stop-retry complete\n");
+
+ /*
+  * The CRTC is enabled again on the same cable before any stop went
+  * through: the pipe was never powered off, so it is resumed, not powered
+  * on a second time.
+  */
+ left(1000);
+ CHECK(dcp_external_disconnect(&display, false) == -ETIMEDOUT); owned();
+ CHECK(dcp_external_start_locked(&display) == 0);
+ CHECK(power_ons == 0 && powers == 0 && display.external_running);
+ CHECK(!display.iomfb.presentation_paused && !display.external_stop_deferred);
+ CHECK(display.pipe_enabled_h17p && display.dptxport[0].connected);
+ /* Once the cable is gone, the deferred session is not resumed. */
+ left(1000);
+ CHECK(dcp_external_disconnect(&display, true) == -ETIMEDOUT);
+ CHECK(dcp_external_start_locked(&display) == -ENODEV && power_ons == 0); owned();
+ printf("case enable-after-deferral complete\n");
+
+ printf("%d assertions, %d failures\n", checks, failures); return !!failures;
+}
+'''
+    return unit + extra + '\n' + tests
+
 def teardown(root):
 
     files = {n: (root / f).read_text() for n, f in {
