@@ -8,6 +8,7 @@
  * Some code borrowed from the Linux EHCI driver.
  */
 
+#include <kunit/static_stub.h>
 #include <linux/jiffies.h>
 #include <linux/pci.h>
 #include <linux/iommu.h>
@@ -43,6 +44,8 @@ MODULE_PARM_DESC(quirks, "Bit flags for quirks to be enabled as default");
 
 void xhci_portsc_writel(struct xhci_port *port, u32 val)
 {
+	KUNIT_STATIC_STUB_REDIRECT(xhci_portsc_writel, port, val);
+
 	trace_xhci_portsc_writel(port, val);
 	writel(val, &port->port_reg->portsc);
 }
@@ -50,6 +53,8 @@ EXPORT_SYMBOL_GPL(xhci_portsc_writel);
 
 u32 xhci_portsc_readl(struct xhci_port *port)
 {
+	KUNIT_STATIC_STUB_REDIRECT(xhci_portsc_readl, port);
+
 	return readl(&port->port_reg->portsc);
 }
 EXPORT_SYMBOL_GPL(xhci_portsc_readl);
