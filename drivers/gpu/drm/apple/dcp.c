@@ -2718,6 +2718,7 @@ static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 /* The generation token belongs to the CRTC that was actually enabled. */
 static int dcp_external_stop_locked(struct apple_dcp *dcp, u64 generation)
 {
+	const char *step;
 	int ret;
 
 	lockdep_assert_held(&dcp->external_lock);
@@ -2732,11 +2733,16 @@ static int dcp_external_stop_locked(struct apple_dcp *dcp, u64 generation)
 	/* Route setup can call this before IOMFB or its shared memory exists. */
 	if (dcp->external_stopped || !dcp->external_power_attempted)
 		goto release_link;
+	step = "settling the queue";
 	ret = iomfb_queue_settle(dcp, msecs_to_jiffies(500));
-	if (!ret)
+	if (!ret) {
+		step = "powering the pipe off";
 		ret = iomfb_external_power_h17p(dcp, false);
-	if (!ret)
+	}
+	if (!ret) {
+		step = "settling the queue after power-off";
 		ret = iomfb_queue_settle(dcp, msecs_to_jiffies(500));
+	}
 	if (ret)
 		goto failed;
 	/* This is a transport acknowledgment, not permission to free scanout. */
@@ -2744,6 +2750,7 @@ static int dcp_external_stop_locked(struct apple_dcp *dcp, u64 generation)
 release_link:
 	scoped_guard(mutex, &dcp->hpd_mutex) {
 		if (dcp->dptxport[0].connected) {
+			step = "withdrawing the DPTX link";
 			if (!dptx_service_available(&dcp->dptxport[0])) {
 				ret = -ENODEV;
 				goto failed;
@@ -2763,6 +2770,7 @@ release_link:
 	return 0;
 failed:
 	/* A retry could race a late reply. Keep this session blocked and owned. */
+	dev_err(dcp->dev, "external display stop failed %s, session held: %d\n", step, ret);
 	dcp->external_error = ret;
 	return ret;
 }
