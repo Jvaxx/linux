@@ -8,6 +8,7 @@
 #include <kunit/test.h>
 #include <kunit/visibility.h>
 #include <linux/device.h>
+#include <linux/interrupt.h>
 #include <linux/module.h>
 #include <linux/pm_runtime.h>
 #include <linux/property.h>
@@ -47,6 +48,15 @@ static void xhci_plat_keep_running_other_quirks_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, xhci_plat_keep_running(~XHCI_RUN_IN_S2IDLE, PM_SUSPEND_TO_IDLE,
 							true, true));
 	KUNIT_EXPECT_TRUE(test, xhci_plat_keep_running(~0ULL, PM_SUSPEND_TO_IDLE, true, true));
+}
+
+/* Only a controller kept running in suspend-to-idle keeps its interrupt enabled across it. */
+static void xhci_plat_irq_flags_test(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, xhci_plat_irq_flags(0), (unsigned long)IRQF_SHARED);
+	KUNIT_EXPECT_EQ(test, xhci_plat_irq_flags(~XHCI_RUN_IN_S2IDLE), (unsigned long)IRQF_SHARED);
+	KUNIT_EXPECT_EQ(test, xhci_plat_irq_flags(XHCI_RUN_IN_S2IDLE),
+			(unsigned long)(IRQF_SHARED | IRQF_NO_SUSPEND));
 }
 
 /* A running controller is left alone; a halted, failed or unpowered one is not. */
@@ -279,6 +289,7 @@ static void xhci_plat_all_property_quirks_test(struct kunit *test)
 static struct kunit_case xhci_plat_test_cases[] = {
 	KUNIT_CASE(xhci_plat_keep_running_test),
 	KUNIT_CASE(xhci_plat_keep_running_other_quirks_test),
+	KUNIT_CASE(xhci_plat_irq_flags_test),
 	KUNIT_CASE(xhci_plat_stopped_test),
 	KUNIT_CASE(xhci_plat_quiesce_dying_test),
 #ifdef CONFIG_PM

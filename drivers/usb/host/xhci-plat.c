@@ -188,6 +188,17 @@ VISIBLE_IF_KUNIT u64 xhci_plat_property_quirks(struct device *dev)
 }
 EXPORT_SYMBOL_IF_KUNIT(xhci_plat_property_quirks);
 
+/*
+ * A controller kept running in suspend-to-idle decides in its event handling which events wake the
+ * system, see xhci_run_in_s2idle_begin(). Its interrupt handler has to run while the system
+ * sleeps, so keep the interrupt enabled across suspend instead of arming it for wakeup.
+ */
+VISIBLE_IF_KUNIT unsigned long xhci_plat_irq_flags(u64 quirks)
+{
+	return IRQF_SHARED | ((quirks & XHCI_RUN_IN_S2IDLE) ? IRQF_NO_SUSPEND : 0);
+}
+EXPORT_SYMBOL_IF_KUNIT(xhci_plat_irq_flags);
+
 int xhci_plat_probe(struct platform_device *pdev, struct device *sysdev, const struct xhci_plat_priv *priv_match)
 {
 	const struct hc_driver	*driver;
@@ -195,6 +206,7 @@ int xhci_plat_probe(struct platform_device *pdev, struct device *sysdev, const s
 	struct xhci_hcd		*xhci;
 	struct resource         *res;
 	struct usb_hcd		*hcd, *usb3_hcd;
+	unsigned long		irqflags;
 	int			ret;
 	int			irq;
 	struct xhci_plat_priv	*priv = NULL;
@@ -326,7 +338,8 @@ int xhci_plat_probe(struct platform_device *pdev, struct device *sysdev, const s
 	if (priv && (priv->quirks & XHCI_SG_TRB_CACHE_SIZE_QUIRK))
 		xhci->quirks |= XHCI_SG_TRB_CACHE_SIZE_QUIRK;
 
-	ret = usb_add_hcd(hcd, irq, IRQF_SHARED);
+	irqflags = xhci_plat_irq_flags(xhci->quirks);
+	ret = usb_add_hcd(hcd, irq, irqflags);
 	if (ret)
 		goto disable_usb_phy;
 
@@ -362,15 +375,22 @@ int xhci_plat_probe(struct platform_device *pdev, struct device *sysdev, const s
 	if (xhci->shared_hcd) {
 		xhci->shared_hcd->rsrc_start = hcd->rsrc_start;
 		xhci->shared_hcd->rsrc_len = hcd->rsrc_len;
-		ret = usb_add_hcd(xhci->shared_hcd, irq, IRQF_SHARED);
+		ret = usb_add_hcd(xhci->shared_hcd, irq, irqflags);
 		if (ret)
 			goto put_usb3_hcd;
 	}
 
 	/*
+	 * Running in suspend-to-idle needs the interrupt requested above for it,
+	 * so a later quirk source, such as the xhci_hcd quirks module parameter,
+	 * cannot turn it on.
+	 */
+	if (!(irqflags & IRQF_NO_SUSPEND))
+		xhci->quirks &= ~XHCI_RUN_IN_S2IDLE;
+
+	/*
 	 * Let the USB core keep hubs awake that need it for wakeup, see
-	 * XHCI_RUN_IN_S2IDLE. Only now are all quirk sources merged, the xhci_hcd
-	 * quirks module parameter included.
+	 * XHCI_RUN_IN_S2IDLE.
 	 */
 	hcd->runs_in_s2idle = !!(xhci->quirks & XHCI_RUN_IN_S2IDLE);
 	if (xhci->shared_hcd)
@@ -536,9 +556,10 @@ static int xhci_plat_suspend_common(struct device *dev)
  * Some platforms have no wake signal for a halted xHC: a halted controller writes no events, so
  * its interrupt cannot fire, and on PCI the remote wakeup or port change would be signalled as a
  * PME instead. Where the platform keeps the controller powered and clocked in suspend-to-idle,
- * leave it running instead, with the root hubs suspended and armed for wakeup as usual. A remote
- * wakeup or port change then raises a Port Status Change Event, and the interrupt, armed for
- * wakeup by the platform, ends suspend-to-idle.
+ * leave it running instead, with the root hubs suspended and armed for wakeup as usual. The
+ * controller then interrupts for every event, its interrupt stays enabled (see
+ * xhci_plat_irq_flags()), and the event handling wakes the system for the events that a halted
+ * controller would signal.
  */
 VISIBLE_IF_KUNIT bool xhci_plat_keep_running(u64 quirks, suspend_state_t target,
 					     bool may_wakeup, bool wakeup_path)
