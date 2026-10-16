@@ -2017,8 +2017,21 @@ impl SepData {
             // acknowledgement sampled before CLEAR_STATE and authentication.
             let st = match sensor::status() {
                 Ok(st) if !st.is_silent() => st,
-                _ => {
-                    dev_warn!(self.dev, "sensor: status unavailable after registration\n");
+                Ok(_) => {
+                    dev_warn!(
+                        self.dev,
+                        "sensor: status unavailable after registration: silent {} ms after power-on\n",
+                        self.sensor_ms()
+                    );
+                    return None;
+                }
+                Err(e) => {
+                    dev_warn!(
+                        self.dev,
+                        "sensor: status unavailable after registration: read failed ({:?}) {} ms after power-on\n",
+                        e,
+                        self.sensor_ms()
+                    );
                     return None;
                 }
             };
