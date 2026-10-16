@@ -57,6 +57,7 @@ struct relink_test {
 	bool real_modeset;	/* atomic_enable is the real dcp_crtc_atomic_modeset() */
 	bool force_modeset;	/* a userspace commit changes the connectors */
 	bool fault_in_call;	/* the link faults before the firmware answers */
+	bool no_reply;		/* the firmware answers a call with no reply */
 	u32 reply;		/* what the firmware answers a call with */
 	int modeset_ret;	/* the result of the real mode set */
 	struct dcp_display_mode catalog;
@@ -135,7 +136,7 @@ static void relink_test_push(struct apple_dcp *dcp, const struct dcp_method_entr
 
 	if (modeset && t->fault_in_call)
 		dcp_external_link_fault(dcp);
-	cb(dcp, &t->reply, cookie);
+	cb(dcp, modeset && t->no_reply ? NULL : &t->reply, cookie);
 }
 
 static void relink_test_crtc_enable(struct drm_crtc *crtc, struct drm_atomic_commit *state)
@@ -886,6 +887,38 @@ static void relink_fault_inactive_test(struct kunit *test)
 	enable_work(&t->con.hotplug_wq);
 }
 
+/* A mode set the firmware gives no reply to has failed. */
+static void relink_no_reply_test(struct kunit *test)
+{
+	struct relink_test *t = relink_test_init(test);
+
+	relink_test_real(t);
+	t->no_reply = true;
+	relink_test_tear(t);
+	relink_test_reconnect(test, t);
+	KUNIT_EXPECT_LT(test, t->modeset_ret, 0);
+	KUNIT_EXPECT_FALSE(test, relink_test_link_up(t));
+	KUNIT_EXPECT_FALSE(test, relink_test_connected(t));
+	KUNIT_EXPECT_EQ(test, t->con.base.state->link_status, DRM_LINK_STATUS_BAD);
+}
+
+/*
+ * A nonzero result alone is not a failure: its meaning is not established,
+ * and it is also seen for a mode set that repeats the current mode.
+ */
+static void relink_nonzero_reply_test(struct kunit *test)
+{
+	struct relink_test *t = relink_test_init(test);
+
+	relink_test_real(t);
+	t->reply = 1;
+	relink_test_tear(t);
+	relink_test_reconnect(test, t);
+	KUNIT_EXPECT_EQ(test, t->modeset_ret, 0);
+	KUNIT_EXPECT_TRUE(test, relink_test_link_up(t));
+	KUNIT_EXPECT_TRUE(test, relink_test_connected(t));
+}
+
 static struct kunit_case relink_cases[] = {
 	KUNIT_CASE(relink_bounce_test),
 	KUNIT_CASE(relink_mode_gone_test),
@@ -904,6 +937,8 @@ static struct kunit_case relink_cases[] = {
 	KUNIT_CASE(relink_fault_during_modeset_test),
 	KUNIT_CASE(relink_fault_after_modeset_test),
 	KUNIT_CASE(relink_fault_inactive_test),
+	KUNIT_CASE(relink_no_reply_test),
+	KUNIT_CASE(relink_nonzero_reply_test),
 	{}
 };
 
