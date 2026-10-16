@@ -96,6 +96,7 @@ struct usb_hub {
  * @state_kn: kernfs_node of the sysfs attribute that accesses @state
  * @location: opaque representation of platform connector location
  * @status_lock: synchronize port_event() vs usb_port_{suspend|resume}
+ * @power_lock: serialize administrative disable with runtime resume
  * @portnum: port index num based one
  * @is_superspeed cache super-speed status
  * @usb3_lpm_u1_permit: whether USB3 U1 LPM is permitted.
@@ -118,6 +119,7 @@ struct usb_port {
 	struct kernfs_node *state_kn;
 	usb_port_location_t location;
 	struct mutex status_lock;
+	struct mutex power_lock; /* administrative disable vs runtime resume */
 	u32 over_current_count;
 	u8 portnum;
 	u32 quirks;

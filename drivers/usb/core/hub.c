@@ -2149,15 +2149,17 @@ bool usb_device_is_owned(struct usb_device *udev)
  * Writing 0 to its "disable" attribute fails with -EBUSY; writing 1 takes the
  * port over, after which usb_hub_port_power_on() leaves it off.
  *
- * A port that is off for someone else, say through its "disable" attribute,
- * is left as it is, and the caller can tell from the return value that it is
- * not held for it. A port that runtime PM had switched off is not such a
- * port: it is resumed, then held off for the caller.
+ * An administratively disabled port is powered off again, in case it was
+ * repowered before the handover. It stays under administrative ownership:
+ * runtime resume leaves it off, and the caller's hub lock prevents a write
+ * to "disable" from enabling it during the lane change. The return value
+ * distinguishes this from a port held for the caller. Other ports, including
+ * those switched off by runtime PM, are resumed and held off for the caller.
  *
  * Context: process context; the caller holds @hdev's device lock.
  *
  * Return: 0 if the port is held off for the caller, also if it was already,
- * 1 if it is off for someone else, -EOPNOTSUPP if the hub cannot switch the
+ * 1 if it is administratively disabled, -EOPNOTSUPP if the hub cannot switch the
  * power of a single port, or another negative error code.
  */
 int usb_hub_port_power_off(struct usb_device *hdev, int port1)
@@ -2165,6 +2167,7 @@ int usb_hub_port_power_off(struct usb_device *hdev, int port1)
 	struct usb_hub *hub = usb_hub_to_struct_hub(hdev);
 	struct usb_interface *intf;
 	struct usb_port *port_dev;
+	bool disabled;
 	int ret;
 
 	device_lock_assert(&hdev->dev);
@@ -2179,9 +2182,7 @@ int usb_hub_port_power_off(struct usb_device *hdev, int port1)
 	port_dev = hub->ports[port1 - 1];
 	if (port_dev->held_off)
 		return 0;
-	/* Runtime PM may have suspended it since, which does not make it ours. */
-	if (port_dev->disabled)
-		return 1;
+	disabled = port_dev->disabled;
 
 	intf = to_usb_interface(hub->intfdev);
 	ret = usb_autopm_get_interface(intf);
@@ -2189,21 +2190,18 @@ int usb_hub_port_power_off(struct usb_device *hdev, int port1)
 		return ret;
 
 	/*
-	 * The port's runtime resume switches its power on, and does not take
-	 * the hub lock, as hub_event() waits for it under that lock. Keep port
-	 * runtime PM out instead, after waiting for any of it in progress.
+	 * Administrative disable excludes the runtime-resume power writer under
+	 * power_lock. For other ports, wait for any port PM and keep it out
+	 * until power-on. Neither path takes the hub lock in the PM callback.
 	 */
-	ret = pm_runtime_resume_and_get(&port_dev->dev);
-	if (ret < 0) {
-		/* After a runtime PM error, nothing resumes the port any more. */
-		if (!pm_runtime_active(&port_dev->dev))
-			goto out;
-		pm_runtime_get_noresume(&port_dev->dev);
-	}
-
-	if (!port_dev->child && !test_bit(port1, hub->power_bits)) {
-		ret = 1;
-		goto put_port;
+	if (!disabled) {
+		ret = pm_runtime_resume_and_get(&port_dev->dev);
+		if (ret < 0) {
+			/* After a runtime PM error, nothing resumes the port any more. */
+			if (!pm_runtime_active(&port_dev->dev))
+				goto out;
+			pm_runtime_get_noresume(&port_dev->dev);
+		}
 	}
 
 	if (port_dev->child)
@@ -2218,7 +2216,7 @@ int usb_hub_port_power_off(struct usb_device *hdev, int port1)
 	}
 
 	/* The runtime PM reference is dropped once the hold ends. */
-	port_dev->held_off = true;
+	port_dev->held_off = !disabled;
 	/* Nothing hub_wq still has queued for the port applies to it off. */
 	clear_bit(port1, hub->change_bits);
 	clear_bit(port1, hub->warm_reset_bits);
@@ -2227,11 +2225,12 @@ int usb_hub_port_power_off(struct usb_device *hdev, int port1)
 	usb_clear_port_feature(hdev, port1, USB_PORT_FEAT_C_CONNECTION);
 	if (!port_dev->is_superspeed)
 		usb_clear_port_feature(hdev, port1, USB_PORT_FEAT_C_ENABLE);
-	usb_autopm_put_interface(intf);
-	return 0;
+	ret = disabled;
+	goto out;
 
 put_port:
-	pm_runtime_put(&port_dev->dev);
+	if (!disabled)
+		pm_runtime_put(&port_dev->dev);
 out:
 	usb_autopm_put_interface(intf);
 	return ret;
