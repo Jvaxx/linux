@@ -752,15 +752,22 @@ static void cd321x_restore_ignores_fault_budget_test(struct kunit *test)
 	/* A prepared port revalidates on its own resume instead. */
 	cd321x_pm_prepare(&pm);
 	KUNIT_EXPECT_EQ(test, cd321x_pm_notifications(&pm, false, false, true), 0U);
+}
+
 /* Only a pipeline owned by another port skips the retry. */
 static void cd321x_display_taken_test(struct kunit *test)
 {
-	KUNIT_EXPECT_TRUE(test, cd321x_display_taken(-ENOSPC));
-	/* A PHY mid-transition or a pending SAFE state must be retried. */
-	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-EBUSY));
-	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-EAGAIN));
-	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-ETIMEDOUT));
-	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(0));
+	/* T8140/T8142: a PHY mid-transition or a pending SAFE state is retried. */
+	KUNIT_EXPECT_TRUE(test, cd321x_display_taken(-ENOSPC, true));
+	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-EBUSY, true));
+	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-EAGAIN, true));
+	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-ETIMEDOUT, true));
+	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(0, true));
+	/* Other SoCs keep -EBUSY as the taken display. */
+	KUNIT_EXPECT_TRUE(test, cd321x_display_taken(-EBUSY, false));
+	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-ENOSPC, false));
+	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(-EAGAIN, false));
+	KUNIT_EXPECT_FALSE(test, cd321x_display_taken(0, false));
 }
 
 static struct kunit_case cd321x_pm_cases[] = {

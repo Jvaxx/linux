@@ -6,6 +6,8 @@
  * Author: Heikki Krogerus <heikki.krogerus@linux.intel.com>
  */
 
+#include <drm/drm_connector.h>
+
 #include <linux/i2c.h>
 #include <linux/acpi.h>
 #include <linux/gpio/consumer.h>
@@ -20,7 +22,6 @@
 #include <linux/usb/role.h>
 #include <linux/workqueue.h>
 #include <linux/firmware.h>
-#include <drm/drm_connector.h>
 
 #include "tps6598x.h"
 #include "cd321x-setup.h"
@@ -216,7 +217,6 @@ static void tps6598x_set_data_role(struct tps6598x *tps,
 				   enum typec_data_role role, bool connected)
 {
 	enum usb_role role_val;
-	int ret;
 
 	if (role == TYPEC_HOST)
 		role_val = USB_ROLE_HOST;
@@ -226,11 +226,8 @@ static void tps6598x_set_data_role(struct tps6598x *tps,
 	if (!connected)
 		role_val = USB_ROLE_NONE;
 
-	ret = usb_role_switch_set_role(tps->role_sw, role_val);
-	if (ret)
-		return ret;
+	usb_role_switch_set_role(tps->role_sw, role_val);
 	typec_set_data_role(tps->port, role);
-	return 0;
 }
 
 static int tps6598x_connect(struct tps6598x *tps, u32 status)
@@ -263,9 +260,7 @@ static int tps6598x_connect(struct tps6598x *tps, u32 status)
 	else
 		typec_set_orientation(tps->port, TYPEC_ORIENTATION_NORMAL);
 	typec_set_mode(tps->port, TYPEC_STATE_USB);
-	ret = tps6598x_set_data_role(tps, TPS_STATUS_TO_TYPEC_DATAROLE(status), true);
-	if (ret)
-		return ret;
+	tps6598x_set_data_role(tps, TPS_STATUS_TO_TYPEC_DATAROLE(status), true);
 
 	tps->partner = typec_register_partner(tps->port, &desc);
 	if (IS_ERR(tps->partner))
@@ -287,37 +282,11 @@ static void tps6598x_disconnect(struct tps6598x *tps, u32 status)
 	typec_set_pwr_opmode(tps->port, TYPEC_PWR_MODE_USB);
 	typec_set_pwr_role(tps->port, TPS_STATUS_TO_TYPEC_PORTROLE(status));
 	typec_set_vconn_role(tps->port, TPS_STATUS_TO_TYPEC_VCONN(status));
-}
-
-static int tps6598x_disconnect(struct tps6598x *tps, u32 status)
-{
-	struct typec_mux_state safe = { .mode = TYPEC_STATE_SAFE };
-	bool prepared = tps->remove_safe_prepared;
-	int ret;
-
-	tps->remove_safe_prepared = false;
-	tps6598x_drop_partner(tps, status);
-	if (!prepared) {
-		typec_set_orientation(tps->port, TYPEC_ORIENTATION_NONE);
-		ret = typec_mux_begin(tps->mux, &safe);
-		if (ret)
-			return ret;
-		/* Park while the host still supplies the PIPE backend clock. */
-		ret = typec_mux_apply(tps->mux);
-		if (ret)
-			return ret;
-	}
-	ret = tps6598x_set_data_role(tps, TPS_STATUS_TO_TYPEC_DATAROLE(status), false);
-	if (ret) {
-		typec_mux_abort(tps->mux);
-		return ret;
-	}
-	ret = typec_mux_end(tps->mux);
-	if (ret)
-		return ret;
+	typec_set_orientation(tps->port, TYPEC_ORIENTATION_NONE);
+	typec_set_mode(tps->port, TYPEC_STATE_SAFE);
+	tps6598x_set_data_role(tps, TPS_STATUS_TO_TYPEC_DATAROLE(status), false);
 
 	power_supply_changed(tps->psy);
-	return 0;
 }
 
 int tps6598x_exec_cmd_tmo(struct tps6598x *tps, const char *cmd,
@@ -569,10 +538,22 @@ static void tps6598x_handle_plug_event(struct tps6598x *tps, u32 status)
 		if (ret)
 			dev_err(tps->dev, "failed to register partner\n");
 	} else {
-		ret = tps6598x_disconnect(tps, status);
-		if (ret)
-			dev_err(tps->dev, "hardware disconnect failed: %d\n", ret);
+		tps6598x_disconnect(tps, status);
 	}
+}
+
+/*
+ * The interrupt mask of this controller. T8140 and T8142 leave the SN201202x
+ * DP status event masked: the display handling these machines were brought
+ * up with never used it (see h17_display).
+ */
+static u64 tipd_irq_mask1(const struct tps6598x *tps)
+{
+	u64 mask = tps->data->irq_mask1;
+
+	if (tps->h17_display)
+		mask &= ~SN201202X_INT_DP_SID_UPDATE;
+	return mask;
 }
 
 /*
@@ -736,7 +717,7 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 		if (ret)
 			goto out;
 		ret = typec_mux_set(cd321x->mux, &cd321x->state);
-		*display_busy = cd321x_display_taken(ret);
+		*display_busy = cd321x_display_taken(ret, tps->h17_display);
 		if (!ret) {
 			cd321x->dp_status = dp_data.status;
 			cd321x->dp_conf = dp_data.conf;
@@ -814,7 +795,13 @@ static int cd321x_dp_release_first(struct cd321x *cd321x)
 	struct typec_mux_state state;
 	int ret;
 
-	if (cd321x->tps.data != &tipd_sn201202x_data || !cd321x->display_route_active ||
+	/*
+	 * T8140/T8142 keep the teardown they were brought up with: there the
+	 * display route releases the display itself, in the prepare phase of
+	 * the SAFE transaction, before the PHY changes.
+	 */
+	if (cd321x->tps.data != &tipd_sn201202x_data || cd321x->tps.h17_display ||
+	    !cd321x->display_route_active ||
 	    cd321x->state.alt != cd321x->port_altmode_dp ||
 	    !(cd321x->dp_status & DP_STATUS_HPD_STATE))
 		return 0;
@@ -933,21 +920,6 @@ static void cd321x_update_work(struct work_struct *work)
 	}
 
 	/*
-	 * Report the sink as gone before any hardware transition that can fail:
-	 * a failed teardown keeps the route, but the sink must not stay present.
-	 * All ports reference the same external display connector, so only the
-	 * port that owns the display route may report a disconnect. A second DP
-	 * sink can enter Alt Mode while its mux request fails with -ENOSPC, and
-	 * must not tear down the display carried by the other port.
-	 */
-	if (IS_REACHABLE(CONFIG_DRM) && cd321x->connector_fwnode &&
-	    dp_route_was_active &&
-	    (!new_connected || was_disconnected || !dp_connected || !dp_hpd ||
-	     dp_hpd_changed || dp_mode_changed)) {
-		drm_connector_oob_hotplug_event(cd321x->connector_fwnode,
-						connector_status_disconnected);
-
-	/*
 	 * ACIO carries the tunneled PCIe reset handshake over the still-live
 	 * Type-C data path. Close a disappearing USB4/TBT session before dropping
 	 * the USB role; otherwise the role transition tears down the ATC lanes and
@@ -967,6 +939,21 @@ static void cd321x_update_work(struct work_struct *work)
 		ret = usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
 		if (ret)
 			goto retry;
+	}
+
+	/*
+	 * Every Type-C port references the same external DCP connector.  Only the
+	 * port which successfully acquired the shared display route may report a
+	 * disconnect.  A second DP sink can negotiate Alt Mode even though its mux
+	 * request is rejected with -EBUSY (-ENOSPC on T8140/T8142); treating that
+	 * sink as the connector owner would tear down the display carried by the
+	 * first port.
+	 */
+	if (IS_REACHABLE(CONFIG_DRM) && cd321x->connector_fwnode &&
+	    dp_route_was_active &&
+	    (!new_connected || was_disconnected || !dp_connected || !dp_hpd ||
+	     dp_hpd_changed || dp_mode_changed)) {
+		drm_connector_oob_hotplug_event(cd321x->connector_fwnode, connector_status_disconnected);
 	}
 
 	/* Process partner disconnection or change */
@@ -1262,9 +1249,9 @@ static int cd321x_check_setup(struct cd321x *cd321x, u64 event)
 
 	lockdep_assert_held(&tps->lock);
 	if (cd321x->pm.phase == CD321X_PM_REMOVED ||
-	    (!cd321x->pm.setup_pending && !(event & ~tps->data->irq_mask1)))
+	    (!cd321x->pm.setup_pending && !(event & ~tipd_irq_mask1(tps))))
 		return 0;
-	ret = cd321x_setup_run(&cd321x->pm, event, tps->data->irq_mask1,
+	ret = cd321x_setup_run(&cd321x->pm, event, tipd_irq_mask1(tps),
 			       &cd321x_setup_ops, cd321x);
 	if (cd321x->pm.phase == CD321X_PM_PREPARED ||
 	    cd321x->pm.phase == CD321X_PM_INITIALIZING)
@@ -1327,10 +1314,10 @@ static irqreturn_t cd321x_interrupt(int irq, void *data)
 	}
 
 	if (event & (APPLE_CD_REG_INT_DATA_STATUS_UPDATE |
-		     (tps->data->irq_mask1 & SN201202X_INT_DP_SID_UPDATE)))
+		     (tipd_irq_mask1(tps) & SN201202X_INT_DP_SID_UPDATE)))
 		if (!tps->data->read_data_status(tps))
 			goto err_unlock;
-	if (event & tps->data->irq_mask1 & SN201202X_INT_DP_SID_UPDATE)
+	if (event & tipd_irq_mask1(tps) & SN201202X_INT_DP_SID_UPDATE)
 		cd321x_dp_sid_event(container_of(tps, struct cd321x, tps));
 
 	/* Can be called uncondtionally since it will check for any changes itself */
@@ -1790,9 +1777,10 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 	ret = typec_set_mode(tps->port, TYPEC_STATE_SAFE);
 	cd321x->state_valid = !ret;
 	/*
-	 * A fixed host can register its SuperSpeed root after the mux provider.
-	 * Wait for that consumer at probe instead of exhausting the cable retry
-	 * budget before it exists. Host startup does not depend on this port.
+	 * A fixed host can register its SuperSpeed root after the mux provider
+	 * (the T8140 ATC PHY reports this as -EAGAIN). Wait for that consumer at
+	 * probe instead of exhausting the cable retry budget before it exists.
+	 * Host startup does not depend on this port.
 	 */
 	if (ret == -EAGAIN) {
 		ret = -EPROBE_DEFER;
@@ -1812,6 +1800,7 @@ err_put_switch:
 	typec_thunderbolt_switch_put(cd321x->tbt_switch);
 	cd321x->tbt_switch = NULL;
 err_unregister_mux:
+	/* A deferred probe must not leak the connector reference on every retry. */
 	fwnode_handle_put(cd321x->connector_fwnode);
 	cd321x->connector_fwnode = NULL;
 	typec_mux_put(cd321x->mux);
@@ -2279,25 +2268,12 @@ static void cd321x_remove(struct tps6598x *tps)
 	ret = typec_thunderbolt_switch_set(cd321x->tbt_switch,
 					   &tbt_switch_data);
 	if (ret)
-		return ret;
-	/* Display quiescence must precede even an ordinary host-role shutdown. */
-	typec_set_orientation(tps->port, TYPEC_ORIENTATION_NONE);
-	ret = typec_mux_begin(tps->mux, &safe);
-	if (ret)
-		return ret;
-	/* Park while the host still supplies the PIPE backend clock. */
-	ret = typec_mux_apply(tps->mux);
-	if (ret)
-		return ret;
-	ret = usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
-	if (ret) {
-		typec_mux_abort(tps->mux);
-		return ret;
-	}
-	/* Leave the SAFE transaction open for tps6598x_disconnect() to end. */
-	tps->remove_safe_prepared = true;
-	return 0;
+		dev_warn(tps->dev,
+			 "failed to close Thunderbolt/USB4 session on remove: %d\n",
+			 ret);
+	usb_role_switch_set_role(tps->role_sw, USB_ROLE_NONE);
 }
+
 
 int tipd_init(struct tps6598x *tps)
 {
@@ -2312,6 +2288,14 @@ int tipd_init(struct tps6598x *tps)
 				     "failed to get reset GPIO\n");
 	if (tps->reset)
 		msleep(TPS_SETUP_MS);
+
+	/*
+	 * The T8140 and T8142 display routes report a display taken by another
+	 * port as -ENOSPC, and these machines were brought up without the
+	 * SN201202x DP status event; keep that display handling there.
+	 */
+	tps->h17_display = of_machine_is_compatible("apple,t8140") ||
+			   of_machine_is_compatible("apple,t8142");
 
 	if (!device_is_compatible(tps->dev, "ti,tps25750")) {
 		ret = tps6598x_read32(tps, TPS_REG_VID, &vid);
@@ -2347,7 +2331,7 @@ int tipd_init(struct tps6598x *tps)
 	if (tps->dbma_at_probe)
 		dev_info(tps->dev, "controller in debug mode \"DBMa\", leaving it there\n");
 
-	ret = tps6598x_write64(tps, TPS_REG_INT_MASK1, tps->data->irq_mask1);
+	ret = tps6598x_write64(tps, TPS_REG_INT_MASK1, tipd_irq_mask1(tps));
 	if (ret)
 		goto err_reset_controller;
 
@@ -2377,20 +2361,9 @@ int tipd_init(struct tps6598x *tps)
 	if (ret)
 		goto err_role_put;
 
-	tps->mux = fwnode_typec_mux_get(fwnode);
-	if (IS_ERR(tps->mux)) {
-		ret = PTR_ERR(tps->mux);
-		/* No provider reference means rollback cannot prove SAFE. */
-		reset_allowed = false;
-		goto err_role_put;
-	}
-
 	ret = tps->data->register_port(tps, fwnode);
-	if (ret) {
-		/* No live port remains to prove SAFE on failed registration. */
-		reset_allowed = false;
-		goto err_mux_put;
-	}
+	if (ret)
+		goto err_role_put;
 
 	if (status & TPS_STATUS_PLUG_PRESENT) {
 		ret = -EINVAL;
@@ -2399,7 +2372,7 @@ int tipd_init(struct tps6598x *tps)
 		if (!tps->data->read_data_status(tps))
 			goto err_unregister_port;
 		ret = tps->data->connect(tps, status);
-		if (ret) {
+		if (ret)
 			dev_err(tps->dev, "failed to register partner\n");
 	}
 
@@ -2452,8 +2425,6 @@ EXPORT_SYMBOL_GPL(tipd_init);
 
 void tipd_remove(struct tps6598x *tps)
 {
-	int ret = 0;
-
 	tipd_debugfs_unregister(tps);
 
 	if (!tps->irq)
@@ -2464,18 +2435,12 @@ void tipd_remove(struct tps6598x *tps)
 	if (tps->data->remove)
 		tps->data->remove(tps);
 
-	if (!ret)
-		ret = tps6598x_disconnect(tps, 0);
-	else
-		tps6598x_drop_partner(tps, 0);
-	if (ret)
-		dev_err(tps->dev, "hardware teardown failed on remove: %d\n", ret);
+	tps6598x_disconnect(tps, 0);
 	tps->data->unregister_port(tps);
 	usb_role_switch_put(tps->role_sw);
 
 	/* Reset PD controller to remove any applied patch */
-	if (!ret)
-		tps->data->reset(tps);
+	tps->data->reset(tps);
 
 	if (tps->reset)
 		gpiod_set_value_cansleep(tps->reset, 1);

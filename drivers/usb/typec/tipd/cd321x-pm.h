@@ -3,7 +3,6 @@
 #define __CD321X_PM_H__
 
 #include <linux/errno.h>
-
 #include <linux/types.h>
 
 #define CD321X_RESUME_ATTEMPTS 3
@@ -211,6 +210,19 @@ static inline void cd321x_pm_remove(struct cd321x_pm_state *pm)
 {
 	pm->phase = CD321X_PM_REMOVED;
 	pm->attempts_left = 0;
+}
+
+/*
+ * Whether a display mux error means that every display pipeline drives
+ * another port. That lasts until the other display goes away, so the port's
+ * USB path is set up without the display and nothing is retried. T8140 and
+ * T8142 display routes report it as -ENOSPC (@enospc), and their PHY returns
+ * -EBUSY while a transition is pending, which must be retried. Elsewhere the
+ * display route reports it as -EBUSY.
+ */
+static inline bool cd321x_display_taken(int ret, bool enospc)
+{
+	return ret == (enospc ? -ENOSPC : -EBUSY);
 }
 
 #endif /* __CD321X_PM_H__ */

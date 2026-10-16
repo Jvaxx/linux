@@ -15,12 +15,11 @@
 #include <linux/usb/typec.h>
 #include <linux/usb/typec_mux.h>
 
-#include "cd321x-pm.h"
-
 #ifndef __TPS6598X_H__
 #define __TPS6598X_H__
 
 #include "cd321x-pm.h"
+
 /* Also read by the SPMI glue to tell when the controller has woken up */
 #define TPS_REG_MODE			0x03
 
@@ -328,6 +327,13 @@ struct tps6598x {
 	int irq;
 	u8 i2c_protocol:1;
 	u8 dbma_at_probe:1; /* Apple "DBMa" debug mode was active at probe */
+	/*
+	 * T8140 (H17P) and T8142 (H17G) Type-C display handling: the display
+	 * mux reports a display taken by another port as -ENOSPC (-EBUSY is a
+	 * transient PHY state and is retried), and the SN201202x DP status
+	 * event and its HPD rules stay off.
+	 */
+	u8 h17_display:1;
 
 	struct gpio_desc *reset;
 	struct typec_port *port;
@@ -335,12 +341,6 @@ struct tps6598x {
 	struct usb_pd_identity partner_identity;
 	struct usb_role_switch *role_sw;
 	struct typec_capability typec_cap;
-	struct typec_mux *mux;
-	/*
-	 * Set by ->remove() once it has parked the mux in SAFE, so that
-	 * tps6598x_disconnect() only ends that mux transaction.
-	 */
-	bool remove_safe_prepared;
 
 	struct power_supply *psy;
 	struct power_supply_desc psy_desc;
