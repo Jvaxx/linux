@@ -1122,7 +1122,7 @@ static void bt7932_hw_error(struct hci_dev *hdev, u8 code)
 }
 
 /*
- * Follows the wakeup setting of the PCI function, which is off by default.
+ * Follows the wakeup setting of the PCI function, see bt7932_probe().
  * Only while it is on does hci_suspend_sync() leave page scan and LE passive
  * scan set up for the devices flagged for remote wakeup, and only then does
  * bt7932_suspend() keep the transport running with its interrupt armed.
@@ -1373,6 +1373,12 @@ static int bt7932_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (ret < 0)
 		goto retained_fault;
 	bt->registered = true;
+	/*
+	 * Let paired devices wake the system by default, as btmtksdio does
+	 * for MediaTek SDIO controllers: BlueZ still decides per device
+	 * (WakeAllowed), and power/wakeup turns it off for the controller.
+	 */
+	device_set_wakeup_enable(&pdev->dev, true);
 	dev_dbg(&pdev->dev, "BT_HCI_REGISTERED; setup/discovery/connection remain separate gates\n");
 	return 0;
 retained_fault:
