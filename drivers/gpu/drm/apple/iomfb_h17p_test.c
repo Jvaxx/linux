@@ -144,11 +144,72 @@ static void h17p_present_abort_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, dcp_present_was_aborted_h17p(&state, 9));
 }
 
+static void h17p_present_retire_test(struct kunit *test)
+{
+	struct dcp_present_state_h17p state = {};
+	u32 id;
+
+	/* Only an accepted present in flight is retired. */
+	KUNIT_ASSERT_TRUE(test, dcp_present_begin_h17p(&state, 7));
+	KUNIT_EXPECT_FALSE(test, dcp_present_retire_h17p(&state, 7));
+	KUNIT_ASSERT_TRUE(test, dcp_present_submit_h17p(&state, 7, true));
+	KUNIT_EXPECT_FALSE(test, dcp_present_retire_h17p(&state, 6));
+	KUNIT_EXPECT_TRUE(test, dcp_present_retire_h17p(&state, 7));
+	KUNIT_EXPECT_FALSE(test, state.pending);
+	KUNIT_EXPECT_FALSE(test, dcp_present_complete_h17p(&state, 7));
+	/* A late completion for it is recognisable; the firmware did not abort it. */
+	KUNIT_EXPECT_TRUE(test, dcp_present_was_retired_h17p(&state, 7));
+	KUNIT_EXPECT_FALSE(test, dcp_present_was_aborted_h17p(&state, 7));
+
+	/* A second retirement keeps the first. */
+	KUNIT_ASSERT_TRUE(test, dcp_present_begin_h17p(&state, 8));
+	KUNIT_ASSERT_TRUE(test, dcp_present_submit_h17p(&state, 8, true));
+	KUNIT_EXPECT_TRUE(test, dcp_present_retire_h17p(&state, 8));
+	KUNIT_EXPECT_TRUE(test, dcp_present_was_retired_h17p(&state, 7));
+	KUNIT_EXPECT_TRUE(test, dcp_present_was_retired_h17p(&state, 8));
+
+	/* An abort is recorded apart from them. */
+	KUNIT_ASSERT_TRUE(test, dcp_present_begin_h17p(&state, 9));
+	KUNIT_ASSERT_TRUE(test, dcp_present_submit_h17p(&state, 9, true));
+	KUNIT_EXPECT_TRUE(test, dcp_present_abort_h17p(&state, 9));
+	KUNIT_EXPECT_TRUE(test, dcp_present_was_aborted_h17p(&state, 9));
+	KUNIT_EXPECT_FALSE(test, dcp_present_was_retired_h17p(&state, 9));
+	KUNIT_EXPECT_TRUE(test, dcp_present_was_retired_h17p(&state, 7));
+
+	/* A late completion of 7 does not complete present 10 in flight. */
+	KUNIT_ASSERT_TRUE(test, dcp_present_begin_h17p(&state, 10));
+	KUNIT_ASSERT_TRUE(test, dcp_present_submit_h17p(&state, 10, true));
+	KUNIT_EXPECT_FALSE(test, dcp_present_complete_h17p(&state, 7));
+	KUNIT_EXPECT_TRUE(test, state.pending);
+	KUNIT_EXPECT_TRUE(test, dcp_present_was_retired_h17p(&state, 7));
+
+	/* Completing 10 shows the firmware is past 7 and 8; the abort is kept. */
+	KUNIT_EXPECT_TRUE(test, dcp_present_complete_h17p(&state, 10));
+	KUNIT_EXPECT_FALSE(test, dcp_present_was_retired_h17p(&state, 7));
+	KUNIT_EXPECT_FALSE(test, dcp_present_was_retired_h17p(&state, 8));
+	KUNIT_EXPECT_TRUE(test, dcp_present_was_aborted_h17p(&state, 9));
+
+	/* At most IOMFB_DROPPED_MAX are kept: the next present stays in flight. */
+	for (id = 100; id < 100 + IOMFB_DROPPED_MAX; id++) {
+		KUNIT_ASSERT_TRUE(test, dcp_present_begin_h17p(&state, id));
+		KUNIT_ASSERT_TRUE(test, dcp_present_submit_h17p(&state, id, true));
+		KUNIT_ASSERT_TRUE(test, dcp_present_retire_h17p(&state, id));
+	}
+	KUNIT_ASSERT_TRUE(test, dcp_present_begin_h17p(&state, id));
+	KUNIT_ASSERT_TRUE(test, dcp_present_submit_h17p(&state, id, true));
+	KUNIT_EXPECT_FALSE(test, dcp_present_retire_h17p(&state, id));
+	KUNIT_EXPECT_TRUE(test, state.pending);
+	KUNIT_EXPECT_TRUE(test, dcp_present_was_retired_h17p(&state, 100));
+	KUNIT_EXPECT_FALSE(test, dcp_present_was_retired_h17p(&state, id));
+	KUNIT_EXPECT_TRUE(test, dcp_present_complete_h17p(&state, id));
+}
+
 static struct kunit_case h17p_present_cases[] = {
 	KUNIT_CASE(h17p_surface_wire_test),
 	KUNIT_CASE(h17p_opaque_x_parameter_test),
 	KUNIT_CASE(h17p_callback_bounds_test),
 	KUNIT_CASE(h17p_present_abort_test),
+	KUNIT_CASE(h17p_present_retire_test),
 	{}
 };
 
