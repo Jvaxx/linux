@@ -26,6 +26,7 @@ struct port_power_test_hc {
 	u16 status;
 	u16 change;
 	unsigned int power_ons;
+	bool fail_power_off;
 };
 
 struct port_power_test {
@@ -170,6 +171,10 @@ static int port_power_test_hub_control(struct usb_hcd *hcd, u16 type_req, u16 va
 			hc->change |= USB_PORT_STAT_C_RESET | USB_PORT_STAT_C_BH_RESET;
 		return 0;
 	case ClearPortFeature:
+		if (value == USB_PORT_FEAT_POWER && hc->fail_power_off) {
+			hc->fail_power_off = false;
+			return -ENOMEM;
+		}
 		if (value == USB_PORT_FEAT_POWER)
 			port_power_test_set_power(hcd, false);
 		else
@@ -536,6 +541,28 @@ static void port_power_test_removed_held(struct kunit *test)
 	usb_unlock_device(t->ss_root);
 }
 
+/* Review: a failed takeover request must not consume the driver's PM hold. */
+static void port_power_review_failed_takeover(struct kunit *test)
+{
+	struct port_power_test *t = test->priv;
+	struct port_power_test_hc *hc = port_power_test_hc(t->shared_hcd);
+	int usage = port_power_test_usage(t->ss_port);
+
+	usb_lock_device(t->ss_root);
+	KUNIT_EXPECT_EQ(test, usb_hub_port_power_off(t->ss_root, 1), 0);
+	usb_unlock_device(t->ss_root);
+	scoped_guard(spinlock_irqsave, &hc->lock)
+		hc->fail_power_off = true;
+	KUNIT_EXPECT_EQ(test, port_power_test_write(test, t->ss_port, "disable", "1"), -ENOMEM);
+	KUNIT_EXPECT_EQ(test, port_power_test_usage(t->ss_port), usage + 1);
+	usb_lock_device(t->ss_root);
+	/* The next PHY update must still own its restoration. */
+	KUNIT_EXPECT_EQ(test, usb_hub_port_power_off(t->ss_root, 1), 0);
+	KUNIT_EXPECT_EQ(test, usb_hub_port_power_on(t->ss_root, 1), 0);
+	KUNIT_EXPECT_TRUE(test, port_power_test_powered(t->shared_hcd));
+	usb_unlock_device(t->ss_root);
+}
+
 static struct kunit_case port_power_test_cases[] = {
 	KUNIT_CASE(port_power_test_hold),
 	KUNIT_CASE(port_power_test_runtime_pm),
@@ -543,6 +570,7 @@ static struct kunit_case port_power_test_cases[] = {
 	KUNIT_CASE(port_power_test_disable),
 	KUNIT_CASE(port_power_test_disabled_suspended),
 	KUNIT_CASE(port_power_test_removed_held),
+	KUNIT_CASE(port_power_review_failed_takeover),
 	{}
 };
 
