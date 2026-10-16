@@ -249,6 +249,8 @@ struct apple_dart_hw {
 struct apple_dart_fw_root {
 	u64 *entry;
 	u64 **leaf;
+	/* Linux root entry already verified against each firmware slot. */
+	u64 *accepted;
 };
 
 /*
@@ -725,7 +727,8 @@ static int apple_dart_publish_root(const struct apple_dart *dart,
 			continue;
 		if (previous || !apple_dart_fw_slot_owned(fw, live, i))
 			return -EBUSY;
-		if (!apple_dart_fw_slot_mirrors(dart, fw, next, i, entries))
+		if ((dart->fw_handoff || next != fw->accepted[i]) &&
+		    !apple_dart_fw_slot_mirrors(dart, fw, next, i, entries))
 			return -EBUSY;
 	}
 
@@ -737,6 +740,7 @@ static int apple_dart_publish_root(const struct apple_dart *dart,
 		if (next == previous)
 			continue;
 		if (!previous && apple_dart_fw_slot_owned(fw, live, i)) {
+			fw->accepted[i] = next;
 			continue;
 		}
 		if (cmpxchg(&live[i], previous, next) != previous)
@@ -773,6 +777,7 @@ static void apple_dart_free_fw_root(struct apple_dart *dart,
 		for (i = 0; i < dart->pgsize / sizeof(u64); i++)
 			if (fw->leaf[i])
 				memunmap(fw->leaf[i]);
+	kfree(fw->accepted);
 	kfree(fw->leaf);
 	kfree(fw->entry);
 	kfree(fw);
@@ -789,9 +794,10 @@ apple_dart_snapshot_fw_root(struct apple_dart *dart, int sid, const u64 *live)
 {
 	size_t i, entries = dart->pgsize / sizeof(u64);
 	struct apple_dart_fw_root *fw;
+	struct apple_dart_fw_root *nomem = dart->fw_handoff ? ERR_PTR(-ENOMEM) : NULL;
 
 	/* Only the T8110-style table layout this walker decodes. */
-	if ((!dart->fw_handoff && !dart->fw_mirror) || dart->hw->fmt != APPLE_DART2)
+	if ((!dart->fw_mirror && !dart->fw_handoff) || dart->hw->fmt != APPLE_DART2)
 		return NULL;
 	if (dart->hw->tcr_4level &&
 	    (apple_dart_readl(dart, DART_TCR(dart, sid)) & dart->hw->tcr_4level))
@@ -799,12 +805,13 @@ apple_dart_snapshot_fw_root(struct apple_dart *dart, int sid, const u64 *live)
 
 	fw = kzalloc(sizeof(*fw), GFP_KERNEL);
 	if (!fw)
-		return ERR_PTR(-ENOMEM);
+		return nomem;
 	fw->entry = kcalloc(entries, sizeof(*fw->entry), GFP_KERNEL);
 	fw->leaf = kcalloc(entries, sizeof(*fw->leaf), GFP_KERNEL);
-	if (!fw->entry || !fw->leaf) {
+	fw->accepted = kcalloc(entries, sizeof(*fw->accepted), GFP_KERNEL);
+	if (!fw->entry || !fw->leaf || !fw->accepted) {
 		apple_dart_free_fw_root(dart, fw);
-		return ERR_PTR(-ENOMEM);
+		return nomem;
 	}
 
 	for (i = 0; i < entries; i++) {
@@ -813,12 +820,18 @@ apple_dart_snapshot_fw_root(struct apple_dart *dart, int sid, const u64 *live)
 
 		if (!(pte & APPLE_DART_PTE_VALID))
 			continue;
-		if (dart->fw_handoff && !apple_dart_fw_table_decode(dart, pte, &phys)) {
+		if (!dart->fw_handoff) {
+			fw->leaf[i] = memremap(apple_dart_pte_to_paddr(dart, pte),
+					       dart->pgsize, MEMREMAP_WB);
+			if (!fw->leaf[i])
+				continue;
+			fw->entry[i] = pte;
+			continue;
+		}
+		if (!apple_dart_fw_table_decode(dart, pte, &phys)) {
 			apple_dart_free_fw_root(dart, fw);
 			return ERR_PTR(-EINVAL);
 		}
-		if (!dart->fw_handoff)
-			phys = apple_dart_pte_to_paddr(dart, pte);
 		fw->leaf[i] = memremap(phys, dart->pgsize, MEMREMAP_WB);
 		if (!fw->leaf[i]) {
 			apple_dart_free_fw_root(dart, fw);
@@ -1143,6 +1156,7 @@ static int apple_dart_fw_invalidate(struct apple_dart_stream_map *stream_map,
 		return 0;
 
 	for_each_set_bit(sid, stream_map->sidmap, dart->num_streams) {
+		const struct apple_dart_fw_root *fw;
 		const u64 *live, *owned;
 		u64 base, span, start_dva, end_dva;
 		bool four_level;
@@ -1181,8 +1195,16 @@ static int apple_dart_fw_invalidate(struct apple_dart_stream_map *stream_map,
 		spin_lock_irqsave(&dart->lock, flags);
 		live = dart->locked_ttbr[sid][0];
 		owned = dart->locked_owned[sid][0];
+		fw = dart->locked_fw[sid][0];
+		/*
+		 * Four-level roots are not snapshotted, and with the reserved-table
+		 * handoff firmware may replace its slots' descendants: there every
+		 * valid slot Linux did not publish is firmware's.
+		 */
 		for (i = first; live && i <= last; i++)
-			if (apple_dart_fw_slot_foreign(live, owned, i))
+			if (four_level || dart->fw_handoff ?
+			    apple_dart_fw_slot_foreign(live, owned, i) :
+			    apple_dart_fw_slot_owned(fw, live, i))
 				__set_bit(i, fw_slots);
 		spin_unlock_irqrestore(&dart->lock, flags);
 		if (!live)
