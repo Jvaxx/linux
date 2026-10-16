@@ -55,9 +55,6 @@
 #define PIODMA_FIFO_MASK		GENMASK(5, 0)
 #define PIODMA_IRQ_LIMIT		16
 
-static bool enumerate = true;
-module_param(enumerate, bool, 0444);
-MODULE_PARM_DESC(enumerate, "Boot-time radio gate (read-only, default on; no effect off J700/T8140)");
 /*
  * The board DT opts in by pointing the host's "apple,piodma" at this engine;
  * a host without that property stays root-port-only. enumerate=0 keeps every

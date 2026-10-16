@@ -1,7 +1,7 @@
 .. SPDX-License-Identifier: GPL-2.0-only
 
 T8140/J700 experimental radio PCIe bootstrap
-============================================
+==========================================
 
 The J700 path trains port 0, validates a bounded PIODMA bootstrap request,
 and enables native ECAM for the MediaTek Wi-Fi and Bluetooth functions.
@@ -34,10 +34,6 @@ teardown, memory reuse and arbitrary downstream devices are unqualified.
 Fresh hardware qualification must check both radio functions across sleep.
 Do not remove the controller or its IOMMU while this experiment is active.
 These lifecycle contracts require further work before production support.
-They protect against accidental teardown and are not a security boundary.
-Root can still reset through raw configuration writes, including secondary-bus
-reset, FLR and Link Disable, change per-link ASPM controls or unbind the root
-port's ``pcieport`` driver. Do not perform these operations on an admitted Neo.
 
 J700's ``wifi0`` alias and PCI endpoint node allow the public bootloader to
 pass the unit's own Wi-Fi address through ``local-mac-address``. The zero

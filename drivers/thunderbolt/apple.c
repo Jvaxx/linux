@@ -125,6 +125,14 @@ static const struct apple_cio_hw apple_cio_t6030_hw = {
 	.dp = &apple_dpin_m3,
 };
 
+/*
+ * T8142 (M5) Type 7 ACIO: ready is checked by acio->type7. Thunderbolt DP
+ * tunnels are not driven on this SoC yet.
+ */
+static const struct apple_cio_hw apple_cio_t8142_hw = {
+	.dp = &apple_dpin_disabled,
+};
+
 #define APPLE_CIO_NHI_HOP_COUNT 0x0
 #define APPLE_CIO_NHI_HOP_COUNT_MASK GENMASK(9, 0)
 
@@ -2551,6 +2559,12 @@ static int apple_cio_start(struct apple_cio *acio)
 					 FIELD_GET(APPLE_CIO_M3_STAT_STATE, state) ==
 					 APPLE_CIO_M3_STAT_STATE_READY,
 					 100, 500000);
+	else if (acio->type7)
+		/* Type 7 reports ready as state 1; other nonzero states are not ready. */
+		ret = readl_poll_timeout(acio->rc_base + APPLE_CIO_M3_STAT, state,
+					 FIELD_GET(APPLE_CIO_M3_STAT_STATE, state) ==
+					 APPLE_CIO_M3_STAT_STATE_READY,
+					 100, 500000);
 	else
 		ret = readl_poll_timeout(acio->rc_base + APPLE_CIO_M3_STAT, state,
 					 state & APPLE_CIO_M3_STAT_STATE, 100, 500000);
@@ -3202,9 +3216,6 @@ static void apple_cio_remove(struct platform_device *pdev)
 	/* A set may hold the switch read lock while waiting for acio->lock. */
 	typec_thunderbolt_switch_unregister(acio->tbt_switch);
 	guard(mutex)(&acio->lock);
-	/* The worker can notify this switch; stop current and future enqueues. */
-	disable_delayed_work_sync(&acio->pcie_tunnel_work);
-	typec_thunderbolt_switch_unregister(acio->tbt_switch);
 	if (acio->current_cable_info)
 		apple_cio_stop(acio);
 }
@@ -3212,6 +3223,9 @@ static void apple_cio_remove(struct platform_device *pdev)
 static const struct of_device_id apple_acio_match[] = {
 	{
 		.compatible = "apple,t8142-usb4-acio",
+		.data = &apple_cio_t8142_hw,
+	},
+	{
 		.compatible = "apple,t6030-usb4-acio",
 		.data = &apple_cio_t6030_hw,
 	},
