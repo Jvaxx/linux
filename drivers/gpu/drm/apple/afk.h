@@ -460,5 +460,15 @@ int afk_service_call_len(struct apple_epic_service *service, u16 group,
 			 u32 command, const void *data, size_t data_len,
 			 size_t data_pad, void *output, size_t output_len,
 			 size_t output_pad, size_t *received);
+/*
+ * As afk_service_call_timeout(), but the length the reply declares is checked
+ * against what arrived and against @output_len + @output_pad, and @received
+ * is set to the number of bytes of @output that the reply filled.
+ */
+int afk_service_call_timeout_len(struct apple_epic_service *service, u16 group,
+				 u32 command, const void *data, size_t data_len,
+				 size_t data_pad, void *output, size_t output_len,
+				 size_t output_pad, unsigned int timeout_ms,
+				 size_t *received);
 
 #endif
