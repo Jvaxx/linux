@@ -1507,6 +1507,27 @@ static void cd321x_stop_work(struct cd321x *cd321x)
 	cancel_delayed_work_sync(&cd321x->update_work);
 }
 
+/*
+ * The USB4/Thunderbolt router is only needed once a USB4 or Thunderbolt link
+ * comes up. If its driver is not built or never binds, do not leave power
+ * delivery, USB and DisplayPort on this port without a driver as well: stop
+ * waiting for the router when the driver core stops waiting for missing
+ * dependencies.
+ */
+static struct typec_thunderbolt_switch *
+cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode)
+{
+	struct typec_thunderbolt_switch *sw;
+
+	sw = fwnode_typec_thunderbolt_switch_get(fwnode);
+	if (sw != ERR_PTR(-EPROBE_DEFER) ||
+	    driver_deferred_probe_check_state(dev) == -EPROBE_DEFER)
+		return sw;
+
+	dev_info(dev, "USB4/Thunderbolt router unavailable, continuing without it\n");
+	return NULL;
+}
+
 static int
 cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 {
@@ -1536,7 +1557,7 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 	if (IS_ERR(cd321x->connector_fwnode))
 		cd321x->connector_fwnode = NULL;
 
-	cd321x->tbt_switch = fwnode_typec_thunderbolt_switch_get(fwnode);
+	cd321x->tbt_switch = cd321x_tbt_switch_get(tps->dev, fwnode);
 	if (IS_ERR(cd321x->tbt_switch)) {
 		ret = PTR_ERR(cd321x->tbt_switch);
 		goto err_put_mux;
