@@ -817,6 +817,24 @@ int iomfb_h17p_first_unbounded_callback(void)
 			return tag;
 	return -1;
 }
+
+/*
+ * Hands a completion of @swap_id to the swap_complete_ap_gated callback, as
+ * the firmware would.  The caller holds the IOMFB lock, as the receiver does.
+ */
+int iomfb_h17p_deliver_swap_complete(struct apple_dcp *dcp, u32 swap_id)
+{
+	struct dc_swap_complete_resp_h17p *resp;
+
+	lockdep_assert_held(&dcp->iomfb.lock);
+	resp = kzalloc_obj(*resp);
+	if (!resp)
+		return -ENOMEM;
+	resp->swap_id = swap_id;
+	cb_handlers[590](dcp, 590, NULL, resp);
+	kfree(resp);
+	return 0;
+}
 #endif
 
 #undef DCP_FW_VER

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Copyright 2021 Alyssa Rosenzweig */
 
+#include <kunit/visibility.h>
 #include <linux/align.h>
 #include <linux/bitfield.h>
 #include <linux/bitmap.h>
@@ -385,6 +386,7 @@ void iomfb_queue_init(struct apple_dcp *dcp)
 {
 	mutex_init(&dcp->iomfb.lock);
 	INIT_LIST_HEAD(&dcp->iomfb.pending);
+	INIT_LIST_HEAD(&dcp->iomfb.dropped);
 	INIT_WORK(&dcp->iomfb.work, iomfb_queue_work);
 	INIT_DELAYED_WORK(&dcp->iomfb.timeout, iomfb_queue_timeout);
 	INIT_DELAYED_WORK(&dcp->iomfb.backlight_retry, iomfb_backlight_retry);
@@ -1773,6 +1775,7 @@ iomfb_scanout_prepare_h17p(struct apple_dcp *dcp, struct drm_crtc *crtc,
 	scanout = kzalloc_obj(*scanout);
 	if (!scanout)
 		return NULL;
+	INIT_LIST_HEAD(&scanout->link);
 	if (dcp->iomfb.scanout) {
 		scanout->request = dcp->iomfb.scanout->request;
 		for (i = 0; i < SWAP_SURFACES; i++) {
@@ -1900,8 +1903,14 @@ void iomfb_present_failed_h17p(struct apple_dcp *dcp)
 bool iomfb_present_complete_h17p(struct apple_dcp *dcp)
 {
 	struct iomfb_transaction *transaction = dcp->iomfb.active;
+	struct iomfb_scanout_h17p *dropped, *next;
 
 	lockdep_assert_held(&dcp->iomfb.lock);
+	/* The firmware is past every present before this one. */
+	list_for_each_entry_safe(dropped, next, &dcp->iomfb.dropped, link) {
+		list_del(&dropped->link);
+		iomfb_scanout_release_h17p(dropped);
+	}
 	if (transaction) {
 		transaction->completed = true;
 		if (transaction->backlight_reserved) {
@@ -1915,6 +1924,65 @@ bool iomfb_present_complete_h17p(struct apple_dcp *dcp)
 		       IOMFB_OPAQUE_X_NEEDED);
 	iomfb_scanout_complete_h17p(dcp);
 	return true;
+}
+
+/*
+ * The firmware accepts presents while an external pipe is not enabled, for
+ * instance after a mode set that failed because the sink went away, and then
+ * drops them: neither a completion nor an abort follows.  Such a present
+ * would hold the queue until its timeout declares the coprocessor crashed,
+ * and a teardown waiting for the queue to settle would fail.
+ *
+ * Called by the swap watchdog: retire the present.  The firmware might still
+ * complete it or read it: until the firmware completes a later present, a
+ * completion of it is ignored, and the framebuffers of the present and those
+ * it displaced stay referenced.  Without a completed present for
+ * IOMFB_DROPPED_MAX retired ones, the queue is left to its timeout.  Returns
+ * false if the present ended or a newer one re-armed the watchdog in the
+ * meantime.  Other firmware has no present state.
+ */
+bool iomfb_retire_dropped_present_h17p(struct apple_dcp *dcp)
+{
+	struct dcp_present_state_h17p *state = &dcp->present_state_h17p;
+	u32 swap_id;
+
+	if (!iomfb_uses_queue(dcp))
+		return true;
+
+	guard(mutex)(&dcp->iomfb.lock);
+	swap_id = state->swap_id;
+	if (time_before(jiffies, dcp->swap_watchdog_deadline) ||
+	    !state->pending || !state->accepted)
+		return false;
+	if (!dcp_present_retire_h17p(state, swap_id))
+		return true;
+
+	iomfb_present_failed_h17p(dcp);
+	if (!iomfb_present_brightness_only_h17p(dcp)) {
+		dcp_unarm_retained_framebuffers(dcp, swap_id);
+		if (dcp->iomfb.next_scanout) {
+			list_add_tail(&dcp->iomfb.next_scanout->link,
+				      &dcp->iomfb.dropped);
+			dcp->iomfb.next_scanout = NULL;
+		}
+	}
+	iomfb_queue_advance(dcp);
+	return true;
+}
+
+/* Release a present's scanout unless it is displayed or was dropped. */
+VISIBLE_IF_KUNIT void iomfb_scanout_put_h17p(struct apple_dcp *dcp,
+					     struct iomfb_scanout_h17p *scanout)
+{
+	/* A transaction that never started is released without the lock. */
+	if (!scanout)
+		return;
+	lockdep_assert_held(&dcp->iomfb.lock);
+	if (scanout == dcp->iomfb.scanout || !list_empty(&scanout->link))
+		return;
+	if (dcp->iomfb.next_scanout == scanout)
+		dcp->iomfb.next_scanout = NULL;
+	iomfb_scanout_release_h17p(scanout);
 }
 
 static void iomfb_backlight_start(struct apple_dcp *dcp,
@@ -1999,11 +2067,7 @@ static void iomfb_atomic_release(struct iomfb_transaction *transaction)
 	struct iomfb_atomic_transaction *atomic = container_of(transaction,
 					 struct iomfb_atomic_transaction, transaction);
 
-	if (atomic->scanout && atomic->dcp->iomfb.scanout != atomic->scanout) {
-		if (atomic->dcp->iomfb.next_scanout == atomic->scanout)
-			atomic->dcp->iomfb.next_scanout = NULL;
-		iomfb_scanout_release_h17p(atomic->scanout);
-	}
+	iomfb_scanout_put_h17p(atomic->dcp, atomic->scanout);
 	drm_atomic_commit_put(atomic->state);
 	kfree(atomic);
 }
