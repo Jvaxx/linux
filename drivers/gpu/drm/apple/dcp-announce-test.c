@@ -367,6 +367,91 @@ static void hold_again_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, dcp_announce_owed(&a));
 }
 
+/* A reported connection whose link was not restored is withdrawn once. */
+static void lost_withdraws_test(struct kunit *test)
+{
+	struct dcp_announce_facts lost = link_ready;
+	struct dcp_announce a = { };
+
+	KUNIT_ASSERT_EQ(test, dcp_announce_update(&a, &link_ready, 1),
+			DCP_ANNOUNCE_CONNECTED);
+	KUNIT_ASSERT_TRUE(test, dcp_announce_notify(&a, DCP_ANNOUNCE_CONNECTED));
+
+	dcp_announce_lose(&a, 1);
+	KUNIT_EXPECT_TRUE(test, dcp_announce_lost(&a, 1));
+	lost.lost = true;
+	KUNIT_EXPECT_EQ(test, dcp_announce_update(&a, &lost, 2),
+			DCP_ANNOUNCE_DISCONNECTED);
+	KUNIT_EXPECT_FALSE(test, a.announced);
+	KUNIT_EXPECT_TRUE(test, dcp_announce_owed(&a));
+	KUNIT_EXPECT_TRUE(test, dcp_announce_notify(&a, DCP_ANNOUNCE_DISCONNECTED));
+	KUNIT_EXPECT_FALSE(test, dcp_announce_owed(&a));
+
+	/* Modes still in for the lost generation do not bring it back. */
+	KUNIT_EXPECT_EQ(test, dcp_announce_update(&a, &lost, 3),
+			DCP_ANNOUNCE_DISCONNECTED);
+	KUNIT_EXPECT_FALSE(test, dcp_announce_owed(&a));
+	/* Nor does an unchanged loss send its event again. */
+	KUNIT_EXPECT_FALSE(test, dcp_announce_notify(&a, DCP_ANNOUNCE_DISCONNECTED));
+}
+
+/* A loss belongs to its cable generation: the next cable is not lost. */
+static void lost_generation_test(struct kunit *test)
+{
+	struct dcp_announce a = { };
+
+	dcp_announce_lose(&a, 1);
+	KUNIT_EXPECT_TRUE(test, dcp_announce_lost(&a, 1));
+	KUNIT_EXPECT_FALSE(test, dcp_announce_lost(&a, 2));
+
+	/* Releasing a CRTC on the next cable retries nothing, and forgets the loss. */
+	KUNIT_EXPECT_FALSE(test, dcp_announce_retry(&a, 2));
+	KUNIT_EXPECT_FALSE(test, dcp_announce_lost(&a, 1));
+}
+
+/* A lost connection whose CRTC was released is a new connection. */
+static void lost_retry_test(struct kunit *test)
+{
+	struct dcp_announce_facts lost = link_only;
+	struct dcp_announce a = { };
+
+	KUNIT_ASSERT_EQ(test, dcp_announce_update(&a, &link_ready, 1),
+			DCP_ANNOUNCE_CONNECTED);
+	dcp_announce_lose(&a, 1);
+	lost.lost = true;
+	KUNIT_ASSERT_EQ(test, dcp_announce_update(&a, &lost, 2),
+			DCP_ANNOUNCE_DISCONNECTED);
+	KUNIT_ASSERT_TRUE(test, dcp_announce_notify(&a, DCP_ANNOUNCE_DISCONNECTED));
+
+	KUNIT_EXPECT_TRUE(test, dcp_announce_retry(&a, 1));
+	KUNIT_EXPECT_FALSE(test, dcp_announce_lost(&a, 1));
+	KUNIT_EXPECT_FALSE(test, dcp_announce_retry(&a, 1));
+	KUNIT_EXPECT_EQ(test, dcp_announce_update(&a, &link_only, 3),
+			DCP_ANNOUNCE_HOLD);
+	KUNIT_EXPECT_FALSE(test, a.announced);
+	KUNIT_EXPECT_EQ(test, dcp_announce_update(&a, &link_ready, 4),
+			DCP_ANNOUNCE_CONNECTED);
+	KUNIT_EXPECT_TRUE(test, dcp_announce_owed(&a));
+	KUNIT_EXPECT_TRUE(test, dcp_announce_notify(&a, DCP_ANNOUNCE_CONNECTED));
+}
+
+/* A connection lost again after its retry waits for the next cable. */
+static void lost_retry_once_test(struct kunit *test)
+{
+	struct dcp_announce a = { };
+
+	dcp_announce_lose(&a, 1);
+	KUNIT_EXPECT_TRUE(test, dcp_announce_retry(&a, 1));
+	dcp_announce_lose(&a, 1);
+	KUNIT_EXPECT_FALSE(test, dcp_announce_retry(&a, 1));
+	KUNIT_EXPECT_TRUE(test, dcp_announce_lost(&a, 1));
+
+	/* The next cable starts afresh. */
+	dcp_announce_lose(&a, 2);
+	KUNIT_EXPECT_TRUE(test, dcp_announce_retry(&a, 2));
+	KUNIT_EXPECT_FALSE(test, dcp_announce_lost(&a, 2));
+}
+
 static struct kunit_case announce_cases[] = {
 	KUNIT_CASE(announce_ready_test),
 	KUNIT_CASE(announce_waits_for_ready_test),
@@ -390,6 +475,10 @@ static struct kunit_case announce_cases[] = {
 	KUNIT_CASE(hold_deadline_generation_test),
 	KUNIT_CASE(hold_release_once_test),
 	KUNIT_CASE(hold_again_test),
+	KUNIT_CASE(lost_withdraws_test),
+	KUNIT_CASE(lost_generation_test),
+	KUNIT_CASE(lost_retry_test),
+	KUNIT_CASE(lost_retry_once_test),
 	{}
 };
 
