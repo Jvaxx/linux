@@ -552,6 +552,23 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 		return;
 	}
 
+	if (rtk->crashlog_inherited && !rtk->crashlog_buffer.size) {
+		/*
+		 * The previous owner negotiated the crashlog buffer, so this
+		 * session never learned its geometry. A CRASH message on an
+		 * inherited session is therefore a crash notification, not a
+		 * buffer request, and must not be answered as one.
+		 */
+		dev_err(rtk->dev,
+			"RTKit: adopted co-processor has crashed (crashlog at %#llx, %#llx bytes, not mapped)\n",
+			(u64)FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_IOVA, msg),
+			(u64)FIELD_GET(APPLE_RTKIT_BUFFER_REQUEST_SIZE, msg) << 12);
+		rtk->crashed = true;
+		if (rtk->ops->crashed)
+			rtk->ops->crashed(rtk->cookie, NULL, 0);
+		return;
+	}
+
 	if (!rtk->crashlog_buffer.size) {
 		if (apple_rtkit_common_rx_get_buffer(rtk, &rtk->crashlog_buffer,
 						     APPLE_RTKIT_EP_CRASHLOG, msg))
@@ -737,6 +754,17 @@ static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 	u8 type = FIELD_GET(APPLE_RTKIT_OSLOG_TYPE, msg);
 	int err;
 
+	/*
+	 * T8140 and T8142 co-processors send notifications 2 to 5 during
+	 * normal operation; they expect no reply and keep running without one.
+	 */
+	if (type >= APPLE_RTKIT_OSLOG_LOG && type <= 5 &&
+	    (of_machine_is_compatible("apple,t8140") ||
+	     of_machine_is_compatible("apple,t8142"))) {
+		dev_dbg(rtk->dev, "RTKit: oslog notification: %016llx\n", msg);
+		return;
+	}
+
 	switch (type) {
 	case APPLE_RTKIT_OSLOG_BUFFER_REQUEST:
 		apple_rtkit_common_rx_get_buffer(rtk, &rtk->oslog_buffer,
@@ -770,7 +798,6 @@ static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 					       msg, NULL, false);
 		if (err)
 			dev_err(rtk->dev, "RTKit: oslog acknowledgment failed: %d\n", err);
-		dev_dbg(rtk->dev, "RTKit: oslog notification: %016llx\n", msg);
 		break;
 	default:
 		dev_warn(rtk->dev, "RTKit: Unknown oslog message: %llx\n",
@@ -966,6 +993,7 @@ void apple_rtkit_flush_rx(struct apple_rtkit *rtk)
 	flush_work(&rtk->sync_ack_work);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_flush_rx);
+
 void apple_rtkit_hold_rx(struct apple_rtkit *rtk)
 {
 	apple_mbox_hold_rx(rtk->mbox);
@@ -1336,7 +1364,6 @@ static int apple_rtkit_boot_common(struct apple_rtkit *rtk, bool early_ap_power)
 	ret = apple_rtkit_wait(rtk, &rtk->epmap_completion);
 	if (ret)
 		return ret;
-	}
 	if (rtk->boot_result)
 		return rtk->boot_result;
 
@@ -1345,14 +1372,12 @@ static int apple_rtkit_boot_common(struct apple_rtkit *rtk, bool early_ap_power)
 		ret = apple_rtkit_set_ap_power_state(rtk, APPLE_RTKIT_PWR_STATE_ON);
 		if (ret)
 			return ret;
-		}
 	}
 
 	dev_dbg(rtk->dev, "RTKit: waiting for IOP power state ACK\n");
 	ret = apple_rtkit_wait(rtk, &rtk->iop_pwr_ack_completion);
 	if (ret)
 		return ret;
-	}
 
 	return early_ap_power ? 0 :
 		apple_rtkit_set_ap_power_state(rtk, APPLE_RTKIT_PWR_STATE_ON);
@@ -1514,10 +1539,10 @@ void apple_rtkit_free_retaining_buffers(struct apple_rtkit *rtk)
 	 * Retain shared buffers, including custom allocation contexts, rather
 	 * than returning their storage to an allocator while it may be live.
 	 */
-	dev_dbg(rtk->dev,
-		"RTKit: retaining the shared buffers of a running co-processor (ioreport %zu, crashlog %zu, oslog %zu, syslog %zu bytes)\n",
-		rtk->ioreport_buffer.size, rtk->crashlog_buffer.size,
-		rtk->oslog_buffer.size, rtk->syslog_buffer.size);
+	dev_warn(rtk->dev,
+		 "RTKit: retaining the shared buffers of an unstopped co-processor (ioreport %zu, crashlog %zu, oslog %zu, syslog %zu bytes)\n",
+		 rtk->ioreport_buffer.size, rtk->crashlog_buffer.size,
+		 rtk->oslog_buffer.size, rtk->syslog_buffer.size);
 	kfree(rtk->syslog_msg_buffer);
 	apple_rtkit_release_rx(rtk);
 	kfree(rtk);
