@@ -165,7 +165,12 @@ static ssize_t disable_store(struct device *dev, struct device_attribute *attr,
 	if (disabled && port_dev->child)
 		usb_disconnect(&port_dev->child);
 
-	rc = usb_hub_set_port_power(hdev, hub, port1, !disabled);
+	/* Runtime resume must not repower the port after a successful disable. */
+	scoped_guard(mutex, &port_dev->power_lock) {
+		rc = usb_hub_set_port_power(hdev, hub, port1, !disabled);
+		if (!rc)
+			port_dev->disabled = disabled;
+	}
 	msleep(2 * hub_power_on_good_delay(hub));
 
 	if (disabled) {
@@ -175,7 +180,6 @@ static ssize_t disable_store(struct device *dev, struct device_attribute *attr,
 	}
 
 	if (!rc) {
-		port_dev->disabled = disabled;
 		if (port_dev->held_off) {
 			port_dev->held_off = false;
 			pm_runtime_put(&port_dev->dev);
@@ -394,7 +398,10 @@ static int usb_port_runtime_resume(struct device *dev)
 	if (!hub)
 		return -EINVAL;
 	if (hub->in_reset) {
-		set_bit(port1, hub->power_bits);
+		guard(mutex)(&port_dev->power_lock);
+
+		if (!port_dev->disabled)
+			set_bit(port1, hub->power_bits);
 		return 0;
 	}
 
@@ -409,7 +416,14 @@ static int usb_port_runtime_resume(struct device *dev)
 	if (retval < 0)
 		return retval;
 
-	retval = usb_hub_set_port_power(hdev, hub, port1, true);
+	/* hub_event() waits for port PM under the hub lock; do not take it here. */
+	scoped_guard(mutex, &port_dev->power_lock) {
+		if (port_dev->disabled) {
+			retval = 0;
+			goto out;
+		}
+		retval = usb_hub_set_port_power(hdev, hub, port1, true);
+	}
 	msleep(hub_power_on_good_delay(hub));
 	if (udev && !retval) {
 		/*
@@ -434,6 +448,7 @@ static int usb_port_runtime_resume(struct device *dev)
 		}
 	}
 
+out:
 	usb_autopm_put_interface(intf);
 
 	return retval;
@@ -800,6 +815,7 @@ int usb_hub_create_port_device(struct usb_hub *hub, int port1)
 	dev_set_name(&port_dev->dev, "%s-port%d", dev_name(&hub->hdev->dev),
 			port1);
 	mutex_init(&port_dev->status_lock);
+	mutex_init(&port_dev->power_lock);
 	retval = device_register(&port_dev->dev);
 	if (retval) {
 		put_device(&port_dev->dev);
