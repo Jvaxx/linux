@@ -1151,7 +1151,7 @@ static irqreturn_t cd321x_interrupt(int irq, void *data)
 		if (TPS_POWER_STATUS_PWROPMODE(tps->pwr_status) == TYPEC_PWR_MODE_PD) {
 			if (tps6598x_read_partner_identity(tps)) {
 				dev_err(tps->dev, "failed to read partner identity\n");
-				tps->partner_identity = (struct usb_pd_identity) {0};
+				goto err_lost;
 			}
 		}
 	}
