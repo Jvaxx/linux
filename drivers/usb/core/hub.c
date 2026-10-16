@@ -3468,6 +3468,42 @@ unsigned usb_wakeup_enabled_descendants(struct usb_device *udev)
 }
 EXPORT_SYMBOL_GPL(usb_wakeup_enabled_descendants);
 
+/**
+ * usb_wakeup_reaches - Whether a remote wakeup from below reaches a hub
+ * @hdev: The hub, with the devices below it suspended for system sleep
+ *
+ * A device signals a remote wakeup only if the USB core enabled that when it
+ * suspended it: resume signalling, or for a hub, a connect, disconnect or
+ * over-current change on one of its ports. A hub passes on the remote wakeup
+ * of a device below it whatever its own wakeup setting (USB 2.0, section
+ * 7.1.7.7). A hub with USB_QUIRK_HUB_NO_SUSPENDED_WAKEUP does not while it is
+ * suspended, but still signals its own; a hub kept awake does both.
+ *
+ * Context: System sleep, once the devices below @hdev are suspended, so that
+ * neither they nor their wakeup settings change. Takes no locks.
+ *
+ * Return: true if a device below @hdev can wake it up.
+ */
+bool usb_wakeup_reaches(struct usb_device *hdev)
+{
+	struct usb_device *child;
+	int port1;
+
+	usb_hub_for_each_child(hdev, port1, child) {
+		/* A hub kept awake reports any change on its status endpoint */
+		u32 quirks = child->awake_in_sleep ? 0 : child->quirks;
+
+		if (child->do_remote_wakeup)
+			return true;
+		if (!(quirks & USB_QUIRK_HUB_NO_SUSPENDED_WAKEUP) &&
+		    usb_wakeup_reaches(child))
+			return true;
+	}
+
+	return false;
+}
+EXPORT_SYMBOL_GPL(usb_wakeup_reaches);
+
 /*
  * usb_port_suspend - suspend a usb device's upstream port
  * @udev: device that's no longer in active use, not a root hub
