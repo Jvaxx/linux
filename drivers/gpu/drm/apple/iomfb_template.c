@@ -44,6 +44,7 @@ struct dcp_wait_cookie {
 	struct kref refcount;
 	struct completion done;
 	u32 status;
+	bool replied;
 };
 
 static void release_wait_cookie(struct kref *ref)
@@ -2235,6 +2236,10 @@ static void complete_set_digital_out_mode(struct apple_dcp *dcp, void *data,
 	struct dcp_wait_cookie *wait = cookie;
 
 	if (wait) {
+		if (data) {
+			WRITE_ONCE(wait->status, *(u32 *)data);
+			WRITE_ONCE(wait->replied, true);
+		}
 		complete(&wait->done);
 		kref_put(&wait->refcount, release_wait_cookie);
 	}
@@ -2362,6 +2367,23 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 		dev_dbg(dcp->dev,
 			"set_digital_out_mode finished with %d to spare\n",
 			jiffies_to_msecs(ret));
+	}
+	/*
+	 * The external H17P display reports a link that does not come up
+	 * through its DPTX fault callbacks.  What the 32-bit result of the
+	 * mode set means is not established: a nonzero one is seen both for
+	 * a mode set that failed and for one repeating the current mode.  Log
+	 * it, and fail only a mode set that got no reply at all.
+	 */
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL) {
+		if (!READ_ONCE(cookie->replied)) {
+			dev_err(dcp->dev, "set_digital_out_mode got no reply\n");
+			kref_put(&cookie->refcount, release_wait_cookie);
+			return -EIO;
+		}
+		if (READ_ONCE(cookie->status))
+			dev_info(dcp->dev, "set_digital_out_mode returned %#x\n",
+				 READ_ONCE(cookie->status));
 	}
 	kref_put(&cookie->refcount, release_wait_cookie);
 	dcp->vrr_enabled = mode->vrr && crtc_state->vrr_enabled;
