@@ -1397,6 +1397,11 @@ done:
  * such a hub and the root hub, root hub included. This only works while the
  * host controller keeps running, so its interrupt reports the hub's status
  * change.
+ *
+ * Other hubs pass on the remote wakeup of a device below them whatever their
+ * own wakeup setting, which only arms them for connect, disconnect and
+ * over-current changes (USB 2.0, sections 7.1.7.7 and 11.4.4). So does a hub
+ * kept awake here: it is kept awake for any device below that can wake it.
  */
 VISIBLE_IF_KUNIT bool usb_stay_awake_for_wakeup(struct usb_device *udev, pm_message_t msg)
 {
@@ -1414,7 +1419,7 @@ VISIBLE_IF_KUNIT bool usb_stay_awake_for_wakeup(struct usb_device *udev, pm_mess
 		return true;
 
 	if ((udev->quirks & USB_QUIRK_HUB_NO_SUSPENDED_WAKEUP) &&
-	    udev->do_remote_wakeup && device_wakeup_path(&udev->dev))
+	    usb_wakeup_reaches(udev))
 		return true;
 
 	/* Children are done with their suspend before their parent starts */
