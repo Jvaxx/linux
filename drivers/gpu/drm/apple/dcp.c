@@ -3548,6 +3548,7 @@ void dcp_poweroff(struct platform_device *pdev)
 		ret = dcp_external_stop_locked(dcp, dcp->external_crtc_generation);
 		if (ret)
 			dev_err(dcp->dev, "external display stop failed: %d\n", ret);
+		dcp_external_crtc_released(dcp);
 		return;
 	}
 
