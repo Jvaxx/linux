@@ -4,10 +4,13 @@
 
 #include <linux/errno.h>
 
+#include <linux/minmax.h>
 #include <linux/types.h>
 
 #define CD321X_RESUME_ATTEMPTS 3
 #define CD321X_LINK_EVENTS 3
+#define CD321X_ACK_RETRY_MS 500
+#define CD321X_ACK_RETRY_MAX_MS 30000
 
 enum cd321x_pm_phase {
 	CD321X_PM_RUNNING,
@@ -24,6 +27,8 @@ struct cd321x_pm_state {
 	enum cd321x_pm_phase phase;
 	unsigned int attempts_left;
 	unsigned int link_events_left;
+	/* Non-zero while events may be left unacknowledged: the retry delay. */
+	unsigned int ack_retry_ms;
 	bool force_reconnect;
 };
 
@@ -125,6 +130,48 @@ static inline bool cd321x_pm_event(struct cd321x_pm_state *pm)
 	pm->phase = CD321X_PM_REVALIDATE;
 	pm->attempts_left = CD321X_RESUME_ATTEMPTS;
 	return true;
+}
+
+/*
+ * Events that could not be read and acknowledged stay latched in the
+ * controller, which then sends no further interrupt. Only a fresh read can
+ * acknowledge them, so request one with a full budget even if an earlier
+ * recovery gave up. Sleep and probe already end with such a read.
+ */
+static inline bool cd321x_pm_event_lost(struct cd321x_pm_state *pm)
+{
+	if (pm->phase == CD321X_PM_INITIALIZING ||
+	    pm->phase == CD321X_PM_PREPARED || pm->phase == CD321X_PM_REMOVED)
+		return false;
+	pm->phase = CD321X_PM_REVALIDATE;
+	pm->attempts_left = CD321X_RESUME_ATTEMPTS;
+	return true;
+}
+
+/*
+ * Until the latched events are acknowledged, the controller raises no
+ * interrupt that could restart a recovery that gave up. So a snapshot read
+ * that fails to acknowledge them does not count against the cable-state
+ * budget, and is never given up: it gives back the attempt taken by
+ * cd321x_pm_begin_read() and is retried after a delay that doubles up to
+ * CD321X_ACK_RETRY_MAX_MS. Sleep cancels the retry and the resume read takes
+ * it over; removal ends it. Returns the delay in milliseconds.
+ */
+static inline unsigned int cd321x_pm_ack_failed(struct cd321x_pm_state *pm)
+{
+	pm->attempts_left++;
+	pm->ack_retry_ms = clamp(2 * pm->ack_retry_ms, CD321X_ACK_RETRY_MS,
+				 CD321X_ACK_RETRY_MAX_MS);
+	return pm->ack_retry_ms;
+}
+
+/* Returns true if acknowledging the events had failed before. */
+static inline bool cd321x_pm_acked(struct cd321x_pm_state *pm)
+{
+	bool retried = pm->ack_retry_ms;
+
+	pm->ack_retry_ms = 0;
+	return retried;
 }
 
 static inline void cd321x_pm_complete(struct cd321x_pm_state *pm)
