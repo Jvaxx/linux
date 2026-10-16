@@ -162,7 +162,9 @@
 
 #ifdef APPLE_T600X_NON_ULTRA
 &display {
-	iommus = <&disp0_dart 0>, <&dispext0_dart 0>, <&dispext1_dart 0>;
+	iommus = <&disp0_dart 0 0x0 0x0 0x0 0xfc000000>,
+		 <&dispext0_dart 0 0x0 0x0 0x0 0xfc000000>,
+		 <&dispext1_dart 0 0x0 0x0 0x0 0xfc000000>;
 };
 
 &dispext1_dart {
