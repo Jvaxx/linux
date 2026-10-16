@@ -1078,30 +1078,40 @@ impl SepData {
         Ok(())
     }
 
-    fn attach_bringup(&self) {
-        if self.profile.nonce_session {
-            // A bring-up that fails on the bus leaves nothing a new attempt
-            // cannot undo: each attempt power-cycles the sensor and, after a
-            // failed one, clears the enclave's partial registration first,
-            // as every verify does.
-            const ATTEMPTS: u32 = 3;
-            for attempt in 1..=ATTEMPTS {
-                if self.bring_sensor_online() {
-                    return;
-                }
-                if attempt < ATTEMPTS {
-                    dev_warn!(
-                        self.dev,
-                        "sensor: attach-time bring-up attempt {} of {} failed; starting again\n",
-                        attempt,
-                        ATTEMPTS
-                    );
-                }
+    /// Brings the sensor up, starting again after a failed attempt for as
+    /// long as `wanted` says the result is still needed.
+    ///
+    /// A bring-up that fails on the bus leaves nothing a new attempt cannot
+    /// undo: each attempt power-cycles the sensor and, after a failed one,
+    /// clears the enclave's partial registration first, as every verify does.
+    fn bring_sensor_online_retrying(&self, purpose: &CStr, wanted: impl Fn() -> bool) -> bool {
+        const ATTEMPTS: u32 = 3;
+        for attempt in 1..=ATTEMPTS {
+            if self.bring_sensor_online() {
+                return true;
+            }
+            if attempt == ATTEMPTS || !wanted() {
+                break;
             }
             dev_warn!(
                 self.dev,
-                "sensor: authenticated attach incomplete; capture unavailable\n"
+                "sensor: {} bring-up attempt {} of {} failed; starting again\n",
+                purpose,
+                attempt,
+                ATTEMPTS
             );
+        }
+        false
+    }
+
+    fn attach_bringup(&self) {
+        if self.profile.nonce_session {
+            if !self.bring_sensor_online_retrying(c"attach-time", || true) {
+                dev_warn!(
+                    self.dev,
+                    "sensor: authenticated attach incomplete; capture unavailable\n"
+                );
+            }
             return;
         }
         if !sensor::is_bound() {
@@ -1375,6 +1385,25 @@ impl SepData {
         self.refresh_match_credential();
     }
 
+    /// Whether the verify this work item runs is still wanted: not cancelled,
+    /// not ended by a suspend and not closed.
+    fn verify_wanted(&self) -> bool {
+        !self.shutting_down.load(Relaxed)
+            && bio::verify_is_live(&self.bio_session.lock(), self.capture_epoch.load(Relaxed))
+    }
+
+    // Every verify registers the sensor again. On a profile with a nonce
+    // session that registration can fail as the attach-time one does, most
+    // often the first one after a system suspend, and a new attempt recovers
+    // it in the same way. Without one, the failure ends the user's
+    // authentication even though the sensor works.
+    fn bring_sensor_online_for_verify(&self) -> bool {
+        if !self.profile.nonce_session {
+            return self.bring_sensor_online();
+        }
+        self.bring_sensor_online_retrying(c"verify", || self.verify_wanted())
+    }
+
     pub(crate) fn run_verify(&self) {
         self.retry_restore_proof();
         if !self.templates_restored.load(Relaxed) {
@@ -1401,7 +1430,7 @@ impl SepData {
         self.settle_before_capture();
 
         // The enclave refuses a capture from an uncalibrated sensor (0x65 answers 1).
-        if !self.bring_sensor_online() {
+        if !self.bring_sensor_online_for_verify() {
             dev_err!(self.dev, "verify: the sensor did not come back online\n");
             self.finish_verify(bio::VerifyOutcome::Failed(ENROL_STATUS_SENSOR), token_bytes);
             let _ = sensor::idle();
