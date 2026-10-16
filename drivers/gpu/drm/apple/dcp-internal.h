@@ -225,8 +225,6 @@ struct apple_dcp {
 	struct apple_connector *connector;
 
 	struct apple_dcp_hw_data hw;
-	/* Protected by the H17P IOMFB receive mutex. */
-	u8 experimental_callback_logs;
 	bool external_prepared;
 	/* Serializes external connection, power, and CRTC generation changes. */
 	struct mutex external_lock;
@@ -434,8 +432,6 @@ struct apple_dcp {
 	struct delayed_work swap_watchdog_wq;
 	unsigned int swap_watchdog_retrains;
 
-	/* List of referenced drm_framebuffers which can be unreferenced
-	 * on the next successfully completed swap.
 	/* List of referenced framebuffers pending a completed replacement swap.
 	 * The commit and RTKit work queues share it under this lock.
 	 */
@@ -468,8 +464,6 @@ struct apple_dcp {
 	struct apple_dcp_afkep *dptxep;
 	struct apple_dcp_afkep *dptx_controller_ep;
 	struct completion dptx_controller_ready;
-	struct apple_dcp_afkep *dptx_v2_probe_ep;
-	struct completion dptx_v2_probe_ready;
 
 	struct apple_dcp_afkep *dpavctrlep;
 	struct apple_epic_service *dpav_ctrl;
@@ -537,24 +531,6 @@ struct apple_dcp {
 	struct dcp_fabric_session typec_reconnect_session; /* hpd_mutex */
 	bool typec_work_enabled; /* hpd_mutex; IRQ recovery admission */
 
-	/* Ported from aurora-silicon/linux#8. */
-	/* DPTX feeds a Thunderbolt DP IN adapter, not the Type-C PHY lanes. */
-	bool dptx_tunnel;
-	/* DFP port in the DPTX target: 0 = dpphy, 1 = dpin0, 2 = dpin1. */
-	u8 dptx_dfp_port;
-	/* Wakes/sleeps the Thunderbolt DP IN adapter from DCP Activate/
-	 * Deactivate. Set by apple_dcp_tb_dp_tunnel(), cleared by
-	 * dcp_typec_route_deactivate().
-	 */
-	int (*tb_dpin_set_active)(void *ctx, bool active);
-	void *tb_dpin_ctx;
-	/* Serializes the Thunderbolt DP IN callback and tunnel crossbar state
-	 * between DCP apcalls and tunnel teardown; never held while waiting
-	 * for DCP.
-	 */
-	struct mutex tb_lock;
-	bool tb_clock_ok;
-
 	struct gpio_desc *hdmi_hpd;
 	struct gpio_desc *hdmi_pwren;
 	struct gpio_desc *dp2hdmi_pwren;
@@ -569,6 +545,15 @@ struct apple_dcp {
 	struct apple_connector *fixed_connector;
 	struct apple_connector *typec_connector;
 	int hdmi_hpd_irq;
+	/* Hardirq, resume and expiry share one generation under this lock. */
+	spinlock_t hdmi_presence_lock;
+	struct dcp_fabric_presence hdmi_presence;
+	unsigned long hdmi_edge_jiffies;
+	bool hdmi_edge_seen;
+	struct delayed_work hdmi_settle_wq;
+	struct delayed_work hdmi_recheck_wq;
+	/* T6030 HDMI converter service requests, see dcp-hdmi.c */
+	struct dcp_hdmi *hdmi;
 
 	/* H17P policy shared by backlight, commit, and reply workers. */
 	struct {
@@ -583,15 +568,6 @@ struct apple_dcp {
 		unsigned long resent_at;
 		bool resent;
 	} backlight;
-	/* Hardirq, resume and expiry share one generation under this lock. */
-	spinlock_t hdmi_presence_lock;
-	struct dcp_fabric_presence hdmi_presence;
-	unsigned long hdmi_edge_jiffies;
-	bool hdmi_edge_seen;
-	struct delayed_work hdmi_settle_wq;
-	struct delayed_work hdmi_recheck_wq;
-	/* T6030 HDMI converter service requests, see dcp-hdmi.c */
-	struct dcp_hdmi *hdmi;
 
 	/* Staging wire record; serialization never mutates the atomic inputs. */
 	struct dcp_present_h17p present_h17p;
@@ -686,6 +662,12 @@ static inline bool dcp_fw_is_14_7(const struct apple_dcp *dcp)
 static inline bool dcp_ext_dptx_607(const struct apple_dcp *dcp)
 {
 	return dcp->fw_compat == DCP_FIRMWARE_V_14_7_TEMPLATE;
+}
+
+/* The T8140 external processor (dispext0) running H17P firmware. */
+static inline bool dcp_is_external_h17p(const struct apple_dcp *dcp)
+{
+	return dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL;
 }
 
 #define DCP_AUDIO_MAX_CHANS 15

@@ -62,6 +62,12 @@ struct apple_dcp_typec_port {
 	u32 applied_status;
 	u32 applied_conf;
 	bool applied_valid;
+	/*
+	 * H17P: SAFE preparation retains this owner until the set phase
+	 * completes (dcp_typec_route_prepare() and its finish and commit).
+	 */
+	bool safe_pending;
+	bool safe_finish_ready;
 	bool hpd;
 	/* Direct DP-alt: the port is in DP mode, routed or not, and its HPD. */
 	bool dp_wanted;
@@ -162,6 +168,7 @@ static bool dcp_typec_route_busy(struct apple_dcp_typec_route *route)
 
 static bool dcp_typec_route_available(struct apple_dcp_typec_route *route)
 {
+	struct apple_dcp_typec_port *port;
 	struct dcp_fabric_pipeline pipeline = {
 		.owned = !!route->dcp->active_typec_route || route->dcp->tb_retiring,
 		.fixed_busy = dcp_typec_route_busy(route),
@@ -169,6 +176,12 @@ static bool dcp_typec_route_available(struct apple_dcp_typec_route *route)
 
 	struct dcp_fabric_policy policy = { .dual_stream = dcp_typec_dual_stream() };
 
+	/* Only H17P routes prepare SAFE: their pipeline stays owned until commit. */
+	list_for_each_entry(port, &dcp_typec_ports, link) {
+		if (port->safe_pending && port->owner &&
+		    port->owner->dcp == route->dcp)
+			return false;
+	}
 	pipeline.presence = dcp_hdmi_presence(route->dcp);
 	return dcp_fabric_available(&pipeline, &policy);
 }
@@ -274,6 +287,9 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 		route->port->secondary_connector : route->port->connector;
 	int ret;
 
+	/* External H17P: a new route starts a new firmware-metadata connection. */
+	dcp_firmware_metadata_connection(dcp, READ_ONCE(dcp->typec_generation), false);
+
 	/*
 	 * The fixed output's HPD handler leaves disconnects to DCP, so the port
 	 * can still be marked connected to a display that is gone. Release it
@@ -359,6 +375,8 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 	}
 	dcp->active_typec_route = route;
 	scoped_guard(mutex, &dcp->tb_lock) {
+		route->deactivate_xbar_done = false;
+		route->deactivate_error = 0;
 		route->active_xbar = xbar;
 		route->tunnel = xbar != route->xbar;
 		route->xbar_up = !route->tunnel;
@@ -375,7 +393,7 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 	return 0;
 }
 
-static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
+static int dcp_typec_route_release(struct apple_dcp_typec_route *route)
 {
 	struct apple_dcp *dcp = route->dcp;
 	struct apple_connector *connector = dcp->typec_connector;
@@ -389,16 +407,36 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 	 * crossbar nor restart the tunnel pixel clock behind our back.
 	 */
 	scoped_guard(mutex, &dcp->tb_lock) {
-		if (!route->tunnel || route->xbar_up)
-			ret = mux_control_deselect(route->active_xbar ?: route->xbar);
-		else
-			dcp_dpxbar_preselect(route->active_xbar, MUX_IDLE_DISCONNECT);
-		/* mux_control_deselect releases its semaphore even on failure. */
-		route->xbar_up = false;
-		if (ret)
-			dev_warn(dcp->dev, "crossbar deselect failed: %d\n", ret);
-		/* Ownership is released; let the caller release its route owner too. */
-		ret = 0;
+		if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
+			if (route->deactivate_error)
+				return route->deactivate_error;
+			if (!route->deactivate_xbar_done) {
+				if (!route->tunnel || route->xbar_up)
+					ret = mux_control_deselect(route->active_xbar ?: route->xbar);
+				else
+					ret = dcp_dpxbar_preselect(route->active_xbar,
+								   MUX_IDLE_DISCONNECT);
+				/* Deselect always unlocks: never consume that selection twice. */
+				route->deactivate_xbar_done = true;
+				route->xbar_up = false;
+				if (ret) {
+					/* Idle is unproven; retain the owner and the real error. */
+					route->deactivate_error = ret;
+					return ret;
+				}
+			}
+		} else {
+			if (!route->tunnel || route->xbar_up)
+				ret = mux_control_deselect(route->active_xbar ?: route->xbar);
+			else
+				dcp_dpxbar_preselect(route->active_xbar, MUX_IDLE_DISCONNECT);
+			/* mux_control_deselect releases its semaphore even on failure. */
+			route->xbar_up = false;
+			if (ret)
+				dev_warn(dcp->dev, "crossbar deselect failed: %d\n", ret);
+			/* Ownership is released; let the caller release its route owner too. */
+			ret = 0;
+		}
 
 		if (route->tunnel && dcp->phy) {
 			/* the tunnel pixel clock must not outlive the tunnel */
@@ -424,6 +462,8 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 		if (sel && sel != -EOPNOTSUPP)
 			dev_warn(dcp->dev, "DP tunnel source reset failed: %d\n", sel);
 	}
+	if (dcp_is_external_h17p(dcp))
+		dpavservep_detach(dcp);
 	route->selected = false;
 	ended_attachment = dcp_modes_end_typec(dcp, route);
 	if (dcp->active_typec_route == route)
@@ -493,6 +533,28 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 	}
 
 	return 0;
+}
+
+static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
+{
+	struct apple_dcp *dcp = route->dcp;
+	int ret;
+
+	if (dcp->fw_compat != DCP_FIRMWARE_H17P)
+		return dcp_typec_route_release(route);
+
+	/*
+	 * External H17P: the route stays owned until its firmware stop has
+	 * completed; a failed stop keeps it, with its error.
+	 */
+	guard(mutex)(&dcp->external_lock);
+	if (dcp_is_external_h17p(dcp) &&
+	    (dcp->external_error || (dcp->external_power_attempted && !dcp->external_stopped)))
+		return dcp->external_error ?: -EAGAIN;
+
+	dcp_firmware_metadata_connection(dcp, READ_ONCE(dcp->typec_generation), false);
+	ret = dcp_typec_route_release(route);
+	return ret;
 }
 
 /*
@@ -1239,6 +1301,10 @@ static int dcp_typec_port_busy(struct apple_dcp_typec_port *port,
 {
 	const char *label = NULL;
 
+	/* H17P: every pipeline drives another display; -EBUSY means retry. */
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+		return -ENOSPC;
+
 	if (port->busy_noted)
 		return -EBUSY;
 	port->busy_noted = true;
@@ -1247,6 +1313,93 @@ static int dcp_typec_port_busy(struct apple_dcp_typec_port *port,
 		 "display on %s waits for a free external display pipeline (each one drives another display); it lights up on its own when one of those displays is unplugged\n",
 		 label ?: "a USB-C port");
 	return -EBUSY;
+}
+
+/*
+ * H17P (T8140, T8142): the mux transaction's SAFE phases. Preparation
+ * disconnects the display and stops new admission, while the route keeps
+ * its owner until the PHY has gone SAFE (dcp_typec_route_finish()) and the
+ * transaction commits (dcp_typec_route_commit()). Other processors register
+ * only dcp_typec_route_set().
+ */
+static int dcp_typec_route_prepare(struct typec_mux_dev *mux,
+				   struct typec_mux_state *state)
+{
+	struct apple_dcp_typec_route *route = typec_mux_get_drvdata(mux);
+	struct apple_dcp_typec_port *port = route->port;
+	struct apple_dcp *dcp;
+	int ret;
+
+	guard(mutex)(&dcp_typec_fabric_lock);
+	if (state->mode != TYPEC_STATE_SAFE)
+		return port->safe_pending ? -EAGAIN : 0;
+	if (!port->owner || port->owner->tunnel)
+		return 0;
+	dcp = port->owner->dcp;
+	/* Stop new admission, but retain the owner until the set phase succeeds. */
+	if (!port->safe_pending)
+		port->safe_finish_ready = false;
+	port->safe_pending = true;
+	port->applied_valid = false;
+	port->dp_wanted = false;
+	port->dp_hpd = false;
+	/* HPD absence alone is not proof of a completed firmware shutdown. */
+	if (dcp_is_external_h17p(dcp)) {
+		scoped_guard(mutex, &dcp->external_lock) {
+			if (dcp->external_error)
+				return dcp->external_error;
+			if (!dcp->external_cable && dcp->external_stopped &&
+			    !READ_ONCE(dcp->dptxport[0].connected)) {
+				port->hpd = false;
+				return 0;
+			}
+		}
+	}
+	ret = dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0);
+	if (ret)
+		return ret;
+	port->hpd = false;
+	return 0;
+}
+
+static int dcp_typec_route_finish(struct typec_mux_dev *mux,
+				  struct typec_mux_state *state)
+{
+	struct apple_dcp_typec_port *port =
+		((struct apple_dcp_typec_route *)typec_mux_get_drvdata(mux))->port;
+	int ret;
+
+	guard(mutex)(&dcp_typec_fabric_lock);
+	if (state->mode != TYPEC_STATE_SAFE || !port->safe_pending ||
+	    port->safe_finish_ready)
+		return 0;
+	ret = port->owner ? dcp_typec_route_deactivate(port->owner) : 0;
+	if (ret)
+		return ret;
+	port->safe_finish_ready = true;
+	return 0;
+}
+
+static void dcp_typec_route_commit(struct typec_mux_dev *mux,
+				   struct typec_mux_state *state)
+{
+	struct apple_dcp_typec_port *port =
+		((struct apple_dcp_typec_route *)typec_mux_get_drvdata(mux))->port;
+
+	guard(mutex)(&dcp_typec_fabric_lock);
+	if (state->mode != TYPEC_STATE_SAFE || !port->safe_pending)
+		return;
+	if (port->owner)
+		port->preferred_route = port->owner;
+	port->owner = NULL;
+	port->safe_pending = false;
+	port->safe_finish_ready = false;
+	port->applied_alt = state->alt;
+	port->applied_mode = state->mode;
+	port->applied_status = 0;
+	port->applied_conf = 0;
+	port->applied_valid = true;
+	dcp_typec_pipeline_freed();
 }
 
 static int dcp_typec_route_set(struct typec_mux_dev *mux,
@@ -1268,6 +1421,13 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 		return 0;
 
 	guard(mutex)(&dcp_typec_fabric_lock);
+
+	/* H17P only: a SAFE transition is still being prepared or finished. */
+	if (state->mode == TYPEC_STATE_SAFE && port->safe_pending)
+		return 0;
+	/* The previous SAFE transition has not finished; retry. */
+	if (port->safe_pending)
+		return -EAGAIN;
 
 	/*
 	 * Every candidate route for this port is notified with the same state,
@@ -1332,6 +1492,7 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 			dcp_typec_rebalance_locked(NULL, 0);
 		}
 
+		port->safe_pending = false;
 		/* Data-only USB4 changes do not invalidate other display routes. */
 		port->applied_valid = true;
 		return 0;
@@ -1378,6 +1539,9 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 
 	if (!port->owner) {
 		best = dcp_typec_free_route(port);
+		/* H17P: every pipeline is driving another port's display. */
+		if (!best && route->dcp->fw_compat == DCP_FIRMWARE_H17P)
+			return -ENOSPC;
 		if (!best)
 			return hpd ? dcp_typec_port_busy(port, route->dcp) : -EBUSY;
 
@@ -1401,9 +1565,11 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 		/*
 		 * A T6030 external processor services the request itself, and
 		 * reads the display again if it changed; elsewhere the active
-		 * mode is applied again.
+		 * mode is applied again. H17P always applies it again.
 		 */
-		if (dcp->typec_connector && dcp->external_native)
+		if (dcp->typec_connector && dcp->fw_compat == DCP_FIRMWARE_H17P)
+			dcp_retrain_oob(dcp->typec_connector);
+		else if (dcp->typec_connector && dcp->external_native)
 			dcp_external_sink_irq(dcp);
 		else if (dcp->typec_connector &&
 			 !READ_ONCE(dcp->typec_connector->connected)) {
@@ -1591,7 +1757,8 @@ int dcp_tunnel_crossbar_up(struct apple_dcp *dcp, u32 unit)
 	if (unit)
 		return dcp_tunnel_split_up_locked(dcp);
 	route = dcp->active_typec_route;
-	if (!route || !route->tunnel || !route->active_xbar)
+	if (!route || !route->tunnel || !route->active_xbar ||
+	    route->deactivate_xbar_done)
 		return -ENODEV;
 	if (!dcp_fabric_callback_valid(route->tunnel_generation, dcp->tb_generation))
 		return -ESTALE;
@@ -3258,7 +3425,9 @@ static void dcp_typec_route_unregister(void *data)
 		if (!route->tunnel && (port->hpd || dcp->typec_cable_connected))
 			dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0);
 		port->hpd = false;
-		dcp_typec_route_deactivate(route);
+		/* External H17P: a failed firmware stop keeps the route owned. */
+		if (dcp_typec_route_deactivate(route) && dcp_is_external_h17p(dcp))
+			return;
 		port->owner = NULL;
 	}
 	if (port->secondary_owner == route) {
@@ -3266,7 +3435,8 @@ static void dcp_typec_route_unregister(void *data)
 
 		if (!route->tunnel && (port->hpd || dcp->typec_cable_connected))
 			dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0);
-		dcp_typec_route_deactivate(route);
+		if (dcp_typec_route_deactivate(route) && dcp_is_external_h17p(dcp))
+			return;
 		port->secondary_owner = NULL;
 	}
 	WRITE_ONCE(route->dcp->tb_retiring, false);
@@ -3444,6 +3614,11 @@ static int dcp_register_typec_routes_present(void *data)
 
 		desc.fwnode = of_fwnode_handle(route_np);
 		desc.set = dcp_typec_route_set;
+		if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
+			desc.prepare = dcp_typec_route_prepare;
+			desc.finish = dcp_typec_route_finish;
+			desc.commit = dcp_typec_route_commit;
+		}
 		desc.name = mux_name;
 		desc.drvdata = route;
 		route->typec_mux = typec_mux_register(dev, &desc);
@@ -3900,7 +4075,8 @@ void dcp_link(struct platform_device *pdev, struct apple_crtc *crtc,
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
-	dcp->crtc = crtc;
+	/* dcp_delayed_vblank() reads this after an early RTKit crash. */
+	WRITE_ONCE(dcp->crtc, crtc);
 
 	/*
 	 * Type-C connectors belong to physical ports and are bound by the

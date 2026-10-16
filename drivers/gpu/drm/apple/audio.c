@@ -27,6 +27,7 @@
 
 #include "av.h"
 #include "dcp.h"
+#include "dcp-internal.h"
 #include "audio.h"
 #include "parser.h"
 
@@ -100,6 +101,13 @@ static const struct snd_pcm_hardware dcp_pcm_hw_unplugged = {
 	.periods_min		= 2,
 	.periods_max		= UINT_MAX,
 };
+
+static bool dcpaud_h17p(struct dcp_audio *dcpaud)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dcpaud->dcp_dev);
+
+	return dcp && dcp->fw_compat == DCP_FIRMWARE_H17P;
+}
 
 static int dcpaud_read_remote_info(struct dcp_audio *dcpaud)
 {
@@ -283,7 +291,12 @@ static int dcp_pcm_open(struct snd_pcm_substream *substream)
 		return ret;
 	}
 
-	dcpaud->open_unplugged = !dcpaud->connected;
+	/* H17P (T8140): the PCM opens without a sink, as on aurora-wip. */
+	dcpaud->open_unplugged = !dcpaud->connected && dcpaud_h17p(dcpaud);
+	if (!dcpaud->connected && !dcpaud->open_unplugged) {
+		mutex_unlock(&dcpaud->data_lock);
+		return -ENXIO;
+	}
 	dcpaud->open_cookie = dcpaud->connection_cookie;
 	mutex_unlock(&dcpaud->data_lock);
 

@@ -20,7 +20,7 @@ struct apple_atomic_state {
 };
 
 #define to_apple_atomic_state(s) container_of(s, struct apple_atomic_state, base)
-bool dcp_h17p_external_enabled(void);
+
 bool dcp_h17p_external_supported(struct device_node *np);
 bool dcp_h17p_external_ready(struct device_node *np);
 
@@ -81,7 +81,8 @@ bool dcp_crtc_mode_fixup(struct drm_crtc *crtc,
 			 const struct drm_display_mode *mode,
 			 struct drm_display_mode *adjusted_mode);
 void dcp_set_dimensions(struct apple_dcp *dcp, u64 generation);
-void dcp_set_dimensions(struct apple_dcp *dcp);
+/* H17P (T8140, T8142) */
+void dcp_set_dimensions_h17p(struct apple_dcp *dcp);
 void dcp_update_connector_dimensions(struct apple_dcp *dcp,
 				     struct drm_connector *connector);
 void dcp_send_message(struct apple_dcp *dcp, u8 endpoint, u64 message);

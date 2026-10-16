@@ -408,6 +408,44 @@ static int drm_crtc_set_brightness(struct apple_dcp *dcp)
 		goto done;
 
 	state = drm_atomic_state_alloc(crtc->dev);
+	if (!state) {
+		ret = -ENOMEM;
+		goto done;
+	}
+
+	state->acquire_ctx = &ctx;
+	crtc_state = drm_atomic_get_crtc_state(state, crtc);
+	if (IS_ERR(crtc_state)) {
+		ret = PTR_ERR(crtc_state);
+		goto fail;
+	}
+
+	crtc_state->color_mgmt_changed |= true;
+
+	ret = drm_atomic_commit(state);
+
+fail:
+	drm_atomic_state_put(state);
+done:
+	drm_modeset_drop_locks(&ctx);
+	drm_modeset_acquire_fini(&ctx);
+
+	return ret;
+}
+
+/*
+ * H17P (T8142 H17G): brightness-only commits re-present the scanout and back
+ * off within the call.
+ */
+static int drm_crtc_set_brightness_h17p(struct apple_dcp *dcp)
+{
+	struct drm_atomic_state *state;
+	struct drm_crtc_state *crtc_state;
+	struct drm_modeset_acquire_ctx ctx;
+	struct drm_crtc *crtc = &dcp->crtc->base;
+	int ret = 0;
+
+	state = drm_atomic_state_alloc(crtc->dev);
 	if (!state)
 		return -ENOMEM;
 
@@ -442,7 +480,6 @@ out:
 	}
 
 	drm_atomic_state_put(state);
-done:
 	drm_modeset_drop_locks(&ctx);
 	drm_modeset_acquire_fini(&ctx);
 
@@ -474,10 +511,12 @@ int dcp_backlight_update(struct apple_dcp *dcp)
 	 * the brightness */
 	msleep((1001 + 23) / 24); // 42ms for 23.976 fps
 
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+		return drm_crtc_set_brightness_h17p(dcp);
 	return drm_crtc_set_brightness(dcp);
 }
 
-static int dcp_set_brightness(struct backlight_device *bd)
+static int dcp_set_brightness_h17p(struct backlight_device *bd)
 {
 	int ret = 0;
 	struct apple_dcp *dcp = bl_get_data(bd);
@@ -514,6 +553,25 @@ static int dcp_set_brightness(struct backlight_device *bd)
 	ret = drm_modeset_lock_single_interruptible(&dcp->crtc->base.mutex);
 	if (ret)
 		return ret;
+
+	dcp->brightness.dac = calculate_dac(dcp, brightness);
+	dcp->brightness.update = true;
+
+	drm_modeset_unlock(&dcp->crtc->base.mutex);
+
+	return dcp_backlight_update(dcp);
+}
+
+static int dcp_set_brightness(struct backlight_device *bd)
+{
+	int ret = 0;
+	struct apple_dcp *dcp = bl_get_data(bd);
+	struct drm_modeset_acquire_ctx ctx;
+	int brightness = backlight_get_brightness(bd);
+
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+		return dcp_set_brightness_h17p(bd);
+
 	drm_modeset_acquire_init(&ctx, DRM_MODESET_ACQUIRE_INTERRUPTIBLE);
 	ret = drm_modeset_lock(&dcp->crtc->base.mutex, &ctx);
 	if (ret == -EDEADLK) {
@@ -530,7 +588,6 @@ static int dcp_set_brightness(struct backlight_device *bd)
 
 	drm_modeset_drop_locks(&ctx);
 	drm_modeset_acquire_fini(&ctx);
-	drm_modeset_unlock(&dcp->crtc->base.mutex);
 
 	return dcp_backlight_update(dcp);
 }
@@ -545,6 +602,13 @@ static bool dcp_backlight_controls_device(struct backlight_device *bd,
 }
 
 static const struct backlight_ops dcp_backlight_ops = {
+	.options = BL_CORE_SUSPENDRESUME,
+	.get_brightness = dcp_get_brightness,
+	.update_status = dcp_set_brightness,
+};
+
+/* H17P: fbdev blanking follows only this display. */
+static const struct backlight_ops dcp_backlight_ops_h17p = {
 	.options = BL_CORE_SUSPENDRESUME,
 	.get_brightness = dcp_get_brightness,
 	.update_status = dcp_set_brightness,
@@ -580,6 +644,8 @@ int dcp_backlight_register(struct apple_dcp *dcp)
 	}
 
 	bl_dev = devm_backlight_device_register(dev, "apple-panel-bl", dev, dcp,
+						dcp->fw_compat == DCP_FIRMWARE_H17P ?
+						&dcp_backlight_ops_h17p :
 						&dcp_backlight_ops, &props);
 	if (IS_ERR(bl_dev))
 		return PTR_ERR(bl_dev);

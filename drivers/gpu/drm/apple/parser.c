@@ -87,19 +87,14 @@ static const struct dcp_parse_tag *parse_tag_of_type(struct dcp_parse_ctx *ctx,
 static int skip_depth(struct dcp_parse_ctx *handle, unsigned int depth)
 {
 	const struct dcp_parse_tag *tag;
-	const void *data;
-	unsigned int count, i;
-	int ret;
-
-	if (depth >= DCP_PARSE_MAX_DEPTH)
-		return -EINVAL;
+	int ret = 0;
+	int i;
 
 	if (depth > 64)
 		return -E2BIG;
 
 	tag = parse_tag(handle);
 
-	tag = parse_tag(handle);
 	if (IS_ERR(tag))
 		return PTR_ERR(tag);
 
@@ -123,12 +118,7 @@ static int skip_depth(struct dcp_parse_ctx *handle, unsigned int depth)
 				return ret;
 		}
 
-		for (i = 0; i < count; ++i) {
-			ret = skip_value(handle, depth + 1);
-			if (ret)
-				return ret;
-		}
-		return 0;
+		return ret;
 
 	case DCP_TYPE_INT64:
 		return PTR_ERR_OR_ZERO(parse_bytes(handle, sizeof(s64)));
@@ -143,13 +133,6 @@ static int skip_depth(struct dcp_parse_ctx *handle, unsigned int depth)
 	default:
 		return -EINVAL;
 	}
-
-	return IS_ERR(data) ? PTR_ERR(data) : 0;
-}
-
-static int skip(struct dcp_parse_ctx *handle)
-{
-	return skip_value(handle, 0);
 }
 
 static int skip(struct dcp_parse_ctx *handle)
@@ -173,6 +156,7 @@ static bool consume_string(struct dcp_parse_ctx *ctx, const char *specimen)
 {
 	const struct dcp_parse_tag *tag;
 	const char *key;
+	ctx->pos = round_up(ctx->pos, 4);
 
 	if (ctx->pos + sizeof(*tag) + strlen(specimen) - 1 > ctx->len)
 		return false;
@@ -324,7 +308,6 @@ int parse(const void *blob, size_t size, struct dcp_parse_ctx *ctx)
 
 	if (size > U32_MAX)
 		return -E2BIG;
-		return -EINVAL;
 
 	*ctx = (struct dcp_parse_ctx) {
 		.blob = blob,
@@ -358,27 +341,31 @@ bool dcp_property_complete(const void *blob, size_t received, size_t advertised)
 	return ctx.pos == received || round_up(ctx.pos, 4) == received;
 }
 
-static int parse_dimension(struct dcp_parse_ctx *handle, struct dimension *dim, bool polarity)
+/*
+ * @polarity: external H17P only, also read SyncPolarity and PixelRepetition.
+ * An automatic 1080p180 exception catalog also records duplicate keys.
+ */
 static int parse_dimension(struct dcp_parse_ctx *handle, struct dimension *dim,
-			   bool require_rate)
+			   bool require_rate, bool polarity)
 {
-	static const char * const fields[] = { "Active", "Total", "FrontPorch", "SyncWidth", "PreciseSyncRate" };
+	static const char * const dup_fields[] = {
+		"Active", "Total", "FrontPorch", "SyncWidth", "PreciseSyncRate",
+	};
 	unsigned int seen = 0;
 	struct iterator it;
 	unsigned int fields = 0;
 	int ret = 0;
 
-	ret = iterator_begin(handle, &it, true);
-	if (ret)
-		return ret;
+	dim->sync_polarity = -1;
+	dim->pixel_repetition = -1;
 
-	for (; it.idx < it.len; ++it.idx) {
+	dcp_parse_foreach_in_dict(handle, it) {
 		char *key = parse_string(it.handle);
 		unsigned int field;
 
 		if (!IS_ERR(key) && handle->automatic_1080p180_rgb8)
-			for (field = 0; field < 5; field++)
-				if (!strcmp(key, fields[field])) {
+			for (field = 0; field < ARRAY_SIZE(dup_fields); field++)
+				if (!strcmp(key, dup_fields[field])) {
 					handle->ambiguous_180hz |= !!(seen & (1U << field));
 					seen |= 1U << field;
 				}
@@ -401,20 +388,7 @@ static int parse_dimension(struct dcp_parse_ctx *handle, struct dimension *dim,
 			ret = parse_int_bound(it.handle, &dim->precise_sync_rate,
 					      require_rate ? 1 : 0, U32_MAX);
 			fields |= BIT(4);
-		} else {
-			ret = skip(it.handle);
-		}
-		else if (!strcmp(key, "Active"))
-			ret = parse_int_bound(it.handle, &dim->active, 0, U16_MAX);
-		else if (!strcmp(key, "Total"))
-			ret = parse_int_bound(it.handle, &dim->total, 0, U16_MAX);
-		else if (!strcmp(key, "FrontPorch"))
-			ret = parse_int_bound(it.handle, &dim->front_porch, 0, U16_MAX);
-		else if (!strcmp(key, "SyncWidth"))
-			ret = parse_int_bound(it.handle, &dim->sync_width, 0, U16_MAX);
-		else if (!strcmp(key, "PreciseSyncRate"))
-			ret = parse_int_bound(it.handle, &dim->precise_sync_rate, 1, U32_MAX);
-		else if (polarity && !strcmp(key, "SyncPolarity")) {
+		} else if (polarity && !strcmp(key, "SyncPolarity")) {
 			if (dim->sync_polarity >= 0)
 				ret = -EINVAL;
 			else
@@ -425,9 +399,9 @@ static int parse_dimension(struct dcp_parse_ctx *handle, struct dimension *dim,
 			else
 				ret = parse_int_bound(it.handle, &dim->pixel_repetition,
 						      0, U32_MAX);
-		}
-		else
+		} else {
 			ret = skip(it.handle);
+		}
 
 		if (!IS_ERR_OR_NULL(key))
 			kfree(key);
@@ -457,9 +431,6 @@ struct color_mode {
 static int fill_color_mode(struct dcp_color_mode *color,
 			   struct color_mode *cmode)
 {
-	if (cmode->id < 0 || cmode->id > U32_MAX)
-		return -EINVAL;
-
 	if (color->score >= cmode->score)
 		return 0;
 
@@ -602,31 +573,26 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 	out->sdr.score = -1;
 	out->best.score = -1;
 
-	ret = iterator_begin(handle, &outer_it, false);
-	if (ret)
-		return ret;
-
-	for (; outer_it.idx < outer_it.len; ++outer_it.idx) {
-		struct iterator it;
-		static const char * const fields[] = { "Colorimetry", "Depth", "DynamicRange", "EOTF", "ID", "PixelEncoding", "Score", "IsVirtual" };
+	dcp_parse_foreach_in_array(handle, outer_it) {
+		static const char * const dup_fields[] = {
+			"Colorimetry", "Depth", "DynamicRange", "EOTF", "ID",
+			"PixelEncoding", "Score", "IsVirtual",
+		};
 		unsigned int seen = 0;
+		struct iterator it;
 		bool is_virtual = true;
 		struct color_mode cmode = {
 			.colorimetry = -1, .depth = -1, .dynamic_range = -1,
 			.eotf = -1, .id = -1, .pixel_encoding = -1, .score = -1,
 		};
 
-		ret = iterator_begin(handle, &it, true);
-		if (ret)
-			return ret;
-
-		for (; it.idx < it.len; ++it.idx) {
+		dcp_parse_foreach_in_dict(handle, it) {
 			char *key = parse_string(it.handle);
 			unsigned int field;
 
 			if (!IS_ERR(key) && handle->automatic_1080p180_rgb8)
-				for (field = 0; field < 8; field++)
-					if (!strcmp(key, fields[field])) {
+				for (field = 0; field < ARRAY_SIZE(dup_fields); field++)
+					if (!strcmp(key, dup_fields[field])) {
 						handle->ambiguous_180hz |= !!(seen & (1U << field));
 						seen |= 1U << field;
 					}
@@ -669,15 +635,14 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 				       cmode.eotf, cmode.dynamic_range,
 				       cmode.pixel_encoding);
 
+		/* External H17P: bounded SDR selection and timing color limits. */
 		if (external_sdr) {
 			unsigned int rank;
 
-			if (cmode.id <= U32_MAX &&
-			    timing_color_contains(&limits->dsc_required, cmode.id))
+			if (timing_color_contains(&limits->dsc_required, cmode.id))
 				continue;
 			rank = external_sdr_rank(&cmode);
-			if (cmode.id <= U32_MAX &&
-			    timing_color_contains(&limits->unsafe, cmode.id)) {
+			if (timing_color_contains(&limits->unsafe, cmode.id)) {
 				/*
 				 * Collect only a timing-local bounded RGB8 candidate.
 				 * Admission still requires current EDID and link proof.
@@ -730,25 +695,30 @@ static u64 calculate_clock(struct dimension *horiz, struct dimension *vert)
 	return DIV_ROUND_CLOSEST_ULL(clock >> 16, 1000);
 }
 
+/*
+ * @external_sdr: the external H17P (T8140 dispext0): bounded SDR color
+ * selection, timing color restrictions, IsPreferred/IsInterlaced and sync
+ * polarity, and no adaptive-sync range.
+ */
 static int parse_mode(struct dcp_parse_ctx *handle,
 		      struct dcp_display_mode *out, s64 *score, int width_mm,
-		      int height_mm, unsigned notch_height, bool internal, bool external_sdr)
+		      int height_mm, unsigned notch_height, bool internal,
+		      bool external_sdr)
 {
-	static const char * const fields[] = {
+	static const char * const dup_fields[] = {
 		"ID", "Score", "MinimumVariableRefreshRate", "MaximumVariableRefreshRate",
 	};
 	unsigned int seen = 0;
 	int ret = 0;
 	struct iterator it;
-	struct dimension horiz = { .active = -1 }, vert = { .active = -1 };
+	struct dimension horiz = { .sync_polarity = -1, .pixel_repetition = -1 };
+	struct dimension vert = { .sync_polarity = -1, .pixel_repetition = -1 };
 	struct timing_color_restrictions limits = {};
 	struct dcp_color_mode unsafe_rgb8 = { .score = -1 };
 	bool have_horiz = false, have_vert = false, have_virtual = false;
 	bool duplicate_scope = false;
-	struct dimension horiz = {}, vert = {};
 	u64 clock;
 	s64 min_vrr = 0, max_vrr = 0;
-	u64 clock;
 	s64 id = -1;
 	s64 best_color_mode = -1;
 	bool is_virtual = false;
@@ -772,17 +742,14 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		if (ret)
 			return ret;
 	}
-	ret = iterator_begin(handle, &it, true);
-	if (ret)
-		return ret;
 
-	for (; it.idx < it.len; ++it.idx) {
+	dcp_parse_foreach_in_dict(handle, it) {
 		char *key = parse_string(it.handle);
 		unsigned int field;
 
 		if (!IS_ERR(key) && handle->automatic_1080p180_rgb8)
-			for (field = 0; field < ARRAY_SIZE(fields); field++)
-				if (!strcmp(key, fields[field])) {
+			for (field = 0; field < ARRAY_SIZE(dup_fields); field++)
+				if (!strcmp(key, dup_fields[field])) {
 					handle->ambiguous_180hz |= !!(seen & (1U << field));
 					seen |= 1U << field;
 				}
@@ -790,27 +757,25 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		if (IS_ERR(key))
 			ret = PTR_ERR(key);
 		else if (is_virtual)
-			ret = skip(it.handle);
+			skip(it.handle);
 		else if (!strcmp(key, "HorizontalAttributes")) {
 			duplicate_scope |= have_horiz;
 			have_horiz = true;
-			ret = parse_dimension(it.handle, &horiz, external_sdr);
+			ret = parse_dimension(it.handle, &horiz, false, external_sdr);
 		} else if (!strcmp(key, "VerticalAttributes")) {
 			duplicate_scope |= have_vert;
 			have_vert = true;
-			ret = parse_dimension(it.handle, &vert, external_sdr);
+			ret = parse_dimension(it.handle, &vert, true, external_sdr);
 		} else if (!strcmp(key, "MinimumVariableRefreshRate"))
 			ret = parse_int_bound(it.handle, &min_vrr, 0, U32_MAX);
 		else if (!strcmp(key, "MaximumVariableRefreshRate"))
 			ret = parse_int_bound(it.handle, &max_vrr, 0, U32_MAX);
 		else if (!strcmp(key, "ColorModes"))
 			ret = parse_color_modes(it.handle, out, external_sdr, &limits,
-					handle->automatic_1080p180_rgb8 ?
-					&unsafe_rgb8 : NULL);
+						handle->automatic_1080p180_rgb8 ?
+						&unsafe_rgb8 : NULL);
 		else if (!strcmp(key, "ID"))
 			ret = parse_int(it.handle, &id);
-		else if (!strcmp(key, "IsVirtual"))
-			ret = parse_int_bound(it.handle, &id, 0, U32_MAX);
 		else if (!strcmp(key, "IsVirtual")) {
 			duplicate_scope |= have_virtual;
 			have_virtual = true;
@@ -828,11 +793,9 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 				ret = parse_bool(it.handle, &interlaced);
 			have_interlaced = true;
 		} else if (!strcmp(key, "Score"))
-			ret = parse_int_bound(it.handle, score, 0, S64_MAX);
-		else if (!strcmp(key, "Score"))
 			ret = parse_int(it.handle, score);
 		else
-			ret = skip(it.handle);
+			skip(it.handle);
 
 		if (!IS_ERR_OR_NULL(key))
 			kfree(key);
@@ -917,10 +880,6 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		out->max_vrr = max_vrr;
 		out->vrr = true;
 	}
-
-	clock = calculate_clock(&horiz, &vert);
-	if (!clock || clock > INT_MAX)
-		return -EINVAL;
 
 	vert.active -= notch_height;
 	vert.sync_width += notch_height;
@@ -1102,20 +1061,11 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 		mode = &modes[*count];
 		ret = parse_mode(it.handle, mode, &score, width_mm, height_mm,
 				 notch_height, internal, external_sdr);
-				 notch_height, internal);
 		*handle = next;
 
 		/* Errors for a single mode are recoverable -- just skip it. */
-		if (ret) {
-			/* A failed parse can stop in the middle of the dictionary. */
-			*it.handle = entry;
-			ret = skip(it.handle);
-			if (ret) {
-				kfree(modes);
-				return ERR_PTR(ret);
-			}
+		if (ret)
 			continue;
-		}
 
 		/* Process a successful mode */
 		(*count)++;
@@ -1159,7 +1109,7 @@ int replace_modes(struct dcp_parse_ctx *handle,
 		return ret;
 
 	next = enumerate_modes(handle, &next_count, width_mm, height_mm,
-			       notch_height, internal);
+			       notch_height, internal, false);
 	if (IS_ERR(next))
 		return PTR_ERR(next);
 	if (it.len && !next_count) {
@@ -1185,10 +1135,6 @@ int parse_display_attributes(struct dcp_parse_ctx *handle, int *width_mm,
 	ret = iterator_begin(handle, &it, true);
 	if (ret)
 		return ret;
-	ret = iterator_begin(handle, &it, true);
-	if (ret)
-		return ret;
-
 	for (; it.idx < it.len; ++it.idx) {
 		char *key = parse_string(it.handle);
 
@@ -1200,6 +1146,44 @@ int parse_display_attributes(struct dcp_parse_ctx *handle, int *width_mm,
 			ret = parse_int_bound(it.handle, &height_cm, 0, INT_MAX / 10);
 		else if (!strcmp(key, "SupportsBacklightControl"))
 			ret = parse_bool_or_skip(it.handle, backlight_control);
+		else
+			ret = skip(it.handle);
+
+		if (!IS_ERR_OR_NULL(key))
+			kfree(key);
+
+		if (ret)
+			return ret;
+	}
+
+	/* 1cm = 10mm */
+	*width_mm = 10 * width_cm;
+	*height_mm = 10 * height_cm;
+
+	return 0;
+}
+
+/* H17P (T8140, T8142): DisplayAttributes as aurora-wip reads them. */
+int parse_display_attributes_h17p(struct dcp_parse_ctx *handle, int *width_mm,
+				  int *height_mm)
+{
+	int ret = 0;
+	struct iterator it;
+	s64 width_cm = 0, height_cm = 0;
+
+	ret = iterator_begin(handle, &it, true);
+	if (ret)
+		return ret;
+
+	for (; it.idx < it.len; ++it.idx) {
+		char *key = parse_string(it.handle);
+
+		if (IS_ERR(key))
+			ret = PTR_ERR(key);
+		else if (!strcmp(key, "MaxHorizontalImageSize"))
+			ret = parse_int(it.handle, &width_cm);
+		else if (!strcmp(key, "MaxVerticalImageSize"))
+			ret = parse_int(it.handle, &height_cm);
 		else
 			ret = skip(it.handle);
 
@@ -1461,11 +1445,7 @@ int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
 	*name = ERR_PTR(-ENOENT);
 	*class = ERR_PTR(-ENOENT);
 
-	ret = iterator_begin(handle, &it, true);
-	if (ret)
-		return ret;
-
-	for (; it.idx < it.len; ++it.idx) {
+	dcp_parse_foreach_in_dict(handle, it) {
 		char *key = parse_string(it.handle);
 
 		if (IS_ERR(key)) {
@@ -1507,7 +1487,7 @@ int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
 			if (!ret)
 				parsed_unit = true;
 		} else {
-			ret = skip(it.handle);
+			skip(it.handle);
 		}
 
 		kfree(key);
@@ -1627,11 +1607,7 @@ static int parse_chmap(struct dcp_parse_ctx *handle, struct snd_pcm_chmap_elem *
 
 	chmap->channels = 0;
 
-	ret = iterator_begin(handle, &it, false);
-	if (ret)
-		return ret;
-
-	for (; it.idx < it.len; ++it.idx) {
+	dcp_parse_foreach_in_array(handle, it) {
 		for (i = 0; i < ARRAY_SIZE(chan_position_names); i++)
 			if (consume_string(it.handle, chan_position_names[i].label))
 				break;
@@ -1659,11 +1635,7 @@ static int parse_chan_layout_element(struct dcp_parse_ctx *handle,
 	int ret;
 	s64 nchans = 0;
 
-	ret = iterator_begin(handle, &it, true);
-	if (ret)
-		return ret;
-
-	for (; it.idx < it.len; ++it.idx) {
+	dcp_parse_foreach_in_dict(handle, it) {
 		if (consume_string(it.handle, "ActiveChannelCount"))
 			ret = parse_int(it.handle, &nchans);
 		else if (consume_string(it.handle, "ChannelLayout"))
@@ -1688,11 +1660,7 @@ static int parse_nchans_mask(struct dcp_parse_ctx *handle, unsigned int *mask)
 
 	*mask = 0;
 
-	ret = iterator_begin(handle, &it, false);
-	if (ret)
-		return ret;
-
-	for (; it.idx < it.len; ++it.idx) {
+	dcp_parse_foreach_in_array(handle, it) {
 		int nchans;
 
 		ret = parse_chan_layout_element(it.handle, &nchans, NULL);
@@ -1712,11 +1680,7 @@ static int parse_avep_element(struct dcp_parse_ctx *handle,
 	struct iterator it;
 	int ret;
 
-	ret = iterator_begin(handle, &it, true);
-	if (ret)
-		return ret;
-
-	for (; it.idx < it.len; ++it.idx) {
+	dcp_parse_foreach_in_dict(handle, it) {
 		if (consume_string(handle, "StreamSampleRate"))
 			ret = parse_sample_rate_bit(it.handle, &mask.rates);
 		else if (consume_string(handle, "SampleSize"))
@@ -1754,20 +1718,12 @@ static int parse_mode_in_avep_element(struct dcp_parse_ctx *handle,
 	struct dcp_parse_ctx save_handle;
 	int ret;
 
-	ret = iterator_begin(handle, &it, true);
-	if (ret)
-		return ret;
-
-	for (; it.idx < it.len; ++it.idx) {
+	dcp_parse_foreach_in_dict(handle, it) {
 		if (consume_string(it.handle, "AudioChannelLayoutElements")) {
 			struct iterator inner_it;
 			int nchans;
 
-			ret = iterator_begin(it.handle, &inner_it, false);
-			if (ret)
-				return ret;
-
-			for (; inner_it.idx < inner_it.len; ++inner_it.idx) {
+			dcp_parse_foreach_in_array(it.handle, inner_it) {
 				save_handle = *it.handle;
 				ret = parse_chan_layout_element(inner_it.handle,
 								&nchans, NULL);
@@ -1820,11 +1776,7 @@ int parse_sound_constraints(struct dcp_parse_ctx *handle,
 		hits->nchans = 0;
 	}
 
-	ret = iterator_begin(handle, &it, false);
-	if (ret)
-		return ret;
-
-	for (; it.idx < it.len; ++it.idx) {
+	dcp_parse_foreach_in_array(handle, it) {
 		ret = parse_avep_element(it.handle, sieve, hits);
 
 		if (ret < 0)
@@ -1843,11 +1795,7 @@ int parse_sound_mode(struct dcp_parse_ctx *handle,
 	struct iterator it;
 	int ret;
 
-	ret = iterator_begin(handle, &it, false);
-	if (ret)
-		return ret;
-
-	for (; it.idx < it.len; ++it.idx) {
+	dcp_parse_foreach_in_array(handle, it) {
 		save_handle = *it.handle;
 		ret = parse_avep_element(it.handle, sieve, NULL);
 
@@ -1877,11 +1825,7 @@ int parse_system_log_mnits(struct dcp_parse_ctx *handle, struct dcp_system_ev_mn
 	s64 timestamp = -1;
 	bool type_match = false;
 
-	ret = iterator_begin(handle, &it, true);
-	if (ret)
-		return ret;
-
-	for (; it.idx < it.len; ++it.idx) {
+	dcp_parse_foreach_in_dict(handle, it) {
 		char *key = parse_string(it.handle);
 		if (IS_ERR(key)) {
 			ret = PTR_ERR(key);
@@ -1898,7 +1842,7 @@ int parse_system_log_mnits(struct dcp_parse_ctx *handle, struct dcp_system_ev_mn
 		} else if (!strcmp(key, "timestamp")) {
 			ret = parse_int(it.handle, &timestamp);
 		} else {
-			ret = skip(it.handle);
+			skip(it.handle);
 		}
 
 		if (!IS_ERR_OR_NULL(key))

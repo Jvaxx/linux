@@ -13,6 +13,15 @@
 
 #include "version_utils.h"
 
+/*
+ * dcp-internal.h includes this header, also from inside another template
+ * instantiation (iomfb_h17p.c): keep that one's DCP_FW.
+ */
+#pragma push_macro("DCP_FW")
+#pragma push_macro("DCP_FW_VER")
+#undef DCP_FW
+#undef DCP_FW_VER
+
 #define DCP_FW v14_7_0
 #define DCP_FW_VER DCP_FW_VERSION(14, 7, 0)
 
@@ -20,5 +29,8 @@
 
 #undef DCP_FW_VER
 #undef DCP_FW
+
+#pragma pop_macro("DCP_FW_VER")
+#pragma pop_macro("DCP_FW")
 
 #endif /* __APPLE_IOMFB_V14_7_TPL_H__ */

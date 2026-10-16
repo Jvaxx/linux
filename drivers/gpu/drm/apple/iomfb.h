@@ -230,6 +230,7 @@ struct dcp_map_buf_req {
 	u8 dva_null;
 } __packed;
 
+/* 12.3, 13.5 and 14.7; H17P's is in iomfb_template.h. */
 struct dcp_map_buf_resp {
 	u64 vaddr;
 	u64 dva;
@@ -276,6 +277,7 @@ struct dcp_map_physical_resp {
 	u32 mem_desc_id;
 } __packed;
 
+/* 12.3, 13.5 and 14.7; H17P's are in iomfb_template.h. */
 struct dcp_swap_start_req {
 	u32 swap_id;
 	struct dcp_iouserclient client;
@@ -318,6 +320,7 @@ struct iomfb_set_fx_prop_req {
 	u32 value;
 } __packed;
 
+/* 12.3, 13.5 and 14.7; H17P's is in iomfb_template.h. */
 struct dcp_set_power_state_req {
 	u64 unklong;
 	u8 unkbool;

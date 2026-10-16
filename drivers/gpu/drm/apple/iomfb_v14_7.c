@@ -2308,7 +2308,7 @@ static int dcp_v14_mode(struct apple_dcp *dcp, struct apple_dcp_v14 *v14)
 		return ret;
 	ctx.dcp = dcp;
 	modes = enumerate_modes(&ctx, &count, dcp->panel.width_mm, dcp->panel.height_mm,
-				dcp->notch_height, true);
+				dcp->notch_height, true, false);
 	if (IS_ERR(modes))
 		return PTR_ERR(modes);
 	for (i = 0; i < count; i++) {

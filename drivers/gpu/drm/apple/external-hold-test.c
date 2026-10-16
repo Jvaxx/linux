@@ -151,7 +151,7 @@ static int hold_test_init(struct kunit *test)
 	mutex_init(&dcp->hpd_mutex);
 	mutex_init(&dcp->tb_lock);
 	spin_lock_init(&dcp->mode_state.lock);
-	spin_lock_init(&dcp->dcpavserv.lock);
+	mutex_init(&dcp->dcpavserv.lock);
 	init_completion(&dcp->typec_iomfb_hpd_ready);
 	INIT_DELAYED_WORK(&dcp->external_retry_wq, dcp_external_retry_work);
 	INIT_DELAYED_WORK(&dcp->typec_reconnect_wq, hold_relink_work);

@@ -46,6 +46,12 @@ struct apple_dcp_typec_route {
 	bool tunnel;
 	/* tunnel: crossbar brought up (at DidChangeLinkConfiguration) */
 	bool xbar_up;
+	/*
+	 * H17P: the lower mux release is consumed even when idle programming
+	 * fails, and that error retains the route's owner.
+	 */
+	bool deactivate_xbar_done;
+	int deactivate_error;
 };
 
 bool dcp_is_typec_output(struct apple_dcp *dcp);

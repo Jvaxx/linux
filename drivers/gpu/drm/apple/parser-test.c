@@ -182,7 +182,7 @@ static struct dcp_display_mode *parse_blob(struct parser_blob *blob,
 	if (ret)
 		return ERR_PTR(ret);
 	ctx.dcp = &parser_dcp;
-	return enumerate_modes(&ctx, count, 500, 300, notch, internal);
+	return enumerate_modes(&ctx, count, 500, 300, notch, internal, false);
 }
 
 static void parser_score_presence(struct kunit *test)

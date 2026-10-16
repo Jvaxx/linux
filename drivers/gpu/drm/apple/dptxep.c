@@ -25,6 +25,16 @@
 
 #include "dptx-j700-training.h"
 
+/*
+ * The 1080p180 rate proof (dcp-180hz.c) belongs to H17-generation
+ * firmware, whose probe sets up its lock; other firmware has none.
+ */
+static void dptx_180hz_invalidate(struct apple_dcp *dcp)
+{
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+		dcp_180hz_invalidate(dcp);
+}
+
 struct dcpdptx_connection_cmd {
 	__le32 unk;
 	__le32 target;
@@ -235,7 +245,7 @@ int dptxport_release_display(struct apple_epic_service *service)
 	struct dptx_port *dptx = service->cookie;
 	int ret;
 
-	dcp_180hz_invalidate(service->ep->dcp);
+	dptx_180hz_invalidate(service->ep->dcp);
 	dptx->release_calls++;
 	dev_dbg(service->ep->dcp->dev,
 		 "DPTX release_display: call #%u this boot caller=%pS\n",
@@ -524,7 +534,7 @@ dptxport_call_will_change_link_config(struct apple_epic_service *service)
 {
 	struct dptx_port *dptx = service->cookie;
 
-	dcp_180hz_invalidate(service->ep->dcp);
+	dptx_180hz_invalidate(service->ep->dcp);
 	dptx->phy_ops.dp.set_lanes = 0;
 	dptx->phy_ops.dp.set_rate = 0;
 	dptx->phy_ops.dp.set_voltages = 0;
@@ -744,6 +754,7 @@ dptxport_call_deactivate(struct apple_epic_service *service,
 	struct dptx_port *dptx = service->cookie;
 	struct apple_dcp *dcp = service->ep->dcp;
 
+	dptx_180hz_invalidate(dcp);
 	dev_info(dcp->dev, "DPTXPort: DEACTIVATE\n");
 	if (dcp->dptx_tunnel)
 		dcp_tunnel_dpin_activate(dcp, dptx->unit, false);
@@ -762,12 +773,20 @@ dptxport_call_deactivate(struct apple_epic_service *service,
 static int dptxport_call_link_config(struct apple_epic_service *service, bool lanes,
 				     const void *data, size_t size, void *reply, size_t room)
 {
-	struct dcp_180hz_token token = dcp_180hz_config_begin(service, lanes);
+	struct dcp_180hz_token token;
 	struct dptx_port *port = service->cookie;
 	bool success = false;
 	u32 value = 0;
 	int ret;
 
+	if (service->ep->dcp->fw_compat != DCP_FIRMWARE_H17P)
+		return lanes ?
+			dptxport_call_set_active_lane_count(service, data, size,
+							    reply, room) :
+			dptxport_call_set_link_rate(service, data, size, reply,
+						    room);
+
+	token = dcp_180hz_config_begin(service, lanes);
 	if (lanes) {
 		ret = dptxport_call_set_active_lane_count(service, data, size, reply, room);
 		if (!ret && size >= sizeof(struct dptxport_apcall_set_active_lane_count) &&
@@ -864,6 +883,7 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 	case DPTX_APCALL_DEVICE_NOT_RESPONDING:
 	case DPTX_APCALL_DEVICE_BUSY_TIMEOUT:
 	case DPTX_APCALL_DEVICE_NOT_STARTED:
+		dptx_180hz_invalidate(service->ep->dcp);
 		dev_warn(service->ep->dcp->dev,
 			 "DPTXPort: firmware reports link fault %u on target %u:%u\n",
 			 idx, service->ep->dcp->dptx_die,
@@ -937,21 +957,6 @@ static int dptxport_prepare(struct apple_epic_service *service, const char *name
 	struct apple_dcp *dcp = service->ep->dcp;
 	int port = dptx_service_port(name, class, unit, service->ep->wire_v2,
 				     dcp->index, dcp->hw.num_dptx_ports);
-	s64 port = unit;
-	bool v14_7 = dcp_fw_is_14_7(service->ep->dcp);
-
-	if (!name)
-		return;
-	if (strcmp(name, "dcpdptx-port-epic") &&
-	    (!v14_7 || strcmp(name, "dcp-lpdptx-port-epic")))
-	if (!name || !class)
-		return;
-	if (strcmp(name, "dcpdptx-port-epic"))
-		return;
-	/* 14.7 may announce the port without its class. */
-	if (v14_7 ? class && class[0] && strcmp(class, "AppleDCPDPTXRemotePort") :
-		    !class || strcmp(class, "AppleDCPDPTXRemotePort"))
-		return;
 
 	if (port < 0)
 		return port;
@@ -959,13 +964,24 @@ static int dptxport_prepare(struct apple_epic_service *service, const char *name
 	return dptx_service_bind(service, &dcp->dptxport[port], unit);
 }
 
+/* M1/M2/M3 (12.3, 13.5 and 14.7 firmware): integration's port binding. */
 static void dptxport_init(struct apple_epic_service *service, const char *name,
 			  const char *class, s64 unit)
 {
-	struct dptx_port *port = service->cookie;
+	bool v14_7 = dcp_fw_is_14_7(service->ep->dcp);
 
-	dptx_service_publish(service);
-	complete(&port->enable_completion);
+	if (!name)
+		return;
+	if (strcmp(name, "dcpdptx-port-epic") &&
+	    (!v14_7 || strcmp(name, "dcp-lpdptx-port-epic")))
+		return;
+	/* 14.7 may announce the port without its class. */
+	if (v14_7 ? class && class[0] && strcmp(class, "AppleDCPDPTXRemotePort") :
+		    !class || strcmp(class, "AppleDCPDPTXRemotePort"))
+		return;
+
+	trace_dptxport_init(service->ep->dcp, unit);
+
 	switch (unit) {
 	case 0:
 	case 1:
@@ -988,6 +1004,16 @@ static void dptxport_init(struct apple_epic_service *service, const char *name,
 		dev_err(service->ep->dcp->dev, "DPTXPort: invalid unit %lld\n",
 			unit);
 	}
+}
+
+/* H17-generation firmware: dptxport_prepare() bound the port before OPEN. */
+static void dptxport_h17_init(struct apple_epic_service *service, const char *name,
+			      const char *class, s64 unit)
+{
+	struct dptx_port *port = service->cookie;
+
+	dptx_service_publish(service);
+	complete(&port->enable_completion);
 	/* Publication may follow the startup wait or the bounded retry window. */
 	if (service->ep->dcp->hw.iomfb_method_profile ==
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL &&
@@ -1088,12 +1114,23 @@ static void dptxport_teardown(struct apple_epic_service *service)
 	dptx_service_unbind(service);
 }
 
+/* 12.3 and 13.5 firmware. */
 static const struct apple_epic_service_ops dptxep_ops[] = {
+	{
+		.name = "AppleDCPDPTXRemotePort",
+		.init = dptxport_init,
+		.call = dptxport_call,
+	},
+	{}
+};
+
+/* H17-generation firmware (T8140 H17P, T8142 H17G). */
+static const struct apple_epic_service_ops dptxep_h17_ops[] = {
 	{
 		.name = "AppleDCPDPTXRemotePort",
 		.prepare = dptxport_prepare,
 		.teardown = dptxport_teardown,
-		.init = dptxport_init,
+		.init = dptxport_h17_init,
 		.call = dptxport_call,
 		.call_v2 = dptxport_group_call,
 	},
@@ -1110,6 +1147,26 @@ static const struct apple_epic_service_ops dptx_controller_ops[] = {
 	{
 		.name = "AppleDCPDPTXController",
 		.init = dptx_controller_service_init,
+	},
+	{}
+};
+
+/* 14.7 also announces the port under its EPIC names. */
+static const struct apple_epic_service_ops dptxep_v14_7_ops[] = {
+	{
+		.name = "AppleDCPDPTXRemotePort",
+		.init = dptxport_init,
+		.call = dptxport_call,
+	},
+	{
+		.name = "dcpdptx-port-epic",
+		.init = dptxport_init,
+		.call = dptxport_call,
+	},
+	{
+		.name = "dcp-lpdptx-port-epic",
+		.init = dptxport_init,
+		.call = dptxport_call,
 	},
 	{}
 };
@@ -1137,26 +1194,6 @@ int dptx_controller_init(struct apple_dcp *dcp)
 
 	return 0;
 }
-/* 14.7 also announces the port under its EPIC names. */
-static const struct apple_epic_service_ops dptxep_v14_7_ops[] = {
-	{
-		.name = "AppleDCPDPTXRemotePort",
-		.init = dptxport_init,
-		.call = dptxport_call,
-	},
-	{
-		.name = "dcpdptx-port-epic",
-		.init = dptxport_init,
-		.call = dptxport_call,
-	},
-	{
-		.name = "dcp-lpdptx-port-epic",
-		.init = dptxport_init,
-		.call = dptxport_call,
-		.call_v2 = dptxport_group_call,
-	},
-	{}
-};
 
 int dptxep_init(struct apple_dcp *dcp)
 {
@@ -1172,9 +1209,18 @@ int dptxep_init(struct apple_dcp *dcp)
 	init_completion(&dcp->dptxport[0].linkcfg_completion);
 	init_completion(&dcp->dptxport[1].linkcfg_completion);
 
-	ep = afk_init(dcp, wire_v2 ? DPTX_ENDPOINT_V2 : DPTX_ENDPOINT, dptxep_ops);
-	if (IS_ERR(ep))
+	if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+		ep = afk_init(dcp, wire_v2 ? DPTX_ENDPOINT_V2 : DPTX_ENDPOINT,
+			      dptxep_h17_ops);
+	else
+		ep = afk_init(dcp, DPTX_ENDPOINT,
+			      dcp_fw_is_14_7(dcp) ? dptxep_v14_7_ops : dptxep_ops);
+	if (IS_ERR(ep)) {
+		/* As integration: other firmware keeps the error pointer. */
+		if (dcp->fw_compat != DCP_FIRMWARE_H17P)
+			dcp->dptxep = ep;
 		return PTR_ERR(ep);
+	}
 	ep->wire_v2 = wire_v2;
 	dcp->dptxep = ep;
 
@@ -1197,6 +1243,9 @@ int dptxep_init(struct apple_dcp *dcp)
 					 "DPTX port %u not announced yet\n", port);
 				return 0;
 			}
+			if (dcp->fw_compat == DCP_FIRMWARE_H17P)
+				dev_warn(dcp->dev, "DPTX transport ready but port %u service not announced\n",
+					 port);
 			return -ETIMEDOUT;
 		} else if (ret < 0) {
 			return ret;

@@ -5,6 +5,7 @@
 
 #include "plane.h"
 
+#include "dcp.h"
 #include "dcp-internal.h"
 #include "iomfb_internal.h"
 
@@ -308,6 +309,26 @@ static void apple_plane_cleanup_fb(struct drm_plane *plane,
 	kfree(entry);
 }
 
+/* Does @plane scan out on an H17-generation pipeline (T8140, T8142)? */
+static bool apple_plane_h17p(struct drm_plane *plane)
+{
+	struct drm_crtc *crtc;
+
+	drm_for_each_crtc(crtc, plane->dev) {
+		struct apple_dcp *dcp;
+
+		if (!(plane->possible_crtcs & drm_crtc_mask(crtc)))
+			continue;
+		dcp = platform_get_drvdata(to_apple_crtc(crtc)->dcp);
+		return dcp && dcp->fw_compat == DCP_FIRMWARE_H17P;
+	}
+	return false;
+}
+
+/*
+ * H17P: a displaced framebuffer stays referenced until the swap that
+ * replaces it completes (dcp_release_retained_framebuffers()).
+ */
 static int apple_plane_prepare_fb(struct drm_plane *plane,
 				  struct drm_plane_state *state)
 {
@@ -321,6 +342,8 @@ static int apple_plane_prepare_fb(struct drm_plane *plane,
 
 	old = drm_atomic_get_old_plane_state(state->state, plane);
 	if (!old || !old->crtc || !old->fb || old->fb == state->fb)
+		return 0;
+	if (!apple_plane_h17p(plane))
 		return 0;
 
 	entry = kzalloc_obj(*entry);
@@ -380,6 +403,12 @@ apple_plane_duplicate_state(struct drm_plane *plane)
         __drm_atomic_helper_plane_duplicate_state(plane, &apple_plane_state->base);
 
 	apple_plane_state->surf = old_apple_plane_state->surf;
+	/* H17P presents re-use the cached scanout geometry. */
+	if (apple_plane_h17p(plane)) {
+		apple_plane_state->src_rect = old_apple_plane_state->src_rect;
+		apple_plane_state->dst_rect = old_apple_plane_state->dst_rect;
+		apple_plane_state->iova = old_apple_plane_state->iova;
+	}
 
 	return &apple_plane_state->base;
 }
