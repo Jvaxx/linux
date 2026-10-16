@@ -580,7 +580,7 @@ static int xhci_plat_suspend(struct device *dev)
 
 		if (ret)
 			return ret;
-		priv->running_in_s2idle = 1;
+		xhci_run_in_s2idle_begin(hcd_to_xhci(hcd));
 		dev_dbg(dev, "wakeup enabled, keep running in suspend-to-idle.\n");
 		return 0;
 	}
@@ -643,6 +643,7 @@ static int xhci_plat_resume(struct device *dev)
 {
 	struct usb_hcd	*hcd = dev_get_drvdata(dev);
 	struct xhci_plat_priv *priv = hcd_to_xhci_priv(hcd);
+	struct xhci_hcd *xhci = hcd_to_xhci(hcd);
 
 	if (priv->sideband_at_suspend) {
 		priv->sideband_at_suspend = 0;
@@ -650,12 +651,11 @@ static int xhci_plat_resume(struct device *dev)
 		return 0;
 	}
 
-	if (priv->running_in_s2idle) {
-		struct xhci_hcd *xhci = hcd_to_xhci(hcd);
+	if (xhci->running_in_s2idle) {
 		u32 status = readl(&xhci->op_regs->status);
 
-		priv->running_in_s2idle = 0;
 		if (!xhci_plat_stopped(status)) {
+			xhci_run_in_s2idle_end(xhci);
 			dev_dbg(dev, "kept running in suspend-to-idle, skip resume.\n");
 			return 0;
 		}
@@ -675,6 +675,7 @@ static int xhci_plat_resume(struct device *dev)
 		xhci_quiesce_dying(xhci);
 		xhci_hc_died(xhci);
 		spin_unlock_irq(&xhci->lock);
+		xhci_run_in_s2idle_end(xhci);
 		return 0;
 	}
 

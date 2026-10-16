@@ -82,8 +82,9 @@ config USB_XHCI_PLATFORM_KUNIT_TEST
 	default KUNIT_ALL_TESTS
 	help
 	  Test how the generic xHCI platform driver turns device properties
-	  into quirks, and when it keeps the controller running across
-	  suspend-to-idle instead of halting it. The tests need no xHCI
+	  into quirks, when it keeps the controller running across
+	  suspend-to-idle instead of halting it, and which events of a
+	  controller kept running wake the system. The tests need no xHCI
 	  hardware.
 
 	  If unsure, say N.
