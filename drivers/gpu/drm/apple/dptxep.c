@@ -744,7 +744,7 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 	case DPTX_APCALL_DEVICE_NOT_RESPONDING:
 	case DPTX_APCALL_DEVICE_BUSY_TIMEOUT:
 	case DPTX_APCALL_DEVICE_NOT_STARTED:
-		dcp_180hz_invalidate(service->ep->dcp);
+		dcp_external_link_fault(service->ep->dcp);
 		dev_warn(service->ep->dcp->dev,
 			 "DPTXPort: firmware reports link fault %u on target %u:%u\n",
 			 idx, service->ep->dcp->dptx_die,

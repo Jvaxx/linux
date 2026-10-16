@@ -32,14 +32,21 @@ static inline void dcp_mode_begin(struct dcp_mode_state *state)
 	spin_unlock_irqrestore(&state->lock, flags);
 }
 
-static inline void dcp_mode_invalidate(struct dcp_mode_state *state)
+/*
+ * The mode is gone, also for a mode set in flight, which then does not
+ * complete it.  Returns whether a set mode was valid until now.
+ */
+static inline bool dcp_mode_invalidate(struct dcp_mode_state *state)
 {
 	unsigned long flags;
+	bool valid;
 
 	spin_lock_irqsave(&state->lock, flags);
+	valid = state->valid;
 	state->valid = false;
 	state->invalidated = true;
 	spin_unlock_irqrestore(&state->lock, flags);
+	return valid;
 }
 
 /* The caller holds state->lock. */

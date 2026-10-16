@@ -2313,6 +2313,22 @@ void dcp_swap_watchdog_complete(struct apple_dcp *dcp)
 	dcp->swap_watchdog_retrains = 0;
 }
 
+/*
+ * The firmware reports that the DisplayPort sink stopped answering, or that
+ * the link did not start.  On the external H17P display, the mode set
+ * before, or being set, has no link any more: drop it, also across a mode
+ * set in flight, and have the hotplug worker set the mode of the CRTC again
+ * or report the display lost (dcp_external_relink()).  A mode set still in
+ * flight reports this itself when it finishes, and before any mode was set
+ * there is nothing to recover.
+ */
+void dcp_external_link_fault(struct apple_dcp *dcp)
+{
+	dcp_180hz_invalidate(dcp);
+	if (dcp_is_external_h17p(dcp) && dcp_mode_invalidate(&dcp->mode_state))
+		dcp_handle_hotplug_actions(dcp, DCP_HOTPLUG_NOTIFY);
+}
+
 static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 {
 	struct apple_dcp *dcp = cookie;
