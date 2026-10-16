@@ -1002,6 +1002,33 @@ static int cd321x_connect(struct tps6598x *tps, u32 status)
 }
 
 /*
+ * The controller raises its interrupt only when events are latched while none
+ * were pending, so latched events that are never acknowledged silence the port
+ * for good. Acknowledge them before a snapshot read: the snapshot covers them.
+ */
+static int cd321x_ack_events(struct tps6598x *tps)
+{
+	u64 event;
+	int ret;
+
+	ret = tps6598x_read64(tps, TPS_REG_INT_EVENT1, &event);
+	if (ret || !event)
+		return ret;
+	trace_cd321x_irq(event);
+
+	return tps6598x_write64(tps, TPS_REG_INT_CLEAR1, event);
+}
+
+/* Recover events that an interrupt could not read, acknowledge or apply. */
+static void cd321x_event_lost(struct cd321x *cd321x)
+{
+	lockdep_assert_held(&cd321x->tps.lock);
+	if (cd321x_pm_event_lost(&cd321x->pm))
+		mod_delayed_work(system_freezable_wq, &cd321x->resume_work,
+				 msecs_to_jiffies(CD321X_DEBOUNCE_DELAY_MS));
+}
+
+/*
  * An attached cable need not generate an IRQ after sleep. Read a fresh
  * snapshot and reapply it with the mode cache invalidated, allowing the
  * provider to validate the resumed session. Preserve a healthy connection;
@@ -1013,6 +1040,7 @@ static void cd321x_resume_work(struct work_struct *work)
 					    struct cd321x, resume_work);
 	struct tps6598x *tps = &cd321x->tps;
 	u32 status;
+	int ret;
 
 	guard(mutex)(&tps->lock);
 	if (cd321x->pm.phase == CD321X_PM_INITIALIZING ||
@@ -1031,6 +1059,18 @@ static void cd321x_resume_work(struct work_struct *work)
 	}
 	if (!cd321x_pm_begin_read(&cd321x->pm))
 		return;
+
+	ret = cd321x_ack_events(tps);
+	if (ret) {
+		/* Retried until it succeeds, so report only the first failure. */
+		if (!cd321x->pm.ack_retry_ms)
+			dev_err(tps->dev, "failed to acknowledge events: %d\n", ret);
+		mod_delayed_work(system_freezable_wq, &cd321x->resume_work,
+				 msecs_to_jiffies(cd321x_pm_ack_failed(&cd321x->pm)));
+		return;
+	}
+	if (cd321x_pm_acked(&cd321x->pm))
+		dev_info(tps->dev, "acknowledged events after retrying\n");
 
 	if (!tps6598x_read_status(tps, &status))
 		goto retry;
@@ -1079,6 +1119,7 @@ static void cd321x_complete(struct tps6598x *tps)
 static irqreturn_t cd321x_interrupt(int irq, void *data)
 {
 	struct tps6598x *tps = data;
+	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
 	u64 event = 0;
 	u32 status;
 	int ret;
@@ -1088,21 +1129,25 @@ static irqreturn_t cd321x_interrupt(int irq, void *data)
 	ret = tps6598x_read64(tps, TPS_REG_INT_EVENT1, &event);
 	if (ret) {
 		dev_err(tps->dev, "%s: failed to read events\n", __func__);
-		goto err_unlock;
+		goto err_lost;
 	}
 	trace_cd321x_irq(event);
 
 	if (!event)
 		goto err_unlock;
 
-	tps6598x_write64(tps, TPS_REG_INT_CLEAR1, event);
+	ret = tps6598x_write64(tps, TPS_REG_INT_CLEAR1, event);
+	if (ret) {
+		dev_err(tps->dev, "%s: failed to clear events\n", __func__);
+		goto err_lost;
+	}
 
 	if (!tps6598x_read_status(tps, &status))
-		goto err_unlock;
+		goto err_lost;
 
 	if (event & APPLE_CD_REG_INT_POWER_STATUS_UPDATE) {
 		if (!tps6598x_read_power_status(tps))
-			goto err_unlock;
+			goto err_lost;
 		if (TPS_POWER_STATUS_PWROPMODE(tps->pwr_status) == TYPEC_PWR_MODE_PD) {
 			if (tps6598x_read_partner_identity(tps)) {
 				dev_err(tps->dev, "failed to read partner identity\n");
@@ -1113,11 +1158,14 @@ static irqreturn_t cd321x_interrupt(int irq, void *data)
 
 	if (event & APPLE_CD_REG_INT_DATA_STATUS_UPDATE)
 		if (!tps->data->read_data_status(tps))
-			goto err_unlock;
+			goto err_lost;
 
 	/* Can be called uncondtionally since it will check for any changes itself */
 	cd321x_connect(tps, status);
+	goto err_unlock;
 
+err_lost:
+	cd321x_event_lost(cd321x);
 err_unlock:
 	mutex_unlock(&tps->lock);
 
@@ -1550,16 +1598,23 @@ cd321x_tbt_switch_get(struct device *dev, struct fwnode_handle *fwnode)
 }
 EXPORT_SYMBOL_IF_KUNIT(cd321x_tbt_switch_get);
 
+/* Separate so that the KUnit tests can drive the workers without a port. */
+VISIBLE_IF_KUNIT void cd321x_init_work(struct cd321x *cd321x)
+{
+	INIT_DELAYED_WORK(&cd321x->update_work, cd321x_update_work);
+	INIT_DELAYED_WORK(&cd321x->resume_work, cd321x_resume_work);
+	atomic_set(&cd321x->link_event, 0);
+	cd321x_pm_init(&cd321x->pm);
+}
+EXPORT_SYMBOL_IF_KUNIT(cd321x_init_work);
+
 static int
 cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
 	int ret;
 
-	INIT_DELAYED_WORK(&cd321x->update_work, cd321x_update_work);
-	INIT_DELAYED_WORK(&cd321x->resume_work, cd321x_resume_work);
-	atomic_set(&cd321x->link_event, 0);
-	cd321x_pm_init(&cd321x->pm);
+	cd321x_init_work(cd321x);
 
 	ret = tps6598x_register_port(tps, fwnode);
 	if (ret)

@@ -31,11 +31,15 @@ config TYPEC_SN201202X
 config TYPEC_TIPD_KUNIT_TEST
 	tristate "KUnit tests for CD321x" if !KUNIT_ALL_TESTS
 	depends on KUNIT && TYPEC_TPS6598X_CORE
+	select REGMAP
 	default KUNIT_ALL_TESTS
 	help
 	  Test suspend gating, fresh cable-state revalidation, bounded retries
 	  and removal during resume. The tests exercise the state transitions
 	  shared with the driver, including aborted and repeated sleep cycles.
+	  Also test that interrupt events which could not be read or cleared
+	  are still acknowledged, however long that keeps failing, so that the
+	  controller keeps raising its interrupt.
 	  Also test that a USB4/Thunderbolt router which never registers its
 	  switch does not keep the port from probing.
 	  These tests run without accessing a physical Type-C controller.

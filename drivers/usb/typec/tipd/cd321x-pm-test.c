@@ -417,6 +417,109 @@ static void cd321x_busy_provider_keeps_real_failure_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, pm.force_reconnect);
 }
 
+static void cd321x_lost_event_rereads_test(struct kunit *test)
+{
+	static const enum cd321x_pm_phase phases[] = {
+		CD321X_PM_RUNNING, CD321X_PM_REVALIDATE,
+		CD321X_PM_APPLY, CD321X_PM_STALE,
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(phases); i++) {
+		struct cd321x_pm_state pm = { .phase = phases[i] };
+
+		/* Even an exhausted recovery must read the latched events. */
+		KUNIT_ASSERT_TRUE(test, cd321x_pm_event_lost(&pm));
+		KUNIT_EXPECT_EQ(test, pm.phase, CD321X_PM_REVALIDATE);
+		KUNIT_EXPECT_FALSE(test, cd321x_pm_can_update(&pm));
+		KUNIT_EXPECT_FALSE(test, pm.force_reconnect);
+		KUNIT_EXPECT_TRUE(test, cd321x_pm_begin_read(&pm));
+		KUNIT_EXPECT_EQ(test, pm.attempts_left, CD321X_RESUME_ATTEMPTS - 1U);
+	}
+}
+
+static void cd321x_lost_event_left_to_resume_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+
+	cd321x_pm_init(&pm);
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_event_lost(&pm));
+	KUNIT_EXPECT_EQ(test, pm.phase, CD321X_PM_INITIALIZING);
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_ready(&pm));
+
+	/* A read failing during suspend is redone by the resume read. */
+	cd321x_pm_prepare(&pm);
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_event_lost(&pm));
+	KUNIT_EXPECT_EQ(test, pm.phase, CD321X_PM_PREPARED);
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_resume(&pm));
+	KUNIT_EXPECT_TRUE(test, cd321x_pm_begin_read(&pm));
+
+	cd321x_pm_remove(&pm);
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_event_lost(&pm));
+	KUNIT_EXPECT_EQ(test, pm.phase, CD321X_PM_REMOVED);
+}
+
+static void cd321x_lost_event_keeps_reconnect_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_retry(&pm, true));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_event_lost(&pm));
+	/* A failed read is no evidence either way about the cable. */
+	KUNIT_EXPECT_TRUE(test, pm.force_reconnect);
+}
+
+static void cd321x_unacked_events_outlast_budget_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+	unsigned int i, delay = 0;
+
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_event_lost(&pm));
+	for (i = 0; i < 4 * CD321X_RESUME_ATTEMPTS; i++) {
+		unsigned int next;
+
+		KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
+		next = cd321x_pm_ack_failed(&pm);
+		/* Never given up, and not charged to the cable-state budget... */
+		KUNIT_EXPECT_EQ(test, pm.phase, CD321X_PM_REVALIDATE);
+		KUNIT_EXPECT_EQ(test, pm.attempts_left, (unsigned int)CD321X_RESUME_ATTEMPTS);
+		KUNIT_EXPECT_FALSE(test, cd321x_pm_can_update(&pm));
+		/* ...only retried less and less often, down to a limit. */
+		KUNIT_EXPECT_EQ(test, next, i ? min(2 * delay, CD321X_ACK_RETRY_MAX_MS) :
+					     CD321X_ACK_RETRY_MS);
+		delay = next;
+	}
+	KUNIT_EXPECT_EQ(test, delay, CD321X_ACK_RETRY_MAX_MS);
+
+	/* Once acknowledged, the cable state has its bounded budget again. */
+	KUNIT_EXPECT_TRUE(test, cd321x_pm_acked(&pm));
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_acked(&pm));
+	for (i = 0; i < CD321X_RESUME_ATTEMPTS; i++) {
+		KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
+		KUNIT_EXPECT_EQ(test, cd321x_pm_retry(&pm, true),
+				i + 1 < CD321X_RESUME_ATTEMPTS);
+	}
+	KUNIT_EXPECT_EQ(test, pm.phase, CD321X_PM_STALE);
+}
+
+static void cd321x_unacked_events_across_sleep_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = {};
+	unsigned int delay;
+
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_event_lost(&pm));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
+	delay = cd321x_pm_ack_failed(&pm);
+	cd321x_pm_prepare(&pm);
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_begin_read(&pm));
+	/* The resume read takes over the retries, without starting afresh. */
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_resume(&pm));
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
+	KUNIT_EXPECT_GT(test, cd321x_pm_ack_failed(&pm), delay);
+	cd321x_pm_remove(&pm);
+	KUNIT_EXPECT_FALSE(test, cd321x_pm_begin_read(&pm));
+}
+
 /* Only a pipeline owned by another port skips the retry. */
 static void cd321x_display_taken_test(struct kunit *test)
 {
@@ -451,6 +554,11 @@ static struct kunit_case cd321x_pm_cases[] = {
 	KUNIT_CASE(cd321x_read_and_apply_share_budget_test),
 	KUNIT_CASE(cd321x_status_event_after_exhaustion_test),
 	KUNIT_CASE(cd321x_runtime_failure_revalidates_test),
+	KUNIT_CASE(cd321x_lost_event_rereads_test),
+	KUNIT_CASE(cd321x_lost_event_left_to_resume_test),
+	KUNIT_CASE(cd321x_lost_event_keeps_reconnect_test),
+	KUNIT_CASE(cd321x_unacked_events_outlast_budget_test),
+	KUNIT_CASE(cd321x_unacked_events_across_sleep_test),
 	KUNIT_CASE(cd321x_display_taken_test),
 	{}
 };
