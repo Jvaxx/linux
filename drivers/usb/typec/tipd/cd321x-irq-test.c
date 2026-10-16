@@ -13,6 +13,8 @@
 #define TEST_REG_INT_EVENT1	0x14
 #define TEST_REG_INT_CLEAR1	0x18
 #define TEST_REG_STATUS		0x1a
+#define TEST_REG_POWER_STATUS	0x3f
+#define TEST_REG_RX_IDENTITY_SOP 0x48
 
 /*
  * The controller latches events in INT_EVENT1 until they are written to
@@ -25,6 +27,10 @@ struct cd321x_test_ctrl {
 	unsigned int failing_event_reads;
 	unsigned int failing_clear_writes;
 	unsigned int failing_status_reads;
+	unsigned int failing_identity_reads;
+	u32 status;
+	u16 pwr_status;
+	struct usb_pd_identity identity;
 };
 
 struct cd321x_test {
@@ -58,6 +64,19 @@ static int cd321x_test_read(void *context, const void *reg, size_t reg_size,
 			ctrl->failing_status_reads--;
 			return -ETIMEDOUT;
 		}
+		memcpy(val, &ctrl->status, min(val_size, sizeof(ctrl->status)));
+		break;
+	case TEST_REG_POWER_STATUS:
+		memcpy(val, &ctrl->pwr_status, min(val_size, sizeof(ctrl->pwr_status)));
+		break;
+	case TEST_REG_RX_IDENTITY_SOP:
+		if (ctrl->failing_identity_reads) {
+			ctrl->failing_identity_reads--;
+			return -ETIMEDOUT;
+		}
+		/* The identity follows a status byte. */
+		memcpy(val + 1, &ctrl->identity,
+		       min(val_size - 1, sizeof(ctrl->identity)));
 		break;
 	}
 
@@ -234,6 +253,31 @@ static void cd321x_failed_read_after_giving_up_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, t->ctrl.latched, 0);
 }
 
+static void cd321x_failed_identity_read_recovers_test(struct kunit *test)
+{
+	struct cd321x_test *t = cd321x_test_port(test);
+	const struct usb_pd_identity old = { .id_header = 0x11 };
+
+	t->cd.tps.partner_identity = old;
+	t->cd.update_status.partner_identity = old;
+	t->ctrl.status = TPS_STATUS_PLUG_PRESENT;
+	t->ctrl.pwr_status = FIELD_PREP(TPS_POWER_STATUS_TYPEC_CURRENT_MASK,
+					TYPEC_PWR_MODE_PD);
+	t->ctrl.identity.id_header = 0x22;
+	t->ctrl.failing_identity_reads = 1;
+	cd321x_test_raise(&t->ctrl, APPLE_CD_REG_INT_POWER_STATUS_UPDATE);
+	cd321x_test_interrupt(t);
+	KUNIT_ASSERT_EQ(test, t->ctrl.latched, 0);
+
+	/* An incomplete read must not replace the identity in use... */
+	KUNIT_EXPECT_EQ(test, t->cd.update_status.partner_identity.id_header,
+			old.id_header);
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&t->cd.update_work));
+	/* ...but be completed by a fresh one. */
+	cd321x_test_recover(test, t);
+	KUNIT_EXPECT_EQ(test, t->cd.update_status.partner_identity.id_header, 0x22U);
+}
+
 static void cd321x_failed_clear_recovers_test(struct kunit *test)
 {
 	struct cd321x_test *t = cd321x_test_port(test);
@@ -329,6 +373,7 @@ static struct kunit_case cd321x_irq_cases[] = {
 	KUNIT_CASE(cd321x_failed_event_read_recovers_test),
 	KUNIT_CASE(cd321x_failed_status_read_recovers_test),
 	KUNIT_CASE(cd321x_failed_read_after_giving_up_test),
+	KUNIT_CASE(cd321x_failed_identity_read_recovers_test),
 	KUNIT_CASE(cd321x_failed_clear_recovers_test),
 	KUNIT_CASE(cd321x_event_reads_failing_for_long_test),
 	KUNIT_CASE(cd321x_clear_writes_failing_for_long_test),
