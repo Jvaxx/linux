@@ -241,6 +241,61 @@ static void usb_wakeup_stay_awake_armed_vl122_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, usb_wakeup_reaches(&root->udev));
 }
 
+/*
+ * The defaults behind the front port of a J700: the VL122 hub, which does not
+ * pass a remote wakeup on while it is suspended, has wakeup disabled, as hubs
+ * have by default, and a keyboard below it has it enabled. The VL122 is kept
+ * awake for the keyboard, and so is the root hub above it.
+ */
+static void usb_wakeup_stay_awake_vl122_test(struct kunit *test)
+{
+	struct usb_wakeup_test_dev *root = usb_wakeup_test_s2idle_root(test);
+	struct usb_wakeup_test_dev *vl122 = usb_wakeup_test_add(test, root, true);
+	struct usb_wakeup_test_dev *hub = usb_wakeup_test_add(test, vl122, true);
+	struct usb_wakeup_test_dev *keyboard = usb_wakeup_test_add(test, hub, false);
+
+	vl122->udev.quirks = USB_WAKEUP_TEST_VL122;
+	KUNIT_EXPECT_FALSE(test, usb_stay_awake_for_wakeup(&vl122->udev, PMSG_SUSPEND));
+
+	keyboard->udev.do_remote_wakeup = 1;
+	KUNIT_EXPECT_FALSE(test, usb_stay_awake_for_wakeup(&keyboard->udev, PMSG_SUSPEND));
+	KUNIT_EXPECT_FALSE(test, usb_stay_awake_for_wakeup(&hub->udev, PMSG_SUSPEND));
+	KUNIT_EXPECT_TRUE(test, usb_stay_awake_for_wakeup(&vl122->udev, PMSG_SUSPEND));
+
+	vl122->udev.awake_in_sleep = 1;
+	KUNIT_EXPECT_TRUE(test, usb_stay_awake_for_wakeup(&root->udev, PMSG_SUSPEND));
+}
+
+/*
+ * Nothing is kept awake for other system sleep transitions, for a controller
+ * that halts or may not wake the system, or with no device below that can wake.
+ */
+static void usb_wakeup_stay_awake_not_test(struct kunit *test)
+{
+	struct usb_wakeup_test_dev *root = usb_wakeup_test_s2idle_root(test);
+	struct usb_wakeup_test_dev *vl122 = usb_wakeup_test_add(test, root, true);
+	struct usb_wakeup_test_dev *keyboard = usb_wakeup_test_add(test, vl122, false);
+	struct usb_hcd *hcd = bus_to_hcd(root->udev.bus);
+
+	vl122->udev.quirks = USB_WAKEUP_TEST_VL122;
+	KUNIT_EXPECT_FALSE(test, usb_stay_awake_for_wakeup(&vl122->udev, PMSG_SUSPEND));
+	keyboard->udev.do_remote_wakeup = 1;
+	KUNIT_ASSERT_TRUE(test, usb_stay_awake_for_wakeup(&vl122->udev, PMSG_SUSPEND));
+
+	KUNIT_EXPECT_FALSE(test, usb_stay_awake_for_wakeup(&vl122->udev, PMSG_FREEZE));
+
+	pm_suspend_target_state = PM_SUSPEND_MEM;
+	KUNIT_EXPECT_FALSE(test, usb_stay_awake_for_wakeup(&vl122->udev, PMSG_SUSPEND));
+	pm_suspend_target_state = PM_SUSPEND_TO_IDLE;
+
+	hcd->runs_in_s2idle = 0;
+	KUNIT_EXPECT_FALSE(test, usb_stay_awake_for_wakeup(&vl122->udev, PMSG_SUSPEND));
+	hcd->runs_in_s2idle = 1;
+
+	device_set_wakeup_enable(hcd->self.controller, false);
+	KUNIT_EXPECT_FALSE(test, usb_stay_awake_for_wakeup(&vl122->udev, PMSG_SUSPEND));
+}
+
 static struct kunit_case usb_wakeup_test_cases[] = {
 	KUNIT_CASE(usb_wakeup_reaches_vl122_test),
 	KUNIT_CASE(usb_wakeup_reaches_hub_test),
@@ -249,6 +304,8 @@ static struct kunit_case usb_wakeup_test_cases[] = {
 	KUNIT_CASE(usb_wakeup_reaches_nothing_test),
 	KUNIT_CASE(usb_wakeup_reaches_armed_vl122_test),
 	KUNIT_CASE(usb_wakeup_stay_awake_armed_vl122_test),
+	KUNIT_CASE(usb_wakeup_stay_awake_vl122_test),
+	KUNIT_CASE(usb_wakeup_stay_awake_not_test),
 	{}
 };
 
