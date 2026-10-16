@@ -7,31 +7,32 @@
  * Based on scpi-cpufreq.c
  */
 
-#include <linux/bitfield.h>
-#include <linux/bitops.h>
-#include <linux/cpu.h>
-#include <linux/cpufreq.h>
 #include <linux/cpuhotplug.h>
-#include <linux/cpumask.h>
-#include <linux/delay.h>
-#include <linux/err.h>
 #include <linux/hrtimer.h>
-#include <linux/io.h>
-#include <linux/iopoll.h>
 #include <linux/jiffies.h>
 #include <linux/ktime.h>
 #include <linux/math64.h>
-#include <linux/module.h>
-#include <linux/of.h>
-#include <linux/of_address.h>
-#include <linux/pm_opp.h>
 #include <linux/pm_qos.h>
-#include <linux/slab.h>
 #include <linux/soc/apple/pmp-report.h>
 #include <linux/spinlock.h>
 #include <linux/tick.h>
 #include <linux/timer.h>
 #include <linux/workqueue.h>
+
+#include <linux/bitfield.h>
+#include <linux/bitops.h>
+#include <linux/cpu.h>
+#include <linux/cpufreq.h>
+#include <linux/cpumask.h>
+#include <linux/delay.h>
+#include <linux/err.h>
+#include <linux/io.h>
+#include <linux/iopoll.h>
+#include <linux/module.h>
+#include <linux/of.h>
+#include <linux/of_address.h>
+#include <linux/pm_opp.h>
+#include <linux/slab.h>
 
 #define APPLE_DVFS_CMD				0x20
 #define APPLE_DVFS_CMD_BUSY			BIT(31)
@@ -524,330 +525,6 @@ static void apple_fast_die_sample(struct apple_fast_die *fd)
 	u8 effort;
 	int ret;
 
-	ret = apple_neo_pmp_report_fast_die_effort(fd->report, fd->lane, &effort);
-	if (!ret) {
-		limit = apple_fast_die_limit(fd, effort);
-		fd->waiting = false;
-	} else {
-		limit = fd->fallback;
-		fd->waiting = true;
-		if (!fd->warned &&
-		    time_after(jiffies, fd->start + APPLE_FAST_DIE_WARN_S * HZ)) {
-			fd->warned = true;
-			dev_warn(priv->cpu_dev,
-				 "PMP not running after %d s (%d): fast die-temperature limit unavailable, CPUs %*pbl stay limited to %u kHz\n",
-				 APPLE_FAST_DIE_WARN_S, ret,
-				 cpumask_pr_args(fd->cpus), limit);
-		}
-	}
-
-	if (limit != fd->limit) {
-		WRITE_ONCE(fd->limit, limit);
-		schedule_work(&fd->work);
-	}
-}
-
-static void apple_fast_die_work(struct work_struct *work)
-{
-	struct apple_fast_die *fd = container_of(work, struct apple_fast_die, work);
-	struct apple_cpu_priv *priv = fd->policy->driver_data;
-	unsigned int limit = READ_ONCE(fd->limit);
-	int ret;
-
-	ret = freq_qos_update_request(&fd->req, limit);
-	if (ret >= 0)
-		return;
-
-	dev_warn_ratelimited(priv->cpu_dev,
-			     "failed to update the fast die-temperature limit: %d\n", ret);
-	/* Make the next sample queue the update again, and make sure it comes. */
-	spin_lock_bh(&fd->lock);
-	if (fd->limit == limit) {
-		fd->limit = 0;
-		apple_fast_die_arm(fd);
-	}
-	spin_unlock_bh(&fd->lock);
-}
-
-static enum hrtimer_restart apple_fast_die_poll(struct hrtimer *t)
-{
-	struct apple_fast_die *fd = container_of(t, struct apple_fast_die, poll);
-	enum hrtimer_restart restart = HRTIMER_NORESTART;
-
-	spin_lock(&fd->lock);
-	apple_fast_die_sample(fd);
-	if (!fd->stopping && (!fd->per_cpu || fd->limit < fd->max)) {
-		hrtimer_forward_now(t, apple_fast_die_interval(fd));
-		restart = HRTIMER_RESTART;
-	} else {
-		fd->polling = false;
-	}
-	spin_unlock(&fd->lock);
-
-	return restart;
-}
-
-static void apple_fast_die_tick(struct timer_list *t)
-{
-	struct apple_fast_die_timer *ft = timer_container_of(ft, t, timer);
-	struct apple_fast_die *fd = ft->fd;
-	unsigned long now = jiffies;
-
-	/*
-	 * The first busy CPU of the cluster to run in a tick takes the sample,
-	 * unless the non-deferrable timer is sampling.
-	 */
-	if (xchg(&fd->last_poll, now) != now && spin_trylock(&fd->lock)) {
-		if (!fd->polling) {
-			apple_fast_die_sample(fd);
-			apple_fast_die_arm(fd);
-		}
-		spin_unlock(&fd->lock);
-	}
-	mod_timer(t, now + 1);
-}
-
-static int apple_fast_die_cpu_online(unsigned int cpu)
-{
-	struct apple_fast_die_timer *ft = per_cpu_ptr(&apple_fast_die_timers, cpu);
-
-	if (!ft->fd)
-		return 0;
-
-	/* Wait for a running sample, which rearms the timer, before arming it. */
-	timer_delete_sync(&ft->timer);
-	ft->timer.expires = jiffies + 1;
-	add_timer_on(&ft->timer, cpu);
-
-	return 0;
-}
-
-static int apple_fast_die_cpu_offline(unsigned int cpu)
-{
-	struct apple_fast_die_timer *ft = per_cpu_ptr(&apple_fast_die_timers, cpu);
-
-	if (ft->fd)
-		timer_delete_sync(&ft->timer);
-
-	return 0;
-}
-
-/*
- * Called at the end of ->init(), with the CPU hotplug lock held.  The core
- * fills policy->related_cpus only after ->init() returns, and may call ->exit()
- * before it does, so the limit keeps its own copy of the cluster's CPUs.
- */
-static int apple_fast_die_init(struct cpufreq_policy *policy,
-			       struct device_node *cluster)
-{
-	struct apple_cpu_priv *priv = policy->driver_data;
-	struct of_phandle_args args;
-	struct apple_fast_die *fd;
-	unsigned int cpu, i, n = 0;
-	bool have_power = true;
-	int parsed, ret;
-
-	parsed = of_parse_phandle_with_fixed_args(cluster, "apple,fast-die-effort",
-						  1, 0, &args);
-	/* Required thermal admission must fail closed with an older DT. */
-	if (parsed == -ENOENT && !priv->info->needs_thermal_policy)
-		return 0;
-
-	while (policy->freq_table[n].frequency != CPUFREQ_TABLE_END)
-		n++;
-
-	fd = kzalloc_flex(*fd, power, n);
-	if (!fd) {
-		ret = -ENOMEM;
-		goto err_put;
-	}
-	fd->nr_states = n;
-	if (!zalloc_cpumask_var(&fd->cpus, GFP_KERNEL)) {
-		ret = -ENOMEM;
-		goto err_free;
-	}
-
-	for (i = 0; i < n; i++) {
-		unsigned long rate = policy->freq_table[i].frequency * 1000UL + 999;
-		struct dev_pm_opp *opp = dev_pm_opp_find_freq_floor(priv->cpu_dev, &rate);
-
-		if (IS_ERR(opp)) {
-			ret = PTR_ERR(opp);
-			goto err_free;
-		}
-		fd->power[i] = dev_pm_opp_get_power(opp);
-		dev_pm_opp_put(opp);
-		if (!fd->power[i])
-			have_power = false;
-	}
-	/* Without an energy model, frequency stands in for power. */
-	if (!have_power)
-		for (i = 0; i < n; i++)
-			fd->power[i] = policy->freq_table[i].frequency;
-
-	fd->policy = policy;
-	spin_lock_init(&fd->lock);
-	INIT_WORK(&fd->work, apple_fast_die_work);
-	hrtimer_setup(&fd->poll, apple_fast_die_poll, CLOCK_MONOTONIC,
-		      HRTIMER_MODE_REL_SOFT);
-	cpumask_copy(fd->cpus, policy->cpus);
-	fd->per_cpu = apple_fast_die_hp_state > 0;
-	for_each_cpu(cpu, fd->cpus)
-		if (tick_nohz_full_cpu(cpu))
-			fd->per_cpu = false;
-	fd->max = policy->freq_table[n - 1].frequency;
-	fd->fallback = apple_fast_die_fit(fd, div_u64(fd->power[n - 1], 3));
-	fd->start = jiffies;
-
-	if (parsed) {
-		/* The limit is meant to be there, so keep the fallback. */
-		dev_warn(priv->cpu_dev,
-			 "invalid apple,fast-die-effort (%d): CPUs %*pbl stay limited to %u kHz\n",
-			 parsed, cpumask_pr_args(fd->cpus), fd->fallback);
-		fd->warned = true;
-	} else {
-		fd->report = args.np;
-		fd->lane = args.args[0];
-	}
-
-	/* Hold the fallback limit until a sample finds the PMP running. */
-	fd->limit = fd->fallback;
-	ret = freq_qos_add_request(&policy->constraints, &fd->req, FREQ_QOS_MAX,
-				   fd->limit);
-	if (ret < 0)
-		goto err_free;
-
-	priv->fast_die = fd;
-
-	if (fd->per_cpu) {
-		for_each_cpu(cpu, fd->cpus) {
-			struct apple_fast_die_timer *ft =
-				per_cpu_ptr(&apple_fast_die_timers, cpu);
-
-			timer_setup(&ft->timer, apple_fast_die_tick,
-				    TIMER_DEFERRABLE | TIMER_PINNED);
-			ft->fd = fd;
-			if (cpu_online(cpu))
-				apple_fast_die_cpu_online(cpu);
-		}
-	}
-
-	spin_lock_bh(&fd->lock);
-	apple_fast_die_arm(fd);
-	spin_unlock_bh(&fd->lock);
-
-	dev_dbg(priv->cpu_dev, "fast die-temperature limit set up, fallback %u kHz\n",
-		fd->fallback);
-
-	return 0;
-
-err_free:
-	free_cpumask_var(fd->cpus);
-	kfree(fd);
-err_put:
-	if (!parsed)
-		of_node_put(args.np);
-	return ret;
-}
-
-static void apple_fast_die_exit(struct apple_cpu_priv *priv)
-{
-	struct apple_fast_die *fd = priv->fast_die;
-	unsigned int cpu;
-
-	if (!fd)
-		return;
-
-	/*
-	 * Keep the update work from arming the hrtimer again, stop the per-CPU
-	 * timers, which can arm it too, then the hrtimer, and then drain the
-	 * update any of them may have queued.
-	 */
-	spin_lock_bh(&fd->lock);
-	fd->stopping = true;
-	spin_unlock_bh(&fd->lock);
-	if (fd->per_cpu) {
-		for_each_cpu(cpu, fd->cpus) {
-			struct apple_fast_die_timer *ft =
-				per_cpu_ptr(&apple_fast_die_timers, cpu);
-
-			timer_shutdown_sync(&ft->timer);
-			ft->fd = NULL;
-		}
-	}
-	hrtimer_cancel(&fd->poll);
-	cancel_work_sync(&fd->work);
-	freq_qos_remove_request(&fd->req);
-
-	priv->fast_die = NULL;
-	of_node_put(fd->report);
-	free_cpumask_var(fd->cpus);
-	kfree(fd);
-}
-
-/* The fastest state whose power is at most @budget, or the slowest. */
-static unsigned int apple_fast_die_fit(const struct apple_fast_die *fd,
-				       u64 budget)
-{
-	unsigned int i, idx = 0;
-
-	for (i = 0; i < fd->nr_states; i++)
-		if (fd->power[i] <= budget)
-			idx = i;
-
-	return fd->policy->freq_table[idx].frequency;
-}
-
-/*
- * Map an effort to a frequency limit, in kHz: the fastest state whose power
- * fits a budget of (255 - effort) / 255 of the fastest state's power.  Any
- * mapping that lowers the limit monotonically as the effort rises would do,
- * since the firmware's loop is closed on the die temperature and corrects
- * the error; power is the natural axis for the output of a temperature
- * controller.
- */
-static unsigned int apple_fast_die_limit(const struct apple_fast_die *fd,
-					 unsigned int effort)
-{
-	/*
-	 * Multiply first: dividing the fastest state's power by 255 first
-	 * rounds it down, which would limit an unlimited cluster one state low.
-	 */
-	return apple_fast_die_fit(fd,
-				  div_u64((u64)fd->power[fd->nr_states - 1] *
-					  (APPLE_FAST_DIE_EFFORT_MAX - effort),
-					  APPLE_FAST_DIE_EFFORT_MAX));
-}
-
-static ktime_t apple_fast_die_interval(const struct apple_fast_die *fd)
-{
-	if (!fd->waiting)
-		return ms_to_ktime(APPLE_FAST_DIE_POLL_MS);
-	if (!fd->warned)
-		return ms_to_ktime(APPLE_FAST_DIE_WAIT_MS);
-	return ms_to_ktime(APPLE_FAST_DIE_GAVE_UP_MS);
-}
-
-/* Arm the non-deferrable timer if the limit needs it.  Call with @lock held. */
-static void apple_fast_die_arm(struct apple_fast_die *fd)
-{
-	if (fd->stopping || fd->polling ||
-	    (fd->per_cpu && fd->limit >= fd->max))
-		return;
-
-	fd->polling = true;
-	hrtimer_start(&fd->poll, apple_fast_die_interval(fd),
-		      HRTIMER_MODE_REL_SOFT);
-}
-
-/* Take a sample and queue an update if the limit changes.  Call with @lock held. */
-static void apple_fast_die_sample(struct apple_fast_die *fd)
-{
-	struct apple_cpu_priv *priv = fd->policy->driver_data;
-	unsigned int limit;
-	u8 effort;
-	int ret;
-
 	ret = apple_pmp_report_fast_die_effort(fd->report, fd->lane, &effort);
 	if (!ret) {
 		limit = apple_fast_die_limit(fd, effort);
@@ -1232,16 +909,6 @@ static int apple_soc_cpufreq_init(struct cpufreq_policy *policy)
 	policy->dvfs_possible_from_any_cpu = true;
 	policy->fast_switch_possible = !info->verify_transition;
 	policy->suspend_freq = freq_table[0].frequency;
-	/* Unqualified SoCs still require protection above their safe ceiling. */
-	if (info->needs_thermal_policy) {
-		cpufreq_for_each_valid_entry(p, policy->freq_table) {
-			if (p->driver_data <= info->max_unmanaged_pstate)
-				continue;
-			dev_err(cpu_dev, "higher P-states require a qualified thermal policy\n");
-			ret = -ENODEV;
-			goto out_free_cpufreq_table;
-		}
-	}
 
 	return 0;
 

@@ -5,4 +5,3 @@ obj-$(CONFIG_APPLE_PMP_REPORT)	+= pmp-report.o
 obj-$(CONFIG_APPLE_PMP_REPORT_KUNIT_TEST) += pmp-report-test.o
 
 obj-$(CONFIG_APPLE_PMC) += pmc.o
-obj-$(CONFIG_APPLE_PMP_REPORT_NEO) += pmp-report-neo.o

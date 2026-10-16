@@ -372,80 +372,6 @@
 		};
 	};
 
-	gpu_opp: opp-table-gpu {
-		compatible = "operating-points-v2";
-
-		/*
-		 * NOTE: The operating points are device-specific and must be
-		 * filled in by the bootloader. Entries keep the order of the
-		 * GPU performance states, which is not sorted by frequency.
-		 */
-		opp00 {
-			opp-hz = /bits/ 64 <0>;
-			opp-microvolt = <125000>;
-		};
-		opp01 {
-			opp-hz = /bits/ 64 <338000000>;
-			opp-microvolt = <605000>;
-		};
-		opp02 {
-			opp-hz = /bits/ 64 <492000000>;
-			opp-microvolt = <630000>;
-		};
-		opp03 {
-			opp-hz = /bits/ 64 <618000000>;
-			opp-microvolt = <650000>;
-		};
-		opp04 {
-			opp-hz = /bits/ 64 <796000000>;
-			opp-microvolt = <695000>;
-		};
-		opp05 {
-			opp-hz = /bits/ 64 <928000000>;
-			opp-microvolt = <745000>;
-		};
-		opp06 {
-			opp-hz = /bits/ 64 <952000000>;
-			opp-microvolt = <800000>;
-		};
-		opp07 {
-			opp-hz = /bits/ 64 <1056000000>;
-			opp-microvolt = <800000>;
-		};
-		opp08 {
-			opp-hz = /bits/ 64 <1053000000>;
-			opp-microvolt = <845000>;
-		};
-		opp09 {
-			opp-hz = /bits/ 64 <1170000000>;
-			opp-microvolt = <845000>;
-		};
-		opp10 {
-			opp-hz = /bits/ 64 <1152000000>;
-			opp-microvolt = <885000>;
-		};
-		opp11 {
-			opp-hz = /bits/ 64 <1278000000>;
-			opp-microvolt = <885000>;
-		};
-		opp12 {
-			opp-hz = /bits/ 64 <1204000000>;
-			opp-microvolt = <905000>;
-		};
-		opp13 {
-			opp-hz = /bits/ 64 <1338000000>;
-			opp-microvolt = <905000>;
-		};
-		opp14 {
-			opp-hz = /bits/ 64 <1326000000>;
-			opp-microvolt = <975000>;
-		};
-		opp15 {
-			opp-hz = /bits/ 64 <1470000000>;
-			opp-microvolt = <975000>;
-		};
-	};
-
 	timer {
 		compatible = "arm,armv8-timer";
 		interrupt-parent = <&aic>;
@@ -567,11 +493,6 @@
 			pmp_report_gfx: report@9 {
 				compatible = "apple,t8140-pmp-v2-report-entry",
 					     "apple,t6000-pmp-v2-report-entry";
-				reg = <0x9>;
-				label = "pmp-gfx";
-				#power-domain-cells = <0>;
-				power-domains = <&ps_gfx>;
-				compatible = "apple,t8140-pmp-v2-report-entry";
 				reg = <0x9>;
 				label = "pmp-gfx";
 				#power-domain-cells = <0>;
@@ -752,6 +673,7 @@
 			reg = <0x3 0x700000 0 0x14000>;
 			/* child nodes are added in t8140-pmgr.dtsi */
 		};
+
 
 		aic: interrupt-controller@301000000 {
 			compatible = "apple,t8140-aic3", "apple,t8122-aic3";
@@ -1251,48 +1173,12 @@
 				     <AIC_IRQ 1000 IRQ_TYPE_LEVEL_HIGH>;
 			interrupt-names = "send-empty", "recv-not-empty";
 			apple,firmware-role = "GFX1";
-			reg = <0x4 0x82600000 0x0 0x4000>,
-			      <0x4 0x82e00000 0x0 0x4000>,
-			      <0x4 0x80000000 0x0 0x4000000>;
-			reg-names = "asc", "sgx";
-			mboxes = <&gfx_mbox>, <&gfx1_mbox>;
-			power-domains = <&ps_gfx>;
-			memory-region = <&uat_ttbs>, <&uat_pagetables>,
-					<&uat_handoff>;
-			memory-region-names = "ttbs", "pagetables", "handoff";
-			operating-points-v2 = <&gpu_opp>;
-			status = "disabled";
-		};
-
-		gfx_mbox: mailbox@482600000 {
-			compatible = "apple,t8140-ascwrap-v6";
-			reg = <0x4 0x82600000 0x0 0x88000>,
-			      <0x4 0x82050000 0x0 0x8>;
-			reg-names = "wrapper", "iop-vbar";
-			interrupt-parent = <&aic>;
-			interrupts = <AIC_IRQ 993 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 996 IRQ_TYPE_LEVEL_HIGH>;
-			interrupt-names = "send-empty", "recv-not-empty";
-			apple,firmware-role = "GFX";
 			power-domains = <&ps_gfx>;
 			#mbox-cells = <0>;
 			status = "disabled";
 		};
-
-		gfx1_mbox: mailbox@482e00000 {
-			compatible = "apple,t8140-ascwrap-v6";
-			reg = <0x4 0x82e00000 0x0 0x88000>,
-			      <0x4 0x82850000 0x0 0x8>;
-			reg-names = "wrapper", "iop-vbar";
-			interrupt-parent = <&aic>;
-			interrupts = <AIC_IRQ 997 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 1000 IRQ_TYPE_LEVEL_HIGH>;
-			interrupt-names = "send-empty", "recv-not-empty";
-			apple,firmware-role = "GFX1";
-			power-domains = <&ps_gfx>;
-			#mbox-cells = <0>;
-			status = "disabled";
-		};
+	};
+};
 
 &soc {
 		disp0_dart: iommu@412300000 {
@@ -1324,96 +1210,6 @@
 			/* VM window of stream 23 */
 			apple,dma-range = <0x100 0x0 0x10 0x0>;
 			status = "disabled";
-		};
-
-		dcp_mbox: mailbox@412e08000 {
-			compatible = "apple,t8140-asc-mailbox", "apple,asc-mailbox-v4";
-			reg = <0x4 0x12e08000 0x0 0x4000>;
-			interrupt-parent = <&aic>;
-			interrupts = <AIC_IRQ 679 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 680 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 681 IRQ_TYPE_LEVEL_HIGH>,
-				     <AIC_IRQ 682 IRQ_TYPE_LEVEL_HIGH>;
-			interrupt-names = "send-empty", "send-not-empty",
-					  "recv-empty", "recv-not-empty";
-			#mbox-cells = <0>;
-			power-domains = <&ps_disp_cpu>;
-			status = "disabled";
-		};
-
-		/*
-		 * Perf-state floors of voter agents 0-3, and the rail state and
-		 * interface enable words, in the PMC window at 0x302800000.
-		 */
-		pmc: power-management@302800000 {
-			compatible = "apple,t8140-pmc";
-			reg = <0x3 0x02800000 0x0 0x10000>,
-			      <0x3 0x028aa000 0x0 0x3000>;
-			reg-names = "voters", "rails";
-			power-domains = <&ps_pmc>;
-			#address-cells = <1>;
-			#size-cells = <0>;
-			/* PMP, CLPC and AP agents */
-			apple,static-voters = <0 1 3>;
-			status = "disabled";
-
-			clpc: performance-controller@1 {
-				compatible = "apple,t8140-clpc";
-				reg = <1>;
-				apple,gpu-power-state = <&ps_gfx>;
-			};
-		};
-
-		/*
-		 * Bandwidth scratch and request registers, 0x20000 and 0x68000
-		 * into the display clock window at 0x302800000 (the sixth disp0
-		 * register range in the Apple Device Tree).
-		 */
-		pmgr_dcp: power-management@302820000 {
-			reg = <0x3 0x02820000 0x0 0x8>,
-			      <0x3 0x02868000 0x0 0x4>;
-			reg-names = "dcp-bw-scratch", "dcp-bw-doorbell";
-			#apple,bw-scratch-cells = <3>;
-			#apple,bw-doorbell-cells = <2>;
-		};
-
-		dcp: dcp@412e00000 {
-			compatible = "apple,t8140-dcp", "apple,dcp";
-			reg = <0x4 0x12e00000 0x0 0x4000>,
-			      <0x4 0x10000000 0x0 0xafc000>,
-			      <0x4 0x12240000 0x0 0x10000>,
-			      <0x4 0x123a8000 0x0 0x4000>,
-			      <0x4 0x123ac000 0x0 0x4000>,
-			      <0x4 0x12800000 0x0 0x800000>,
-			      <0x4 0x12850000 0x0 0x4000>;
-			reg-names = "coproc", "disp-0", "disp-1", "disp-2",
-				    "disp-3", "disp-4", "iop-vbar";
-			mboxes = <&dcp_mbox>;
-			mbox-names = "mbox";
-			iommus = <&dcp_dart 23>;
-			power-domains = <&ps_disp_cpu>;
-			clocks = <&clk_disp0_154>, <&clk_disp0_194>;
-			clock-names = "clock-154", "clock-194";
-			apple,bw-scratch = <&pmgr_dcp 0 5 0>;
-			apple,bw-doorbell = <&pmgr_dcp 1 6>;
-			/*
-			 * A single zero selects surface 0; J700 kernels that
-			 * read this as a surface list take it the same way.
-			 */
-			apple,iomfb-surfaces = <0>;
-			/* generate a phandle for the loader */
-			phandle = <&dcp>;
-			/* bus properties for the piodma child device */
-			#address-cells = <2>;
-			#size-cells = <2>;
-			ranges;
-			/* the loader enables it when it hands the display over */
-			status = "disabled";
-
-			disp0_piodma: piodma {
-				iommus = <&disp0_dart 16>;
-				phandle = <&disp0_piodma>;
-			};
 		};
 
 		dcp_mbox: mailbox@412e08000 {
@@ -1542,6 +1338,7 @@
 				pinmux = <APPLE_PINMUX(170, 1)>,
 					 <APPLE_PINMUX(171, 1)>;
 			};
+
 		};
 
 		avd: avd@381080000 {
@@ -1994,7 +1791,6 @@
 			power-domains = <&ps_ane_sys>;
 			status = "disabled";
 		};
-	};
 };
 
 #include "t8140-pmgr.dtsi"

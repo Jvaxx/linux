@@ -130,6 +130,9 @@ impl PmpState {
 #[pin_data]
 struct PmpData {
     dev: ARef<device::Device>,
+    /// T8140 firmware is not sent the UPDATE_IOREG confirmation, and its
+    /// messages are not taken as device-power replies.
+    t8140: bool,
     pmp_mmio: Pin<KBox<Devres<IoMem<PMP_MIN_MMIO_SIZE>>>>,
     asc_mmio: Pin<KBox<Devres<IoMem<ASC_MMIO_SIZE>>>>,
     #[pin]
@@ -143,7 +146,7 @@ struct PmpData {
 }
 
 impl PmpData {
-    fn new(dev: &platform::Device<Core>) -> Result<Arc<PmpData>> {
+    fn new(dev: &platform::Device<Core>, t8140: bool) -> Result<Arc<PmpData>> {
         let pmp_req = dev.io_request_by_name(c"pmp").ok_or(EINVAL)?;
         let pmp_mmio = KBox::pin_init(pmp_req.iomap_sized::<PMP_MIN_MMIO_SIZE>(), GFP_KERNEL)?;
         let asc_req = dev.io_request_by_name(c"asc").ok_or(EINVAL)?;
@@ -152,6 +155,7 @@ impl PmpData {
             try_pin_init!(
                 PmpData {
                     dev: dev.as_ref().into(),
+                    t8140,
                     pmp_mmio,
                     asc_mmio,
                     rtkit <- new_mutex!(None),
@@ -361,7 +365,8 @@ impl PmpData {
     }
     fn recv_message(&self, msg: u64) -> Result<()> {
         let pm_command = (msg >> PM_COMMAND_SHIFT) & 0xff;
-        if msg & PM_COMMAND_MARKER != 0 && (pm_command == 0x0f || pm_command == 0x10) {
+        if !self.t8140 && msg & PM_COMMAND_MARKER != 0 && (pm_command == 0x0f || pm_command == 0x10)
+        {
             let mut state = self.power_command.lock();
             state.reply(msg);
             if *state == Command::Failed {
@@ -380,7 +385,7 @@ impl PmpData {
             OPC_SET_IOREG => self.set_ioreg(msg & SET_IOREG_INDEX_MASK)?,
             // Firmware waits for this confirmation before publishing reports.
             // Do not echo the registry index/payload or add a generic ACK bit.
-            OPC_UPDATE_IOREG => OPC_CONFIRM_IOREG << OPC_SHIFT,
+            OPC_UPDATE_IOREG if !self.t8140 => OPC_CONFIRM_IOREG << OPC_SHIFT,
             _ => {
                 dev_err!(self.dev, "Got unknown message {}", msg);
                 return Err(EIO);
@@ -510,11 +515,12 @@ impl platform::Driver for PmpDriver {
 
     fn probe(pdev: &platform::Device<Core>, info: Option<&bool>) -> impl PinInit<Self, Error> {
         let dev: ARef<device::Device> = pdev.as_ref().into();
-        if info.copied().unwrap_or(false) {
+        let t8140 = info.copied().unwrap_or(false);
+        if t8140 {
             // SAFETY: The T8140 DART accepts 42-bit IOVAs; no DMA allocations exist yet.
             unsafe { pdev.dma_set_mask_and_coherent(DmaMask::new::<42>())? };
         }
-        let data = PmpData::new(pdev)?;
+        let data = PmpData::new(pdev, t8140)?;
         let node = dev.fwnode().ok_or(EIO)?;
         let dvid = node
             .property_read(c"apple,dram-vendor-id")

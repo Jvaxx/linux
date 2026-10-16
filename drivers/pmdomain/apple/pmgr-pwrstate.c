@@ -49,8 +49,10 @@ struct apple_pmgr_ps {
 	bool force_reset;
 	bool externally_clocked;
 	bool retained_25g83;
-	bool system_sleep;
 	bool firmware_owned;
+	/* T8140: follow a transition that times out with the opposite one. */
+	bool undo_timeout;
+	bool system_sleep;
 };
 
 #define genpd_to_apple_pmgr_ps(_genpd) container_of(_genpd, struct apple_pmgr_ps, genpd)
@@ -150,9 +152,10 @@ static bool apple_pmgr_ps_is_active(struct apple_pmgr_ps *ps)
 }
 
 /*
- * genpd keeps a domain off when ->power_on() fails and on when ->power_off()
- * fails. Follow a failed transition with the opposite one, so the domain is
- * not left requesting a state genpd does not know it is in.
+ * With undo_timeout (T8140, T8142): genpd keeps a domain off when ->power_on() fails
+ * and on when ->power_off() fails. Follow a failed transition with the
+ * opposite one, so the domain is not left requesting a state genpd does not
+ * know it is in.
  *
  * The exception is a failed power-on in the noirq and syscore phases of a
  * system sleep transition: genpd ignores the error there and records the
@@ -170,7 +173,7 @@ static int apple_pmgr_ps_power_on(struct generic_pm_domain *genpd)
 		return 0;
 
 	ret = apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_ACTIVE, true);
-	if (ret && !ps->system_sleep)
+	if (ret && ps->undo_timeout && !ps->system_sleep)
 		apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_PWRGATE, false);
 
 	return ret;
@@ -178,10 +181,14 @@ static int apple_pmgr_ps_power_on(struct generic_pm_domain *genpd)
 
 static int apple_pmgr_ps_power_off(struct generic_pm_domain *genpd)
 {
+	struct apple_pmgr_ps *ps = genpd_to_apple_pmgr_ps(genpd);
 	int ret;
 
+	if (ps->firmware_owned)
+		return 0;
+
 	ret = apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_PWRGATE, false);
-	if (ret)
+	if (ret && ps->undo_timeout)
 		apple_pmgr_ps_set(genpd, APPLE_PMGR_PS_ACTIVE, true);
 
 	return ret;
@@ -192,9 +199,24 @@ static void apple_pmgr_ps_set_system_sleep(struct device *dev, bool sleep)
 	struct apple_pmgr_ps *ps = dev_get_drvdata(dev);
 	unsigned long flags;
 
+	/* Only read by domains that undo a failed transition. */
+	if (!ps->undo_timeout)
+		return;
+
 	spin_lock_irqsave(&ps->genpd.slock, flags);
 	ps->system_sleep = sleep;
 	spin_unlock_irqrestore(&ps->genpd.slock, flags);
+}
+
+/*
+ * Domains that do not undo a failed transition need no sleep window: let the
+ * PM core treat them as it treats a device without PM callbacks.
+ */
+static int apple_pmgr_ps_prepare(struct device *dev)
+{
+	struct apple_pmgr_ps *ps = dev_get_drvdata(dev);
+
+	return !ps->undo_timeout;
 }
 
 static int apple_pmgr_ps_suspend_late(struct device *dev)
@@ -358,6 +380,8 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	}
 
 	ps->retained_25g83 = apple_pmgr_retained_25g83(node, ps->offset);
+	ps->undo_timeout = of_device_is_compatible(node, "apple,t8140-pmgr-pwrstate") ||
+			   of_device_is_compatible(node, "apple,t8142-pmgr-pwrstate");
 	ps->genpd.flags |= GENPD_FLAG_IRQ_SAFE;
 	ps->genpd.name = name;
 	ps->genpd.power_on = apple_pmgr_ps_power_on;
@@ -371,7 +395,8 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	ps->firmware_owned = of_property_read_bool(node, "apple,firmware-owned");
 
 	ret = of_property_read_u32(node, "apple,min-state", &ps->min_state);
-	if (!ps->retained_25g83 && ret == 0 && ps->min_state <= APPLE_PMGR_PS_ACTIVE)
+	if (!ps->retained_25g83 && ret == 0 && ps->min_state <= APPLE_PMGR_PS_ACTIVE &&
+	    !ps->firmware_owned)
 		regmap_update_bits(regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_PS_MIN,
 				   FIELD_PREP(APPLE_PMGR_PS_MIN, ps->min_state));
 
@@ -390,7 +415,6 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 			return dev_err_probe(dev, -EBUSY, "inherited domain %s is not active\n", name);
 		ps->genpd.flags |= GENPD_FLAG_ALWAYS_ON;
 	}
-	if (of_property_read_bool(node, "apple,always-on")) {
 	if (ps->firmware_owned) {
 		/* Consumers (the boot framebuffer) need it; never try to turn it on. */
 		if (!active)
@@ -414,7 +438,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	}
 
 	/* Turn on auto-PM if the domain is already on */
-	if (active && !ps->retained_25g83)
+	if (active && !ps->retained_25g83 && !ps->firmware_owned)
 		regmap_update_bits(regmap, ps->offset, APPLE_PMGR_FLAGS | APPLE_PMGR_AUTO_ENABLE,
 				   APPLE_PMGR_AUTO_ENABLE);
 
@@ -483,6 +507,7 @@ static const struct of_device_id apple_pmgr_ps_of_match[] = {
 MODULE_DEVICE_TABLE(of, apple_pmgr_ps_of_match);
 
 static const struct dev_pm_ops apple_pmgr_ps_pm_ops = {
+	.prepare = pm_sleep_ptr(apple_pmgr_ps_prepare),
 	LATE_SYSTEM_SLEEP_PM_OPS(apple_pmgr_ps_suspend_late, apple_pmgr_ps_resume_early)
 };
 
