@@ -56,6 +56,7 @@ attr() {
 
 ready() {
     log "Touch ID is ready after $(elapsed) s: $*"
+    pam_hint
     exit 0
 }
 
@@ -83,6 +84,17 @@ sensor_down() {
     not_ready "sensor attach incomplete; capture unavailable ($1, sensor $(attr sensor))"
 }
 
+# fprintd answers only what PAM asks it. Where authselect manages PAM (Fedora),
+# fingerprints stay unused until its with-fingerprint feature is on; that is
+# the user's choice, so only say how to make it.
+pam_hint() {
+    features=$(authselect current --raw 2>/dev/null) || return 0
+    case " $features " in
+        *" with-fingerprint "*) ;;
+        *) log "PAM does not use fingerprints; for Touch ID at sudo, polkit and the lock screen, run: sudo authselect enable-feature with-fingerprint" ;;
+    esac
+}
+
 if [ ! -c "$dev" ]; then
     log "$dev is not there; Touch ID is not available this boot"
     exit 0
@@ -107,6 +119,7 @@ done
 
 if [ -z "$diag" ]; then
     log "Touch ID is activated, but this kernel does not report whether its sensor attached"
+    pam_hint
     exit 0
 fi
 
