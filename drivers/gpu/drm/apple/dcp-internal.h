@@ -250,8 +250,12 @@ struct apple_dcp {
 	bool external_hotplug_pending;
 	bool external_hotplug_connected;
 	bool external_stopped;
+	/* The last stop sent nothing and stays owned; see external_stop_retry_wq. */
+	bool external_stop_deferred;
+	unsigned int external_stop_retries;
 	int external_error;
 	struct work_struct external_stop_work;
+	struct delayed_work external_stop_retry_wq;
 
 
 	/* firmware version and compatible firmware version */

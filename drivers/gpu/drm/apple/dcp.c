@@ -2743,6 +2743,14 @@ static int dcp_external_start_locked(struct apple_dcp *dcp)
 	ret = dcp_external_link_locked(dcp);
 	if (ret || dcp->external_running)
 		return ret;
+	/* A deferred stop sent nothing: the pipe is still powered. */
+	if (dcp->external_stop_deferred) {
+		dcp->external_stop_deferred = false;
+		dcp->external_stop_retries = 0;
+		dcp->external_running = true;
+		iomfb_pause_presentation(dcp, false);
+		return 0;
+	}
 	iomfb_pause_presentation(dcp, true);
 	/* Even a timed-out first activation can have changed firmware state. */
 	dcp->external_power_attempted = true;
@@ -2767,6 +2775,8 @@ static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 	return dcp_external_link_locked(dcp);
 }
 
+#define DCP_EXTERNAL_STOP_RETRIES	3
+
 /* The generation token belongs to the CRTC that was actually enabled. */
 static int dcp_external_stop_locked(struct apple_dcp *dcp, u64 generation)
 {
@@ -2787,6 +2797,21 @@ static int dcp_external_stop_locked(struct apple_dcp *dcp, u64 generation)
 		goto release_link;
 	step = "settling the queue";
 	ret = iomfb_queue_settle(dcp, msecs_to_jiffies(500));
+	if (ret == -ETIMEDOUT) {
+		/*
+		 * Nothing was sent, so no late reply can race a retry.  The
+		 * session stays owned, but not latched: a SAFE transition, the
+		 * retry work or the next enable of the CRTC takes it from here.
+		 */
+		dev_warn(dcp->dev, "external display stop deferred: IOMFB queue busy\n");
+		dcp->external_stop_deferred = true;
+		if (dcp->external_stop_retries++ < DCP_EXTERNAL_STOP_RETRIES)
+			mod_delayed_work(system_wq, &dcp->external_stop_retry_wq,
+					 msecs_to_jiffies(DCP_SWAP_WATCHDOG_MS));
+		return ret;
+	}
+	dcp->external_stop_deferred = false;
+	dcp->external_stop_retries = 0;
 	if (!ret) {
 		step = "powering the pipe off";
 		ret = iomfb_external_power_h17p(dcp, false);
@@ -2855,6 +2880,17 @@ static int dcp_external_disconnect(struct apple_dcp *dcp, bool physical)
 		dcp_external_report_disconnected(dcp);
 	}
 	return ret;
+}
+
+/* Stop a deferred session again once the swap watchdog had its turn. */
+static void dcp_external_stop_retry(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(to_delayed_work(work), struct apple_dcp,
+					     external_stop_retry_wq);
+
+	guard(mutex)(&dcp->external_lock);
+	if (dcp->external_stop_deferred)
+		dcp_external_stop_locked(dcp, dcp->external_generation);
 }
 
 static void dcp_external_stop_work(struct work_struct *work)
@@ -3099,6 +3135,7 @@ int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
 		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
 		cancel_work_sync(&dcp->external_stop_work);
+		cancel_delayed_work_sync(&dcp->external_stop_retry_wq);
 		guard(mutex)(&dcp->external_lock);
 		new_cable = !dcp->external_cable;
 		if (new_cable)
@@ -3448,6 +3485,7 @@ void dcp_poweron(struct platform_device *pdev)
 		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
 		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
 		cancel_work_sync(&dcp->external_stop_work);
+		cancel_delayed_work_sync(&dcp->external_stop_retry_wq);
 		guard(mutex)(&dcp->external_lock);
 		ret = dcp_external_start_locked(dcp);
 		if (!ret)
@@ -3553,7 +3591,7 @@ void dcp_poweroff(struct platform_device *pdev)
 		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
 		guard(mutex)(&dcp->external_lock);
 		ret = dcp_external_stop_locked(dcp, dcp->external_crtc_generation);
-		if (ret)
+		if (ret && !dcp->external_stop_deferred)
 			dev_err(dcp->dev, "external display stop failed: %d\n", ret);
 		dcp_external_crtc_released(dcp);
 		return;
@@ -4135,6 +4173,7 @@ VISIBLE_IF_KUNIT void dcp_disable_typec_work(struct apple_dcp *dcp, bool release
 	disable_delayed_work_sync(&dcp->placeholder_edid_wq);
 	disable_delayed_work_sync(&dcp->announce_wq);
 	cancel_work_sync(&dcp->external_stop_work);
+	cancel_delayed_work_sync(&dcp->external_stop_retry_wq);
 }
 
 VISIBLE_IF_KUNIT void dcp_enable_typec_work(struct apple_dcp *dcp)
@@ -4380,6 +4419,7 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 		scoped_guard(mutex, &dcp->iomfb.lock)
 			WRITE_ONCE(dcp->quiescing, true);
 		cancel_work_sync(&dcp->external_stop_work);
+		cancel_delayed_work_sync(&dcp->external_stop_retry_wq);
 		if (dcp->crtc && !dcp->drm_retained) {
 			drm_dev_get(dcp->crtc->base.dev);
 			dcp->drm_retained = true;
@@ -4534,6 +4574,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	mutex_init(&dcp->hpd_mutex);
 	mutex_init(&dcp->external_lock);
 	INIT_WORK(&dcp->external_stop_work, dcp_external_stop_work);
+	INIT_DELAYED_WORK(&dcp->external_stop_retry_wq, dcp_external_stop_retry);
 	mutex_init(&dcp->tb_lock);
 	spin_lock_init(&dcp->mode_state.lock);
 	spin_lock_init(&dcp->metadata.lock);
