@@ -53,6 +53,16 @@ $afkv2_cc -std=gnu11 -Wall -Wextra -Werror ${CFLAGS:-} $afkv2_sanitizers \
     "$afkv2_tmp/service.c" -o "$afkv2_tmp/service"
 "$afkv2_tmp/service"
 
+# The DPTX HPD request: only a complete reply carries the HPD echo.
+"$afkv2_python" "$afkv2_dir/extract-hpd.py" \
+    "$afkv2_root/drivers/gpu/drm/apple/afk.c" \
+    "$afkv2_root/drivers/gpu/drm/apple/dptxep.c" "$afkv2_tmp/hpd.c"
+# shellcheck disable=SC2086
+$afkv2_cc -std=gnu11 -Wall -Wextra -Werror ${CFLAGS:-} $afkv2_sanitizers \
+    -I"$afkv2_dir/host-include" -I"$afkv2_root/drivers/gpu/drm/apple" \
+    "$afkv2_tmp/hpd.c" -o "$afkv2_tmp/hpd"
+"$afkv2_tmp/hpd"
+
 "$afkv2_python" "$afkv2_dir/extract-send.py" \
     "$afkv2_root/drivers/gpu/drm/apple/afk.c" "$afkv2_tmp/send.c"
 # shellcheck disable=SC2086

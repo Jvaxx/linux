@@ -28,6 +28,11 @@ EDID header/checksum/block limits, and continued rejection of inline responses
 by the OOB matcher. The actual service-call body is extracted for short reply,
 error status and timeout checks; its wire sender is mocked.
 
+The DPTX HPD request is extracted with that service-call body and its timeout
+wrapper. With legacy and AFK-v2 framing, a reply whose declared body stops
+before the HPD echo, or runs past the bytes that arrived, is refused for both
+HPD states; complete and padded replies are accepted and a wrong echo refused.
+
 The real sender is also extracted to test a 128-byte mocked command payload
 with a 32 KiB response capacity, OOB behavior, send failures and timeout
 retention. The two production EDID readers are tested independently to
