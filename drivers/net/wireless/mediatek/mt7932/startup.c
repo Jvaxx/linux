@@ -263,44 +263,6 @@ static void mt_policy_disable(struct mt7932 *m, const struct mt7932_policy *poli
 		return;
 	}
 	wiphy_lock(m->wiphy);
-	for (i = 0; i < 17; i++) {
-		struct ieee80211_channel *channel = mt_channel(m, i);
-		bool forbidden = !mt7932_policy_permits(policy, channel->hw_value);
-
-		__assign_bit(i, m->policy_disabled, forbidden);
-		if (forbidden)
-			channel->flags |= IEEE80211_CHAN_DISABLED;
-	}
-	wiphy_unlock(m->wiphy);
-	rtnl_unlock();
-}
-
-/* Retry only a completed file lookup that failed before any policy SET.
- * Consume the flag under the same lock as the worker publication, so repeated
- * userspace requests cannot continually invalidate an in-flight attempt.
- */
-void mt_retry_missing_policy(struct mt7932 *m)
-{
-	unsigned long flags;
-
-	spin_lock_irqsave(&m->response_lock, flags);
-	if (m->reg_retryable && m->reg_pending && m->interface_registered &&
-	    !m->stopping && !m->policy_failed && !m->link_failed && !m->cal_state.error) {
-		m->reg_retryable = false;
-		m->reg_generation++;
-		schedule_work(&m->startup_work);
-	}
-	spin_unlock_irqrestore(&m->response_lock, flags);
-/* Keep cfg80211's channel list in step with the channels the country
- * package leaves out of the firmware domain. cfg80211 recomputes the flags
- * on its next regulatory change, which runs this again.
- */
-static void mt_policy_disable(struct mt7932 *m, const struct mt7932_policy *policy)
-{
-	unsigned int i;
-
-	rtnl_lock();
-	wiphy_lock(m->wiphy);
 	for (i = 0; i < MT7932_CHANNELS; i++) {
 		struct ieee80211_channel *channel = mt_channel(m, i);
 		bool forbidden = !mt7932_policy_permits(policy, channel->hw_value);
@@ -402,16 +364,6 @@ static void mt_startup_work(struct work_struct *work)
 		}
 		if (!ret) {
 			ret = mt7932_policy_parse(&policy, file->data, file->size, reg.domain);
-			if (ret)
-				dev_err_ratelimited(&m->pdev->dev, "local input %s has invalid policy: %d\n", path, ret);
-		}
-		if (!ret) {
-			mt7932_policy_filter(&reg, &policy);
-			mt_policy_disable(m, &policy, generation);
-		if (!ret) {
-			mt7932_policy_filter(&reg, &policy);
-			mt_policy_disable(m, &policy);
-			ret = mt7932_policy_parse(&policy, file->data, file->size, reg.domain);
 			if (!ret) {
 				mt7932_policy_filter(&reg, &policy);
 				mt_policy_disable(m, &policy, generation);
@@ -486,9 +438,6 @@ static void mt_regulatory_notify(struct wiphy *wiphy, struct regulatory_request 
 	reg.domain[4] = 1; /* 2 GHz remains 20 MHz. */
 	reg.domain[5] = mt7932_domain_5g_bw();
 	for (i = 0; i < MT7932_CHANNELS; i++) {
-		struct ieee80211_channel *channel = i < MT7932_CHANNELS_2G ?
-			&m->channels[i] : &m->channels5[i - MT7932_CHANNELS_2G];
-	for (i = 0; i < 17; i++) {
 		struct ieee80211_channel *channel = mt_channel(m, i);
 		u32 flags = channel->flags;
 
