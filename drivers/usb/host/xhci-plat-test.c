@@ -18,7 +18,7 @@
 #include "xhci.h"
 #include "xhci-plat.h"
 
-/* Only suspend-to-idle with the quirk, wakeup enabled and a wakeup path keeps it running. */
+/* Only suspend-to-idle with the quirk, wakeup enabled and a USB wakeup keeps it running. */
 static void xhci_plat_keep_running_test(struct kunit *test)
 {
 	static const suspend_state_t targets[] = {
@@ -29,17 +29,44 @@ static void xhci_plat_keep_running_test(struct kunit *test)
 	for (i = 0; i < ARRAY_SIZE(targets); i++) {
 		for (combo = 0; combo < 8; combo++) {
 			u64 quirks = (combo & 1) ? XHCI_RUN_IN_S2IDLE : 0;
-			bool may_wakeup = combo & 2, wakeup_path = combo & 4;
+			bool may_wakeup = combo & 2, usb_wakeup = combo & 4;
 			bool expected = combo == 7 && targets[i] == PM_SUSPEND_TO_IDLE;
 
 			bool kept = xhci_plat_keep_running(quirks, targets[i], may_wakeup,
-							   wakeup_path);
+							   usb_wakeup);
 
 			KUNIT_EXPECT_EQ_MSG(test, kept, expected,
-					    "target %d quirk %d may_wakeup %d wakeup_path %d",
-					    targets[i], combo & 1, may_wakeup, wakeup_path);
+					    "target %d quirk %d may_wakeup %d usb_wakeup %d",
+					    targets[i], combo & 1, may_wakeup, usb_wakeup);
 		}
 	}
+}
+
+/*
+ * Something below a root hub has to be able to wake the system, which the USB core decided as it
+ * suspended the devices. The J700 defaults are the first case: wakeup is enabled for a keyboard,
+ * but disabled for the VL122 hub between it and the root hub, which does not pass the remote
+ * wakeup on while it is suspended, and for the root hub. Nothing can wake the system through it.
+ */
+static void xhci_plat_usb_wakeup_test(struct kunit *test)
+{
+	struct usb_hcd *hcd = kunit_kzalloc(test, sizeof(*hcd), GFP_KERNEL);
+	struct usb_device *rhdev = kunit_kzalloc(test, sizeof(*rhdev), GFP_KERNEL);
+
+	KUNIT_ASSERT_TRUE(test, hcd && rhdev);
+	KUNIT_EXPECT_FALSE(test, xhci_plat_usb_wakeup(NULL));
+	KUNIT_EXPECT_FALSE(test, xhci_plat_usb_wakeup(hcd));
+	hcd->self.root_hub = rhdev;
+	KUNIT_EXPECT_FALSE(test, xhci_plat_usb_wakeup(hcd));
+
+	/* Armed for connect, disconnect and over-current changes */
+	rhdev->do_remote_wakeup = 1;
+	KUNIT_EXPECT_TRUE(test, xhci_plat_usb_wakeup(hcd));
+	rhdev->do_remote_wakeup = 0;
+
+	/* Kept awake for a hub below, see usb_suspend_both() */
+	rhdev->awake_in_sleep = 1;
+	KUNIT_EXPECT_TRUE(test, xhci_plat_usb_wakeup(hcd));
 }
 
 /* Other quirks do not stand in for the suspend-to-idle one. */
@@ -289,6 +316,7 @@ static void xhci_plat_all_property_quirks_test(struct kunit *test)
 static struct kunit_case xhci_plat_test_cases[] = {
 	KUNIT_CASE(xhci_plat_keep_running_test),
 	KUNIT_CASE(xhci_plat_keep_running_other_quirks_test),
+	KUNIT_CASE(xhci_plat_usb_wakeup_test),
 	KUNIT_CASE(xhci_plat_irq_flags_test),
 	KUNIT_CASE(xhci_plat_stopped_test),
 	KUNIT_CASE(xhci_plat_quiesce_dying_test),

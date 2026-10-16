@@ -559,15 +559,31 @@ static int xhci_plat_suspend_common(struct device *dev)
  * leave it running instead, with the root hubs suspended and armed for wakeup as usual. The
  * controller then interrupts for every event, its interrupt stays enabled (see
  * xhci_plat_irq_flags()), and the event handling wakes the system for the events that a halted
- * controller would signal.
+ * controller would signal. That costs power, so do it only when a USB device can wake the system
+ * through one of its root hubs, see xhci_plat_usb_wakeup().
  */
 VISIBLE_IF_KUNIT bool xhci_plat_keep_running(u64 quirks, suspend_state_t target,
-					     bool may_wakeup, bool wakeup_path)
+					     bool may_wakeup, bool usb_wakeup)
 {
 	return (quirks & XHCI_RUN_IN_S2IDLE) && target == PM_SUSPEND_TO_IDLE &&
-	       may_wakeup && wakeup_path;
+	       may_wakeup && usb_wakeup;
 }
 EXPORT_SYMBOL_IF_KUNIT(xhci_plat_keep_running);
+
+/*
+ * Whether a USB device can wake the system through the root hub of @hcd, once the USB core has
+ * suspended them all: the root hub is armed for connect, disconnect and over-current changes, or
+ * kept awake for a hub below it, or the remote wakeup of a device below reaches it. A device with
+ * wakeup enabled does not count if a hub on its way does not pass the wakeup on.
+ */
+VISIBLE_IF_KUNIT bool xhci_plat_usb_wakeup(struct usb_hcd *hcd)
+{
+	struct usb_device *rhdev = hcd ? hcd->self.root_hub : NULL;
+
+	return rhdev && (rhdev->do_remote_wakeup || rhdev->awake_in_sleep ||
+			 usb_wakeup_reaches(rhdev));
+}
+EXPORT_SYMBOL_IF_KUNIT(xhci_plat_usb_wakeup);
 
 /* Whether a controller that was left running reads back as stopped or failed */
 VISIBLE_IF_KUNIT bool xhci_plat_stopped(u32 usbsts)
@@ -581,8 +597,9 @@ static bool xhci_plat_run_in_s2idle(struct device *dev)
 	struct usb_hcd	*hcd = dev_get_drvdata(dev);
 	struct xhci_hcd	*xhci = hcd_to_xhci(hcd);
 
-	return xhci_plat_keep_running(xhci->quirks, pm_suspend_target_state,
-				      device_may_wakeup(dev), device_wakeup_path(dev));
+	return xhci_plat_keep_running(xhci->quirks, pm_suspend_target_state, device_may_wakeup(dev),
+				      xhci_plat_usb_wakeup(xhci->main_hcd) ||
+				      xhci_plat_usb_wakeup(xhci->shared_hcd));
 }
 
 static int xhci_plat_suspend(struct device *dev)
