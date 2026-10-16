@@ -368,6 +368,4 @@ source "drivers/gpu/drm/apple/Kconfig.tests"
 config DRM_PANEL_ORIENTATION_QUIRKS
 	tristate
 
-source "drivers/gpu/drm/asahi-neo/Kconfig"
 
-source "drivers/gpu/drm/apple-neo/Kconfig"
