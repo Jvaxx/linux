@@ -25,6 +25,7 @@
  *
  */
 
+#include <kunit/visibility.h>
 #include <linux/device.h>
 #include <linux/slab.h>
 #include <linux/export.h>
@@ -1390,12 +1391,14 @@ done:
 
 /*
  * Whether to keep a device awake in suspend-to-idle so that a remote wakeup
- * from below can reach the host controller: a hub that does not pass one on
- * while it is suspended itself, and every device between such a hub and the
- * root hub, root hub included. This only works while the host controller keeps
- * running, so its interrupt reports the hub's status change.
+ * can reach the host controller: a hub that does not pass one on from below
+ * while it is suspended itself, a hub with wakeup enabled that does not signal
+ * the changes of its own ports while it is suspended, and every device between
+ * such a hub and the root hub, root hub included. This only works while the
+ * host controller keeps running, so its interrupt reports the hub's status
+ * change.
  */
-static bool usb_stay_awake_for_wakeup(struct usb_device *udev, pm_message_t msg)
+VISIBLE_IF_KUNIT bool usb_stay_awake_for_wakeup(struct usb_device *udev, pm_message_t msg)
 {
 	struct usb_hcd *hcd = bus_to_hcd(udev->bus);
 	struct usb_device *child;
@@ -1405,6 +1408,10 @@ static bool usb_stay_awake_for_wakeup(struct usb_device *udev, pm_message_t msg)
 	    pm_suspend_target_state != PM_SUSPEND_TO_IDLE ||
 	    !device_may_wakeup(hcd->self.controller))
 		return false;
+
+	if ((udev->quirks & USB_QUIRK_HUB_NO_SUSPENDED_PORT_WAKEUP) &&
+	    udev->do_remote_wakeup)
+		return true;
 
 	if ((udev->quirks & USB_QUIRK_HUB_NO_SUSPENDED_WAKEUP) &&
 	    udev->do_remote_wakeup && device_wakeup_path(&udev->dev))
@@ -1418,6 +1425,7 @@ static bool usb_stay_awake_for_wakeup(struct usb_device *udev, pm_message_t msg)
 
 	return false;
 }
+EXPORT_SYMBOL_IF_KUNIT(usb_stay_awake_for_wakeup);
 
 /**
  * usb_suspend_both - suspend a USB device and its interfaces
