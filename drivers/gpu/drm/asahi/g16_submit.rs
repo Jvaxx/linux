@@ -115,7 +115,7 @@ impl Packet {
         if let Err(error) = result {
             let _ = self.failure.compare_exchange(0, error.to_errno(),
                 Ordering::Relaxed, Ordering::Relaxed);
-            if let Ok(status) = self.vm.status() { status.record(error.to_errno()); }
+            if let Ok(status) = self.vm.agx_status() { status.record(error.to_errno()); }
             self.completion.set_error(error);
         }
         if result.is_ok() {
@@ -134,8 +134,14 @@ impl Packet {
 }
 
 pub(crate) struct Job { shared: Shared, packet: Arc<Packet>, dev: driver::AsahiDevRef }
+/// Timeout state of a [`Job`], owned by the scheduler's timeout worker.
+pub(crate) struct JobTimeout { shared: Shared, packet: Arc<Packet>, dev: driver::AsahiDevRef }
 impl sched::JobImpl for Job {
-    fn run(job: &mut sched::Job<Self>) -> Result<Option<Fence>> {
+    type TimeoutData = JobTimeout;
+    fn timeout_data(&self) -> JobTimeout {
+        JobTimeout { shared: self.shared.clone(), packet: self.packet.clone(), dev: self.dev.clone() }
+    }
+    fn run(job: &mut Self) -> Result<Option<Fence>> {
         let failure = job.packet.failure.load(Ordering::Relaxed);
         if failure != 0 {
             let error = Error::from_errno(failure);
@@ -153,7 +159,7 @@ impl sched::JobImpl for Job {
         driver::queue_g16_completion_worker(job.dev.clone());
         Ok(Some(Fence::from_fence(&job.packet.completion)))
     }
-    fn timed_out(job: &mut sched::Job<Self>) -> sched::Status {
+    fn timed_out(job: &mut JobTimeout, _finished: bool) -> sched::Status {
         let mut guard = job.shared.lock();
         let Some(runtime) = Option::as_mut(&mut *guard) else {
             job.packet.finish(Err(ENODEV));
@@ -169,7 +175,7 @@ impl sched::JobImpl for Job {
         runtime.fail_job(job.packet.id, ETIMEDOUT);
         sched::Status::NoDevice
     }
-    fn cancel(job: &mut sched::Job<Self>) {
+    fn cancel(job: &mut Self) {
         let mut guard = job.shared.lock();
         if let Some(runtime) = Option::as_mut(&mut *guard) {
             runtime.fail_job(job.packet.id, ECANCELED);

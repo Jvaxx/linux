@@ -8,6 +8,7 @@ pub(crate) enum GpuGen {
     G13 = 13,
     G14 = 14,
     G15 = 15,
+    G17 = 17,
 }
 
 /// GPU variant enumeration. Note: Part of the UABI.

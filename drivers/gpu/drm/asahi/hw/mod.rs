@@ -21,25 +21,6 @@ pub(crate) mod t8112;
 pub(crate) mod t8122;
 pub(crate) mod t8140;
 
-/// GPU generation enumeration. Note: Part of the UABI.
-#[derive(Debug, PartialEq, Copy, Clone)]
-#[repr(u32)]
-pub(crate) enum GpuGen {
-    G13 = 13,
-    G14 = 14,
-}
-
-/// GPU variant enumeration. Note: Part of the UABI.
-#[derive(Debug, PartialEq, Copy, Clone)]
-#[repr(u32)]
-pub(crate) enum GpuVariant {
-    P = 'P' as u32,
-    G = 'G' as u32,
-    S = 'S' as u32,
-    C = 'C' as u32,
-    D = 'D' as u32,
-}
-
 /// GPU revision enumeration. Note: Part of the UABI.
 #[derive(Debug, PartialEq, Copy, Clone)]
 #[repr(u32)]

@@ -84,7 +84,7 @@ impl Packet {
         // Claim error/signal ownership once; this flag is NOT proof that the
         // fence is signaled or that hardware DMA has stopped.
         if self.finish_claimed.swap(true, Ordering::Relaxed) { return; }
-        if let Err(e)=result {if let Ok(status) = self.vm.status() { status.record(e.to_errno()); }self.completion.set_error(e);}
+        if let Err(e)=result {if let Ok(status) = self.vm.agx_status() { status.record(e.to_errno()); }self.completion.set_error(e);}
         // A scheduler job/fence and the runtime's last packet can outlive
         // hardware retirement. They must not keep the VM's active-job count
         // nonzero: GEM closes otherwise accumulate across completed frames.
@@ -103,8 +103,14 @@ impl Packet {
     }
 }
 pub(crate) struct Job {shared:Shared,packet:Arc<Packet>}
+/// Timeout state of a [`Job`], owned by the scheduler's timeout worker.
+pub(crate) struct JobTimeout {shared:Shared,packet:Arc<Packet>}
 impl sched::JobImpl for Job {
-    fn run(job:&mut sched::Job<Self>)->Result<Option<Fence>> {
+    type TimeoutData = JobTimeout;
+    fn timeout_data(&self)->JobTimeout {
+        JobTimeout {shared:self.shared.clone(),packet:self.packet.clone()}
+    }
+    fn run(job:&mut Self)->Result<Option<Fence>> {
         // Queue the packet and return its fence; the completion worker publishes and retires
         // it, so the scheduler can hand over further ready jobs meanwhile.
         if let Err(e)=crate::m3_runtime::Runtime::submit(&job.shared,job.packet.clone()) {
@@ -114,7 +120,7 @@ impl sched::JobImpl for Job {
         }
         Ok(Some(Fence::from_fence(&job.packet.completion)))
     }
-    fn timed_out(job:&mut sched::Job<Self>)->sched::Status {
+    fn timed_out(job:&mut JobTimeout,_finished:bool)->sched::Status {
         // Retain the publishing branch's explicit diagnostic override.
         if !crate::m3_params::timeout_nohang() {
             if let Some(r)=Option::as_mut(&mut *job.shared.lock()) {r.health().mark_failed();}
@@ -136,7 +142,7 @@ impl sched::JobImpl for Job {
         job.packet.finish(Err(EIO));
         sched::Status::NoDevice
     }
-    fn cancel(job:&mut sched::Job<Self>) {
+    fn cancel(job:&mut Self) {
         crate::m3_runtime::Runtime::withdraw(&job.shared,&job.packet);
         job.packet.finish(Err(ECANCELED));
     }

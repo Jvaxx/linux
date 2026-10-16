@@ -11,7 +11,6 @@
 //! coprocessors start, and enables dynamic power gating before the firmware is initialized.
 
 use crate::{hw, identity};
-use crate::hw;
 use core::mem::MaybeUninit;
 use kernel::{
     bindings, c_str,
@@ -26,7 +25,6 @@ use kernel::{
     platform,
     prelude::*,
     sync::{aref::ARef, Arc}, //
-    sync::aref::ARef, //
     time::Delta,
 };
 
@@ -663,9 +661,43 @@ impl Resources {
             return Err(ENODEV);
         }
 
-        let (core_masks, total_active_cores) =
-            self.split_core_masks(&mut core_mask_regs, num_clusters, num_cores)?;
-        let (gpu_rev, gpu_rev_id) = self.gpu_revision(id_version)?;
+        let mut core_masks = KVec::new();
+        let mut total_active_cores: u32 = 0;
+
+        let max_core_mask = ((1u64 << num_cores) - 1) as u32;
+        for _ in 0..num_clusters {
+            let mask = core_mask_regs[0] & max_core_mask;
+            core_masks.push(mask, GFP_KERNEL)?;
+            for i in 0..core_mask_regs.len() {
+                core_mask_regs[i] >>= num_cores;
+                if i < (core_mask_regs.len() - 1) {
+                    core_mask_regs[i] |= core_mask_regs[i + 1] << (32 - num_cores);
+                }
+            }
+            total_active_cores += mask.count_ones();
+        }
+
+        if core_mask_regs.iter().any(|a| *a != 0) {
+            dev_err!(
+                self.dev.as_ref(),
+                "Leftover core mask: {:#x?}\n",
+                core_mask_regs
+            );
+            return Err(EIO);
+        }
+
+        let (gpu_rev, gpu_rev_id) = match (id_version >> 8) & 0xff {
+            0x00 => (hw::GpuRevision::A0, hw::GpuRevisionID::A0),
+            0x01 => (hw::GpuRevision::A1, hw::GpuRevisionID::A1),
+            0x10 => (hw::GpuRevision::B0, hw::GpuRevisionID::B0),
+            0x11 => (hw::GpuRevision::B1, hw::GpuRevisionID::B1),
+            0x20 => (hw::GpuRevision::C0, hw::GpuRevisionID::C0),
+            0x21 => (hw::GpuRevision::C1, hw::GpuRevisionID::C1),
+            a => {
+                dev_err!(self.dev.as_ref(), "Unknown GPU revision {}\n", a);
+                return Err(ENODEV);
+            }
+        };
 
         // Preserve the public G13/G14 identity independently of the firmware
         // core identity: the legacy ABI distinguishes Max and Ultra by clusters.

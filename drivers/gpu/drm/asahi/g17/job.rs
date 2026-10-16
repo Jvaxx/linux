@@ -288,6 +288,7 @@ impl<B: Backend> Drop for Job<B> {
 impl<B: Backend> sched::JobImpl for Job<B> {
     type TimeoutData = Timeout<B>;
     const MODULE: Option<&'static kernel::ThisModule> = Some(&crate::THIS_MODULE);
+    const SYNCHRONIZED_CANCEL: bool = true;
 
     fn timeout_data(&self) -> Timeout<B> {
         Timeout {

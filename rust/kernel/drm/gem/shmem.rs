@@ -58,6 +58,7 @@ pub struct ObjectConfig<'a, T: DriverObject> {
 
     /// Opt in to revocable CPU VMAs, with driver-controlled idle eviction.
     pub reclaimable_cpu_mappings: bool,
+
     /// Reclaim private backing pages before returning from the final free callback.
     /// The default retains the usual deferred file-release policy.
     pub synchronous_reclaim: bool,
@@ -254,6 +255,9 @@ impl<T: DriverObject> Object<T> {
                     obj <- Opaque::init_zeroed(),
                     parent_resv_obj: None,
                     sgt_access: AtomicUsize::new(0),
+                    // Imports have no private shmem file; dumb buffers keep the
+                    // default deferred file release.
+                    synchronous_reclaim: false,
                     inner <- T::new(dev, size, args),
                 }),
                 GFP_KERNEL,

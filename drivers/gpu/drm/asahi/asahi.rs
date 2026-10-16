@@ -111,7 +111,6 @@ mod agx_resources;
 mod agx_status;
 mod agx_uapi;
 mod gem;
-mod gem_stats;
 mod g17;
 mod gpu;
 mod hw;
@@ -140,6 +139,7 @@ struct DriverModule {
     // Field drop order unregisters/joins driver producers before queue teardown.
     #[pin]
     _driver: kernel::driver::Registration<kernel::platform::Adapter<driver::AsahiDriver>>,
+    // Deferred G17P cleanup work; allocated at module load on every platform.
     _cleanup: cleanup::QueueOwner,
 }
 

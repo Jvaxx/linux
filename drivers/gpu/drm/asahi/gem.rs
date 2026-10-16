@@ -117,6 +117,7 @@ pub(crate) fn validate_vm_binding(gem: &Object, vm: &mmu::Vm) -> Result {
     Ok(())
 }
 
+
 unsafe impl Send for AsahiObject {}
 unsafe impl Sync for AsahiObject {}
 
@@ -228,6 +229,10 @@ pub(crate) struct AsahiObjConfig {
     flags: u32,
     exportable: bool,
     kernel: bool,
+    /// Created by this driver rather than by the DRM core for a dma-buf import or a dumb
+    /// buffer. Only driver-created objects enter the M3 memory accounting, as before core
+    /// objects were allocated as asahi objects.
+    driver_created: bool,
 }
 
 /// Validate before rounding: wrapping a user size can create a much smaller
@@ -245,26 +250,12 @@ fn new_kernel_object_with_cpu_mapping(
     size: usize,
     map_wc: bool,
 ) -> Result<ObjectRef> {
-/// Create a new kernel-owned GEM object.
-pub(crate) fn new_kernel_object(dev: &AsahiDevice, size: usize) -> Result<ObjectRef> {
-    new_kernel_object_mapped(dev, size, false)
-}
-
-/// Create a new kernel-owned GEM object whose kernel mapping is write-combined.
-///
-/// Used for memory that a non-coherent agent reads as soon as the host has stored to it and
-/// issued a barrier, without cache maintenance.
-pub(crate) fn new_kernel_object_wc(dev: &AsahiDevice, size: usize) -> Result<ObjectRef> {
-    new_kernel_object_mapped(dev, size, true)
-}
-
-fn new_kernel_object_mapped(dev: &AsahiDevice, size: usize, map_wc: bool) -> Result<ObjectRef> {
     let gem = shmem::Object::<AsahiObject>::new(
         dev,
         checked_object_size(size)?,
         shmem::ObjectConfig::<AsahiObject> {
-            reclaimable_cpu_mappings: false,
             map_wc,
+            reclaimable_cpu_mappings: false,
             parent_resv_obj: None,
             synchronous_reclaim: dev.is_m3,
         },
@@ -272,8 +263,14 @@ fn new_kernel_object_mapped(dev: &AsahiDevice, size: usize, map_wc: bool) -> Res
             flags: 0,
             exportable: false,
             kernel: true,
+            driver_created: true,
         },
     )?;
+
+    // Only the G17P runtime marks its kernel objects held (see `set_mapping_held`).
+    if dev.hold_kernel_pages {
+        set_mapping_held(&gem, true);
+    }
 
     mod_pr_debug!("AsahiObject new kernel object id={}\n", gem.id);
     Ok(ObjectRef::new(gem))
@@ -314,6 +311,7 @@ pub(crate) fn new_object(
             flags,
             exportable: parent_object.is_none(),
             kernel: false,
+            driver_created: true,
         },
     )?;
 
@@ -334,13 +332,13 @@ impl DriverObject for AsahiObject {
         mod_pr_debug!("AsahiObject::new id={}\n", id);
         try_pin_init!(AsahiObject {
             id,
+            _allocation: if dev.is_m3 && args.driver_created {
+                Some(crate::agx_memory_stats::Allocation::gem(size, args.kernel)?)
+            } else { None },
             size,
             flags: args.flags,
             exportable: args.exportable,
             kernel: args.kernel,
-            _allocation: if dev.is_m3 {
-                Some(crate::agx_memory_stats::Allocation::gem(size, args.kernel)?)
-            } else { None },
             kernel_mappings: AtomicU64::new(0),
         })
     }
@@ -352,6 +350,7 @@ impl DriverObject for AsahiObject {
             flags: 0,
             exportable: true,
             kernel: false,
+            driver_created: false,
         })
     }
 

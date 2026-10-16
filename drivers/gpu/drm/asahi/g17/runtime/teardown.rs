@@ -158,9 +158,6 @@ impl Host for Service<'_> {
                 context.id(),
                 error
             ),
-            Failure::Stalled => {
-                dev_warn!(dev, "Scheduler {} release is still pending\n", context.id())
-            }
         }
     }
 }
@@ -169,7 +166,6 @@ impl Firmware {
     /// The event worker has already reclaimed drained pairs and reannounced
     /// pending controls. Recovery blocks new releases, never an observed ack.
     pub(in crate::g17) fn service_teardown(&mut self, reclaim: &mut ReclaimBatch) -> Result {
-        crate::g17::queue_stats::note_teardowns(self.queues.teardown.len());
         self.queues.render.collect_reclaimable(reclaim)?;
         if self.queues.teardown.is_empty() {
             return Ok(());
@@ -198,8 +194,6 @@ impl Firmware {
             .take_consumed(consumer, producer, &mut service)?
             .is_some()
         {}
-        teardown.report_stalled(super::now_ns(), &mut service);
-        crate::g17::queue_stats::note_teardowns(teardown.len());
         Ok(())
     }
 }
