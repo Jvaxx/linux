@@ -12,4 +12,5 @@ tps6598x-y				:= i2c.o
 obj-$(CONFIG_TYPEC_SN201202X)		+= sn201202x.o
 sn201202x-y				:= spmi.o
 
-obj-$(CONFIG_TYPEC_TIPD_KUNIT_TEST) += cd321x-pm-test.o cd321x-tbt-test.o
+obj-$(CONFIG_TYPEC_TIPD_KUNIT_TEST) += cd321x-pm-test.o cd321x-tbt-test.o \
+					   cd321x-irq-test.o
