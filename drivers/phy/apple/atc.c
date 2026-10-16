@@ -22,6 +22,8 @@
  * Author: Sven Peter <sven@kernel.org>
  */
 
+#include <kunit/static_stub.h>
+
 #include <dt-bindings/phy/phy.h>
 #include <linux/bitfield.h>
 #include <linux/cleanup.h>
@@ -2787,6 +2789,9 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 	int ret = 0;
 	u32 reg;
 
+	if (IS_ENABLED(CONFIG_PHY_APPLE_ATC_KUNIT_TEST))
+		KUNIT_STATIC_STUB_REDIRECT(atcphy_configure, atcphy, mode);
+
 	lockdep_assert_held(&atcphy->lock);
 	if (atcphy->pipe_pending)
 		return -EBUSY;
@@ -3350,9 +3355,8 @@ static int atcphy_probe_rcdev(struct apple_atcphy *atcphy)
 	return devm_reset_controller_register(atcphy->dev, &atcphy->rcdev);
 }
 
-static int atcphy_sw_set(struct typec_switch_dev *sw, enum typec_orientation orientation)
+static int atcphy_set_orientation(struct apple_atcphy *atcphy, enum typec_orientation orientation)
 {
-	struct apple_atcphy *atcphy = typec_switch_get_drvdata(sw);
 	bool swap_lanes;
 
 	guard(mutex)(&atcphy->lock);
@@ -3379,6 +3383,11 @@ static int atcphy_sw_set(struct typec_switch_dev *sw, enum typec_orientation ori
 		atcphy->pipe_state, atcphy->host_active);
 
 	return 0;
+}
+
+static int atcphy_sw_set(struct typec_switch_dev *sw, enum typec_orientation orientation)
+{
+	return atcphy_set_orientation(typec_switch_get_drvdata(sw), orientation);
 }
 
 static void atcphy_typec_switch_unregister(void *data)
@@ -3603,23 +3612,18 @@ static void atcphy_usb3_pm_put(struct atcphy_usb3_pm *pm)
 #endif
 }
 
-static int atcphy_mux_set_locked(struct typec_mux_dev *mux, struct typec_mux_state *state)
+/* The PHY mode a Type-C mux state asks for; unsupported states turn the PHY off. */
+static enum atcphy_mode atcphy_typec_target_mode(struct apple_atcphy *atcphy,
+						 const struct typec_mux_state *state)
 {
-	struct apple_atcphy *atcphy = typec_mux_get_drvdata(mux);
 	enum atcphy_mode target_mode;
-	int ret;
-
-	guard(mutex)(&atcphy->lock);
-	dev_dbg(atcphy->dev, "mux mode=%lu svid=%04x current=%u fixed=%u dp=%u ss=%u\n",
-		state->mode, state->alt ? state->alt->svid : 0, atcphy->mode,
-		atcphy->fixed_usb2, atcphy->dp_tunables, atcphy->ss_tunables);
 
 	if (state->mode == TYPEC_STATE_SAFE) {
 		target_mode = APPLE_ATCPHY_MODE_OFF;
 	} else if (state->mode == TYPEC_STATE_USB) {
 		target_mode = APPLE_ATCPHY_MODE_USB3;
 	} else if (!state->alt && state->mode == TYPEC_MODE_USB4) {
-		struct enter_usb_data *data = state->data;
+		const struct enter_usb_data *data = state->data;
 		u32 eudo_usb_mode = FIELD_GET(EUDO_USB_MODE_MASK, data->eudo);
 
 		switch (eudo_usb_mode) {
@@ -3673,8 +3677,35 @@ static int atcphy_mux_set_locked(struct typec_mux_dev *mux, struct typec_mux_sta
 	if (atcphy->fixed_usb2 && target_mode == APPLE_ATCPHY_MODE_OFF)
 		target_mode = APPLE_ATCPHY_MODE_USB2;
 
-	dev_dbg(atcphy->dev, "mux target=%u\n", target_mode);
+	return target_mode;
+}
+
+/*
+ * Whether a mux update leaves both the lanes and the PIPE as they are. That is
+ * the case when the mode does not change and no earlier PIPE handoff to a
+ * running controller behind a fixed hub is still outstanding. A DisplayPort
+ * HPD or status update with an unchanged pin assignment is one of these.
+ */
+static bool atcphy_mux_is_noop(const struct apple_atcphy *atcphy, enum atcphy_mode target_mode)
+{
+	if (atcphy->mode != target_mode || atcphy->mode_dirty)
+		return false;
+
+	return !(atcphy->fixed_usb2 && atcphy->host_active &&
+		 (atcphy->pipe_state != atcphy_modes[target_mode].pipehandler_state ||
+		  atcphy->pipe_pending));
+}
+
+static int atcphy_mux_set_locked(struct apple_atcphy *atcphy, enum atcphy_mode target_mode)
+{
+	int ret;
+
+	guard(mutex)(&atcphy->lock);
+	dev_dbg(atcphy->dev, "mux target=%u current=%u dirty=%u\n", target_mode,
+		atcphy->mode, atcphy->mode_dirty);
+
 	if (atcphy->mode == target_mode && !atcphy->mode_dirty) {
+		atcphy->typec_mode = target_mode;
 		/* Retry a failed PIPE setup without disturbing the configured lanes. */
 		if (atcphy->fixed_usb2 && atcphy->host_active &&
 		    (atcphy->pipe_state != atcphy_modes[target_mode].pipehandler_state ||
@@ -3688,6 +3719,11 @@ static int atcphy_mux_set_locked(struct typec_mux_dev *mux, struct typec_mux_sta
 		}
 		return 0;
 	}
+
+	/* A re-probe after failed role shutdown must leave the live PIPE alone. */
+	if (!atcphy->fixed_usb2 && target_mode == APPLE_ATCPHY_MODE_OFF &&
+	    atcphy->pipe_state != ATCPHY_PIPEHANDLER_STATE_DUMMY)
+		return -EBUSY;
 
 	switch (target_mode) {
 	case APPLE_ATCPHY_MODE_TBT:
@@ -3753,18 +3789,41 @@ static int atcphy_mux_set_locked(struct typec_mux_dev *mux, struct typec_mux_sta
 	return atcphy_configure(atcphy, target_mode);
 }
 
-static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *state)
+static int atcphy_mux_update(struct apple_atcphy *atcphy, const struct typec_mux_state *state)
 {
-	struct apple_atcphy *atcphy = typec_mux_get_drvdata(mux);
 	struct atcphy_usb3_pm pm = {};
+	enum atcphy_mode target_mode;
 	int ret;
+
+	scoped_guard(mutex, &atcphy->lock) {
+		dev_dbg(atcphy->dev, "mux mode=%lu svid=%04x current=%u fixed=%u dp=%u ss=%u\n",
+			state->mode, state->alt ? state->alt->svid : 0, atcphy->mode,
+			atcphy->fixed_usb2, atcphy->dp_tunables, atcphy->ss_tunables);
+		target_mode = atcphy_typec_target_mode(atcphy, state);
+		/*
+		 * Only a lane or PIPE change needs the USB3 root hub below.
+		 * Taking it means waiting for the hub's ongoing work, which
+		 * includes a whole enumeration with its timeouts, and would
+		 * hold up a DisplayPort update that changes neither.
+		 */
+		if (atcphy_mux_is_noop(atcphy, target_mode)) {
+			/* Record matching requests for the next PHY init to restore. */
+			atcphy->typec_mode = target_mode;
+			return 0;
+		}
+	}
 
 	ret = atcphy_usb3_pm_get(atcphy, &pm);
 	if (ret)
 		return ret;
-	ret = atcphy_mux_set_locked(mux, state);
+	ret = atcphy_mux_set_locked(atcphy, target_mode);
 	atcphy_usb3_pm_put(&pm);
 	return ret;
+}
+
+static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *state)
+{
+	return atcphy_mux_update(typec_mux_get_drvdata(mux), state);
 }
 
 static void atcphy_typec_mux_unregister(void *data)
@@ -3779,6 +3838,7 @@ static int atcphy_probe_mux(struct apple_atcphy *atcphy)
 		.drvdata = atcphy,
 		.fwnode = atcphy->dev->fwnode,
 		.set = atcphy_mux_set,
+		.safe_after_role = !atcphy->fixed_usb2,
 	};
 
 	mux = typec_mux_register(atcphy->dev, &mux_desc);
@@ -4128,3 +4188,7 @@ module_platform_driver(atcphy_driver);
 MODULE_AUTHOR("Sven Peter <sven@kernel.org>");
 MODULE_DESCRIPTION("Apple Type-C PHY driver");
 MODULE_LICENSE("GPL");
+
+#if IS_ENABLED(CONFIG_PHY_APPLE_ATC_KUNIT_TEST)
+#include "atc-test.c"
+#endif

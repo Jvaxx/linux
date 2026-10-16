@@ -13,6 +13,20 @@ config PHY_APPLE_ATC
 
 	  If M is selected the module will be called 'phy-apple-atc'.
 
+config PHY_APPLE_ATC_KUNIT_TEST
+	bool "KUnit tests for the Apple Type-C PHY" if !KUNIT_ALL_TESTS
+	depends on PHY_APPLE_ATC && KUNIT
+	depends on PHY_APPLE_ATC=m || KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Build the KUnit tests for the Type-C mux decisions of the Apple
+	  Type-C PHY driver into the driver. They check how Type-C states
+	  map to PHY modes and which mux updates may skip the lane and
+	  PIPE work. The tests need no hardware and run when the driver
+	  is loaded.
+
+	  If unsure, say N.
+
 config PHY_APPLE_DPTX
 	tristate "Apple DPTX PHY"
 	depends on ARCH_APPLE || COMPILE_TEST
