@@ -14,3 +14,4 @@ sn201202x-y				:= spmi.o
 
 obj-$(CONFIG_TYPEC_TIPD_KUNIT_TEST) += cd321x-pm-test.o cd321x-tbt-test.o \
 					   cd321x-irq-test.o
+obj-$(CONFIG_TYPEC_SN201202X_KUNIT_TEST) += sn201202x-pm-test.o

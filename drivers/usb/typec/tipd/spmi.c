@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 
+#include <kunit/visibility.h>
 #include <linux/interrupt.h>
 #include <linux/iopoll.h>
 #include <linux/of_device.h>
@@ -286,7 +287,7 @@ static void sn201202x_remove(struct spmi_device *device)
 	spmi_command_sleep(sn->sdev);
 }
 
-static int __maybe_unused sn201202x_resume(struct device *dev)
+VISIBLE_IF_KUNIT int __maybe_unused sn201202x_resume(struct device *dev)
 {
 	struct tps6598x *tps = dev_get_drvdata(dev);
 	struct sn201202x *sn = tps_to_sn(tps);
@@ -300,12 +301,13 @@ static int __maybe_unused sn201202x_resume(struct device *dev)
 		enable_irq(tps->irq);
 	return err;
 }
+EXPORT_SYMBOL_IF_KUNIT(sn201202x_resume);
 
-static int __maybe_unused sn201202x_suspend(struct device *dev)
+VISIBLE_IF_KUNIT int __maybe_unused sn201202x_suspend(struct device *dev)
 {
 	struct tps6598x *tps = dev_get_drvdata(dev);
 	struct sn201202x *sn = tps_to_sn(tps);
-	int err;
+	int err, ret;
 
 	/*
 	 * A sleeping controller cannot be read, so its events must not be
@@ -324,10 +326,15 @@ static int __maybe_unused sn201202x_suspend(struct device *dev)
 	if (!sn->polled &&
 	    !wait_for_completion_timeout(&sn->sleep_completion, msecs_to_jiffies(100))) {
 		err = -ETIMEDOUT;
-		goto out_resume;
+		goto out_wake;
 	}
 	return 0;
 
+out_wake:
+	/* It accepted SLEEP, so it may be asleep without having confirmed it. */
+	ret = sn201202x_wake(sn);
+	if (ret)
+		dev_err(dev, "failed to wake up after failed suspend: %d\n", ret);
 out_resume:
 	tipd_resume(tps);
 out_enable:
@@ -335,6 +342,7 @@ out_enable:
 		enable_irq(tps->irq);
 	return err;
 }
+EXPORT_SYMBOL_IF_KUNIT(sn201202x_suspend);
 
 MODULE_DEVICE_TABLE(of, sn201202x_of_match);
 
