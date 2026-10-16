@@ -65,7 +65,6 @@ struct dwc3 {
 struct dwc3_apple {
 	struct dwc3 dwc;
 	enum dwc3_apple_state state;
-	int irq;
 	struct reset_controller_dev *reset;
 	int lock;
 	void *dev;
@@ -219,21 +218,6 @@ static void dev_pm_syscore_device(void *d, bool s)
 {
 	(void)d;
 	syscore = s;
-}
-static bool wake_irq_set;
-
-static int dev_pm_set_wake_irq(void *d, int irq)
-{
-	(void)d;
-	(void)irq;
-	wake_irq_set = true;
-	return 0;
-}
-
-static void dev_pm_clear_wake_irq(void *d)
-{
-	(void)d;
-	wake_irq_set = 0;
 }
 static void dwc3_enable_susphy(struct dwc3 *d, bool s)
 {
