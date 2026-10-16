@@ -4411,6 +4411,11 @@ F:	kernel/audit*
 F:	lib/*audit.c
 K:	\baudit_[a-z_0-9]\+\b
 
+AURORA DISPLAY NOTIFIER
+M:	Ryan Murray <ryan@aurorasilicon.org>
+S:	Maintained
+F:	tools/aurora-display-notifier/
+
 AUTOFDO BUILD
 M:	Rong Xu <xur@google.com>
 M:	Han Shen <shenhan@google.com>
