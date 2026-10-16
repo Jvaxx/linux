@@ -29,7 +29,9 @@ The modules contain public synthetic host boundaries and retained assertions:
   faulted ACK/BIST cleanup, dirty-route retry, OFF/new-calibration epochs,
   warm reset and legacy T8103/T8122/T8140/T8142 route controls.
 * lifecycle: actual physical-disconnect authority and ownership despite failed
-  teardown; DWC3/core/PHY PM and reset-reference recovery; exact firmware
+  teardown; a fast dock replug whose DPTX link never configures (withdrawn,
+  unacknowledged, unanswered, refused and live failures); DWC3/core/PHY PM
+  and reset-reference recovery; exact firmware
   tuple/resource admission, unsupported VRR rejection and power reply bounds;
   15,552 D134 dispatcher scope/length/context and legacy reply cases.
 
