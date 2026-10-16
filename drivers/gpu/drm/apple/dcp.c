@@ -2488,13 +2488,19 @@ bool dcp_has_typec_routes(struct platform_device *pdev)
 #define DPTX_RECONNECT_DELAY msecs_to_jiffies(1000)
 #define DPTX_RECONNECT_RETRIES 5
 
-static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *waiting_service)
+/*
+ * Connect DPTX port @port. On failure, @retryable (if given) tells whether
+ * the attempt left nothing outstanding in the firmware, so that a later
+ * connection may simply try again: the service was not published yet, or a
+ * link that never came up was withdrawn and the firmware acknowledged that.
+ */
+static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable)
 {
 	unsigned long timeout;
-	int ret = 0;
+	int ret = 0, err;
 
-	if (waiting_service)
-		*waiting_service = false;
+	if (retryable)
+		*retryable = false;
 	if (!dcp->phy) {
 		dev_warn(dcp->dev, "dcp_dptx_connect: missing phy\n");
 		return -ENODEV;
@@ -2511,8 +2517,8 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *waiting_s
 		dev_warn(dcp->dev, "dcp_dptx_connect: dptx service for port %d not enabled\n", port);
 		ret = -ENODEV;
 		/* No firmware request has been made; the first publication can retry. */
-		if (waiting_service && !READ_ONCE(dcp->dptxport[port].closed)) {
-			*waiting_service = true;
+		if (retryable && !READ_ONCE(dcp->dptxport[port].closed)) {
+			*retryable = true;
 			ret = -EAGAIN;
 		}
 		goto out_unlock;
@@ -2577,7 +2583,7 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *waiting_s
 			"dcp_dptx_connect: timed out waiting for port %u link configuration\n",
 			port);
 		ret = -ETIMEDOUT;
-		goto out_disconnect;
+		goto out_withdraw;
 	}
 
 	dev_dbg(dcp->dev, "dcp_dptx_connect: waited %d ms for link\n",
@@ -2593,9 +2599,39 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *waiting_s
 
 	return 0;
 
-out_disconnect:
+out_withdraw:
 	mutex_lock(&dcp->hpd_mutex);
+	if (!dcp_is_external_h17p(dcp)) {
+		dcp->dptxport[port].connected = false;
+		goto out_release;
+	}
+	/*
+	 * No link configuration arrived, typically because the sink went away
+	 * while the firmware trained it.  Withdraw the request the way a
+	 * disconnect does, HPD first.  Only once the firmware has acknowledged
+	 * both is nothing of this attempt outstanding; until then the port
+	 * stays held.
+	 */
+	err = -ENODEV;
+	if (dptx_service_available(&dcp->dptxport[port])) {
+		err = dcp_is_typec_output(dcp) ?
+		      dptxport_set_hpd(dcp->dptxport[port].service, false) : 0;
+		if (!err)
+			err = dptxport_release_display(dcp->dptxport[port].service);
+	}
+	if (err) {
+		dev_err(dcp->dev,
+			"dcp_dptx_connect: port %u not withdrawn, still held: %d\n",
+			port, err);
+		goto out_unlock;
+	}
+	dev_info(dcp->dev, "dcp_dptx_connect: port %u withdrawn, the next connection retries\n",
+		 port);
 	dcp->dptxport[port].connected = false;
+	if (retryable)
+		*retryable = true;
+	goto out_unlock;
+
 out_release:
 	dptxport_release_display(dcp->dptxport[port].service);
 
@@ -2631,7 +2667,7 @@ static void dcp_external_publish_generation(struct apple_dcp *dcp)
 /* external_lock is never taken by the serialized IOMFB receive callbacks. */
 static int dcp_external_link_locked(struct apple_dcp *dcp)
 {
-	bool waiting_service;
+	bool retryable;
 	int ret;
 
 	lockdep_assert_held(&dcp->external_lock);
@@ -2641,8 +2677,8 @@ static int dcp_external_link_locked(struct apple_dcp *dcp)
 		return dcp->external_error;
 	if (!dcp->external_cable)
 		return -ENODEV;
-	ret = dcp_dptx_connect_raw(dcp, 0, &waiting_service);
-	if (ret && !waiting_service)
+	ret = dcp_dptx_connect_raw(dcp, 0, &retryable);
+	if (ret && !retryable)
 		dcp->external_error = ret;
 	return ret;
 }
