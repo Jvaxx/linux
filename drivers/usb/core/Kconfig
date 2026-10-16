@@ -108,6 +108,17 @@ config USB_QUIRKS_KUNIT_TEST
 
 	  If unsure, say N.
 
+config USB_WAKEUP_KUNIT_TEST
+	tristate "KUnit tests for USB wakeup in system sleep" if !KUNIT_ALL_TESTS
+	depends on USB && PM && KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Test which USB devices the USB core finds able to wake the system
+	  once it has suspended them, on device trees built in memory. The
+	  tests need no USB hardware.
+
+	  If unsure, say N.
+
 config USB_LEDS_TRIGGER_USBPORT
 	tristate "USB port LED trigger"
 	depends on USB && LEDS_TRIGGERS
