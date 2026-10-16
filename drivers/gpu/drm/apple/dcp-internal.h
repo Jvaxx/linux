@@ -570,6 +570,7 @@ bool dcp_external_hotplug(struct apple_dcp *dcp, bool connected);
 void dcp_announce_arm(struct apple_dcp *dcp);
 void dcp_announce_work(struct work_struct *work);
 void dcp_external_crtc_released(struct apple_dcp *dcp);
+void dcp_external_link_fault(struct apple_dcp *dcp);
 
 /* A KUnit test can wait here for the work it races with. */
 static inline void dcp_test_point(struct apple_dcp *dcp, enum dcp_test_point point)
