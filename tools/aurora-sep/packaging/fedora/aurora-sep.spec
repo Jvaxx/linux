@@ -3,9 +3,12 @@
 # Built from tools/aurora-sep: rpmbuild --define "_sourcedir <that directory>"
 # (build.sh does this).
 
+%global selinuxtype targeted
+%global modulename aurora_sep
+
 Name:           aurora-sep
 Version:        1
-Release:        4%{?dist}
+Release:        5%{?dist}
 Summary:        Loader and desktop integration for the Apple SEP fingerprint driver
 
 License:        GPL-2.0-only
@@ -21,6 +24,8 @@ Source7:        fprintd-no-timeout.conf.in
 Source8:        logind-aurora-sep.conf
 Source9:        aurora-sep-greeter-fingerprint
 Source10:       aurora-sep-greeter-fingerprint.service
+Source11:       aurora_sep.te
+Source12:       aurora_sep.fc
 
 BuildArch:      noarch
 BuildRequires:  systemd-rpm-macros
@@ -30,6 +35,7 @@ Requires:       coreutils
 Requires:       fprintd
 Requires:       keyutils
 Requires:       kmod
+Requires:       (%{name}-selinux = %{version}-%{release} if selinux-policy-%{selinuxtype})
 # Only for aurora-sep-greeter-fingerprint.service, which is off by default.
 Suggests:       /usr/bin/gresource
 %{?systemd_requires}
@@ -44,11 +50,25 @@ libfprint needs the aurora driver, which this package does not provide; it is
 packaged in https://github.com/aurora-silicon/aurora-sep-userspace. Read XART-SAFETY.md before installing it on
 a machine that also runs macOS.
 
+%package selinux
+Summary:        SELinux policy module for the Apple SEP fingerprint device
+BuildRequires:  selinux-policy-devel
+Requires:       selinux-policy-%{selinuxtype}
+Requires(post): selinux-policy-%{selinuxtype}
+%{?selinux_requires}
+
+%description selinux
+Labels /dev/sep-bio, the Apple SEP driver's Touch ID device, and lets fprintd
+open it. The targeted policy otherwise leaves the device as device_t, which
+fprintd may not open, so fprintd lists no fingerprint reader.
+
 %prep
 %setup -q -c -T
-cp -p %{SOURCE3} %{SOURCE4} .
+cp -p %{SOURCE3} %{SOURCE4} %{SOURCE11} %{SOURCE12} .
 
 %build
+make -f %{_datadir}/selinux/devel/Makefile %{modulename}.pp
+bzip2 -9 %{modulename}.pp
 
 %install
 # A unit and the helper it runs ($1, installed as $3), pointed at the
@@ -73,6 +93,8 @@ install -Dpm 0644 %{SOURCE8} \
 # Load the driver at boot, so the enclave is up before the login screen asks.
 install -d %{buildroot}%{_presetdir}
 echo 'enable aurora-sep.service' >%{buildroot}%{_presetdir}/80-aurora-sep.preset
+install -Dpm 0644 %{modulename}.pp.bz2 \
+    %{buildroot}%{_datadir}/selinux/packages/%{selinuxtype}/%{modulename}.pp.bz2
 
 %post
 %systemd_post aurora-sep.service aurora-sep-ready.service aurora-sep-greeter-fingerprint.service
@@ -83,6 +105,25 @@ echo 'enable aurora-sep.service' >%{buildroot}%{_presetdir}/80-aurora-sep.preset
 %postun
 # Never restart them: the driver attaches to the enclave once per boot.
 %systemd_postun aurora-sep.service aurora-sep-ready.service aurora-sep-greeter-fingerprint.service
+
+%pre selinux
+%selinux_relabel_pre -s %{selinuxtype}
+
+%post selinux
+%selinux_modules_install -s %{selinuxtype} %{_datadir}/selinux/packages/%{selinuxtype}/%{modulename}.pp.bz2
+
+%postun selinux
+%selinux_modules_uninstall -s %{selinuxtype} %{modulename}
+if [ $1 -eq 0 ] && selinuxenabled 2>/dev/null && [ -c /dev/sep-bio ]; then
+    restorecon /dev/sep-bio || :
+fi
+
+%posttrans selinux
+%selinux_relabel_post -s %{selinuxtype}
+# udev labels the device when the driver creates it; label one that exists.
+if selinuxenabled 2>/dev/null && [ -c /dev/sep-bio ]; then
+    restorecon /dev/sep-bio || :
+fi
 
 %files
 %doc README.md XART-SAFETY.md
@@ -98,7 +139,14 @@ echo 'enable aurora-sep.service' >%{buildroot}%{_presetdir}/80-aurora-sep.preset
 %{_prefix}/lib/systemd/logind.conf.d/50-aurora-sep.conf
 %{_presetdir}/80-aurora-sep.preset
 
+%files selinux
+%{_datadir}/selinux/packages/%{selinuxtype}/%{modulename}.pp.bz2
+%ghost %verify(not md5 size mode mtime) %{_sharedstatedir}/selinux/%{selinuxtype}/active/modules/200/%{modulename}
+
 %changelog
+* Mon Oct 19 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-5
+- Add aurora-sep-selinux, which labels /dev/sep-bio for fprintd
+
 * Sun Oct 18 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-4
 - Report Touch ID ready only once the sensor attached and the
   fingerprints were restored, and the reason when it is not

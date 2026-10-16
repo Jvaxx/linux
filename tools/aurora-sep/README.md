@@ -148,6 +148,16 @@ systemctl daemon-reload
 systemctl restart fprintd.service
 ```
 
+Where SELinux is enforcing, as on Fedora, fprintd may not open `/dev/sep-bio`
+until it is labelled. Build and load the policy module (Fedora's
+`selinux-policy-devel` provides the Makefile), then label the device:
+
+```sh
+make -f /usr/share/selinux/devel/Makefile aurora_sep.pp
+semodule -i aurora_sep.pp
+restorecon /dev/sep-bio
+```
+
 On Omarchy, run `omarchy-apply-lock` once after enrollment. The Quickshell
 lock screen then selects `omarchy-lock-fingerprint` automatically and accepts
 Touch ID through fprintd. Hyprlock's separate fingerprint switch is not used
@@ -168,8 +178,12 @@ mkdir rpms
 podman run --rm -v "$PWD":/src:ro,z -v "$PWD/rpms":/out:z \
     registry.fedoraproject.org/fedora:45 \
     /src/tools/aurora-sep/packaging/fedora/build.sh /out
-sudo dnf install rpms/aurora-sep-1-*.noarch.rpm
+sudo dnf install rpms/aurora-sep-1-*.noarch.rpm rpms/aurora-sep-selinux-1-*.noarch.rpm
 ```
+
+`aurora-sep-selinux` holds the policy module above. `aurora-sep` requires it
+wherever the targeted policy is installed. Where SELinux is disabled, the
+module is installed but not loaded, and nothing is relabelled.
 
 On Arch Linux and Arch Linux ARM, build `aurora-sep`:
 

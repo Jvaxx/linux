@@ -53,6 +53,14 @@ class FedoraSpecTest(unittest.TestCase):
         for source in sources:
             self.assertTrue((SEP / source).is_file(), source)
 
+    def test_selinux_module_labels_the_loader_device(self):
+        path, kind, context = (SEP / "aurora_sep.fc").read_text().split()
+        self.assertEqual(kind, "-c")
+        self.assertIn(path, (SEP / "load-driver").read_text())
+        label = re.search(r":(\w+_t),", context).group(1)
+        te = (SEP / "aurora_sep.te").read_text()
+        self.assertRegex(te, r"(?m)^type %s;$" % label)
+
     def test_build_script_builds_only_aurora_sep(self):
         text = (FEDORA / "build.sh").read_text()
         self.assertIn("aurora-sep.spec", text)
