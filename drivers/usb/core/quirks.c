@@ -586,7 +586,8 @@ static const struct usb_device_id usb_quirk_list[] = {
 
 	/* VIA Labs, Inc. VL122 USB2.0 Hub */
 	{ USB_DEVICE(0x2109, 0x2122), .driver_info =
-			USB_QUIRK_HUB_NO_SUSPENDED_WAKEUP },
+			USB_QUIRK_HUB_NO_SUSPENDED_WAKEUP |
+			USB_QUIRK_HUB_NO_SUSPENDED_PORT_WAKEUP },
 
 	/* VIA Labs, Inc. USB2.0 Hub */
 	{ USB_DEVICE(0x2109, 0x2817), .driver_info = USB_QUIRK_NO_LPM },
