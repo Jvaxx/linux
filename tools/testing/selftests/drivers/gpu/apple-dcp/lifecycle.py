@@ -84,7 +84,9 @@ typedef uint32_t u32; typedef uint64_t u64;
 #define DCP_HOTPLUG_NOTIFY 1
 struct work_struct { bool pending; };
 struct delayed_work { struct work_struct work; };
-static int system_freezable_wq;
+static int system_freezable_wq, system_wq;
+#define DCP_SWAP_WATCHDOG_MS 1000
+#define DCP_EXTERNAL_STOP_RETRIES 3
 static int schedule_work(struct work_struct *w) { w->pending = true; return 1; }
 static void cancel_work_sync(struct work_struct *w) { w->pending = false; }
 static void cancel_delayed_work_sync(struct delayed_work *w) { w->work.pending = false; }
@@ -101,6 +103,8 @@ struct apple_dcp {
  struct delayed_work typec_reconnect_wq, placeholder_edid_wq;
  struct work_struct external_stop_work;
  bool external_running, external_stopped, external_power_attempted;
+ bool external_stop_deferred; unsigned int external_stop_retries;
+ struct delayed_work external_stop_retry_wq;
  bool external_cable, typec_cable_connected, typec_crtc_off, pipe_enabled_h17p;
  bool external_physically_absent, external_prepared, placeholder_retried;
  int typec_reconnect_tries;

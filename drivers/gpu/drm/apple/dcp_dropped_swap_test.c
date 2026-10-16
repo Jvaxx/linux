@@ -18,9 +18,9 @@
  * A dock leaves during the first mode set of an external H17P display.  The
  * firmware fails the mode set, accepts the next present and drops it without
  * a completion or an abort.  The teardown that follows waits for the IOMFB
- * queue to settle.  This replays that sequence through the real queue and
- * swap watchdog; the firmware is the test, which answers the present as the
- * receive callbacks would and never completes it.
+ * queue to settle.  This replays that sequence through the real queue, swap
+ * watchdog and external stop; the firmware is the test, which answers the
+ * present as the receive callbacks would and never completes it.
  */
 #define DROPPED_SWAP_ID	162
 
@@ -118,6 +118,7 @@ static void dropped_test_exit(void *data)
 	struct iomfb_scanout_h17p *scanout, *next;
 
 	cancel_delayed_work_sync(&dcp->swap_watchdog_wq);
+	cancel_delayed_work_sync(&dcp->external_stop_retry_wq);
 	iomfb_queue_stop(dcp);
 	guard(mutex)(&dcp->iomfb.lock);
 	list_for_each_entry_safe(scanout, next, &dcp->iomfb.dropped, link) {
@@ -159,6 +160,8 @@ static struct dropped_test *dropped_test_init(struct kunit *test,
 	INIT_DELAYED_WORK(&dcp->swap_watchdog_wq, dcp_swap_watchdog);
 	INIT_DELAYED_WORK(&dcp->typec_reconnect_wq, dropped_test_noop_delayed);
 	INIT_DELAYED_WORK(&dcp->placeholder_edid_wq, dropped_test_noop_delayed);
+	/* A retried stop would send the power-off, which this test cannot answer. */
+	INIT_DELAYED_WORK(&dcp->external_stop_retry_wq, dropped_test_noop_delayed);
 
 	spin_lock_init(&t->drm.event_lock);
 	t->crtc.base.dev = &t->drm;
@@ -323,6 +326,39 @@ static void completed_present_kept_test(struct kunit *test)
 }
 
 /*
+ * The teardown of the captured sequence: a queue that does not settle before
+ * the power-off is sent leaves no firmware request outstanding.  The stop is
+ * not latched and keeps everything owned; once the watchdog has retired the
+ * dropped present, a retry finds the queue settled.
+ */
+static void stop_deferred_test(struct kunit *test)
+{
+	struct dropped_test *t = dropped_test_external(test);
+	struct apple_dcp *dcp = &t->dcp;
+
+	dcp->external_prepared = true;
+	dcp->external_cable = true;
+	dcp->external_power_attempted = true;
+	dcp->external_running = true;
+	dcp->dptxport[0].connected = true;
+	dcp->pipe_enabled_h17p = true;
+	dropped_test_present(test, t, 0, &t->fb[1]);
+
+	dcp_poweroff(t->pdev);
+	KUNIT_EXPECT_EQ(test, dcp->external_error, 0);
+	KUNIT_EXPECT_FALSE(test, dcp->external_stopped);
+	KUNIT_EXPECT_TRUE(test, READ_ONCE(dcp->pipe_enabled_h17p));
+	KUNIT_EXPECT_TRUE(test, READ_ONCE(dcp->dptxport[0].connected));
+	KUNIT_EXPECT_TRUE(test, dcp->iomfb.presentation_paused);
+	/* Nothing else retries a CRTC that is off: the stop retries itself. */
+	KUNIT_EXPECT_TRUE(test, dcp->external_stop_deferred);
+	KUNIT_EXPECT_TRUE(test, delayed_work_pending(&dcp->external_stop_retry_wq));
+
+	KUNIT_EXPECT_EQ(test, iomfb_queue_settle(dcp, msecs_to_jiffies(2000)), 0);
+	KUNIT_EXPECT_FALSE(test, READ_ONCE(dcp->crashed));
+}
+
+/*
  * Without a completed present for IOMFB_DROPPED_MAX dropped ones, the next one
  * is not retired: the display is retrained as before and the queue is left to
  * its timeout.
@@ -465,6 +501,7 @@ static struct kunit_case dropped_swap_cases[] = {
 	KUNIT_CASE(dropped_present_retired_test),
 	KUNIT_CASE(dropped_present_buffers_test),
 	KUNIT_CASE(completed_present_kept_test),
+	KUNIT_CASE(stop_deferred_test),
 	KUNIT_CASE(dropped_present_bounded_test),
 	KUNIT_CASE(legacy_watchdog_test),
 	KUNIT_CASE(h17g_watchdog_test),
