@@ -163,8 +163,8 @@ static inline bool shmem_uffd_range_missing(struct folio *folio, pgoff_t index,
 		unsigned int offset, unsigned long length) { return false; }
 static inline void shmem_uffd_mark_mapped(struct folio *folio,
 		unsigned long offset, unsigned long length) { }
-static inline void shmem_uffd_forget(struct address_space *mapping,
-				   pgoff_t start, unsigned long nr) { }
+/* Do not evaluate the arguments: folio_nr_pages() would still read flags. */
+#define shmem_uffd_forget(mapping, start, nr) do { } while (0)
 #endif
 
 void shmem_unlock_mapping(struct address_space *mapping);
