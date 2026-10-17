@@ -99,11 +99,11 @@ struct macsmc_gpio {
 };
 
 static bool macsmc_gpio_is_j700_pcio(struct macsmc_gpio *smcgp,
-					  unsigned int offset)
+				     unsigned int offset)
 {
 	return smcgp->j700_pcio &&
-		(offset == MACSMC_J700_AFE_RESET_GPIO ||
-		 offset == MACSMC_J700_RADIO_REG_ON_GPIO);
+	       (offset == MACSMC_J700_AFE_RESET_GPIO ||
+		offset == MACSMC_J700_RADIO_REG_ON_GPIO);
 }
 
 static int macsmc_gpio_nr(smc_key key)
@@ -236,7 +236,7 @@ static int macsmc_gpio_set(struct gpio_chip *gc, unsigned int offset, int value)
 			lo = MACSMC_J700_AFE_RESET_LO;
 			hi = MACSMC_J700_AFE_RESET_HI;
 		}
-		payload = ((u64)hi << 32) | lo | !!value;
+		payload = ((u64)hi << 32) | lo | (value ? 1 : 0);
 
 		ret = apple_smc_write_u64(smcgp->smc, SMC_KEY(pcIO), payload);
 		if (ret < 0) {

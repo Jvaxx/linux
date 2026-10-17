@@ -153,7 +153,7 @@ static int isp_submit_buffers(struct apple_isp *isp, bool pre_start)
 	struct isp_channel *chan = isp->chan_bh;
 	struct isp_message *req = &chan->req;
 	struct isp_buffer *buf, *tmp;
-	unsigned int num_rendered = 0;
+	unsigned int num_rendered = 0, num_buffers = 0;
 	unsigned long flags;
 	size_t offset;
 	int err;
@@ -180,7 +180,7 @@ static int isp_submit_buffers(struct apple_isp *isp, bool pre_start)
 		bufd->iovas[0] = meta->iova;
 		bufd->flags[0] = 0x40000000;
 		bufd++;
-		bl->num_buffers++;
+		num_buffers++;
 
 		meta->submitted = true;
 	}
@@ -199,7 +199,7 @@ static int isp_submit_buffers(struct apple_isp *isp, bool pre_start)
 		bufd->iovas[0] = meta->iova;
 		bufd->flags[0] = 0x40000000;
 		bufd++;
-		bl->num_buffers++;
+		num_buffers++;
 
 		meta->submitted = true;
 	}
@@ -222,7 +222,7 @@ static int isp_submit_buffers(struct apple_isp *isp, bool pre_start)
 		       buf->surfs[0].iova,
 		       buf->surfs[0].iova + buf->surfs[0].size); */
 		bufd++;
-		bl->num_buffers++;
+		num_buffers++;
 		num_rendered++;
 
 		/*
@@ -235,6 +235,12 @@ static int isp_submit_buffers(struct apple_isp *isp, bool pre_start)
 
 send:
 	spin_unlock_irqrestore(&isp->buf_lock, flags);
+
+	/*
+	 * The firmware can write to the command area, so the error path below
+	 * goes by the count kept here rather than the one in the batch.
+	 */
+	bl->num_buffers = num_buffers;
 
 	req->arg0 = isp->cmd_iova;
 	req->arg1 = max_t(u64, ISP_IPC_BUFEXC_STAT_SIZE,
@@ -255,7 +261,7 @@ send:
 		spin_lock_irqsave(&isp->buf_lock, flags);
 
 		bufd = &bl->buffers[0];
-		for (int i = 0; i < bl->num_buffers; i++, bufd++) {
+		for (unsigned int i = 0; i < num_buffers; i++, bufd++) {
 			list_for_each_entry_safe_reverse(
 				buf, tmp, &isp->bufs_submitted, link) {
 				if (bufd->iovas[0] == buf->surfs[0].iova) {

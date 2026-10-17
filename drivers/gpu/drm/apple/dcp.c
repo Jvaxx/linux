@@ -105,7 +105,7 @@ static int dcp_pin_live_session(struct apple_dcp *dcp)
 	mutex_lock(&dcp_retained_sessions_lock);
 	list_add_tail(&session->link, &dcp_retained_sessions);
 	mutex_unlock(&dcp_retained_sessions_lock);
-	dev_info(dcp->dev, "live H17P DMA resources retained until reboot; rebind unsupported\n");
+	dev_dbg(dcp->dev, "live H17P DMA resources retained until reboot\n");
 	return 0;
 }
 
@@ -3305,22 +3305,11 @@ int dcp_start(struct platform_device *pdev)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	int ret;
 
-	if (!dcp->rtk)
-		return -ENODEV;
-
+	/* Even if nothing starts, dcp_wait_ready() must find it initialised. */
 	init_completion(&dcp->start_done);
 
-	/*
-	 * The coprocessor start can fail (or be recovered from) without tearing
-	 * the DRM side down, so this can be reached with no RTKit instance at
-	 * all.  Starting an endpoint then dereferences NULL inside
-	 * apple_rtkit_start_ep() and takes the machine with it.
-	 */
-	if (!dcp->rtk || IS_ERR(dcp->rtk)) {
-		dev_err(dcp->dev,
-			"cannot start endpoints: RTKit is not initialised\n");
+	if (IS_ERR_OR_NULL(dcp->rtk))
 		return -ENODEV;
-	}
 
 	/* Make the H17P allocator available before external service discovery. */
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL) {
@@ -4154,6 +4143,23 @@ static int dcp_connector_type_from_dt(struct device_node *np)
 	return DRM_MODE_CONNECTOR_Unknown;
 }
 
+/*
+ * The fixed route's crossbar selection and Type-C mux are taken at probe and
+ * must be released with the device: a crossbar left selected blocks the next
+ * probe's mux_control_select() for good.
+ */
+static void dcp_release_fixed_route(void *data)
+{
+	struct apple_dcp *dcp = data;
+
+	if (dcp->fixed_route_selected) {
+		mux_control_deselect(dcp->xbar);
+		dcp->fixed_route_selected = false;
+	}
+	typec_mux_put(dcp->typec_mux);
+	dcp->typec_mux = NULL;
+}
+
 VISIBLE_IF_KUNIT void dcp_disable_typec_work(struct apple_dcp *dcp, bool release_cable)
 {
 	scoped_guard(mutex, &dcp->hpd_mutex) {
@@ -4296,9 +4302,6 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 		of_node_put(panel_np);
 		dcp->fixed_connector_type = DRM_MODE_CONNECTOR_eDP;
 		dcp->connector_type = DRM_MODE_CONNECTOR_eDP;
-		INIT_WORK(&dcp->bl_register_wq, dcp_work_register_backlight);
-		mutex_init(&dcp->bl_register_mutex);
-		INIT_WORK(&dcp->bl_update_wq, dcp_work_update_backlight);
 	}
 
 	ret = dcp_create_piodma_iommu_dev(dcp);
@@ -4343,9 +4346,6 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	// TDOD: mem_desc IDs start at 1, for simplicity just skip '0' entry
 	set_bit(0, dcp->memdesc_map);
 
-	INIT_WORK(&dcp->vblank_wq, dcp_delayed_vblank);
-	INIT_DELAYED_WORK(&dcp->swap_watchdog_wq, dcp_swap_watchdog);
-
 	if (dcp->hw.iomfb_method_profile ==
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL) {
 		/* Pin before the first write or mailbox wake can expose DMA. */
@@ -4387,7 +4387,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 		goto err_piodma;
 
 	if (dcp->hw.adopt_live_session)
-		dev_info(dev, "negotiating RTKit with the running DCP\n");
+		dev_dbg(dev, "negotiating RTKit with the running DCP\n");
 
 	/* Announce host readiness before awaiting external IOP readiness. */
 	if (dcp->hw.iomfb_method_profile ==
@@ -4463,7 +4463,6 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 		disable_irq(dcp->hdmi_hpd_irq);
 
 	dcp_disable_typec_work(dcp, true);
-	typec_mux_put(dcp->typec_mux);
 
 	if (dcp->avep) {
 		av_service_disconnect(dcp);
@@ -4617,6 +4616,12 @@ static int dcp_platform_probe(struct platform_device *pdev)
 			  dcp_placeholder_edid_work);
 	INIT_DELAYED_WORK(&dcp->announce_wq, dcp_announce_work);
 	INIT_DELAYED_WORK(&dcp->bl_fallback_wq, dcp_work_backlight_fallback);
+	/* System sleep and shutdown cancel these even if no bind succeeded. */
+	INIT_WORK(&dcp->vblank_wq, dcp_delayed_vblank);
+	INIT_DELAYED_WORK(&dcp->swap_watchdog_wq, dcp_swap_watchdog);
+	INIT_WORK(&dcp->bl_register_wq, dcp_work_register_backlight);
+	INIT_WORK(&dcp->bl_update_wq, dcp_work_update_backlight);
+	mutex_init(&dcp->bl_register_mutex);
 	/* Balanced by enable at successful component bind. */
 	disable_delayed_work(&dcp->typec_reconnect_wq);
 	disable_delayed_work(&dcp->placeholder_edid_wq);
@@ -4723,6 +4728,9 @@ static int dcp_platform_probe(struct platform_device *pdev)
 				dev_err(dev, "Failed to get dp-xbar: %ld\n", PTR_ERR(dcp->xbar));
 				return PTR_ERR(dcp->xbar);
 			}
+			ret = devm_add_action_or_reset(dev, dcp_release_fixed_route, dcp);
+			if (ret)
+				return ret;
 			ret = mux_control_select(dcp->xbar, mux_index);
 			if (ret)
 				dev_warn(dev, "mux_control_select failed: %d\n", ret);
@@ -4867,7 +4875,9 @@ static void dcp_drain_for_sleep(struct apple_dcp *dcp)
  */
 static void dcp_hold_for_sleep(struct apple_dcp *dcp)
 {
-	if (!dcp_uses_soft_dpms(dcp) || dcp->fw_compat != DCP_FIRMWARE_H17P ||
+	/* A failed component bind leaves no coprocessor session to hold. */
+	if (IS_ERR_OR_NULL(dcp->rtk) ||
+	    !dcp_uses_soft_dpms(dcp) || dcp->fw_compat != DCP_FIRMWARE_H17P ||
 	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G ||
 	    READ_ONCE(dcp->crashed))
 		return;

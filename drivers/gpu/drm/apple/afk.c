@@ -1207,15 +1207,15 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 	wptr = le32_to_cpu(*ep->rxbfr.wptr);
 	trace_afk_recv_rwptr_pre(ep, rptr, wptr);
 
-	if (rptr == wptr)
-		return false;
-
-	if (rptr > (ep->rxbfr.bufsz - sizeof(*hdr))) {
-		dev_warn(ep->dcp->dev,
-			 "AFK[ep:%02x]: rptr out of bounds: 0x%x > 0x%lx\n",
-			 ep->endpoint, rptr, ep->rxbfr.bufsz - sizeof(*hdr));
+	if (!afk_ring_ptrs_valid(rptr, wptr, ep->rxbfr.bufsz, ep->rxbfr.stride)) {
+		dev_warn_ratelimited(ep->dcp->dev,
+				     "AFK[ep:%02x]: invalid receive ring pointers: rptr 0x%x wptr 0x%x\n",
+				     ep->endpoint, rptr, wptr);
 		return false;
 	}
+
+	if (rptr == wptr)
+		return false;
 
 	dma_rmb();
 
@@ -1252,8 +1252,8 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 
 	if (!afk_ring_payload_fits(rptr, size, ep->rxbfr.bufsz)) {
 		dev_warn(ep->dcp->dev,
-			 "AFK[ep:%02x]: queue entry out of bounds: 0x%lx > 0x%lx\n",
-			 ep->endpoint, rptr + size + sizeof(*hdr), ep->rxbfr.bufsz);
+			 "AFK[ep:%02x]: queue entry of 0x%x bytes at 0x%x out of bounds\n",
+			 ep->endpoint, size, rptr);
 		return false;
 	}
 
@@ -1277,6 +1277,23 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 	afk_recv_handle(ep, channel, type, ep->rx_scratch, size);
 
 	return true;
+}
+
+static bool afk_recv_entry(void *ep)
+{
+	return afk_recv(ep);
+}
+
+static void afk_recv_drain(struct apple_dcp_afkep *ep)
+{
+	unsigned int budget = afk_ring_drain_budget(ep->rxbfr.bufsz,
+						    ep->rxbfr.stride);
+
+	if (afk_ring_drain(afk_recv_entry, ep, budget) == budget &&
+	    ep->rxbfr.ready && le32_to_cpu(*ep->rxbfr.rptr) != le32_to_cpu(*ep->rxbfr.wptr))
+		dev_warn_ratelimited(ep->dcp->dev,
+				     "AFK[ep:%02x]: receive ring did not drain in one pass\n",
+				     ep->endpoint);
 }
 
 static void afk_receive_message_worker(struct work_struct *work_)
@@ -1313,8 +1330,7 @@ static void afk_receive_message_worker(struct work_struct *work_)
 		break;
 
 	case RBEP_RECV:
-		while (afk_recv(work->ep))
-			;
+		afk_recv_drain(work->ep);
 		break;
 
 	default:

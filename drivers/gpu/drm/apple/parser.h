@@ -117,6 +117,14 @@ struct dimension {
 	s64 pixel_repetition;
 };
 
+/*
+ * Upper bound on the TimingElements catalog. DCP reports one element per
+ * timing it derived from the sink's EDID and DisplayID, and every catalog
+ * logged on J700 so far holds at most 14. The cap leaves ample headroom
+ * while keeping the retained array (320 bytes per entry) below 1 MiB.
+ */
+#define DCP_MAX_TIMING_MODES 1024
+
 int parse(const void *blob, size_t size, struct dcp_parse_ctx *ctx);
 bool dcp_property_complete(const void *blob, size_t received, size_t advertised);
 struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
