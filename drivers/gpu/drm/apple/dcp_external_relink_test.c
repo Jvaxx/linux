@@ -402,6 +402,7 @@ static struct relink_test *relink_test_init(struct kunit *test)
 	mutex_init(&dcp->external_lock);
 	mutex_init(&dcp->hpd_mutex);
 	mutex_init(&dcp->dcpavserv.lock);
+	dcp_modes_init(dcp);
 	spin_lock_init(&dcp->metadata.lock);
 	spin_lock_init(&dcp->mode_state.lock);
 	INIT_DELAYED_WORK(&dcp->announce_wq, dcp_announce_work);
@@ -740,6 +741,8 @@ static void relink_test_real(struct relink_test *t)
 	t->catalog.mode = *t->mode;
 	t->dcp.modes = &t->catalog;
 	t->dcp.nr_modes = 1;
+	/* The catalog the firmware published for this connection. */
+	t->dcp.modes_admitted = true;
 	t->dcp.test_push = relink_test_push;
 }
 
