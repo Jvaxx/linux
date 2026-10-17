@@ -20,10 +20,23 @@ static const struct apple_epic_service_ops ibootep_ops[] = {
 	{}
 };
 
+static const struct apple_epic_service_ops external_ibootep_ops[] = {
+	{
+		.name = "dispext-service",
+		.init = disp_service_init,
+	},
+	{}
+};
+
 int ibootep_init(struct apple_dcp *dcp)
 {
-	dcp->ibootep = afk_init(dcp, DISP0_ENDPOINT, ibootep_ops);
-	afk_start(dcp->ibootep);
+	const struct apple_epic_service_ops *ops = ibootep_ops;
 
-	return 0;
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL)
+		ops = external_ibootep_ops;
+	dcp->ibootep = afk_init(dcp, DISP0_ENDPOINT, ops);
+	if (IS_ERR(dcp->ibootep))
+		return PTR_ERR(dcp->ibootep);
+
+	return afk_start(dcp->ibootep);
 }
