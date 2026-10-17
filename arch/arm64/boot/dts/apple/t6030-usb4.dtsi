@@ -37,11 +37,14 @@
 			      <&ps_atc2_cio_usb>, <&ps_atc2_pcie>;
 };
 
-&soc {
+/ {
 	usb4_0_pcie_tunnel: usb4-pcie-tunnel-0 {
 		#address-cells = <2>;
 		#size-cells = <2>;
 		ranges;
+		nonposted-mmio;
+		/* Preserve the SoC DMA window after moving the virtual container. */
+		dma-ranges = <0 0 0 0 0xffffffff 0xffffc000>;
 
 		usb4_0_pcie_dart: iommu@721008000 {
 			compatible = "apple,t6030-dart", "apple,t8110-dart";

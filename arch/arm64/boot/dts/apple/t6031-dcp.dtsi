@@ -35,6 +35,13 @@
 		clock-frequency = <712000000>;
 		clock-output-names = "clk_disp0";
 	};
+
+	/* Component master without MMIO, outside the simple-bus. */
+	display: display-subsystem {
+		compatible = "apple,t6031-display-subsystem";
+		iommus = <&disp0_dart 0>;
+		status = "disabled";
+	};
 };
 
 &soc {
@@ -97,6 +104,7 @@
 		clocks = <&clk_disp0>;
 		#address-cells = <2>;
 		#size-cells = <2>;
+		ranges;
 		status = "disabled";
 
 		disp0_piodma: piodma {
@@ -104,11 +112,6 @@
 		};
 	};
 
-	display: display-subsystem {
-		compatible = "apple,t6031-display-subsystem";
-		iommus = <&disp0_dart 0>;
-		status = "disabled";
-	};
 };
 
 /*

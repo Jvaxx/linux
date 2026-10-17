@@ -44,18 +44,18 @@
 		 * properties. Disabled until then, so that neither the kernel nor m1n1's RAM-map scan (dt_set_memory)
 		 * sees a zero-sized placeholder.
 		 */
-		uat_handoff: uat-handoff {
-			reg = <0 0 0 0>;
+		uat_handoff: uat-handoff@30 {
+			reg = <0 0x30 0 0>;
 			status = "disabled";
 		};
 
-		uat_pagetables: uat-pagetables {
-			reg = <0 0 0 0>;
+		uat_pagetables: uat-pagetables@20 {
+			reg = <0 0x20 0 0>;
 			status = "disabled";
 		};
 
-		uat_ttbs: uat-ttbs {
-			reg = <0 0 0 0>;
+		uat_ttbs: uat-ttbs@10 {
+			reg = <0 0x10 0 0>;
 			status = "disabled";
 		};
 
@@ -63,8 +63,8 @@
 		 * G15 second-level TTBR1 table: keep it in the linear map with
 		 * uat-pagetables. The bootloader fills reg and enables this node.
 		 */
-		uat_pagetables_l2: uat-pagetables-l2 {
-			reg = <0 0 0 0>;
+		uat_pagetables_l2: uat-pagetables-l2@40 {
+			reg = <0 0x40 0 0>;
 			status = "disabled";
 		};
 	};

@@ -46,6 +46,13 @@
 		clock-frequency = <0>;
 		clock-output-names = "clk_dispext0";
 	};
+
+	/* Component master without MMIO, outside the simple-bus. */
+	display: display-subsystem {
+		compatible = "apple,t8122-display-subsystem";
+		iommus = <&disp0_dart 0>;
+		status = "disabled";
+	};
 };
 
 &{/soc} {
@@ -103,6 +110,7 @@
 		clocks = <&clk_disp0>;
 		#address-cells = <2>;
 		#size-cells = <2>;
+		ranges;
 		status = "disabled";
 
 		disp0_piodma: piodma {
@@ -110,11 +118,6 @@
 		};
 	};
 
-	display: display-subsystem {
-		compatible = "apple,t8122-display-subsystem";
-		iommus = <&disp0_dart 0>;
-		status = "disabled";
-	};
 
 	/*
 	 * The PMGR bandwidth page (ADT disp0/dispext0 reg 5). The internal

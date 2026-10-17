@@ -31,6 +31,13 @@
 		clock-frequency = <712000000>;
 		clock-output-names = "clk_disp0";
 	};
+
+	/* Component master without MMIO, outside the simple-bus. */
+	display: display-subsystem {
+		compatible = "apple,t6030-display-subsystem";
+		iommus = <&disp0_dart 0>;
+		status = "disabled";
+	};
 };
 
 &soc {
@@ -88,6 +95,7 @@
 		clocks = <&clk_disp0>;
 		#address-cells = <2>;
 		#size-cells = <2>;
+		ranges;
 		status = "disabled";
 
 		disp0_piodma: piodma {
@@ -95,11 +103,6 @@
 		};
 	};
 
-	display: display-subsystem {
-		compatible = "apple,t6030-display-subsystem";
-		iommus = <&disp0_dart 0>;
-		status = "disabled";
-	};
 
 	dcpext_dart: iommu@2d130c000 {
 		compatible = "apple,t6030-dart", "apple,t8110-dart";
@@ -149,6 +152,7 @@
 		apple,typec-mux-indices = <0 0 0>;
 		#address-cells = <2>;
 		#size-cells = <2>;
+		ranges;
 		status = "disabled";
 
 		/*
@@ -247,6 +251,7 @@
 		apple,typec-mux-indices = <2 2 2>;
 		#address-cells = <2>;
 		#size-cells = <2>;
+		ranges;
 		status = "disabled";
 
 		/* Enabled with this processor by the display gate, as for dcpext. */

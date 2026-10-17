@@ -27,6 +27,11 @@
 	status = "disabled";
 };
 
+/* This profile requests only DISP and ANS until external admission succeeds. */
+&pmp_report_dispext {
+	status = "disabled";
+};
+
 &pmp_report_ans {
 	apple,always-on;
 };
