@@ -679,6 +679,176 @@ static void atcphy_test_host_start_without_usb3(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, atcphy_usb3_set_mode(phy, PHY_MODE_USB_HOST, 0), -EBUSY);
 }
 
+/*
+ * The controller as the PIPE lock sees it: while @held, as through the PD
+ * elections of a Mac taking another data role, it does not acknowledge the
+ * lock. The USB side stubs share @steps.
+ */
+struct atcphy_test_election {
+	struct atcphy_test_steps steps;
+	bool held;
+};
+
+static int atcphy_test_lock(struct apple_atcphy *atcphy)
+{
+	struct atcphy_test_election *election = kunit_get_current_test()->priv;
+
+	return election->held ? -ETIMEDOUT : 0;
+}
+
+/* The host BIST of a USB3 handoff, which zeroed registers cannot run */
+static int atcphy_test_bist(struct apple_atcphy *atcphy)
+{
+	return 0;
+}
+
+/* The lane change, as far as the PIPE handling depends on it */
+static int atcphy_test_lanes(struct apple_atcphy *atcphy, enum atcphy_mode mode)
+{
+	lockdep_assert_held(&atcphy->lock);
+	atcphy->mode = mode;
+	atcphy->mode_dirty = false;
+	return 0;
+}
+
+/*
+ * The rear port of a J700 with a Mac on it: USB3, with the PIPE on the USB3
+ * backend of the running host. The real mode change runs between the recorded
+ * USB side steps of atcphy_test_stub_steps().
+ */
+static struct apple_atcphy *atcphy_test_alloc_election(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_fixed_hub(test);
+	struct atcphy_test_election *election;
+
+	election = kunit_kzalloc(test, sizeof(*election), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, election);
+	test->priv = election;
+	kunit_activate_static_stub(test, atcphy_pipehandler_lock, atcphy_test_lock);
+	kunit_activate_static_stub(test, atcphy_configure_pipehandler_usb3_host_t8122,
+				   atcphy_test_bist);
+	kunit_activate_static_stub(test, atcphy_configure, atcphy_test_lanes);
+	kunit_activate_static_stub(test, atcphy_usb3_pm_get, atcphy_test_pm_get);
+	kunit_activate_static_stub(test, atcphy_usb3_port_off, atcphy_test_port_off);
+	kunit_activate_static_stub(test, atcphy_usb3_port_on, atcphy_test_port_on);
+	kunit_activate_static_stub(test, atcphy_usb3_port_retry_delay, atcphy_test_retry_delay);
+	atcphy_test_fake_regs(test, atcphy);
+	atcphy->mode = APPLE_ATCPHY_MODE_USB3;
+	atcphy->typec_mode = APPLE_ATCPHY_MODE_USB3;
+
+	return atcphy;
+}
+
+static const struct typec_mux_state atcphy_test_safe = { .mode = TYPEC_STATE_SAFE };
+static const struct typec_mux_state atcphy_test_usb = { .mode = TYPEC_STATE_USB };
+
+/* A refused PIPE change leaves the port down, and nothing queued */
+static void atcphy_test_election_refused(struct kunit *test, struct apple_atcphy *atcphy,
+					 const struct typec_mux_state *state)
+{
+	struct atcphy_test_election *election = test->priv;
+
+	memset(election->steps.log, 0, sizeof(election->steps.log));
+	KUNIT_EXPECT_EQ(test, atcphy_mux_update(atcphy, state), -ETIMEDOUT);
+	KUNIT_EXPECT_STREQ(test, election->steps.log, "g0");
+	KUNIT_EXPECT_TRUE(test, atcphy->usb3_port_off);
+	KUNIT_EXPECT_FALSE(test, atcphy_usb3_port_ready(atcphy));
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&atcphy->usb3_port_work));
+}
+
+/* The safe state and then the USB state, as the Type-C driver applies them again */
+static void atcphy_test_election_redrive(struct kunit *test, struct apple_atcphy *atcphy)
+{
+	struct atcphy_test_election *election = test->priv;
+	char *log = election->steps.log;
+
+	memset(log, 0, sizeof(election->steps.log));
+	KUNIT_EXPECT_EQ(test, atcphy_mux_update(atcphy, &atcphy_test_safe), 0);
+	KUNIT_EXPECT_STREQ(test, log, "g0");
+	KUNIT_EXPECT_EQ(test, atcphy->mode, APPLE_ATCPHY_MODE_USB2);
+	KUNIT_EXPECT_FALSE(test, atcphy->mode_dirty);
+	KUNIT_EXPECT_EQ(test, atcphy->pipe_state, ATCPHY_PIPEHANDLER_STATE_DUMMY);
+	KUNIT_EXPECT_TRUE(test, atcphy->usb3_port_off);
+
+	memset(log, 0, sizeof(election->steps.log));
+	KUNIT_EXPECT_EQ(test, atcphy_mux_update(atcphy, &atcphy_test_usb), 0);
+	KUNIT_EXPECT_STREQ(test, log, "g01");
+	KUNIT_EXPECT_EQ(test, atcphy->mode, APPLE_ATCPHY_MODE_USB3);
+	KUNIT_EXPECT_EQ(test, atcphy->pipe_state, ATCPHY_PIPEHANDLER_STATE_USB3);
+	KUNIT_EXPECT_FALSE(test, atcphy->pipe_pending);
+	KUNIT_EXPECT_FALSE(test, atcphy->usb3_port_off);
+	KUNIT_EXPECT_TRUE(test, atcphy_usb3_port_ready(atcphy));
+}
+
+/*
+ * SuperSpeed comes back after a data role swap whose safe state found the PIPE
+ * held, however many times it was refused, once the Type-C driver applies its
+ * whole state again after the elections.
+ */
+static void atcphy_test_election_held_safe(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_election(test);
+	struct atcphy_test_election *election = test->priv;
+	unsigned int i;
+
+	election->held = true;
+	/* Many more times than the Type-C driver used to retry */
+	for (i = 0; i < 8; i++)
+		atcphy_test_election_refused(test, atcphy, &atcphy_test_safe);
+	/* The PIPE could not be parked, so the lanes were left alone */
+	KUNIT_EXPECT_TRUE(test, atcphy->mode_dirty);
+	KUNIT_EXPECT_EQ(test, atcphy->pipe_state, ATCPHY_PIPEHANDLER_STATE_USB3);
+
+	election->held = false;
+	atcphy_test_election_redrive(test, atcphy);
+}
+
+/* The same if the elections go on into the USB state that follows the safe one */
+static void atcphy_test_election_held_usb(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc_election(test);
+	struct atcphy_test_election *election = test->priv;
+
+	election->held = true;
+	atcphy_test_election_refused(test, atcphy, &atcphy_test_safe);
+	election->held = false;
+	KUNIT_EXPECT_EQ(test, atcphy_mux_update(atcphy, &atcphy_test_safe), 0);
+	KUNIT_EXPECT_EQ(test, atcphy->pipe_state, ATCPHY_PIPEHANDLER_STATE_DUMMY);
+
+	/* The lanes are rebuilt for USB3, but the PIPE cannot follow */
+	election->held = true;
+	atcphy_test_election_refused(test, atcphy, &atcphy_test_usb);
+	KUNIT_EXPECT_EQ(test, atcphy->mode, APPLE_ATCPHY_MODE_USB3);
+	KUNIT_EXPECT_EQ(test, atcphy->pipe_state, ATCPHY_PIPEHANDLER_STATE_DUMMY);
+
+	election->held = false;
+	atcphy_test_election_redrive(test, atcphy);
+}
+
+/*
+ * Only the fixed-hub ports of a J700 have the Type-C driver retry a timeout
+ * until it passes; every M1 and M2 port, and fixed-hub ports on other PHYs,
+ * keep its bounded retries.
+ */
+static void atcphy_test_transient_timeouts(struct kunit *test)
+{
+	struct apple_atcphy *atcphy = atcphy_test_alloc(test, true);
+
+	atcphy->hw = &atcphy_hw_t8140;
+	KUNIT_EXPECT_TRUE(test, atcphy_mux_transient_timeouts(atcphy));
+	atcphy->fixed_usb2 = false;
+	KUNIT_EXPECT_FALSE(test, atcphy_mux_transient_timeouts(atcphy));
+
+	atcphy->hw = &atcphy_hw_t8103;
+	KUNIT_EXPECT_FALSE(test, atcphy_mux_transient_timeouts(atcphy));
+	atcphy->hw = &atcphy_hw_t8122;
+	KUNIT_EXPECT_FALSE(test, atcphy_mux_transient_timeouts(atcphy));
+	atcphy->fixed_usb2 = true;
+	KUNIT_EXPECT_FALSE(test, atcphy_mux_transient_timeouts(atcphy));
+	atcphy->hw = &atcphy_hw_t8142;
+	KUNIT_EXPECT_FALSE(test, atcphy_mux_transient_timeouts(atcphy));
+}
+
 #if IS_REACHABLE(CONFIG_USB)
 /* Only the controller's SuperSpeed root hub is ever handed the port changes */
 static void atcphy_test_usb3_root(struct kunit *test)
@@ -825,6 +995,9 @@ static struct kunit_case atcphy_mux_test_cases[] = {
 	KUNIT_CASE(atcphy_test_stopped_power_off),
 	KUNIT_CASE(atcphy_test_stopped_reset),
 	KUNIT_CASE(atcphy_test_host_start_without_usb3),
+	KUNIT_CASE(atcphy_test_election_held_safe),
+	KUNIT_CASE(atcphy_test_election_held_usb),
+	KUNIT_CASE(atcphy_test_transient_timeouts),
 #if IS_REACHABLE(CONFIG_USB)
 	KUNIT_CASE(atcphy_test_usb3_root),
 #endif
