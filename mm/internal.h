@@ -1148,9 +1148,14 @@ static inline unsigned long vma_address_end(struct page_vma_mapped_walk *pvmw)
 #endif
 
 	/* Common case, plus ->pgoff is invalid for KSM */
+#ifdef CONFIG_MM_SUBPAGE
 	if (pvmw->nr_pages == 1 && mm_page_size(vma->vm_mm) >= PAGE_SIZE)
 		return min((pvmw->address & mm_page_mask(vma->vm_mm)) +
 			   mm_page_size(vma->vm_mm), vma->vm_end);
+#else
+	if (pvmw->nr_pages == 1)
+		return pvmw->address + PAGE_SIZE;
+#endif
 
 	if (pvmw->pgoff_is_anon)
 		pgoff_vma_start = vma_start_anon_pgoff(vma);
