@@ -880,13 +880,15 @@ struct write_opcode_ctx {
  * Verification callback used by uprobe_write calls to make sure the underlying
  * instruction is in the expected stage of the INT3 update sequence.
  */
-static int verify_insn(struct page *page, unsigned long vaddr, uprobe_opcode_t *new_opcode,
+static int verify_insn(struct page *page, unsigned long vaddr, unsigned int page_offset,
+		       uprobe_opcode_t *new_opcode,
 		       int nbytes, void *data)
 {
 	struct write_opcode_ctx *ctx = data;
 	uprobe_opcode_t old_opcode[OPT_INSN_SIZE];
 
-	uprobe_copy_from_page(page, ctx->base, old_opcode, OPT_INSN_SIZE);
+	uprobe_copy_from_page(page, page_offset - (vaddr - ctx->base),
+			      old_opcode, OPT_INSN_SIZE);
 
 	switch (ctx->expect) {
 	case EXPECT_SWBP:
