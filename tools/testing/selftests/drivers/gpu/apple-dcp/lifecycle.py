@@ -406,6 +406,10 @@ int main(void)
         shim = shim.replace(old, 'static int cd321x_typec_update_mode(struct tps6598x *t, struct cd321x_status *s, bool *busy,\n'
                             ' bool *held)\n'
                             '{ (void)t; (void)s; *busy = mode_error == -EBUSY; *held = false; return mode_error; }')
+    # How long a held mux has been retried is measured on the driver's clock.
+    if 'jiffies_to_msecs(jiffies)' in funcs:
+        shim += ('\nstatic unsigned long jiffies;\n'
+                 'static unsigned jiffies_to_msecs(unsigned long t) { return t; }\n')
     source = prefix + pm + shim + dp + funcs + tests
     return source
 
@@ -576,6 +580,10 @@ int main(void)
  printf("%d assertions, %d failures\n", checks, failures); return !!failures;
 }
 '''
+    # unless the update work already needed the clock
+    clock = 'static unsigned jiffies_to_msecs(unsigned long t) { return t; }\n'
+    if clock in unit:
+        firmware = firmware.replace(clock, '')
     return unit + firmware + raw + '\n' + tests
 
 def dropped(root):

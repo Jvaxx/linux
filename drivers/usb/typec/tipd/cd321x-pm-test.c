@@ -520,13 +520,16 @@ static void cd321x_unacked_events_across_sleep_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, cd321x_pm_begin_read(&pm));
 }
 
+/* A millisecond clock that wraps half way through the time a hold-up is retried */
+#define TEST_WRAP_MS (0U - CD321X_MUX_HELD_MS / 2)
+
 static void cd321x_held_mux_outlasts_budget_test(struct kunit *test)
 {
 	struct cd321x_pm_state pm = { .phase = CD321X_PM_RUNNING };
-	unsigned int i, delay = 0;
+	unsigned int i, delay = 0, now = TEST_WRAP_MS;
 
 	for (i = 0; i < 4 * CD321X_RESUME_ATTEMPTS; i++) {
-		unsigned int next = cd321x_pm_mux_held(&pm);
+		unsigned int next = cd321x_pm_mux_held(&pm, now);
 
 		/* Never given up, and not charged to the cable-state budget... */
 		KUNIT_EXPECT_EQ(test, pm.phase, CD321X_PM_REVALIDATE);
@@ -537,6 +540,7 @@ static void cd321x_held_mux_outlasts_budget_test(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, next, i ? min(2 * delay, CD321X_MUX_RETRY_MAX_MS) :
 					     CD321X_MUX_RETRY_MS);
 		delay = next;
+		now += delay;
 		/* An event brings the retry forward, but not a read already under way. */
 		KUNIT_EXPECT_TRUE(test, cd321x_pm_mux_event(&pm));
 		KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
@@ -565,10 +569,11 @@ static void cd321x_held_mux_across_sleep_test(struct kunit *test)
 {
 	struct cd321x_pm_state pm = { .phase = CD321X_PM_RUNNING };
 
-	cd321x_pm_mux_held(&pm);
+	cd321x_pm_mux_held(&pm, 0);
 	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
 	cd321x_pm_snapshot_ready(&pm);
-	KUNIT_EXPECT_EQ(test, cd321x_pm_mux_held(&pm), 2 * CD321X_MUX_RETRY_MS);
+	KUNIT_EXPECT_EQ(test, cd321x_pm_mux_held(&pm, CD321X_MUX_RETRY_MS),
+			2 * CD321X_MUX_RETRY_MS);
 
 	/* The resume read takes the retry over, and a new hold-up starts afresh. */
 	cd321x_pm_prepare(&pm);
@@ -578,7 +583,8 @@ static void cd321x_held_mux_across_sleep_test(struct kunit *test)
 	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
 	cd321x_pm_snapshot_ready(&pm);
 	KUNIT_EXPECT_TRUE(test, pm.force_reconnect);
-	KUNIT_EXPECT_EQ(test, cd321x_pm_mux_held(&pm), CD321X_MUX_RETRY_MS);
+	KUNIT_EXPECT_EQ(test, cd321x_pm_mux_held(&pm, CD321X_MUX_HELD_MS),
+			CD321X_MUX_RETRY_MS);
 
 	/* Removal ends it. */
 	cd321x_pm_remove(&pm);
@@ -586,24 +592,33 @@ static void cd321x_held_mux_across_sleep_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, cd321x_pm_mux_event(&pm));
 }
 
+/* A failure of a held mux, which must be retried after a delay */
+static void cd321x_held_mux_retried(struct kunit *test, struct cd321x_pm_state *pm,
+				    unsigned int now)
+{
+	KUNIT_EXPECT_GT(test, cd321x_pm_mux_held(pm, now), 0);
+	KUNIT_EXPECT_EQ(test, pm->phase, CD321X_PM_REVALIDATE);
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(pm));
+	cd321x_pm_snapshot_ready(pm);
+}
+
+/* A hold-up is retried for CD321X_MUX_HELD_MS from its first failure... */
 static void cd321x_held_mux_gives_up_test(struct kunit *test)
 {
 	struct cd321x_pm_state pm = { .phase = CD321X_PM_RUNNING };
-	unsigned int i, total = 0;
+	unsigned int now;
 
-	for (i = 0; i < CD321X_MUX_RETRIES; i++) {
-		unsigned int delay = cd321x_pm_mux_held(&pm);
+	for (now = TEST_WRAP_MS; now - TEST_WRAP_MS < CD321X_MUX_HELD_MS;
+	     now += CD321X_MUX_RETRY_MAX_MS)
+		cd321x_held_mux_retried(test, &pm, now);
+	cd321x_held_mux_retried(test, &pm, TEST_WRAP_MS + CD321X_MUX_HELD_MS - 1);
+	KUNIT_EXPECT_LT(test, pm.mux_retries, CD321X_MUX_RETRIES);
 
-		KUNIT_EXPECT_GT(test, delay, 0);
-		total += delay;
-		KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
-		cd321x_pm_snapshot_ready(&pm);
-	}
-	/* Some two minutes on, a hold-up is taken for a fault... */
-	KUNIT_EXPECT_GE(test, total, 120000U);
-	KUNIT_EXPECT_EQ(test, cd321x_pm_mux_held(&pm), 0);
+	/* ...and is then taken for a fault... */
+	KUNIT_EXPECT_EQ(test, cd321x_pm_mux_held(&pm, TEST_WRAP_MS + CD321X_MUX_HELD_MS), 0);
 	KUNIT_EXPECT_EQ(test, pm.phase, CD321X_PM_STALE);
 	KUNIT_EXPECT_EQ(test, pm.mux_retry_ms, 0);
+	KUNIT_EXPECT_EQ(test, pm.mux_retries, 0);
 	KUNIT_EXPECT_FALSE(test, cd321x_pm_mux_event(&pm));
 	KUNIT_EXPECT_FALSE(test, cd321x_pm_begin_read(&pm));
 
@@ -612,8 +627,40 @@ static void cd321x_held_mux_gives_up_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, pm.force_reconnect);
 	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
 	cd321x_pm_snapshot_ready(&pm);
-	KUNIT_EXPECT_EQ(test, cd321x_pm_mux_held(&pm), CD321X_MUX_RETRY_MS);
+	now = TEST_WRAP_MS + 2 * CD321X_MUX_HELD_MS;
+	KUNIT_EXPECT_EQ(test, cd321x_pm_mux_held(&pm, now), CD321X_MUX_RETRY_MS);
 	KUNIT_EXPECT_EQ(test, pm.mux_retries, 1);
+	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
+	cd321x_pm_snapshot_ready(&pm);
+	cd321x_held_mux_retried(test, &pm, now + CD321X_MUX_HELD_MS - 1);
+}
+
+/*
+ * ...however many retries events bring forward: they come no closer together
+ * than the two debounces, about a second.
+ */
+static void cd321x_held_mux_brought_forward_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = { .phase = CD321X_PM_RUNNING };
+	unsigned int i;
+
+	for (i = 0; i < CD321X_MUX_HELD_MS / 1000; i++)
+		cd321x_held_mux_retried(test, &pm, TEST_WRAP_MS + i * 1000);
+	KUNIT_EXPECT_EQ(test, cd321x_pm_mux_held(&pm, TEST_WRAP_MS + i * 1000), 0);
+	KUNIT_EXPECT_EQ(test, pm.phase, CD321X_PM_STALE);
+}
+
+/* Should retries ever come faster, their number still bounds the warnings. */
+static void cd321x_held_mux_retries_bounded_test(struct kunit *test)
+{
+	struct cd321x_pm_state pm = { .phase = CD321X_PM_RUNNING };
+	unsigned int i;
+
+	for (i = 0; i < CD321X_MUX_RETRIES; i++)
+		cd321x_held_mux_retried(test, &pm, TEST_WRAP_MS);
+	KUNIT_EXPECT_EQ(test, cd321x_pm_mux_held(&pm, TEST_WRAP_MS), 0);
+	KUNIT_EXPECT_EQ(test, pm.phase, CD321X_PM_STALE);
+	KUNIT_EXPECT_EQ(test, pm.mux_retries, 0);
 }
 
 static void cd321x_held_mux_other_failure_test(struct kunit *test)
@@ -622,7 +669,7 @@ static void cd321x_held_mux_other_failure_test(struct kunit *test)
 	unsigned int i;
 
 	for (i = 0; i < 4; i++) {
-		cd321x_pm_mux_held(&pm);
+		cd321x_pm_mux_held(&pm, i * CD321X_MUX_RETRY_MS);
 		KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
 		cd321x_pm_snapshot_ready(&pm);
 	}
@@ -647,7 +694,7 @@ static void cd321x_held_mux_other_failure_test(struct kunit *test)
 	KUNIT_ASSERT_TRUE(test, cd321x_pm_event(&pm));
 	KUNIT_ASSERT_TRUE(test, cd321x_pm_begin_read(&pm));
 	cd321x_pm_snapshot_ready(&pm);
-	KUNIT_EXPECT_EQ(test, cd321x_pm_mux_held(&pm), CD321X_MUX_RETRY_MS);
+	KUNIT_EXPECT_EQ(test, cd321x_pm_mux_held(&pm, CD321X_MUX_HELD_MS), CD321X_MUX_RETRY_MS);
 	cd321x_pm_remove(&pm);
 	KUNIT_EXPECT_EQ(test, pm.mux_retry_ms, 0);
 	KUNIT_EXPECT_EQ(test, pm.mux_retries, 0);
@@ -695,6 +742,8 @@ static struct kunit_case cd321x_pm_cases[] = {
 	KUNIT_CASE(cd321x_held_mux_outlasts_budget_test),
 	KUNIT_CASE(cd321x_held_mux_across_sleep_test),
 	KUNIT_CASE(cd321x_held_mux_gives_up_test),
+	KUNIT_CASE(cd321x_held_mux_brought_forward_test),
+	KUNIT_CASE(cd321x_held_mux_retries_bounded_test),
 	KUNIT_CASE(cd321x_held_mux_other_failure_test),
 	KUNIT_CASE(cd321x_display_taken_test),
 	{}
