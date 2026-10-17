@@ -17,6 +17,7 @@
 #include <linux/platform_device.h>
 #include <linux/firmware.h>
 #include <linux/iommu.h>
+#include <linux/spinlock.h>
 
 #include <media/v4l2-ctrls.h>
 #include <media/v4l2-device.h>
@@ -31,6 +32,8 @@
 /* Shifts addreses right and bytesperline?? */
 #define AVD_QUIRK_LSR	BIT(0)
 #define AVD_QUIRK_NO_PIPE_STATE	 BIT(1)
+/* HEVC DMA configuration and extended scratch-address table. */
+#define AVD_QUIRK_HEVC_V5_HEADER	BIT(2)
 
 #define VP_SLOT_NONE		255
 #define INST_FIFO_SLOT_NONE	255
@@ -114,6 +117,9 @@ struct avd_decoded_buffer {
 	struct v4l2_m2m_buffer base;
 
 	struct avd_comp comp;
+	/* Pending CPU fill, retained with the buffer until dequeue. */
+	size_t grey_chroma_offset;
+	bool grey_chroma_10bit;
 
 	union {
 		struct avd_vp9_decoded_buffer_info vp9;
@@ -172,6 +178,7 @@ struct avd_coded_fmt_desc {
 
 struct avd_variant {
 	unsigned int vp_slots[4];
+	unsigned int vp_slot_base[4];
 	unsigned int fifo_slots;
 	unsigned int capabilities;
 	void (*configure_stream)(struct avd_dev *avd, dma_addr_t addr,
@@ -184,6 +191,14 @@ struct avd_variant {
 	u32 submit_queue_max_offset;
 	u32 submit_queue_status_offset;
 	unsigned int quirks;
+};
+
+/* Lifecycle of the one m2m job the device runs at a time. */
+enum avd_job_state {
+	AVD_JOB_IDLE,
+	AVD_JOB_RUNNING,	/* inside avd_device_run() */
+	AVD_JOB_SUBMITTED,	/* handed to the hardware, watchdog armed */
+	AVD_JOB_FINISHING,	/* claimed by the IRQ handler or the watchdog */
 };
 
 struct avd_dev {
@@ -204,6 +219,15 @@ struct avd_dev {
 	struct iommu_domain *empty_domain;
 
 	struct mutex vdev_lock;
+
+	/* The current job; see avd_device_run(). Protected by job_lock. */
+	spinlock_t job_lock;
+	enum avd_job_state job_state;
+	struct avd_ctx *job_ctx;
+	u64 job_seq;
+	bool job_end_sent;
+	bool job_pending;
+	enum vb2_buffer_state job_pending_result;
 
 	struct reset_control *rstc;
 
@@ -240,6 +264,8 @@ struct avd_ctx {
 	bool decomp;
 
 	struct delayed_work watchdog_work;
+	/* job_seq of the job watchdog_work was armed for */
+	u64 wd_seq;
 
 	void *priv;
 
@@ -264,6 +290,13 @@ void avd_job_finish(struct avd_ctx *ctx, enum vb2_buffer_state result);
 
 void avd_run_preamble(struct avd_ctx *ctx, struct avd_run *run);
 void avd_run_postamble(struct avd_ctx *ctx, struct avd_run *run);
+
+#if IS_ENABLED(CONFIG_KUNIT)
+bool avd_h264_find_slice_data(const u8 *data, u32 len, u32 header_len,
+			      u32 *off);
+bool avd_h264_slice_fits(const struct v4l2_ctrl_h264_sps *sps, size_t held,
+			 size_t held_bytes, u32 len, size_t decoded_size);
+#endif
 
 extern const struct avd_coded_fmt_ops avd_h264_fmt_ops;
 extern const struct avd_coded_fmt_ops avd_hevc_fmt_ops;

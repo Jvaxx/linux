@@ -1291,14 +1291,21 @@ static int avd_av1_run(struct avd_ctx *ctx)
 			   run.frame->tile_info.tile_cols *
 					   run.frame->tile_info.tile_rows +
 				   1);
-	if (ret)
+	if (ret) {
+		avd_run_postamble(ctx, &run.base);
 		return ret;
+	}
+
+	ret = avd_av1_alloc_work_bufs(ctx, &run);
+	if (ret) {
+		avd_run_postamble(ctx, &run.base);
+		return ret;
+	}
 
 	dst = vb2_to_avd_decoded_buf(&run.base.bufs.dst->vb2_buf);
 	update_dec_buf_info(dst, run.seq, run.frame);
 
 	avd_av1_set_prob(ctx, &run);
-	avd_av1_alloc_work_bufs(ctx, &run);
 
 	set_header(ctx, &run);
 	set_tiles(ctx, &run);
@@ -1331,33 +1338,12 @@ static int avd_av1_alloc_bufs(struct avd_ctx *ctx)
 	return 0;
 }
 
-static int avd_av1_start(struct avd_ctx *ctx)
-{
-	struct avd_av1_ctx *av1_ctx;
-	int ret;
-
-	av1_ctx = kzalloc(sizeof(*av1_ctx), GFP_KERNEL);
-	if (!av1_ctx)
-		return -ENOMEM;
-
-	ctx->priv = av1_ctx;
-	ret = avd_av1_alloc_bufs(ctx);
-	if (ret)
-		goto err_free_ctx;
-
-	return 0;
-
-err_free_ctx:
-	kfree(av1_ctx);
-	ctx->priv = NULL;
-	return ret;
-}
-
 static void avd_av1_stop(struct avd_ctx *ctx)
 {
 	struct avd_av1_ctx *av1_ctx = ctx->priv;
 	struct avd_dev *avd = ctx->dev;
 
+	avd_buf_free(avd, &av1_ctx->bufs.above_info);
 	avd_buf_free(avd, &av1_ctx->bufs.rf_above_info);
 	avd_buf_free(avd, &av1_ctx->bufs.az_above);
 	avd_buf_free(avd, &av1_ctx->bufs.ip_above);
@@ -1376,6 +1362,28 @@ static void avd_av1_stop(struct avd_ctx *ctx)
 	avd_buf_free(avd, &av1_ctx->bufs.probs);
 
 	kfree(av1_ctx);
+	ctx->priv = NULL;
+}
+
+static int avd_av1_start(struct avd_ctx *ctx)
+{
+	struct avd_av1_ctx *av1_ctx;
+	int ret;
+
+	av1_ctx = kzalloc(sizeof(*av1_ctx), GFP_KERNEL);
+	if (!av1_ctx)
+		return -ENOMEM;
+
+	ctx->priv = av1_ctx;
+	ret = avd_av1_alloc_bufs(ctx);
+	if (ret)
+		goto err_free_ctx;
+
+	return 0;
+
+err_free_ctx:
+	avd_av1_stop(ctx);
+	return ret;
 }
 
 static enum avd_image_fmt avd_av1_get_image_fmt(struct avd_ctx *ctx,
@@ -1422,6 +1430,9 @@ static void avd_av1_submit(struct avd_ctx *ctx)
 static void avd_av1_adjust_decoded_fmt(struct avd_ctx *ctx,
 				       struct v4l2_pix_format_mplane *pix_mp)
 {
+	/* Keep both auxiliary regions aligned after compressed storage. */
+	pix_mp->plane_fmt[0].sizeimage =
+		ALIGN(pix_mp->plane_fmt[0].sizeimage, AVD_ALIGN);
 	pix_mp->plane_fmt[0].sizeimage += ALIGN(AVD_CDFS_SIZE, AVD_ALIGN);
 	pix_mp->plane_fmt[0].sizeimage +=
 		ALIGN(avd_color_size(pix_mp->width, pix_mp->height), AVD_ALIGN);

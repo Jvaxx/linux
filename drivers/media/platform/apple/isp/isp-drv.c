@@ -28,8 +28,11 @@ static void apple_isp_detach_genpd(struct apple_isp *isp)
 	for (int i = isp->pd_count - 1; i >= 0; i--) {
 		if (isp->pd_link[i])
 			device_link_del(isp->pd_link[i]);
-		if (!IS_ERR_OR_NULL(isp->pd_dev[i]))
-			dev_pm_domain_detach(isp->pd_dev[i], true);
+		if (IS_ERR_OR_NULL(isp->pd_dev[i]))
+			continue;
+		if (isp->hw->resident_fw)
+			dev_pm_syscore_device(isp->pd_dev[i], false);
+		dev_pm_domain_detach(isp->pd_dev[i], true);
 	}
 
 	return;
@@ -74,6 +77,68 @@ static int apple_isp_attach_genpd(struct apple_isp *isp)
 			apple_isp_detach_genpd(isp);
 			return -EINVAL;
 		}
+
+		/*
+		 * The domains of resident firmware are switched by the
+		 * driver alone, through runtime PM: the firmware does not
+		 * start again once they have been off. System sleep would
+		 * otherwise also have genpd switch them off in the noirq
+		 * phase of suspend and back on in the noirq phase of resume,
+		 * where the CPU core domains of a stopped coprocessor fail
+		 * to reach the active state.
+		 */
+		if (isp->hw->resident_fw)
+			dev_pm_syscore_device(isp->pd_dev[i], true);
+	}
+
+	return 0;
+}
+
+static void apple_isp_unmap_fw_mmio(struct apple_isp *isp, unsigned int count)
+{
+	for (unsigned int i = 0; i < count; i++)
+		iommu_unmap(isp->domain, isp->hw->fw_mmio[i].base,
+			    isp->hw->fw_mmio[i].size);
+}
+
+/*
+ * Some firmware accesses registers of other blocks, such as the PMGR
+ * scratch registers named in PMP_CTRL_SET, through its DART at their
+ * physical addresses. Map those windows 1:1.
+ */
+static int apple_isp_map_fw_mmio(struct apple_isp *isp)
+{
+	u64 start = isp->fw.heap_top, end = start + isp->iova_size;
+
+	for (unsigned int i = 0; i < isp->hw->num_fw_mmio; i++) {
+		const struct isp_mmio_window *w = &isp->hw->fw_mmio[i];
+		int err;
+
+		/* Keep them out of the range the surfaces come from. */
+		if (w->base < end && w->base + w->size > start) {
+			dev_err(isp->dev,
+				"MMIO window 0x%llx+0x%llx overlaps the IOVA range\n",
+				w->base, w->size);
+			err = -EINVAL;
+		} else {
+			/*
+			 * Cacheable: with the no-cache attribute, the ISP took
+			 * an SError on its first write to the PMP scratch
+			 * register when streaming started.
+			 */
+			err = iommu_map(isp->domain, w->base, w->base, w->size,
+					IOMMU_READ | IOMMU_WRITE | IOMMU_CACHE,
+					GFP_KERNEL);
+			if (err)
+				dev_err(isp->dev,
+					"failed to map MMIO window 0x%llx+0x%llx: %d\n",
+					w->base, w->size, err);
+		}
+
+		if (err) {
+			apple_isp_unmap_fw_mmio(isp, i);
+			return err;
+		}
 	}
 
 	return 0;
@@ -95,6 +160,7 @@ static int apple_isp_init_iommu(struct apple_isp *isp)
 	if (!isp->domain)
 		return -ENODEV;
 	isp->shift = __ffs(isp->domain->pgsize_bitmap);
+	isp->fw_iova_mask = isp->hw->fw_iova_mask ?: U64_MAX;
 
 	idx = of_property_match_string(dev->of_node, "memory-region-names",
 				       "heap");
@@ -128,14 +194,21 @@ static int apple_isp_init_iommu(struct apple_isp *isp)
 	}
 
 	// FIXME: refactor this, maybe use regular iova stuff?
-	drm_mm_init(&isp->iovad, isp->fw.heap_top,
-		    vm_size - (heap_base & 0xffffffff));
+	isp->iova_size = vm_size - (heap_base & 0xffffffff);
+	drm_mm_init(&isp->iovad, isp->fw.heap_top, isp->iova_size);
+
+	err = apple_isp_map_fw_mmio(isp);
+	if (err) {
+		drm_mm_takedown(&isp->iovad);
+		return err;
+	}
 
 	return 0;
 }
 
 static void apple_isp_free_iommu(struct apple_isp *isp)
 {
+	apple_isp_unmap_fw_mmio(isp, isp->hw->num_fw_mmio);
 	drm_mm_takedown(&isp->iovad);
 }
 
@@ -239,11 +312,22 @@ static enum isp_firmware_version isp_read_fw_version(struct device *dev,
 						     const char *name)
 {
 	u32 ver[ISP_FW_VERSION_MAX_LEN];
-	int len = of_property_read_variable_u32_array(dev->of_node, name, ver,
-						      ISP_FW_VERSION_MIN_LEN,
-						      ISP_FW_VERSION_MAX_LEN);
+	int size, len;
+
+	/* The array reader truncates trailing bytes; require complete cells. */
+	if (of_find_property(dev->of_node, name, &size) && size % sizeof(u32)) {
+		dev_warn(dev, "could not parse %s: invalid length %d\n", name, size);
+		return ISP_FIRMWARE_V_UNKNOWN;
+	}
+
+	len = of_property_read_variable_u32_array(dev->of_node, name, ver,
+						  ISP_FW_VERSION_MIN_LEN,
+						  ISP_FW_VERSION_MAX_LEN);
 
 	switch (len) {
+	case -EINVAL:
+		/* not provided, see isp_check_firmware_version() */
+		break;
 	case 3:
 		if (ver[0] == 12 && ver[1] == 3 && ver[2] <= 1)
 			return ISP_FIRMWARE_V_12_3;
@@ -272,16 +356,25 @@ static enum isp_firmware_version isp_read_fw_version(struct device *dev,
 	return ISP_FIRMWARE_V_UNKNOWN;
 }
 
-static enum isp_firmware_version isp_check_firmware_version(struct device *dev)
+static enum isp_firmware_version
+isp_check_firmware_version(struct apple_isp *isp)
 {
+	struct device *dev = isp->dev;
 	enum isp_firmware_version version, compat;
+
+	/* The H17 interface is selected by match data, not by version. */
+	if (isp->hw->fw_abi == ISP_FW_ABI_H17)
+		return ISP_FIRMWARE_V_UNKNOWN;
 
 	/* firmware version is just informative */
 	version = isp_read_fw_version(dev, "apple,firmware-version");
 	compat = isp_read_fw_version(dev, "apple,firmware-compat");
 
-	dev_info(dev, "ISP firmware-compat: %s (FW: %s)\n", isp_fw2str(compat),
-		 isp_fw2str(version));
+	dev_dbg(dev, "ISP firmware-compat: %s (FW: %s)\n", isp_fw2str(compat),
+		isp_fw2str(version));
+
+	if (!of_property_present(dev->of_node, "apple,firmware-compat"))
+		dev_warn(dev, "firmware compatibility version not provided, assuming 12.x\n");
 
 	return compat;
 }
@@ -290,13 +383,18 @@ static int apple_isp_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct apple_isp *isp;
+	struct resource *res;
 	int err;
 
 	err = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(42));
 	if (err)
 		return err;
 
-	isp = devm_kzalloc(dev, sizeof(*isp), GFP_KERNEL);
+	/*
+	 * Not devres: an open video device file keeps this until it is
+	 * closed, also after unbind. See apple_isp_release().
+	 */
+	isp = kzalloc_obj(*isp);
 	if (!isp)
 		return -ENOMEM;
 
@@ -308,14 +406,14 @@ static int apple_isp_probe(struct platform_device *pdev)
 	/* Differences between firmware versions are rather minor so try to work
 	 * with unknown firmware.
 	 */
-	isp->fw_compat = isp_check_firmware_version(dev);
+	isp->fw_compat = isp_check_firmware_version(isp);
 
 	err = of_property_read_u32(dev->of_node, "apple,platform-id",
 				   &isp->platform_id);
 	if (err) {
 		dev_err(dev, "failed to get 'apple,platform-id' property: %d\n",
 			err);
-		return err;
+		goto free_isp;
 	}
 
 	err = of_property_read_u32(dev->of_node, "apple,temporal-filter",
@@ -326,13 +424,13 @@ static int apple_isp_probe(struct platform_device *pdev)
 	err = apple_isp_init_presets(isp);
 	if (err) {
 		dev_err(dev, "failed to initialize presets\n");
-		return err;
+		goto free_isp;
 	}
 
 	err = apple_isp_attach_genpd(isp);
 	if (err) {
 		dev_err(dev, "failed to attatch power domains\n");
-		return err;
+		goto free_isp;
 	}
 
 	isp->coproc = devm_platform_ioremap_resource_byname(pdev, "coproc");
@@ -341,7 +439,8 @@ static int apple_isp_probe(struct platform_device *pdev)
 		goto detach_genpd;
 	}
 
-	isp->mbox = devm_platform_ioremap_resource_byname(pdev, "mbox");
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "mbox");
+	isp->mbox = devm_ioremap_resource(dev, res);
 	if (IS_ERR(isp->mbox)) {
 		err = PTR_ERR(isp->mbox);
 		goto detach_genpd;
@@ -353,10 +452,32 @@ static int apple_isp_probe(struct platform_device *pdev)
 		goto detach_genpd;
 	}
 
-	isp->mbox2 = devm_platform_ioremap_resource_byname(pdev, "mbox2");
-	if (IS_ERR(isp->mbox2)) {
-		err = PTR_ERR(isp->mbox2);
-		goto detach_genpd;
+	if (isp->hw->mbox2_offset) {
+		if (resource_size(res) <
+		    isp->hw->mbox2_offset + ISP_MBOX2_SIZE) {
+			dev_err(dev, "mbox window too small for the doorbells\n");
+			err = -EINVAL;
+			goto detach_genpd;
+		}
+		isp->mbox2 = isp->mbox + isp->hw->mbox2_offset;
+	} else {
+		isp->mbox2 = devm_platform_ioremap_resource_byname(pdev,
+								   "mbox2");
+		if (IS_ERR(isp->mbox2)) {
+			err = PTR_ERR(isp->mbox2);
+			goto detach_genpd;
+		}
+	}
+
+	/* Capture watchdog, where the ISP gates its frames on one */
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "wdt");
+	if (res) {
+		isp->wdt = devm_ioremap_resource(dev, res);
+		if (IS_ERR(isp->wdt)) {
+			err = PTR_ERR(isp->wdt);
+			goto detach_genpd;
+		}
+		apple_isp_wdt_init(isp);
 	}
 
 	isp->irq = platform_get_irq(pdev, 0);
@@ -406,13 +527,13 @@ static int apple_isp_probe(struct platform_device *pdev)
 	err = apple_isp_setup_video(isp);
 	if (err) {
 		dev_err(dev, "failed to register video device: %d\n", err);
-		goto free_surface;
+		goto halt_firmware;
 	}
-
-	dev_info(dev, "apple-isp probe!\n");
 
 	return 0;
 
+halt_firmware:
+	apple_isp_firmware_halt(isp);
 free_surface:
 	pm_runtime_disable(dev);
 	apple_isp_free_firmware_surface(isp);
@@ -422,6 +543,9 @@ destroy_wq:
 	destroy_workqueue(isp->wq);
 detach_genpd:
 	apple_isp_detach_genpd(isp);
+free_isp:
+	/* Nothing else can reach it before the video device is registered. */
+	kfree(isp);
 	return err;
 }
 
@@ -430,11 +554,16 @@ static void apple_isp_remove(struct platform_device *pdev)
 	struct apple_isp *isp = platform_get_drvdata(pdev);
 
 	apple_isp_remove_video(isp);
+	/* Stop resident firmware before freeing what it may still use. */
+	apple_isp_firmware_halt(isp);
+	apple_isp_free_video(isp);
 	pm_runtime_disable(isp->dev);
 	apple_isp_free_firmware_surface(isp);
 	apple_isp_free_iommu(isp);
 	destroy_workqueue(isp->wq);
 	apple_isp_detach_genpd(isp);
+	/* Freed now, or when the last open file is closed. */
+	v4l2_device_put(&isp->v4l2_dev);
 }
 
 static const struct apple_isp_hw apple_isp_hw_t8103 = {
@@ -603,6 +732,60 @@ static const struct apple_isp_hw apple_isp_hw_t6031 = {
 	.meta_size = ISP_META_SIZE_T6031,
 };
 
+/*
+ * Registers the T8140 firmware accesses at their physical addresses: the
+ * bootloader's DART address filter ranges for the ISP, rounded out to
+ * 16 KiB pages.
+ */
+static const struct isp_mmio_window apple_isp_fw_mmio_t8140[] = {
+	{ 0x220004000, 0x14000 },	/* DSID broadcast-clear windows */
+	{ 0x220044000, 0x14000 },
+	{ 0x220084000, 0x14000 },
+	{ 0x2200c4000, 0x14000 },
+	{ 0x220104000, 0x14000 },
+	{ 0x3003c0000, 0x28000 },	/* PMGR, with the PMP clock scratch */
+	{ 0x300704000, 0x4000 },	/* PMGR, ISP power states */
+	{ 0x300730000, 0x4000 },
+	{ 0x300e3c000, 0x4000 },
+	{ 0x302824000, 0x4000 },	/* PMP bandwidth scratch */
+	{ 0x31062c000, 0x20000 },
+	{ 0x401660000, 0x4000 },
+};
+
+static const struct apple_isp_hw apple_isp_hw_t8140 = {
+	.gen = ISP_GEN_T8140,
+	.fw_abi = ISP_FW_ABI_H17,
+	.pmu_base = 0x0,
+
+	.dsid_count = 1,
+	.dsid_clr_base0 = 0x220114000,
+	.dsid_clr_range0 = 0x2fc,
+
+	.clock_scratch = 0x3003d0ca0,
+	.clock_base = 0x0,
+	.clock_bit = 0x0,
+	.clock_size = 0x8,
+	.bandwidth_scratch = 0x302824000,
+	.bandwidth_base = 0x0,
+	.bandwidth_bit = 0x0,
+	.bandwidth_size = 0x8,
+	.mbox_irq_enable = ISP_MBOX_IRQ_ENABLE_T6031,
+
+	.scl1 = false,
+	.lpdp = true,
+	.meta_size = ISP_META_SIZE_T8140,
+
+	.fw_iova_mask = GENMASK_ULL(35, 0),
+	.mbox2_offset = 0x410,
+	.mbox_irq_route = true,
+	.coproc_control = ISP_COPROC_CONTROL_T8140,
+	.fw_mmio = apple_isp_fw_mmio_t8140,
+	.num_fw_mmio = ARRAY_SIZE(apple_isp_fw_mmio_t8140),
+	.boot_mode = 1,
+	.capture_meta_size = ISP_CAPTURE_META_SIZE_T8140,
+	.resident_fw = true,
+};
+
 static const struct of_device_id apple_isp_of_match[] = {
 	{ .compatible = "apple,t8103-isp", .data = &apple_isp_hw_t8103 },
 	{ .compatible = "apple,t8112-isp", .data = &apple_isp_hw_t8112 },
@@ -611,6 +794,7 @@ static const struct of_device_id apple_isp_of_match[] = {
 	{ .compatible = "apple,t6020-isp", .data = &apple_isp_hw_t6020 },
 	{ .compatible = "apple,t6030-isp", .data = &apple_isp_hw_t6030 },
 	{ .compatible = "apple,t6031-isp", .data = &apple_isp_hw_t6031 },
+	{ .compatible = "apple,t8140-isp", .data = &apple_isp_hw_t8140 },
 	{},
 };
 MODULE_DEVICE_TABLE(of, apple_isp_of_match);
@@ -635,6 +819,33 @@ static __maybe_unused int apple_isp_suspend(struct device *dev)
 	 */
 	apple_isp_video_suspend(isp);
 
+	/*
+	 * Resident firmware stays up, idle, across suspend-to-idle and
+	 * suspend-to-RAM: its domains stay on, see apple_isp_attach_genpd().
+	 */
+	return 0;
+}
+
+static __maybe_unused int apple_isp_freeze(struct device *dev)
+{
+	struct apple_isp *isp = dev_get_drvdata(dev);
+
+	apple_isp_video_suspend(isp);
+
+	/*
+	 * Hibernation hands the system from one kernel to another, and
+	 * firmware left running would go on using the memory of the kernel
+	 * that started it. Stop it cleanly instead; the camera is then
+	 * unavailable until the next system boot.
+	 */
+	if (isp->hw->resident_fw) {
+		mutex_lock(&isp->video_lock);
+		if (isp->fw_state == ISP_FW_RUNNING)
+			dev_warn(dev, "stopping the firmware for hibernation, the camera is unavailable until the next boot\n");
+		apple_isp_firmware_halt(isp);
+		mutex_unlock(&isp->video_lock);
+	}
+
 	return 0;
 }
 
@@ -648,7 +859,12 @@ static __maybe_unused int apple_isp_resume(struct device *dev)
 }
 
 static const struct dev_pm_ops apple_isp_pm_ops = {
-	SYSTEM_SLEEP_PM_OPS(apple_isp_suspend, apple_isp_resume)
+	.suspend	= pm_sleep_ptr(apple_isp_suspend),
+	.resume		= pm_sleep_ptr(apple_isp_resume),
+	.freeze		= pm_sleep_ptr(apple_isp_freeze),
+	.thaw		= pm_sleep_ptr(apple_isp_resume),
+	.poweroff	= pm_sleep_ptr(apple_isp_freeze),
+	.restore	= pm_sleep_ptr(apple_isp_resume),
 	RUNTIME_PM_OPS(apple_isp_runtime_suspend, apple_isp_runtime_resume, NULL)
 };
 
