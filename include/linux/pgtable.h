@@ -1630,6 +1630,7 @@ static inline int pgd_none_or_clear_bad(pgd_t *pgd)
 
 static inline int p4d_none_or_clear_bad_mm(struct mm_struct *mm, p4d_t *p4d)
 {
+#ifdef CONFIG_ARCH_HAS_MM_PGTABLE
 	if (p4d_none_mm(mm, *p4d))
 		return 1;
 	if (unlikely(p4d_bad_mm(mm, *p4d))) {
@@ -1638,6 +1639,16 @@ static inline int p4d_none_or_clear_bad_mm(struct mm_struct *mm, p4d_t *p4d)
 		return 1;
 	}
 	return 0;
+#else
+	/* Native geometry only: identical to p4d_none_or_clear_bad(). */
+	if (p4d_none(*p4d))
+		return 1;
+	if (unlikely(p4d_bad(*p4d))) {
+		p4d_clear_bad(p4d);
+		return 1;
+	}
+	return 0;
+#endif
 }
 
 static inline int p4d_none_or_clear_bad(p4d_t *p4d)
