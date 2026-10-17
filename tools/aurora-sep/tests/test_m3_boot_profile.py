@@ -87,17 +87,42 @@ class BootProfile(unittest.TestCase):
         with self.lock1.open('r+') as lock:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
 
     def test_two_locks_share_one_deadline(self):
-        import threading, time
-        self.lock1.touch();self.lock2.touch()
-        with self.lock1.open('r+') as first,self.lock2.open('r+') as second:
-            fcntl.flock(first,fcntl.LOCK_EX|fcntl.LOCK_NB)
-            fcntl.flock(second,fcntl.LOCK_EX|fcntl.LOCK_NB)
-            release=threading.Timer(0.12,fcntl.flock,args=(first,fcntl.LOCK_UN));release.start()
-            started=time.monotonic()
-            try:self.run_helper('retain',False,timeout=0.22)
-            finally:release.join()
-        self.assertLess(time.monotonic()-started,0.32)
-        self.assertFalse(self.state.exists());self.assertEqual(self.conf.read_text(),self.original)
+        from unittest import mock
+
+        spec = importlib.util.spec_from_file_location('m3_boot_profile', HELPER)
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        now = [0.0]
+        descriptors = []
+        first_acquired = []
+
+        def advance(seconds):
+            now[0] += seconds
+
+        def contend(fd, flags):
+            self.assertEqual(flags, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if fd not in descriptors:
+                descriptors.append(fd)
+            if fd == descriptors[0] and now[0] >= 0.12:
+                first_acquired.append(fd)
+                return
+            raise BlockingIOError
+
+        # Only clock and contention are synthetic; production opens, validates,
+        # acquires and closes both lock files. A deadline reset at the second
+        # lock would advance the clock beyond the original 0.22-second budget.
+        with mock.patch.object(helper.time, 'monotonic', side_effect=lambda: now[0]), \
+             mock.patch.object(helper.time, 'sleep', side_effect=advance), \
+             mock.patch.object(helper.fcntl, 'flock', side_effect=contend):
+            with self.assertRaises(TimeoutError):
+                with helper.locks([self.lock1, self.lock2], timeout=0.22):
+                    self.fail('the second lock must remain busy')
+        self.assertTrue(first_acquired)
+        self.assertEqual(len(descriptors), 2)
+        self.assertAlmostEqual(now[0], 0.22)
+        for fd in descriptors:
+            with self.assertRaises(OSError):
+                helper.os.fstat(fd)
 
     def test_installed_copy_matches_standalone_helper(self):
         installer=HELPER.with_name('install-aurora-sep.sh').read_text()

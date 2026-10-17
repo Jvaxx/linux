@@ -1185,9 +1185,9 @@ class ProMesaTest(flow.M3FlowBase):
     def test_u1s_fixtures_pass_on_the_built_in_copy(self):
         # mesa-m3's own detector fixtures (42 cases, exact output and exit status) on this
         # script's copy, as the package build runs them on the package's.
-        fixtures = Path.home() / "source/aurora-recipes/mesa-m3-recipe/tests/test-user-setup.sh"
+        fixtures = flow.INSTALLER.parent / "recipes/mesa-m3/tests/test-user-setup.sh"
         if not fixtures.is_file() or os.geteuid() == 0:
-            self.skipTest("mesa-m3-recipe/tests/test-user-setup.sh (as a normal user) is needed")
+            self.skipTest("in-tree Mesa user-setup fixtures and a non-root test user are required")
         det, lst = self.tmp / "mesa-m3-user-setup", self.tmp / "user-setup.list"
         for fn, path in (("m3_pro_mesa_builtin_detector", det), ("m3_pro_mesa_builtin_list", lst)):
             path.write_bytes(subprocess.run(["bash", "-c", f"AURORA_SEP_SOURCE_ONLY=1 source '{flow.INSTALLER}'; {fn}"],
@@ -1275,7 +1275,7 @@ class ProMesaTest(flow.M3FlowBase):
                 if case == "another user's run":
                     # Both were added by this script: both come out, and nobody else.
                     self.assertEqual(sorted(l for l in self.log()[since:].splitlines() if l.startswith("gpasswd")),
-                                     [f"gpasswd -d {me} render", "gpasswd -d other render"])
+                                     sorted([f"gpasswd -d {me} render", "gpasswd -d other render"]))
                     self.assertNotIn("render", self.groups())
                 else:
                     self.assertNotIn("gpasswd", self.log()[since:])

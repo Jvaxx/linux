@@ -1135,11 +1135,27 @@ class SurveyTest(MaxBase):
 
         with mock.patch.object(flow.subprocess, "run", side_effect=capture):
             self.run_sh(self.body(extra))
-        return subprocess.Popen(captured["args"], env={**captured["env"], **env}, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True, start_new_session=True)
+        process = subprocess.Popen(captured["args"], env={**captured["env"], **env}, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True, start_new_session=True)
 
-    def wait_for(self, cond, what):
-        for _ in range(400):
+        def cleanup():
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            try:
+                process.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate(timeout=10)
+
+        self.addCleanup(cleanup)
+        return process
+
+    def wait_for(self, cond, what, timeout=10):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
             if cond():
                 return
             time.sleep(0.025)
@@ -1372,8 +1388,23 @@ printf '%s\\n' "$v" | exec /usr/bin/tee "$@"
         self.max_mac("j514c", backlight=True)
         self.failing_tee()
         bl = self.tmp / "sys/class/backlight/apple-panel-bl/brightness"
-        p = self.popen("M3_SURVEY_PHASE_S=12\n", FAKE_TEE_FAIL="321")
-        self.wait_for(lambda: bl.read_text() == "1\n", "the backlight at its minimum")
+        marker = self.tmp / "minimum-phase-active"
+        extra = f"""
+M3_SURVEY_PHASE_S=3
+# Keep the minimum phase active until the test delivers the interrupt.
+eval "$(declare -f m3_survey_sample | sed 1s/m3_survey_sample/m3_survey_sample_original/)"
+m3_survey_sample() {{
+  if [[ $1 == backlight-min ]]; then
+    : > {marker}
+    while :; do sleep 60; done
+  else
+    m3_survey_sample_original "$@"
+  fi
+}}
+"""
+        p = self.popen(extra, FAKE_TEE_FAIL="321")
+        self.wait_for(marker.exists, "the active minimum-backlight phase", timeout=30)
+        self.assertEqual(bl.read_text(), "1\n")
         os.killpg(p.pid, signal.SIGINT)
         out, err = p.communicate(timeout=30)
         self.assertEqual(p.returncode, 130, err)
