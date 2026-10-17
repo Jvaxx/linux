@@ -1400,14 +1400,16 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 	/*
 	 * Every candidate route for this port is notified with the same state,
 	 * so only the first to arrive does the work; the others return early.
+	 * That includes a sink's IRQ_HPD request: the port controller sends a
+	 * new one as a changed status, clearing IRQ_HPD first when the route
+	 * still holds the previous request (cd321x_dp_send()).
 	 *
 	 * Deliberately not a nominated coordinator: fwnode_typec_mux_get()
 	 * caps the providers one connector may have and drops the remainder
 	 * without a word, so a nominated route might never be called at all --
 	 * and the port would then never be routed.
 	 */
-	if (port->applied_valid && !(dp_status & DP_STATUS_IRQ_HPD) &&
-	    port->applied_alt == state->alt &&
+	if (port->applied_valid && port->applied_alt == state->alt &&
 	    port->applied_mode == state->mode &&
 	    port->applied_status == dp_status && port->applied_conf == dp_conf)
 		return 0;
