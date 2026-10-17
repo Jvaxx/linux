@@ -207,6 +207,10 @@ fn sks_declared_sizes() -> (usize, usize) {
     (0x8000, 0x4000)
 }
 
+fn boottime_ms() -> u64 {
+    shim::boottime_ns() / 1_000_000
+}
+
 struct Hex<'a>(&'a [u8]);
 
 impl kernel::fmt::Display for Hex<'_> {
@@ -1160,25 +1164,28 @@ impl SepData {
             return Err(EINVAL);
         }
 
-        self.control.lock().entropy_begin()?;
+        self.control.lock().entropy_begin(boottime_ms())?;
 
         let msg = proto::encode_control(&op, proto::TAG_ENTROPY);
         if let Err(e) = self.send(msg) {
-            self.control.lock().entropy_end();
+            let full = e == ETIMEDOUT;
+            self.control
+                .lock()
+                .entropy_end(control::EntropyEnd::NotSent { full }, boottime_ms());
             return Err(e);
         }
 
         let mut remaining = time::msecs_to_jiffies(op.timeout_ms());
         let mut guard = self.control.lock();
-        let result = loop {
+        let (result, end) = loop {
             if let Some(value) = guard.entropy_take() {
-                break Ok(value);
+                break (Ok(value), control::EntropyEnd::Answered);
             }
             if self.rng_shutdown.load(Relaxed) {
-                break Err(ECANCELED);
+                break (Err(ECANCELED), control::EntropyEnd::Abandoned);
             }
             if remaining == 0 {
-                break Err(ETIMEDOUT);
+                break (Err(ETIMEDOUT), control::EntropyEnd::TimedOut);
             }
             match self
                 .control_wq
@@ -1189,7 +1196,7 @@ impl SepData {
                 CondVarTimeoutResult::Timeout => remaining = 0,
             }
         };
-        guard.entropy_end();
+        guard.entropy_end(end, boottime_ms());
         result
     }
 
@@ -1228,6 +1235,12 @@ impl SepData {
         this.rng_survey_attempts.store(attempt, Relaxed);
         match this.survey_hwrng() {
             Ok(()) => dev_info!(this.dev, "hwrng: registered after ready-phase survey (attempt {})\n", attempt),
+            // Holding back after a request that went unanswered: this
+            // attempt did not ask the enclave anything.
+            Err(e) if e == EAGAIN => {
+                this.rng_survey_attempts.store(attempt - 1, Relaxed);
+                Self::arm_settle(this);
+            }
             Err(e) if attempt < RNG_SURVEY_ATTEMPTS => {
                 dev_warn!(this.dev, "hwrng: survey attempt {} failed ({:?}); retrying\n", attempt, e);
                 Self::arm_settle(this);
@@ -1834,6 +1847,11 @@ impl SepData {
 
         // must return a negative errno, not 0: a blocking reader would spin on 0
         let e = failure.unwrap_or(EIO);
+        // Holding back after a request that went unanswered. Nothing failed
+        // in this read; the core tries again later.
+        if e == EAGAIN {
+            return e.to_errno();
+        }
         let n = self.rng_failures.load(Relaxed).wrapping_add(1);
         self.rng_failures.store(n, Relaxed);
         if n == 1 {
@@ -2081,6 +2099,11 @@ impl SepData {
             control::Delivery::Entropy => {
                 self.control_wq.notify_all();
             }
+            control::Delivery::EntropyLate { recovered: true } => dev_info!(
+                self.dev,
+                "hwrng: the enclave answered a request that had timed out; reads resume\n"
+            ),
+            control::Delivery::EntropyLate { recovered: false } => {}
             control::Delivery::Matched => self.control_wq.notify_all(),
             control::Delivery::Unmatched => {}
         }
