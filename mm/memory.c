@@ -2966,6 +2966,7 @@ out:
 	return ret;
 }
 
+#ifdef CONFIG_MM_SUBPAGE
 static int insert_pages(struct vm_area_struct *vma, unsigned long addr,
 			struct page **pages, unsigned long *num, pgprot_t prot)
 {
@@ -2979,6 +2980,79 @@ static int insert_pages(struct vm_area_struct *vma, unsigned long addr,
 	*num = DIV_ROUND_UP(length, PAGE_SIZE);
 	return ret;
 }
+#else
+static int insert_page_in_batch_locked(struct vm_area_struct *vma, pte_t *pte,
+			unsigned long addr, struct page *page, pgprot_t prot)
+{
+	int err;
+
+	err = validate_page_before_insert(vma, page);
+	if (err)
+		return err;
+	return insert_page_into_pte_locked(vma, pte, addr, page, prot, false, 0);
+}
+
+/* insert_pages() amortizes the cost of spinlock operations
+ * when inserting pages in a loop.
+ */
+static int insert_pages(struct vm_area_struct *vma, unsigned long addr,
+			struct page **pages, unsigned long *num, pgprot_t prot)
+{
+	pmd_t *pmd = NULL;
+	pte_t *start_pte, *pte;
+	spinlock_t *pte_lock;
+	struct mm_struct *const mm = vma->vm_mm;
+	unsigned long curr_page_idx = 0;
+	unsigned long remaining_pages_total = *num;
+	unsigned long pages_to_write_in_pmd;
+	int ret;
+more:
+	ret = -EFAULT;
+	pmd = walk_to_pmd(mm, addr);
+	if (!pmd)
+		goto out;
+
+	pages_to_write_in_pmd = min_t(unsigned long,
+		remaining_pages_total, PTRS_PER_PTE - pte_index(addr));
+
+	/* Allocate the PTE if necessary; takes PMD lock once only. */
+	ret = -ENOMEM;
+	if (pte_alloc(mm, pmd))
+		goto out;
+
+	while (pages_to_write_in_pmd) {
+		int pte_idx = 0;
+		const int batch_size = min_t(int, pages_to_write_in_pmd, 8);
+
+		start_pte = pte_offset_map_lock(mm, pmd, addr, &pte_lock);
+		if (!start_pte) {
+			ret = -EFAULT;
+			goto out;
+		}
+		for (pte = start_pte; pte_idx < batch_size; ++pte, ++pte_idx) {
+			int err = insert_page_in_batch_locked(vma, pte,
+				addr, pages[curr_page_idx], prot);
+			if (unlikely(err)) {
+				pte_unmap_unlock(start_pte, pte_lock);
+				ret = err;
+				remaining_pages_total -= pte_idx;
+				goto out;
+			}
+			addr += PAGE_SIZE;
+			++curr_page_idx;
+		}
+		pte_unmap_unlock(start_pte, pte_lock);
+		pages_to_write_in_pmd -= batch_size;
+		remaining_pages_total -= batch_size;
+	}
+	if (remaining_pages_total)
+		goto more;
+	ret = 0;
+out:
+	*num = remaining_pages_total;
+	return ret;
+}
+#endif
 
 /**
  * vm_insert_pages_range - map a byte range from a native-page array
@@ -3037,6 +3111,7 @@ int vm_insert_pages(struct vm_area_struct *vma, unsigned long addr,
 			struct page **pages, unsigned long *num)
 {
 	const unsigned long nr_pages = *num;
+#ifdef CONFIG_MM_SUBPAGE
 	unsigned long length, end;
 
 	if (!IS_ALIGNED(addr, mm_page_size(vma->vm_mm)) ||
@@ -3044,6 +3119,12 @@ int vm_insert_pages(struct vm_area_struct *vma, unsigned long addr,
 	    check_add_overflow(addr, length, &end) ||
 	    !range_in_vma(vma, addr, end))
 		return -EFAULT;
+#else
+	const unsigned long end = addr + PAGE_SIZE * nr_pages;
+
+	if (!range_in_vma(vma, addr, end))
+		return -EFAULT;
+#endif
 	if (!(vma->vm_flags & VM_MIXEDMAP)) {
 		VM_WARN_ON_ONCE(mmap_read_trylock(vma->vm_mm));
 		VM_WARN_ON_ONCE(vma->vm_flags & VM_PFNMAP);
@@ -3067,11 +3148,17 @@ int map_kernel_pages_prepare(struct vm_area_desc *desc)
 	}
 
 	nr_pages = action->map_kernel.nr_pages;
+#ifdef CONFIG_MM_SUBPAGE
 	if (!IS_ALIGNED(addr, mm_page_size(desc->mm)) ||
 	    check_mul_overflow(nr_pages, PAGE_SIZE, &end) ||
 	    check_add_overflow(addr, end, &end) ||
 	    !range_in_vma_desc(desc, addr, end))
 		return -EFAULT;
+#else
+	end = addr + PAGE_SIZE * nr_pages;
+	if (!range_in_vma_desc(desc, addr, end))
+		return -EFAULT;
+#endif
 
 	return 0;
 }
@@ -3175,6 +3262,7 @@ static int __vm_map_pages(struct vm_area_struct *vma, struct page **pages,
 			 unsigned long num, unsigned long offset,
 			 unsigned int subpage_offset)
 {
+#ifdef CONFIG_MM_SUBPAGE
 	unsigned long bytes, available;
 
 	if (offset >= num ||
@@ -3188,6 +3276,20 @@ static int __vm_map_pages(struct vm_area_struct *vma, struct page **pages,
 		return -ENXIO;
 	return vm_insert_pages_range(vma, vma->vm_start, pages, num, bytes,
 				     vma->vm_end - vma->vm_start);
+#else
+	unsigned long count = vma_pages(vma);
+	unsigned long uaddr = vma->vm_start;
+
+	/* Fail if the user requested offset is beyond the end of the object */
+	if (offset >= num)
+		return -ENXIO;
+
+	/* Fail if the user requested size exceeds available object size */
+	if (count > num - offset)
+		return -ENXIO;
+
+	return vm_insert_pages(vma, uaddr, pages + offset, &count);
+#endif
 }
 
 /**
