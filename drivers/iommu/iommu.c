@@ -3349,10 +3349,12 @@ out_unlock:
  *
  * The device driver about to bind @dev wants to do DMA through the kernel
  * DMA API. Return 0 if it is allowed, otherwise an error.
+ * Drivers with driver_managed_dma may manage this usage themselves. The
+ * device lock must serialize probe and removal while holding the usage.
  */
 int iommu_device_use_default_domain(struct device *dev)
 {
-	/* Caller is the driver core during the pre-probe path */
+	/* Called with the device lock held during probe. */
 	struct iommu_group *group = dev->iommu_group;
 	int ret = 0;
 
@@ -3379,6 +3381,7 @@ unlock_out:
 	mutex_unlock(&group->mutex);
 	return ret;
 }
+EXPORT_SYMBOL_GPL(iommu_device_use_default_domain);
 
 /**
  * iommu_device_unuse_default_domain() - Device driver stops handling device
@@ -3390,7 +3393,7 @@ unlock_out:
  */
 void iommu_device_unuse_default_domain(struct device *dev)
 {
-	/* Caller is the driver core during the post-probe path */
+	/* Called with the device lock held during removal. */
 	struct iommu_group *group = dev->iommu_group;
 
 	if (!group)
@@ -3402,6 +3405,7 @@ void iommu_device_unuse_default_domain(struct device *dev)
 
 	mutex_unlock(&group->mutex);
 }
+EXPORT_SYMBOL_GPL(iommu_device_unuse_default_domain);
 
 static int __iommu_group_alloc_blocking_domain(struct iommu_group *group)
 {
