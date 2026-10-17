@@ -139,7 +139,9 @@ pub(crate) trait HeaderSlot {
 /// buffer.
 ///
 /// Once looked at, the header is poisoned again whatever the outcome, so the
-/// next message cannot take it for its own.
+/// next message cannot take it for its own. A message whose header is not
+/// looked at, such as a grant, leaves the buffer alone: the reply may already
+/// be landing behind it. [`send_for_reply`] poisons that header instead.
 pub(crate) fn take_header(
     slot: &impl HeaderSlot,
     marker: u8,
@@ -175,6 +177,19 @@ pub(crate) fn take_header(
         });
     }
     Packet::decode(&header).map_err(|_| DeviceStatus::Malformed)
+}
+
+/// Poisons the header in `slot` again, then calls `send` for a host message
+/// that asks the enclave for its next one: a request, or the next chunk of
+/// one. The enclave may have written a header there that nothing read, such
+/// as a grant's, and the next reply must not take it for its own. Until
+/// `send`, the enclave is waiting for the host, so no header can be landing.
+pub(crate) fn send_for_reply<T>(
+    slot: &impl HeaderSlot,
+    send: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    slot.repoison();
+    send()
 }
 
 impl Packet {
@@ -827,9 +842,73 @@ mod tests {
         assert!(take(&dma, MARKER_FIRST).is_err());
         assert!(dma.poisoned());
 
-        // A grant leaves the buffer alone.
+        // A grant leaves the buffer alone; the host's next send poisons it.
         dma.show(4, 0x16);
         assert!(take(&dma, MARKER_REQUEST).is_ok());
         assert!(!dma.poisoned());
+        assert!(send_for_reply(&dma, || Ok(())).is_ok());
+        assert!(dma.poisoned());
+    }
+
+    /// The enclave's grant writes a request-next header, as the host's own
+    /// grant does, and the host sends its next chunk.
+    fn grant_then_send(dma: &Dma) {
+        dma.deliver(
+            &Packet::request_next(OPCODE, 0x3fe4, 0x8000),
+            HEADER_WORDS,
+            0,
+        );
+        assert!(take(dma, MARKER_REQUEST).is_ok());
+        assert!(send_for_reply(dma, || Ok(())).is_ok());
+    }
+
+    #[test]
+    fn a_grants_header_is_not_taken_for_the_reply() {
+        let dma = Dma::new();
+        let mut rx = Reassembly::new();
+        assert!(rx.begin(OPCODE).is_ok());
+        rx.begin_send(OPCODE);
+        let generation = rx.generation();
+        grant_then_send(&dma);
+        assert!(matches!(
+            rx.on_chunk(generation, MARKER_REQUEST, &Packet::NONE, &[]),
+            Progress::Grant
+        ));
+        rx.end_send();
+
+        // The reply arrives before any of its header.
+        dma.deliver(&data(8, 0, 8), 0, HEADER_WORDS);
+        let taken = take(&dma, MARKER_FIRST);
+        assert!(taken.is_ok());
+        let Ok(packet) = taken else {
+            return;
+        };
+        assert_eq!(packet.offset, 0);
+        assert_eq!(packet.chunk, 8);
+        assert!(matches!(
+            rx.on_chunk(generation, MARKER_FIRST, &packet, &[0u8; 8]),
+            Progress::Complete
+        ));
+        assert!(rx.take_done().is_some_and(|done| done.status.is_ok()));
+    }
+
+    #[test]
+    fn a_grants_header_does_not_hide_an_error_status() {
+        let dma = Dma::new();
+        grant_then_send(&dma);
+        dma.deliver(&reply(0x16), 0, HEADER_WORDS);
+        assert!(take(&dma, MARKER_ERROR).is_ok_and(|p| p.err == 0x16));
+    }
+
+    #[test]
+    fn the_header_is_poisoned_before_the_host_sends() {
+        let dma = Dma::new();
+        dma.deliver(&data(8, 0, 8), HEADER_WORDS, 0);
+        let sent = send_for_reply(&dma, || {
+            assert!(dma.poisoned());
+            Ok(7u32)
+        });
+        assert!(sent.is_ok_and(|v| v == 7));
+        assert!(send_for_reply(&dma, || -> Result<()> { Err(EIO) }).is_err());
     }
 }
