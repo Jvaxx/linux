@@ -148,10 +148,13 @@ static irqreturn_t cd321x_test_interrupt(struct cd321x_test *t)
 	return t->cd.tps.data->irq_handler(0, &t->cd.tps);
 }
 
-/* The read of a snapshot that was scheduled to recover the events. */
+/*
+ * Run the snapshot read that was scheduled to recover the events. It is queued
+ * without delay, so on SMP a worker may already have run it: check its effect,
+ * not whether it is still pending.
+ */
 static void cd321x_test_recover(struct kunit *test, struct cd321x_test *t)
 {
-	KUNIT_ASSERT_TRUE(test, delayed_work_pending(&t->cd.resume_work));
 	flush_delayed_work(&t->cd.resume_work);
 	scoped_guard(mutex, &t->cd.tps.lock)
 		KUNIT_EXPECT_TRUE(test, cd321x_pm_can_update(&t->cd.pm));
