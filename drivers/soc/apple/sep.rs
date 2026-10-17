@@ -1547,6 +1547,24 @@ impl SepData {
         true
     }
 
+    /// Fills `len` bytes at `off` of the outbound buffer with the poison
+    /// again, once the message they held has been read.
+    fn ool_repoison(&self, slot: &Mutex<Option<OolPair>>, off: usize, len: usize) {
+        let guard = slot.lock();
+        let Some(buffers) = guard.as_ref() else {
+            return;
+        };
+        if off + len > buffers.allocated {
+            return;
+        }
+        // SAFETY: the region is within the allocation as checked above, and
+        // the driver is the only host-side accessor. The enclave writes the
+        // region only to deliver a message, and the one it held has been
+        // looked at. If part of it was still landing, that part may land over
+        // the fill afterwards, as a header that has not landed yet does.
+        unsafe { buffers.outbound.as_mut()[off..off + len].fill(OOL_POISON_OUTBOUND) };
+    }
+
     fn ool_await_written(&self, slot: &Mutex<Option<OolPair>>, off: usize, len: usize) -> bool {
         for _ in 0..OOL_WRITE_POLL_ATTEMPTS {
             {

@@ -124,6 +124,8 @@ fn header_landed(header: &[u8; HEADER_LEN], words: &[usize], poison: u8) -> bool
 pub(crate) trait HeaderSlot {
     /// Copies the header out; `false` once the buffers are gone.
     fn sample(&self, header: &mut [u8; HEADER_LEN]) -> bool;
+    /// Fills the header with the poison again.
+    fn repoison(&self);
     /// Waits before the next sample.
     fn pause(&self);
 }
@@ -135,6 +137,9 @@ pub(crate) trait HeaderSlot {
 /// written, when the message arrives: one changed byte is not enough. A
 /// message whose handling reads no header is taken without looking at the
 /// buffer.
+///
+/// Once looked at, the header is poisoned again whatever the outcome, so the
+/// next message cannot take it for its own.
 pub(crate) fn take_header(
     slot: &impl HeaderSlot,
     marker: u8,
@@ -160,6 +165,7 @@ pub(crate) fn take_header(
             break;
         }
     }
+    slot.repoison();
 
     if !landed {
         return Err(if header.iter().all(|&b| b == poison) {
@@ -574,6 +580,10 @@ mod tests {
             header[word * 4..word * 4 + 4].copy_from_slice(&value.to_le_bytes());
             self.header.set(header);
         }
+
+        fn poisoned(&self) -> bool {
+            self.header.get().iter().all(|&b| b == POISON)
+        }
     }
 
     impl HeaderSlot for Dma {
@@ -581,6 +591,10 @@ mod tests {
             self.samples.set(self.samples.get() + 1);
             *header = self.header.get();
             true
+        }
+
+        fn repoison(&self) {
+            self.header.set([POISON; HEADER_LEN]);
         }
 
         fn pause(&self) {
@@ -749,5 +763,73 @@ mod tests {
         assert!(rx
             .take_done()
             .is_some_and(|done| matches!(done.status, DeviceStatus::Malformed)));
+    }
+
+    #[test]
+    fn the_previous_replys_header_is_not_taken_for_the_next() {
+        let dma = Dma::new();
+        dma.deliver(&data(8, 0, 8), HEADER_WORDS, 0);
+        assert!(take(&dma, MARKER_FIRST).is_ok_and(|p| p.chunk == 8));
+
+        // The next exchange's message arrives before any of its header.
+        dma.deliver(&data(4, 0, 4), 0, HEADER_WORDS);
+        let taken = take(&dma, MARKER_FIRST);
+        assert!(taken.is_ok());
+        let Ok(packet) = taken else {
+            return;
+        };
+        assert_eq!(packet.chunk, 4);
+        assert_eq!(packet.total, 4);
+    }
+
+    #[test]
+    fn a_continuation_does_not_take_the_first_chunks_header() {
+        let dma = Dma::new();
+        let mut rx = Reassembly::new();
+        assert!(rx.begin(OPCODE).is_ok());
+        let generation = rx.generation();
+
+        dma.deliver(&data(16, 0, 8), HEADER_WORDS, 0);
+        let taken = take(&dma, MARKER_FIRST);
+        assert!(taken.is_ok());
+        let Ok(first) = taken else {
+            return;
+        };
+        assert!(matches!(
+            rx.on_chunk(generation, MARKER_FIRST, &first, &[0u8; 8]),
+            Progress::NeedMore(_)
+        ));
+
+        // The second chunk's message arrives before its header lands.
+        dma.deliver(&data(16, 8, 8), 0, 2);
+        let taken = take(&dma, MARKER_NEXT);
+        assert!(taken.is_ok());
+        let Ok(next) = taken else {
+            return;
+        };
+        assert!(matches!(
+            rx.on_chunk(generation, MARKER_NEXT, &next, &[0u8; 8]),
+            Progress::Complete
+        ));
+        assert!(rx
+            .take_done()
+            .is_some_and(|done| done.status.is_ok() && done.payload.len() == 16));
+    }
+
+    #[test]
+    fn a_header_is_poisoned_again_once_looked_at() {
+        let dma = Dma::new();
+        dma.deliver(&data(8, 0, 8), HEADER_WORDS, 0);
+        assert!(take(&dma, MARKER_FIRST).is_ok());
+        assert!(dma.poisoned());
+
+        dma.deliver(&data(8, 0, 8), 4, 0);
+        assert!(take(&dma, MARKER_FIRST).is_err());
+        assert!(dma.poisoned());
+
+        // A grant leaves the buffer alone.
+        dma.show(4, 0x16);
+        assert!(take(&dma, MARKER_REQUEST).is_ok());
+        assert!(!dma.poisoned());
     }
 }
