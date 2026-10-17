@@ -25,6 +25,15 @@ def source_defines(source):
         definitions.append('\n'.join(definition))
     return definitions
 
+def tipd_pm_header(root):
+    """CD321x PM state machine for host units, with a host clamp() for minmax.h."""
+    header = (root / 'drivers/usb/typec/tipd/cd321x-pm.h').read_text()
+    header = header.replace('#include <linux/types.h>', '')
+    # Single line: probe-mux-pm-dispatch filters duplicate definitions per line.
+    return header.replace('#include <linux/minmax.h>',
+        '#define clamp(val, lo, hi) ({ __auto_type _v = (val); '
+        '__typeof__(_v) _lo = (lo), _hi = (hi); _v < _lo ? _lo : _v > _hi ? _hi : _v; })')
+
 def run_unit(name, unit, output, cases=((),), includes=(), extra=()):
     work = output / name
     work.mkdir(parents=True, exist_ok=True)

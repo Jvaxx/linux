@@ -4,7 +4,7 @@
 from pathlib import Path
 import os, re, subprocess
 import phy
-from common import block
+from common import block, tipd_pm_header
 
 def ownership(root, usb_unreachable=False):
     ns=phy.parking(root)
@@ -373,7 +373,7 @@ struct device;
 struct tps6598x { int lock; void *port; struct device *dev; };
 struct notifier_block { int (*notifier_call)(struct notifier_block *,unsigned long,void *); };
 '''
-    pm = source('drivers/usb/typec/tipd/cd321x-pm.h').replace('#include <linux/types.h>', '')
+    pm = tipd_pm_header(root)
     mocks = r'''
 struct cd321x {
  struct tps6598x tps;
@@ -425,6 +425,8 @@ static void cd321x_stop_work(struct cd321x *c) {
     core = source('drivers/usb/typec/tipd/core.c')
     switch_get = block(core, 'VISIBLE_IF_KUNIT struct typec_thunderbolt_switch *\ncd321x_tbt_switch_get(')
     production = switch_get.replace('VISIBLE_IF_KUNIT', 'static', 1) + '\n'
+    init_work = block(core, 'VISIBLE_IF_KUNIT void cd321x_init_work(')
+    production += init_work.replace('VISIBLE_IF_KUNIT', 'static', 1) + '\n'
     production += function(core, 'cd321x_register_port') + '\n' + function(core, 'cd321x_unregister_port')
     controls = r'''
 static void reset(struct cd321x *c) {
@@ -453,6 +455,22 @@ int main(void) {
  assert(!cd321x_pm_can_update(&budget)&&cd321x_pm_resume(&budget));
  assert(cd321x_pm_link_event(&budget));
  puts("PASS actual retry budget becomes stale without a fresh event");
+ struct cd321x_pm_state lost={0};
+ cd321x_pm_init(&lost);assert(!cd321x_pm_event_lost(&lost)&&cd321x_pm_ready(&lost));
+ for(unsigned int i=0;i<CD321X_RESUME_ATTEMPTS;i++){
+  assert(cd321x_pm_begin_read(&lost));cd321x_pm_snapshot_ready(&lost);cd321x_pm_retry(&lost,false);
+ }
+ /* Latched events raise no interrupt, so even a stale port must read them. */
+ assert(lost.phase==CD321X_PM_STALE&&cd321x_pm_event_lost(&lost));
+ for(unsigned int i=0,delay=0;i<4*CD321X_RESUME_ATTEMPTS;i++){
+  unsigned int expected=i?(2*delay<CD321X_ACK_RETRY_MAX_MS?2*delay:CD321X_ACK_RETRY_MAX_MS):CD321X_ACK_RETRY_MS;
+  assert(cd321x_pm_begin_read(&lost));delay=cd321x_pm_ack_failed(&lost);
+  assert(delay==expected&&lost.attempts_left==CD321X_RESUME_ATTEMPTS&&!cd321x_pm_can_update(&lost));
+ }
+ assert(lost.ack_retry_ms==CD321X_ACK_RETRY_MAX_MS&&cd321x_pm_acked(&lost)&&!cd321x_pm_acked(&lost));
+ cd321x_pm_prepare(&lost);assert(!cd321x_pm_event_lost(&lost)&&lost.phase==CD321X_PM_PREPARED);
+ cd321x_pm_remove(&lost);assert(!cd321x_pm_event_lost(&lost)&&lost.phase==CD321X_PM_REMOVED);
+ puts("PASS actual lost events reopen a stale port; unacknowledged events keep their budget with capped backoff");
  if(TEST_DEFER){
   reset(&c);mux_error=-EAGAIN;
   int ret=cd321x_register_port(&c.tps,&connector);
@@ -546,7 +564,7 @@ def probe_dispatch(root):
     used = {'cd321x_pm_new_connection', 'cd321x_pm_init', 'cd321x_pm_remove', 'cd321x_pm_ready',
             'cd321x_pm_begin_read', 'cd321x_pm_snapshot_ready',
             'cd321x_pm_complete', 'cd321x_pm_can_update'}
-    for match in list(re.finditer(r'^static inline (?:void|bool) (cd321x_\w+)\(', port, re.M))[::-1]:
+    for match in list(re.finditer(r'^static inline (?:void|bool|unsigned int) (cd321x_\w+)\(', port, re.M))[::-1]:
         if match.group(1) not in used:
             body = block(port, match.group())
             port = port[:match.start()] + port[match.start() + len(body):]
