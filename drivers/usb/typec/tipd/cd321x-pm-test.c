@@ -1053,6 +1053,23 @@ static void cd321x_restore_ignores_fault_budget_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, cd321x_pm_notifications(&pm, false, false, true), 0U);
 }
 
+static void cd321x_dp_send_test(struct kunit *test)
+{
+	const u32 hpd = DP_STATUS_HPD_STATE | DP_STATUS_CON_UFP_D;
+	const u32 irq = hpd | DP_STATUS_IRQ_HPD;
+
+	/* An unchanged status is not sent, also one that carries IRQ_HPD. */
+	KUNIT_EXPECT_EQ(test, cd321x_dp_send(hpd, hpd, false), CD321X_DP_SEND_NONE);
+	KUNIT_EXPECT_EQ(test, cd321x_dp_send(irq, irq, false), CD321X_DP_SEND_NONE);
+	/* A new IRQ_HPD from the partner is a changed status. */
+	KUNIT_EXPECT_EQ(test, cd321x_dp_send(hpd, irq, false), CD321X_DP_SEND);
+	KUNIT_EXPECT_EQ(test, cd321x_dp_send(irq, hpd, false), CD321X_DP_SEND);
+	KUNIT_EXPECT_EQ(test, cd321x_dp_send(hpd, 0, false), CD321X_DP_SEND);
+	/* An HPD pulse is sent once, as an edge if the route holds IRQ_HPD. */
+	KUNIT_EXPECT_EQ(test, cd321x_dp_send(hpd, irq, true), CD321X_DP_SEND);
+	KUNIT_EXPECT_EQ(test, cd321x_dp_send(irq, irq, true), CD321X_DP_SEND_EDGE);
+}
+
 static struct kunit_case cd321x_pm_cases[] = {
 	KUNIT_CASE(cd321x_reset_first_irq_before_ready_test),
 	KUNIT_CASE(cd321x_reset_first_irq_during_prepare_test),
@@ -1100,6 +1117,7 @@ static struct kunit_case cd321x_pm_cases[] = {
 	KUNIT_CASE(cd321x_held_mux_retries_bounded_test),
 	KUNIT_CASE(cd321x_held_mux_other_failure_test),
 	KUNIT_CASE(cd321x_display_taken_test),
+	KUNIT_CASE(cd321x_dp_send_test),
 	KUNIT_CASE(cd321x_restore_ignores_fault_budget_test),
 	{}
 };

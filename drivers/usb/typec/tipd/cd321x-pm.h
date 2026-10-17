@@ -6,6 +6,7 @@
 
 #include <linux/minmax.h>
 #include <linux/types.h>
+#include <linux/usb/typec_dp.h>
 
 #define CD321X_RESUME_ATTEMPTS 3
 #define CD321X_LINK_EVENTS 3
@@ -360,6 +361,30 @@ static inline void cd321x_pm_remove(struct cd321x_pm_state *pm)
 static inline bool cd321x_display_taken(int ret, bool enospc)
 {
 	return ret == (enospc ? -ENOSPC : -EBUSY);
+}
+
+enum cd321x_dp_send {
+	CD321X_DP_SEND_NONE,	/* the display route holds this status */
+	CD321X_DP_SEND,		/* send the status */
+	CD321X_DP_SEND_EDGE,	/* send it without IRQ_HPD first, then with it */
+};
+
+/*
+ * What a DP alt mode update with DP status @status sends to the display
+ * route, which holds @applied for the same pin assignment and configuration.
+ * The route drops a status equal to the one it holds, and so does this: an
+ * IRQ_HPD that the partner's last status still carries is not a new request.
+ * @pulse is a new request: the sink dropped HPD and raised it again since the
+ * last update (@status has IRQ_HPD set for it). When the route holds IRQ_HPD
+ * already, the request is sent as an edge, so that the route sees it.
+ */
+static inline enum cd321x_dp_send cd321x_dp_send(u32 applied, u32 status,
+						 bool pulse)
+{
+	if (pulse)
+		return applied & DP_STATUS_IRQ_HPD ? CD321X_DP_SEND_EDGE :
+						     CD321X_DP_SEND;
+	return applied == status ? CD321X_DP_SEND_NONE : CD321X_DP_SEND;
 }
 
 #endif /* __CD321X_PM_H__ */
