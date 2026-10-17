@@ -18,6 +18,7 @@
 #include <linux/of.h>
 #include <linux/of_device.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <linux/soc/apple/dp-tunnel.h>
 
 /*
@@ -103,6 +104,11 @@ struct apple_dpxbar {
 	void __iomem *regs;
 	int selected_dispext[MUX_MAX];
 	spinlock_t lock;
+#if IS_ENABLED(CONFIG_MUX_APPLE_DPXBAR_T6030)
+	/* T6030: the selected output's connection is up, and power is held. */
+	bool link_up;
+	bool pm_held;
+#endif
 };
 
 static inline void dpxbar_mask32(struct apple_dpxbar *xbar, u32 reg, u32 mask,
@@ -672,6 +678,222 @@ int apple_dpxbar_preselect(struct mux_control *mux, int state)
 }
 EXPORT_SYMBOL_GPL(apple_dpxbar_preselect);
 
+#if IS_ENABLED(CONFIG_MUX_APPLE_DPXBAR_T6030)
+/*
+ * T6030 (M3 Pro) USB-C crossbars, one per Type-C ATC at core + 0x4c000,
+ * with the physical DP output only. A display controller's source S (its
+ * selector: DCPEXT0 0, DCPEXT1 2) is connected with source bit B = 1 << S
+ * and the two-bit field at Q = 2 * S; the selector goes to both fields of
+ * +0x30. Every step is a read-modify-write of one u32 register, and each
+ * transition ends in an exactly checked register image: this crossbar has
+ * no other user, so connection up and idle are complete images.
+ */
+static const struct {
+	u16 offset;
+	u16 value;
+} t6030_idle[] = {
+	{ 0x000, 0x000 }, { 0x004, 0x1ff }, { 0x008, 0x000 }, { 0x00c, 0x000 },
+	{ 0x010, 0x000 }, { 0x014, 0x1ff }, { 0x018, 0x000 }, { 0x01c, 0x000 },
+	{ 0x020, 0x000 }, { 0x024, 0x111 }, { 0x028, 0x000 }, { 0x02c, 0x000 },
+	{ 0x030, 0x000 }, { 0x034, 0x000 }, { 0x800, 0x000 }, { 0x804, 0x1ff },
+	{ 0x808, 0x000 }, { 0x80c, 0x000 }, { 0x810, 0x1ff }, { 0x814, 0x000 },
+	{ 0x818, 0x000 }, { 0x81c, 0x111 },
+};
+
+/* Idle; +0x34 may keep its parked 0x100 from an earlier connection. */
+static bool t6030_is_idle(struct apple_dpxbar *xbar)
+{
+	for (unsigned int i = 0; i < ARRAY_SIZE(t6030_idle); i++) {
+		u32 v = readl(xbar->regs + t6030_idle[i].offset);
+
+		if (v != t6030_idle[i].value &&
+		    !(t6030_idle[i].offset == 0x034 && v == 0x100))
+			return false;
+	}
+	return true;
+}
+
+static bool t6030_is_up(struct apple_dpxbar *xbar, unsigned int sel)
+{
+	const u32 b = BIT(sel), q = 2 * sel;
+
+	return readl(xbar->regs + 0x000) == b && readl(xbar->regs + 0x004) == (0x1ff & ~b) &&
+	       readl(xbar->regs + 0x008) == b && readl(xbar->regs + 0x00c) == b &&
+	       readl(xbar->regs + 0x014) == (0x1ff & ~b) &&
+	       readl(xbar->regs + 0x018) == BIT(q) && readl(xbar->regs + 0x01c) == 0x100 &&
+	       readl(xbar->regs + 0x024) == 0x011 && readl(xbar->regs + 0x028) == 0x100 &&
+	       readl(xbar->regs + 0x02c) == b && readl(xbar->regs + 0x030) == (sel << 20 | sel << 8) &&
+	       readl(xbar->regs + 0x034) == 0x100;
+}
+
+static void t6030_dump(struct apple_dpxbar *xbar, const char *what)
+{
+	char buf[256];
+	int n = 0;
+
+	for (unsigned int i = 0; i < ARRAY_SIZE(t6030_idle); i++)
+		n += scnprintf(buf + n, sizeof(buf) - n, " %03x=%x", t6030_idle[i].offset,
+			       readl(xbar->regs + t6030_idle[i].offset));
+	dev_err(xbar->dev, "%s:%s\n", what, buf);
+}
+
+/* Connection up from the idle image. */
+static int t6030_up(struct apple_dpxbar *xbar, unsigned int sel)
+{
+	const u32 b = BIT(sel), q = 2 * sel;
+
+	if (!t6030_is_idle(xbar)) {
+		t6030_dump(xbar, "not idle before connection up");
+		return -EBUSY;
+	}
+	dpxbar_mask32(xbar, T602X_REG_030, 0xf00000, sel << 20);
+	dpxbar_mask32(xbar, T602X_REG_030, 0x000f00, sel << 8);
+	if (readl(xbar->regs + T602X_REG_030) != (sel << 20 | sel << 8)) {
+		t6030_dump(xbar, "selector not taken");
+		return -EIO;
+	}
+	dpxbar_clear32(xbar, T602X_FIFO_WR_N_CLK_EN, b);
+	dpxbar_clear32(xbar, T602X_REG_014, b);
+	dpxbar_clear32(xbar, T602X_FIFO_RD_PCLK2_EN, 0x100);
+	udelay(1);
+	if ((readl(xbar->regs + T602X_REG_804_STAT) & b) ||
+	    (readl(xbar->regs + T602X_REG_810_STAT) & b) ||
+	    (readl(xbar->regs + T602X_REG_81C_STAT) & 0x100)) {
+		t6030_dump(xbar, "clock gates not released");
+		return -EIO;
+	}
+	dpxbar_set32(xbar, T602X_FIFO_WR_UNK_EN, b);
+	dpxbar_mask32(xbar, T602X_REG_018, 3 << q, 1 << q);
+	dpxbar_mask32(xbar, T602X_FIFO_RD_N_CLK_EN, 0x300, 0x100);
+	dpxbar_set32(xbar, T602X_FIFO_WR_DPTX_CLK_EN, b);
+	dpxbar_set32(xbar, T602X_REG_00C, b);
+	dpxbar_set32(xbar, T602X_REG_01C, 0x100);
+	dpxbar_set32(xbar, T602X_REG_034, 0x100);
+	dpxbar_set32(xbar, T602X_FIFO_RD_UNK_EN, b);
+	if (!t6030_is_up(xbar, sel)) {
+		t6030_dump(xbar, "connection not up");
+		return -EIO;
+	}
+	return 0;
+}
+
+/* Connection down (park) to the idle image. */
+static int t6030_down(struct apple_dpxbar *xbar, unsigned int sel)
+{
+	const u32 b = BIT(sel), q = 2 * sel;
+
+	dpxbar_clear32(xbar, T602X_FIFO_RD_UNK_EN, b);
+	dpxbar_clear32(xbar, T602X_FIFO_WR_DPTX_CLK_EN, b);
+	dpxbar_clear32(xbar, T602X_REG_00C, b);
+	dpxbar_clear32(xbar, T602X_REG_01C, 0x100);
+	udelay(1);
+	dpxbar_clear32(xbar, T602X_FIFO_WR_UNK_EN, b);
+	dpxbar_clear32(xbar, T602X_REG_018, 3 << q);
+	dpxbar_clear32(xbar, T602X_FIFO_RD_N_CLK_EN, 0x300);
+	dpxbar_set32(xbar, T602X_FIFO_WR_N_CLK_EN, b);
+	dpxbar_set32(xbar, T602X_REG_014, b);
+	dpxbar_set32(xbar, T602X_FIFO_RD_PCLK2_EN, 0x100);
+	dpxbar_clear32(xbar, T602X_REG_030, 0xf00f00);
+	if (!t6030_is_idle(xbar)) {
+		t6030_dump(xbar, "not idle after connection down");
+		return -EIO;
+	}
+	return 0;
+}
+
+/*
+ * Select connects source @state and holds the crossbar's power until the
+ * deselect has verified the idle image. A failed transition keeps the
+ * selection and the power: the hardware may have been written.
+ */
+static int apple_dpxbar_set_t6030(struct mux_control *mux, int state)
+{
+	struct apple_dpxbar *xbar = mux_chip_priv(mux->chip);
+	unsigned int index = mux_control_get_index(mux);
+	unsigned long flags;
+	int prev, ret = 0;
+
+	/* Only the DP output exists; the others are never selected, so idle. */
+	if (index != MUX_DPPHY)
+		return state == MUX_IDLE_DISCONNECT ? 0 : -EINVAL;
+	if (state != MUX_IDLE_DISCONNECT && (state < 0 || state >= xbar->hw->n_ufp))
+		return -EINVAL;
+
+	if (state != MUX_IDLE_DISCONNECT && !xbar->pm_held) {
+		ret = pm_runtime_resume_and_get(xbar->dev);
+		if (ret)
+			return ret;
+		xbar->pm_held = true;
+	}
+	if (!xbar->pm_held)
+		return 0;	/* never selected: nothing was written */
+
+	spin_lock_irqsave(&xbar->lock, flags);
+	prev = xbar->selected_dispext[index];
+	/* Down first: a connection still up, or a selection whose state is unknown. */
+	if (prev >= 0 && (xbar->link_up || !t6030_is_idle(xbar))) {
+		ret = t6030_down(xbar, prev);
+		if (!ret)
+			xbar->link_up = false;
+	}
+	if (!ret && state != MUX_IDLE_DISCONNECT) {
+		xbar->selected_dispext[index] = state;
+		ret = t6030_up(xbar, state);
+		xbar->link_up = !ret;
+	} else if (!ret) {
+		xbar->selected_dispext[index] = -1;
+	}
+	spin_unlock_irqrestore(&xbar->lock, flags);
+
+	if (!ret && state == MUX_IDLE_DISCONNECT) {
+		xbar->pm_held = false;
+		pm_runtime_put(xbar->dev);
+	}
+	if (ret)
+		dev_err(xbar->dev, "dpphy: %s source %d failed: %d\n",
+			state == MUX_IDLE_DISCONNECT ? "disconnecting" : "connecting",
+			state == MUX_IDLE_DISCONNECT ? prev : state, ret);
+	else
+		dev_info(xbar->dev, "dpphy: %s source %d\n",
+			 state == MUX_IDLE_DISCONNECT ? "disconnected" : "connected",
+			 state == MUX_IDLE_DISCONNECT ? prev : state);
+	return ret;
+}
+
+/* Park and unpark the selected connection around link reconfiguration. */
+static int apple_dpxbar_t6030_link(struct mux_control *mux, bool up)
+{
+	struct apple_dpxbar *xbar = mux_chip_priv(mux->chip);
+	unsigned int index = mux_control_get_index(mux);
+	unsigned long flags;
+	int state, ret = 0;
+
+	if (index != MUX_DPPHY)
+		return -EINVAL;
+	spin_lock_irqsave(&xbar->lock, flags);
+	state = xbar->selected_dispext[index];
+	if (state < 0)
+		ret = -ENODEV;
+	else if (up && !xbar->link_up)
+		ret = t6030_up(xbar, state);
+	else if (!up && xbar->link_up)
+		ret = t6030_down(xbar, state);
+	if (!ret)
+		xbar->link_up = up;
+	spin_unlock_irqrestore(&xbar->lock, flags);
+	if (ret)
+		dev_err(xbar->dev, "dpphy: link %s of source %d failed: %d\n",
+			up ? "up" : "down", state, ret);
+	else
+		dev_dbg(xbar->dev, "dpphy: link %s, source %d\n", up ? "up" : "down", state);
+	return ret;
+}
+
+static const struct mux_control_ops apple_dpxbar_t6030_ops = {
+	.set = apple_dpxbar_set_t6030,
+};
+#endif
+
 static const struct mux_control_ops apple_dpxbar_ops = {
 	.set = apple_dpxbar_set,
 };
@@ -782,6 +1004,10 @@ int apple_dpxbar_link_up(struct mux_control *mux)
 		return -EINVAL;
 	if (mux->chip->ops == &apple_dpxbar_t602x_ops)
 		return apple_dpxbar_t602x_link_up(mux);
+#if IS_ENABLED(CONFIG_MUX_APPLE_DPXBAR_T6030)
+	if (mux->chip->ops == &apple_dpxbar_t6030_ops)
+		return apple_dpxbar_t6030_link(mux, true);
+#endif
 	return apple_dpxbar_t8103_link_up(mux);
 }
 EXPORT_SYMBOL_GPL(apple_dpxbar_link_up);
@@ -825,6 +1051,10 @@ int apple_dpxbar_link_down(struct mux_control *mux)
 		return -EINVAL;
 	if (mux->chip->ops == &apple_dpxbar_t602x_ops)
 		return apple_dpxbar_t602x_link_down(mux);
+#if IS_ENABLED(CONFIG_MUX_APPLE_DPXBAR_T6030)
+	if (mux->chip->ops == &apple_dpxbar_t6030_ops)
+		return apple_dpxbar_t6030_link(mux, false);
+#endif
 	return apple_dpxbar_t8103_link_down(mux);
 }
 EXPORT_SYMBOL_GPL(apple_dpxbar_link_down);
@@ -852,6 +1082,17 @@ static int apple_dpxbar_probe(struct platform_device *pdev)
 	if (IS_ERR(dpxbar->regs))
 		return PTR_ERR(dpxbar->regs);
 
+#if IS_ENABLED(CONFIG_MUX_APPLE_DPXBAR_T6030)
+	/*
+	 * T6030: probe writes nothing; the crossbar is powered (its ATC's
+	 * common domain) only while an output is selected.
+	 */
+	if (hw->ops == &apple_dpxbar_t6030_ops) {
+		ret = devm_pm_runtime_enable(dev);
+		if (ret)
+			return ret;
+	} else
+#endif
 	if (!of_device_is_compatible(dev->of_node, "apple,t6020-display-crossbar")) {
 		readl(dpxbar->regs + UNK_TUNABLE);
 		writel(hw->tunable, dpxbar->regs + UNK_TUNABLE);
@@ -895,6 +1136,13 @@ static const struct apple_dpxbar_hw apple_dpxbar_hw_t6020 = {
 	.ops = &apple_dpxbar_t602x_ops,
 };
 
+#if IS_ENABLED(CONFIG_MUX_APPLE_DPXBAR_T6030)
+static const struct apple_dpxbar_hw apple_dpxbar_hw_t6030 = {
+	.n_ufp = 9,
+	.ops = &apple_dpxbar_t6030_ops,
+};
+#endif
+
 static const struct of_device_id apple_dpxbar_ids[] = {
 	{
 		.compatible = "apple,t8103-display-crossbar",
@@ -912,6 +1160,12 @@ static const struct of_device_id apple_dpxbar_ids[] = {
 		.compatible = "apple,t6020-display-crossbar",
 		.data = &apple_dpxbar_hw_t6020,
 	},
+#if IS_ENABLED(CONFIG_MUX_APPLE_DPXBAR_T6030)
+	{
+		.compatible = "apple,t6030-display-crossbar",
+		.data = &apple_dpxbar_hw_t6030,
+	},
+#endif
 	{}
 };
 MODULE_DEVICE_TABLE(of, apple_dpxbar_ids);
