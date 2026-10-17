@@ -31,6 +31,11 @@
  * 0x8030 (ATC3). The loader enables dcpext0 like dcpext1; its PHY takes the
  * calibration the loader copies from ATC3's ADT node.
  *
+ * The HDMI port's audio is DCPEXT0's audio service with DPA1, the
+ * DisplayPort audio interface its port@0 links (no AP-side registers): SIO
+ * channel 0x66 carries the samples, as on the M1 Pro/Max HDMI port. The
+ * loader reserves the SIO firmware and enables the SIO with its parameters.
+ *
  * Copyright The Asahi Linux Contributors
  */
 
@@ -39,6 +44,7 @@
 		atcphy3 = &atcphy3;
 		dcpext0 = &dcpext0;
 		dcpext1 = &dcpext1;
+		sio = &sio;
 	};
 
 	/* DISPEXT0 clock ID 353 (ADT dispext0 clock-ids, frequency index 97). */
@@ -208,6 +214,38 @@
 		piodma {
 			iommus = <&dispext0_dart 4>;
 		};
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				dcpext0_audio: endpoint {
+					remote-endpoint = <&dpaudio1_dcpext0>;
+				};
+			};
+		};
+	};
+
+	/* DPA1: the HDMI port's DisplayPort audio, SIO channel 0x66. */
+	dpaudio1: audio-controller-1 {
+		compatible = "apple,t6030-dpaudio", "apple,dpaudio";
+		dmas = <&sio 0x66>;
+		dma-names = "tx";
+		power-domains = <&ps_dpa1>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 {
+				reg = <0>;
+				dpaudio1_dcpext0: endpoint {
+					remote-endpoint = <&dcpext0_audio>;
+				};
+			};
+		};
 	};
 
 	dcpext1: dcp@2d6c00000 {
@@ -359,4 +397,9 @@
 			};
 		};
 	};
+};
+
+/* The SIO's mailbox; the boot loader enables the SIO with its firmware. */
+&sio_mbox {
+	status = "okay";
 };
