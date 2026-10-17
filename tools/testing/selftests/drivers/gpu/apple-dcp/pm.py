@@ -485,7 +485,7 @@ struct notifier_block { int (*notifier_call)(struct notifier_block *,unsigned lo
 struct cd321x {
  struct tps6598x tps;
  struct work update_work,resume_work;
- int link_event;
+ int link_event,ready_event,restore_event;
  struct cd321x_pm_state pm;
  void *mux,*tbt_switch,*port_altmode_dp,*port_altmode_tbt;
  struct fwnode_handle *connector_fwnode;
@@ -545,10 +545,11 @@ static void balanced(void) {
  assert(!ports&&!altmodes&&!muxes&&!switches&&!notifiers&&!connector.refs);
 }
 int main(void) {
+ (void)cd321x_pm_notifications;
  struct cd321x c;
  struct cd321x_pm_state budget;
  cd321x_pm_init(&budget);assert(cd321x_pm_ready(&budget));
- assert(cd321x_display_taken(-ENOSPC)&&!cd321x_display_taken(-EBUSY)&&!cd321x_display_taken(0));
+ assert(cd321x_display_taken(-ENOSPC,true)&&!cd321x_display_taken(-EBUSY,true)&&!cd321x_display_taken(0,true)&&cd321x_display_taken(-EBUSY,false)&&!cd321x_display_taken(-ENOSPC,false)&&!cd321x_display_taken(0,false));
  for(unsigned int i=0;i<CD321X_RESUME_ATTEMPTS;i++){
   assert(cd321x_pm_begin_read(&budget));cd321x_pm_snapshot_ready(&budget);
   assert(cd321x_pm_retry(&budget,false)==(i+1<CD321X_RESUME_ATTEMPTS));

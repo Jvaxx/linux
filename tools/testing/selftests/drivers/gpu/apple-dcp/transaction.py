@@ -369,6 +369,8 @@ static int register_port(struct tps6598x *t,struct fwnode_handle *f) { (void)t;(
 static bool read_data_status(struct tps6598x *t) { (void)t;return true; }
 static int connect(struct tps6598x *t,u32 status) { (void)t;(void)status;return connect_error; }
 """
+    helpers += '\n#define of_machine_is_compatible(name) (!strcmp((name), \"apple,t8140\"))\n#define BIT_ULL(n) (1ULL << (n))\n#define SN201202X_INT_DP_SID_UPDATE BIT_ULL(37)\n'
+    helpers += block(core, 'static bool cd321x_uses_dp_sid(') + '\n' + block(core, 'static u64 cd321x_irq_mask(') + '\n'
     unit += helpers + block(core, 'int tipd_init(') + r"""
 static void probe_initial(struct cd321x *c) {
  initial(c);ordinary_port=true;phy_provider.safe_after_role=true;c->tps.irq=1;data.register_port=register_port;data.read_data_status=read_data_status;data.connect=connect;

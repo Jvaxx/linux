@@ -7,7 +7,12 @@ struct apple_atcphy {
 	struct reset_controller_dev rcdev;
 	void *dev;
 	int lock, dp_link_rate;
-	bool swap_lanes, tunnel_clock_on, tunnel_saved;
+	bool swap_lanes, tunnel_clock_on, tunnel_saved, dp_only, pd_was_off;
+	unsigned int tunnel_rate, tunnel_users;
+	struct {
+		bool aux, pll;
+		unsigned int pairs, rate;
+	} dp_t8122;
 	bool fixed_usb2, host_active, mode_dirty, ss_tunables, dp_tunables,
 		aux_power_requested;
 	unsigned int dp_owned_pmas, dp_idle_pmas;
@@ -153,6 +158,36 @@ static void atc_tunnel_restore(struct apple_atcphy *p)
 {
 	(void)p;
 }
+/* The teardown fixture leaves electrical tunnel/main-link resources stopped. */
+static int atc_t8122_tunnel_stop(struct apple_atcphy *p)
+{
+	assert(!p->tunnel_clock_on && !p->tunnel_users);
+	return 0;
+}
+
+static void atcphy_dp_stop_t8122(struct apple_atcphy *p)
+{
+	assert(!p->dp_t8122.aux && !p->dp_t8122.pll);
+}
+
+static void atcphy_dp_aux_on_t8122(struct apple_atcphy *p)
+{
+	assert(!p->hw->dp_t8122);
+}
+
+static bool of_machine_is_compatible(const char *name)
+{
+	return !strcmp(name, "apple,t8140");
+}
+
+#define READ_ONCE(x) (x)
+#define WRITE_ONCE(p, v) ((p) = (v))
+static void _atcphy_dwc3_reset_assert(struct apple_atcphy *p);
+static void atcphy_usb2_power_off(struct apple_atcphy *p);
+static void atcphy_restore_after_pd_off(struct apple_atcphy *p);
+static int atcphy_power_off(struct apple_atcphy *p);
+static int atcphy_configure(struct apple_atcphy *p, enum atcphy_mode mode);
+
 /* USB2 power-on is outside this teardown/recovery control. */
 static void atcphy_usb2_power_on(struct apple_atcphy *p)
 {

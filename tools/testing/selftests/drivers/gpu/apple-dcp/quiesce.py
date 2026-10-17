@@ -135,10 +135,10 @@ enum atcphy_mode { APPLE_ATCPHY_MODE_OFF, APPLE_ATCPHY_MODE_USB2,
 enum atcphy_pipehandler_state { ATCPHY_PIPEHANDLER_STATE_DUMMY, ATCPHY_PIPEHANDLER_STATE_USB3 };
 struct apple_atcphy {
  void *dev; int lock;
- const struct { bool has_usb4,has_t8140_dp; } *hw;
+ const struct { bool has_usb4,has_t8140_dp,dp_t8122; } *hw;
  struct { void *usb2phy; } regs;
  bool fixed_usb2,host_active,mode_dirty,pipe_pending,usb_off_pending,ss_tunables,dp_tunables;
- bool usb3_port_off,park_owed;
+ bool usb3_port_off,park_owed,dp_only,pd_was_off;
  enum atcphy_mode mode,typec_mode;
  enum atcphy_pipehandler_state pipe_state;
 };
@@ -150,7 +150,8 @@ static struct { enum atcphy_pipehandler_state pipehandler_state; bool enable_dp_
 static struct apple_atcphy ordinary_phy;
 static struct phy usb_phy={.data=&ordinary_phy};
 static unsigned phy_warns,configure_calls,lane_requests;
-static int atcphy_park_pipehandler(struct apple_atcphy *p) { p->pipe_state=ATCPHY_PIPEHANDLER_STATE_DUMMY;return 0; }
+static void atcphy_restore_after_pd_off(struct apple_atcphy *p) { assert(!p->pd_was_off); }
+static int atcphy_park_pipehandler(struct apple_atcphy *p, bool keep_dp) { (void)keep_dp;p->pipe_state=ATCPHY_PIPEHANDLER_STATE_DUMMY;return 0; }
 static int atcphy_configure_pipehandler(struct apple_atcphy *p,bool on) { (void)p;(void)on;assert(false);return -EINVAL; }
 static int atcphy_configure(struct apple_atcphy *p,enum atcphy_mode mode) { configure_calls++;lane_requests+=mode!=APPLE_ATCPHY_MODE_OFF;p->mode=mode;p->mode_dirty=false;return 0; }
 static void set32(void *p,unsigned v) { (void)p;(void)v;assert(false); }

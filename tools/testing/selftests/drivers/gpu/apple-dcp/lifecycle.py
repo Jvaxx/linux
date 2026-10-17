@@ -55,6 +55,8 @@ def disconnect(root):
         (dcp, 'dcp_dptx_connect_oob'),
         (core, 'cd321x_retry_revalidation'),
         *((core, n) for n in held),
+        *((core, n) for n in ('cd321x_uses_dp_sid', 'cd321x_dp_hpd',
+                              'cd321x_dp_sid_replay', 'cd321x_dp_release_first')),
         (core, 'cd321x_update_work')))
     prefix = r'''
 #include <assert.h>
@@ -185,13 +187,25 @@ struct typec_mux_state { void *alt, *data; int mode; };
 struct typec_thunderbolt_switch_data { int state; };
 struct typec_partner_desc { bool usb_pd; int accessory; struct usb_pd_identity *identity; };
 struct cd321x_status { u32 status, data_status, status_changed, data_status_changed, pwr_status;
- struct usb_pd_identity partner_identity; };
+ struct usb_pd_identity partner_identity;
+ bool dp_sid_event,dp_sid_hpd_low,dp_sid_irq;
+ struct { u32 status_rx,configure; } dp_sid_status; };
 struct tps6598x { void *partner, *dev, *port, *psy; int lock; u32 data_status; enum usb_role *role_sw; };
 struct cd321x { struct tps6598x tps; struct cd321x_status update_status;
  struct cd321x_pm_state pm; struct delayed_work update_work, resume_work;
  struct typec_mux_state state; bool state_valid, display_route_active, cur_partner_is_pd;
- bool dp_irq_hpd, dp_sink_reported;
+ bool dp_irq_hpd, dp_sink_reported,dp_sid_valid;
+ u32 dp_status,dp_conf; void *port_altmode_dp;
  struct usb_pd_identity cur_partner_identity; void *connector_fwnode, *tbt_switch, *mux; };
+/* The disconnect/transaction fixtures use the native H17 machine. */
+#define device_is_compatible(dev, name) (!strcmp((name), "apple,sn201202x"))
+#define of_machine_is_compatible(name) (!strcmp((name), "apple,t8140"))
+#define le32_to_cpu(v) (v)
+#define cpu_to_le32(v) (v)
+#ifndef DP_STATUS_HPD_STATE
+#define DP_STATUS_HPD_STATE (1U << 7)
+#endif
+struct typec_displayport_data { u32 status,conf; };
 /* No mux here declares its timeouts transient: every failure is budgeted. */
 static bool typec_mux_timeout_transient(void *m) { (void)m; return false; }
 #define dev_dbg(...) ((void)0)
@@ -210,6 +224,11 @@ static int cd321x_typec_update_mode(struct tps6598x *t, struct cd321x_status *s,
 /* SAFE through the driver's own mux handle is the same SAFE request. */
 static int __attribute__((unused)) typec_mux_set(void *m, struct typec_mux_state *s)
 { (void)m; return typec_set_mode(NULL, s->mode); }
+static int typec_mux_begin(void *m, struct typec_mux_state *s) { (void)m;(void)s;return 0; }
+static bool typec_mux_safe_after_role(void *m) { (void)m;return false; }
+static int typec_mux_apply(void *m) { struct typec_mux_state s={.mode=TYPEC_STATE_SAFE};return typec_mux_set(m,&s); }
+static void typec_mux_abort(void *m) { (void)m; }
+static int typec_mux_end(void *m) { (void)m;return 0; }
 static void typec_unregister_partner(void *p) { (void)p; }
 static void *typec_register_partner(void *p, struct typec_partner_desc *d)
 { (void)p; (void)d; return (void *)1; }
@@ -839,7 +858,7 @@ def teardown(root):
         normalized = n == 'atc' and name == 'atcphy_mux_set' and 'static int atcphy_mux_set_locked(' in s
         if normalized:
             return atc_mux_without_pm(s)
-        m = re.search(r'^(?:static [^\n]*\b|(?:int|void) )' + name + r'\(', s, re.M)
+        m = re.search(r'^(?:static [^\n]*\b|(?:int|void) )' + name + r'\([^;{}]*\)\s*\{', s, re.M)
         assert m, (n, name)
         result = block(s, m.start())
         return result
@@ -864,11 +883,11 @@ def teardown(root):
                 'atcphy_configure_pipehandler_usb3_host_t8103',
                 'atcphy_configure_pipehandler_usb3_host_t8122',
                 'atcphy_configure_pipehandler_usb3', 'atcphy_configure_pipehandler_usb4',
-                'atcphy_enable_dummy_phy', 'atcphy_pipe_live', 'atcphy_configure_pipehandler_dummy',
+                'atcphy_enable_dummy_phy', 'atcphy_pipe_live', 'atcphy_needs_dummy_phy', 'atcphy_configure_pipehandler_dummy',
                 'atcphy_configure_pipehandler', 'atcphy_park_pipehandler',
                 'atcphy_get_mode_config', 'atcphy_dp_configure',
                 'j700_field_update', 'j700_aux_disable', 'atcphy_disable_dp_aux',
-                'atcphy_power_off', 'atcphy_power_on', *ATC_POST_TUNABLE, 'atcphy_configure',
+                'atcphy_power_off', 'atcphy_power_on', *ATC_POST_TUNABLE, 'atcphy_configure', 'atcphy_restore_after_pd_off',
                 'atcphy_usb2_init', 'atcphy_usb3_power_off',
                 'atcphy_usb3_route', 'atcphy_usb3_set_mode', 'atcphy_usb2_power_off',
                 '_atcphy_dwc3_reset_assert', 'atcphy_dwc3_reset_assert', 'atcphy_mux_set'),

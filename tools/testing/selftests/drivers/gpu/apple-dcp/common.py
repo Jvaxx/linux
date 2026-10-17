@@ -22,6 +22,10 @@ Path.read_text = _read_dcp_unit
 def block(source, marker):
     start = source.index(marker) if isinstance(marker, str) else marker
     opening = source.index('{', start)
+    if isinstance(marker, str) and marker.startswith('static ') and '(' in marker:
+        while 0 <= source.find(';', start) < opening:
+            start = source.index(marker, source.index(';', start) + 1)
+            opening = source.index('{', start)
     end, depth = opening + 1, 1
     while depth:
         depth += (source[end] == '{') - (source[end] == '}')
@@ -87,7 +91,7 @@ def atc_function(source, name):
     The fixed-hub SuperSpeed handover splits helpers out of the functions that the
     fixtures extract; older sources keep that code inline.
     """
-    marker = re.search(r'^static [^\n]+\b' + name + r'\(', source, re.M)
+    marker = re.search(r'^static [^\n;]+\b' + name + r'\([^;{}]*\)\s*\{', source, re.M)
     return block(source, marker.start()) + '\n' if marker else ''
 
 
