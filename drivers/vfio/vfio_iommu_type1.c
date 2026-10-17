@@ -255,6 +255,12 @@ static size_t vfio_dirty_pgsize(struct vfio_iommu *iommu)
 	return IS_ENABLED(CONFIG_MM_SUBPAGE) ? SZ_4K : 1UL << __ffs(iommu->pgsize_bitmap);
 }
 
+/* Fragment providers exist only when mixed user granules are built in. */
+static inline bool vfio_dma_has_fragments(struct vfio_dma *dma)
+{
+	return IS_ENABLED(CONFIG_MM_SUBPAGE) && dma->fragments;
+}
+
 static int vfio_dma_bitmap_alloc(struct vfio_dma *dma, size_t pgsize)
 {
 	uint64_t npages = dma->size / pgsize;
@@ -440,7 +446,7 @@ static int vfio_iova_put_vfio_pfn(struct vfio_dma *dma, struct vfio_pfn *vpfn)
 
 	vpfn->ref_count--;
 	if (!vpfn->ref_count) {
-		if (dma->fragments) {
+		if (vfio_dma_has_fragments(dma)) {
 			unsigned long offset = vpfn->iova - dma->iova;
 			unsigned long length = vpfn->length;
 
@@ -973,7 +979,7 @@ static int vfio_pin_external_segment(struct vfio_iommu *iommu,
 			return -EINVAL;
 		}
 		*pfn = vpfn->pfn;
-	} else if (dma->fragments) {
+	} else if (vfio_dma_has_fragments(dma)) {
 		ret = vfio_fragments_external(dma, iova, length, pfn);
 		if (ret)
 			return ret;
@@ -1207,7 +1213,7 @@ static long vfio_unmap_unpin(struct vfio_iommu *iommu, struct vfio_dma *dma,
 
 	if (!dma->size)
 		return 0;
-	if (dma->fragments) {
+	if (vfio_dma_has_fragments(dma)) {
 		vfio_fragments_unmap(iommu, dma);
 		return 0;
 	}
@@ -1643,7 +1649,7 @@ static int vfio_pin_map_dma(struct vfio_iommu *iommu, struct vfio_dma *dma,
 	unsigned long pfn, limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
 	int ret = 0;
 
-	if (dma->fragments) {
+	if (vfio_dma_has_fragments(dma)) {
 		dma->size = map_size;
 		ret = vfio_fragments_map_all(iommu, dma);
 		if (ret)
@@ -1755,8 +1761,8 @@ static int vfio_change_dma_owner(struct vfio_iommu *iommu, struct vfio_dma *dma,
 	struct vfio_fragment_provider *provider;
 	int ret;
 
-	if (dma->fragments || (mm_page_size(current->mm) == PAGE_SIZE &&
-			      IS_ALIGNED(vaddr, PAGE_SIZE)))
+	if (vfio_dma_has_fragments(dma) ||
+	    (mm_page_size(current->mm) == PAGE_SIZE && IS_ALIGNED(vaddr, PAGE_SIZE)))
 		return vfio_change_dma_mm(dma, current->group_leader, current->mm,
 					  capable(CAP_IPC_LOCK));
 
@@ -1922,7 +1928,7 @@ static int vfio_iommu_replay(struct vfio_iommu *iommu,
 		size_t pos = 0;
 
 		dma = rb_entry(n, struct vfio_dma, node);
-		if (dma->fragments) {
+		if (vfio_dma_has_fragments(dma)) {
 			ret = vfio_fragments_acquire(dma, 0, dma->size);
 			if (!ret)
 				ret = vfio_fragments_map_domain(dma, domain->domain);
@@ -2014,7 +2020,7 @@ unwind:
 		struct vfio_dma *dma = rb_entry(n, struct vfio_dma, node);
 		size_t pos = 0;
 
-		if (dma->fragments) {
+		if (vfio_dma_has_fragments(dma)) {
 			iommu_unmap(domain->domain, dma->iova, dma->size);
 			vfio_fragments_release_unused(dma);
 			continue;
@@ -2555,7 +2561,7 @@ static void vfio_iommu_unmap_unpin_reaccount(struct vfio_iommu *iommu)
 		long locked = 0, unlocked = 0;
 
 		dma = rb_entry(n, struct vfio_dma, node);
-		if (dma->fragments) {
+		if (vfio_dma_has_fragments(dma)) {
 			vfio_unmap_unpin(iommu, dma, true);
 			continue;
 		}
@@ -3332,7 +3338,7 @@ static int vfio_iommu_type1_dma_rw_chunk(struct vfio_iommu *iommu,
 		return -EPERM;
 
 	mm = dma->mm;
-	if (dma->fragments) {
+	if (vfio_dma_has_fragments(dma)) {
 		int ret;
 
 		if (!kthread && current->mm != mm)
