@@ -972,6 +972,11 @@ struct task_struct {
 
 	struct mm_struct		*mm;
 	struct mm_struct		*active_mm;
+#ifdef CONFIG_ARCH_HAS_USER_PAGE_SIZE
+	/* Per-thread exec policy; fork inherits it, the live mm is immutable. */
+	unsigned int			exec_page_shift;
+	unsigned int			default_exec_page_shift;
+#endif
 
 	struct task_exec_state __rcu	*exec_state;
 
