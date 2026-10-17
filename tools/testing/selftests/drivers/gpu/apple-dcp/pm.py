@@ -4,12 +4,30 @@
 from pathlib import Path
 import os, re, subprocess
 import phy
-from common import block, tipd_pm_header
+from common import block, tipd_pm_header, atc_function
 
 def ownership(root, usb_unreachable=False):
     ns=phy.parking(root)
     s=ns['atc'];has_pm='static int atcphy_usb3_pm_get(' in s
-    prod=ns['production'].replace('struct apple_atcphy {','struct apple_atcphy {\n    struct device_node *np;',1)
+    # The fixed-hub SuperSpeed handover powers the SuperSpeed root port off around
+    # a change, where the PM wrapper used to resume the link on that port.
+    port_power='static int atcphy_usb3_port_off(' in s
+    link_resume='static int atcphy_usb3_link_get(' in s
+    fields='\n    struct device_node *np;'
+    if port_power:
+        fields+='\n    struct delayed_work usb3_port_work, park_work;\n    unsigned int usb3_port_retries, park_retries;'
+    prod=ns['production'].replace('struct apple_atcphy {','struct apple_atcphy {'+fields,1)
+    if port_power:
+        # The PIPE may only move while the SuperSpeed port of the held root is down.
+        mux_write='if (p == (void *)&pipe_regs[PIPEHANDLER_MUX_CTRL / 4]) mux_writes++;'
+        assert mux_write in prod
+        prod=prod.replace(mux_write,'if (p == (void *)&pipe_regs[PIPEHANDLER_MUX_CTRL / 4]) { mux_writes++; assert(!pipe_change_window() || usb3_port_down); }',1)
+        prod=r'''
+struct work_struct { int unused; };
+struct delayed_work { struct work_struct work; unsigned int queued; unsigned long delay; };
+static bool usb3_port_down;
+static bool pipe_change_window(void);
+'''+prod
     if has_pm:
         prod = prod.replace(block(prod, 'static int atcphy_mux_set('), '')
     # Non-mux fixture entry points continue to exercise actual source. Only the new
@@ -106,10 +124,16 @@ static void put_device(struct device *d) { assert(d->refs>0);d->refs--; }
 static struct usb_device *usb_get_dev(struct usb_device *u) { u->refs++;return u; }
 static void usb_put_dev(struct usb_device *u) { assert(u->refs>0);u->refs--; }
 static int usb_for_each_dev(void *data,int (*fn)(struct usb_device *,void *)) { if(root_missing)return 0;for(unsigned int i=0;i<4;i++){int r=fn(&roots[i],data);if(r)return r;}return 0; }
-static struct usb_device *usb_hub_find_child(struct usb_device *u, int port) { assert(u==&roots[3]&&root_locked&&port==1);
+/* Root state changes while the root is held: at the lookup of its child or, without one, at its resume. */
+static void root_held_events(struct usb_device *u) {
  if(detach_at_lookup)usb_set_device_state(u,USB_STATE_NOTATTACHED);
  if(quiesce_at_lookup)hcd.state=HC_STATE_QUIESCING;
+}
+#if LINK_RESUME
+static struct usb_device *usb_hub_find_child(struct usb_device *u, int port) { assert(u==&roots[3]&&root_locked&&port==1);
+ root_held_events(u);
  return link_present?&link_device:NULL; }
+#endif
 static void usb_lock_device(struct usb_device *u) {
  if(u==&roots[3]){assert(!root_locked);if(REQUIRES_PLATFORM_LOCKS)assert(controller_locked&&host_locked);root_locked=true;if(detach_on_lock)u->state=0;}
  else {assert(u==&link_device&&root_locked&&!link_locked);link_locked=true;}
@@ -134,6 +158,7 @@ static int pm_runtime_resume_and_get(struct device *d) {
  struct lock_guard g=lock_take(&pm_phy->lock);lock_release(&g);
  if(resume_error)return resume_error;
  pm_refs++;stuck_ack=link_present&&link_device.state!=USB_STATE_NOTATTACHED&&link_suspended;if(detach_on_resume)roots[3].state=0;
+ if(!LINK_RESUME)root_held_events(&roots[3]);
  if(inaccessible_on_resume)clear_bit(HCD_FLAG_HW_ACCESSIBLE,&hcd.flags);
  if(dead_on_resume)set_bit(HCD_FLAG_DEAD,&hcd.flags);
  return 0;
@@ -151,6 +176,43 @@ static void pm_runtime_put_autosuspend(struct device *d) {
  if(d==&link_device.dev){assert(link_locked&&link_pm_refs==1);link_pm_refs--;}
  else {assert(d==&roots[3].dev&&!link_locked&&pm_refs==1);pm_refs--;}
 }
+#define dev_info(...) ((void)0)
+#if PORT_POWER
+#define to_delayed_work(w) container_of(w, struct delayed_work, work)
+#define msecs_to_jiffies(ms) ((unsigned long)(ms))
+struct workqueue_struct { int unused; };
+static struct workqueue_struct freezable_wq;
+#define system_freezable_wq (&freezable_wq)
+static unsigned int port_offs, port_ons;
+static int port_off_error, port_on_error;
+static bool port_disabled;
+static bool mod_delayed_work(struct workqueue_struct *wq, struct delayed_work *w, unsigned long delay)
+{ assert(wq==system_freezable_wq&&!pm_phy->lock);w->queued++;w->delay=delay;return true; }
+static bool pipe_change_window(void) { return root_locked; }
+/* Port power of the held root; the device on it goes, and with it its hold on the PIPE. */
+static int usb_hub_port_power_off(struct usb_device *u, int port)
+{
+ assert(u==&roots[3]&&port==1&&root_locked&&pm_refs==1&&!pm_phy->lock);
+ port_offs++;
+ if(port_off_error)return port_off_error;
+ if(port_disabled)return 1;
+ if(link_present&&link_device.state!=USB_STATE_NOTATTACHED){link_device.state=USB_STATE_NOTATTACHED;stuck_ack=false;}
+ usb3_port_down=true;
+ return 0;
+}
+/* Only once the PIPE is back on the USB3 backend of the running host. */
+static int usb_hub_port_power_on(struct usb_device *u, int port)
+{
+ assert(u==&roots[3]&&port==1&&root_locked&&pm_refs==1&&!pm_phy->lock);
+ assert(usb3_port_down&&pm_phy->host_active&&!pm_phy->mode_dirty&&!pm_phy->pipe_pending);
+ assert(pm_phy->pipe_state==ATCPHY_PIPEHANDLER_STATE_USB3);
+ port_ons++;
+ if(port_on_error)return port_on_error;
+ if(port_disabled)return 1;
+ usb3_port_down=false;
+ return 0;
+}
+#endif
 '''
     suffix=ns['suffix'].replace('int main(', 'int __attribute__((unused)) fixture_main(',1)
     controls=r'''
@@ -175,6 +237,9 @@ static void prepare(struct apple_atcphy *p,bool fixed,bool t8140,bool swap)
     link_present=link_suspended=link_locked=false;
     link_pm_refs=link_resumes=link_error=link_detach_on_resume=link_dead_on_resume=0;
     detach_at_lookup=quiesce_at_lookup=0;
+#if PORT_POWER
+    usb3_port_down=port_disabled=false;port_offs=port_ons=0;port_off_error=port_on_error=0;
+#endif
 }
 static int safe(struct apple_atcphy *p)
 {
@@ -272,6 +337,7 @@ int main(void)
   int ret=safe(&p);fprintf(stderr,"post-child admission event %u returned %d writes %u\n",event,ret,writes-before);
   assert(ret==-ENODEV&&writes==before);balanced(&p);
  }
+#if LINK_RESUME
  /* Selectively suspended upstream link is not resumed by root ownership alone. */
  for(unsigned int swap=0;swap<2;swap++){
   prepare(&p,true,true,swap);link_present=link_suspended=stuck_ack=true;
@@ -291,6 +357,38 @@ int main(void)
  prepare(&p,true,true,false);link_present=link_suspended=true;fail_caller="atcphy_pipehandler_lock";before=writes;
  assert(safe(&p)==-ETIMEDOUT&&writes==before&&p.mode_dirty&&p.pipe_state==ATCPHY_PIPEHANDLER_STATE_USB3);balanced(&p);
  fail_caller=NULL;assert(safe(&p)==0);balanced(&p);
+#else
+ /* The device on the SuperSpeed port goes with the port, before the PIPE moves. */
+ for(unsigned int swap=0;swap<2;swap++){
+  prepare(&p,true,true,swap);link_present=link_suspended=stuck_ack=true;
+  int link_ret=safe(&p);fprintf(stderr,"port-off SAFE returned %d, root resumes %d, port offs %u\n",link_ret,resumes,port_offs);
+  assert(link_ret==0&&resumes==1&&link_resumes==0&&link_device.state==USB_STATE_NOTATTACHED);
+  /* SAFE has no USB3: the port stays off until a USB3 mode has the PIPE back. */
+  assert(port_offs==1&&!port_ons&&usb3_port_down&&p.usb3_port_off);balanced(&p);
+  assert(select_mode(&p,APPLE_ATCPHY_MODE_USB3_DP)==0&&p.pipe_state==ATCPHY_PIPEHANDLER_STATE_USB3);
+  assert(port_offs==2&&port_ons==1&&!usb3_port_down&&!p.usb3_port_off);balanced(&p);
+ }
+ /* A port that does not go down stops the change before any PHY programming. */
+ prepare(&p,true,true,false);link_present=link_suspended=true;port_off_error=-EIO;before=writes;
+ unsigned int retained=p.dp_usb_context_valid,owners=p.dp_owned_pmas;
+ assert(safe(&p)==-EIO&&writes==before&&p.dp_usb_context_valid==retained&&p.dp_owned_pmas==owners);
+ assert(!port_ons&&!usb3_port_down&&!p.usb3_port_off);balanced(&p);
+ port_off_error=0;assert(safe(&p)==0&&usb3_port_down);balanced(&p);
+ /* A port that someone else switched off stays theirs. */
+ prepare(&p,true,true,false);port_disabled=usb3_port_down=true;
+ assert(safe(&p)==0&&port_offs==1&&!p.usb3_port_off);balanced(&p);
+ assert(select_mode(&p,APPLE_ATCPHY_MODE_USB3_DP)==0&&!port_ons&&usb3_port_down);balanced(&p);
+ /* A port that does not come back fails the change; the same mode then only powers it on. */
+ prepare(&p,true,true,false);assert(safe(&p)==0);port_on_error=-EIO;
+ assert(select_mode(&p,APPLE_ATCPHY_MODE_USB3_DP)==-EIO&&port_ons==1&&p.usb3_port_off&&p.usb3_port_work.queued==1);
+ balanced(&p);port_on_error=0;before=writes;
+ assert(select_mode(&p,APPLE_ATCPHY_MODE_USB3_DP)==0&&port_ons==2&&!p.usb3_port_off&&writes==before);balanced(&p);
+ /* PM resume is NOT proof of ACK; the port is down and stays down. */
+ prepare(&p,true,true,false);link_present=link_suspended=true;fail_caller="atcphy_pipehandler_lock";before=writes;
+ assert(safe(&p)==-ETIMEDOUT&&writes==before&&p.mode_dirty&&p.pipe_state==ATCPHY_PIPEHANDLER_STATE_USB3);
+ assert(usb3_port_down&&p.usb3_port_off&&!port_ons);balanced(&p);
+ fail_caller=NULL;assert(safe(&p)==0);balanced(&p);
+#endif
  for(unsigned int count=0;count<2;count++){
   prepare(&p,true,true,false);roots[3].maxchild=count?2:0;before=writes;
   assert(safe(&p)==(count?-ENODEV:-EAGAIN)&&writes==before);balanced(&p);
@@ -308,11 +406,20 @@ int main(void)
     if has_pm:
      helpers=ns['block'](s,'struct atcphy_usb3_pm {')+';\n'
      helpers+='#if IS_REACHABLE(CONFIG_USB)\n'
-     if 'static int atcphy_usb3_link_get(' in s:
+     if link_resume:
       helpers+=ns['function'](s,'atcphy_usb3_link_get')+'\n'+ns['function'](s,'atcphy_usb3_link_put')+'\n'
+     helpers+=atc_function(s,'atcphy_usb3_is_root')
      helpers+=ns['function'](s,'atcphy_usb3_pm_find')+'\n#endif\n'
      helpers+=ns['function'](s,'atcphy_usb3_pm_get')+'\n'+ns['function'](s,'atcphy_usb3_pm_put')+'\n'
-     helpers+=ns['function'](s,'atcphy_mux_is_noop')+'\n'+ns['function'](s,'atcphy_mux_update')+'\n'
+     # The port power steps and the retries that the mux update queues; the
+     # delayed work functions themselves are left to the KUnit tests.
+     helpers+=''.join(atc_function(s,name) for name in
+       ('atcphy_usb3_port_off','atcphy_usb3_port_on','atcphy_usb3_port_retry_delay',
+        'atcphy_usb3_port_retry','atcphy_mux_in_mode'))
+     helpers+=ns['function'](s,'atcphy_mux_is_noop')+'\n'
+     helpers+=''.join(atc_function(s,name) for name in
+       ('atcphy_park_retry_delay','atcphy_park_retry','atcphy_park_due','atcphy_mux_change'))
+     helpers+=ns['function'](s,'atcphy_mux_update')+'\n'
      # Lane fixtures provide the target mapping and locked body; use the real callback here.
      marker=re.search(r'^static int atcphy_mux_set\(',s,re.M).group()
      helpers+=ns['block'](s,marker)+'\n'
@@ -326,7 +433,7 @@ int main(void)
       ('static void typec_mux_unlock(', 'void typec_mux_abort(', 'int typec_mux_begin(', 'int typec_mux_apply(', 'int typec_mux_end(', 'int typec_mux_set('))+'\n'
     hcd_source=(root/'drivers/usb/core/hcd.c').read_text()
     hcd_death=ns['block'](hcd_source,'void usb_hc_died (')+'\n'
-    text=prefix+prod+'\n#define REQUIRES_PLATFORM_LOCKS '+str(int('device_lock(&pm->controller->dev)' in s))+'\n#define USB_REACHABLE '+str(int(not usb_unreachable))+'\n#define HCD_DEAD_ONLY '+str(int(False))+'\n'+pmfixture+helpers+typec_caller+hcd_death+suffix+controls
+    text=prefix+prod+'\n#define REQUIRES_PLATFORM_LOCKS '+str(int('device_lock(&pm->controller->dev)' in s))+'\n#define PORT_POWER '+str(int(port_power))+'\n#define LINK_RESUME '+str(int(link_resume))+'\n#define USB_REACHABLE '+str(int(not usb_unreachable))+'\n#define HCD_DEAD_ONLY '+str(int(False))+'\n'+pmfixture+helpers+typec_caller+hcd_death+suffix+controls
     return text
 
 def probe(root):

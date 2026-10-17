@@ -90,3 +90,15 @@ pending PIPE work and a mismatched PIPE still require ownership. KUnit static
 redirects are disabled in host fixtures so the production bodies execute.
 CD321x probe uses the actual optional-router lookup with a modeled deferred
 probe decision; both supplier waiting and optional-router fallback are checked.
+
+With the fixed-hub SuperSpeed handover the locked mux body is
+atcphy_mux_switch(), and the PM fixtures run the actual USB side around it:
+the SuperSpeed root port goes down before the PIPE moves, the device on it
+with it, and comes up only once the PIPE is back on the USB3 backend of the
+running host. A modeled port refuses PIPE moves while it is up, and its
+power-off and power-on failures, a port someone else switched off and the
+retries the update queues are checked. The adapter of the lane fixtures takes
+no port down and checks that none comes up. A failed USB3 power-off or reset
+leaves dwc3 out of host mode, and a fixed-hub host whose PIPE cannot be routed
+still starts. Each fixture detects these from the source, so the expectations
+for sources without the handover remain.
