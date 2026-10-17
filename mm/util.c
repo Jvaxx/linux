@@ -406,7 +406,7 @@ unsigned long __weak arch_randomize_brk(struct mm_struct *mm)
 	return randomize_page_shift(mm->brk, SZ_1G, mm_page_shift(mm));
 }
 
-unsigned long arch_mmap_rnd(void)
+static unsigned long mmap_rnd(const struct mm_struct *mm)
 {
 	unsigned int bits;
 	unsigned long mask;
@@ -418,8 +418,13 @@ unsigned long arch_mmap_rnd(void)
 #endif /* CONFIG_HAVE_ARCH_MMAP_RND_COMPAT_BITS */
 		bits = mmap_rnd_bits;
 
-	mask = mm_aslr_mask(current->mm, (1UL << bits) - 1);
-	return (get_random_long() & mask) << mm_page_shift(current->mm);
+	mask = mm_aslr_mask(mm, (1UL << bits) - 1);
+	return (get_random_long() & mask) << mm_page_shift(mm);
+}
+
+unsigned long arch_mmap_rnd(void)
+{
+	return mmap_rnd(current->mm);
 }
 
 static int mmap_is_legacy(const struct rlimit *rlim_stack)
@@ -443,7 +448,8 @@ static int mmap_is_legacy(const struct rlimit *rlim_stack)
 #define MIN_GAP		(SZ_128M)
 #define MAX_GAP		(STACK_TOP / 6 * 5)
 
-static unsigned long mmap_base(const unsigned long rnd, const struct rlimit *rlim_stack)
+static unsigned long mmap_base(const struct mm_struct *mm, const unsigned long rnd,
+			       const struct rlimit *rlim_stack)
 {
 #ifdef CONFIG_STACK_GROWSUP
 	/*
@@ -452,15 +458,15 @@ static unsigned long mmap_base(const unsigned long rnd, const struct rlimit *rli
 	 * task. mmap_base starts directly below the stack and grows
 	 * downwards.
 	 */
-	return (mmap_upper_limit(rlim_stack) - rnd) & mm_page_mask(current->mm);
+	return (mmap_upper_limit(rlim_stack) - rnd) & mm_page_mask(mm);
 #else
 	unsigned long gap = rlim_stack->rlim_cur;
 	unsigned long pad = stack_guard_gap;
 
 	/* Account for stack randomization if necessary */
 	if (current->flags & PF_RANDOMIZE)
-		pad += mm_aslr_mask(current->mm, STACK_RND_MASK) <<
-			mm_page_shift(current->mm);
+		pad += mm_aslr_mask(mm, STACK_RND_MASK) <<
+			mm_page_shift(mm);
 
 	/* Values close to RLIM_INFINITY can overflow. */
 	if (gap + pad > gap)
@@ -471,7 +477,7 @@ static unsigned long mmap_base(const unsigned long rnd, const struct rlimit *rli
 	else if (gap > MAX_GAP)
 		gap = MAX_GAP;
 
-	return mm_page_align(current->mm, STACK_TOP - gap - rnd);
+	return mm_page_align(mm, STACK_TOP - gap - rnd);
 #endif
 }
 
@@ -480,13 +486,13 @@ void arch_pick_mmap_layout(struct mm_struct *mm, const struct rlimit *rlim_stack
 	unsigned long random_factor = 0UL;
 
 	if (current->flags & PF_RANDOMIZE)
-		random_factor = arch_mmap_rnd();
+		random_factor = mmap_rnd(mm);
 
 	if (mmap_is_legacy(rlim_stack)) {
 		mm->mmap_base = TASK_UNMAPPED_BASE + random_factor;
 		mm_flags_clear(MMF_TOPDOWN, mm);
 	} else {
-		mm->mmap_base = mmap_base(random_factor, rlim_stack);
+		mm->mmap_base = mmap_base(mm, random_factor, rlim_stack);
 		mm_flags_set(MMF_TOPDOWN, mm);
 	}
 }
