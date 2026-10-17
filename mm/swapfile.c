@@ -1406,7 +1406,8 @@ static bool swap_alloc_fast(struct folio *folio, bool mandatory)
 	offset = this_cpu_read(percpu_swap_cluster.offset[order]);
 	if (!si || !offset || !get_swap_device_info(si))
 		return false;
-	if (!swap_folio_alloc_allowed(si, folio, mandatory)) {
+	if (IS_ENABLED(CONFIG_MM_SUBPAGE) &&
+	    !swap_folio_alloc_allowed(si, folio, mandatory)) {
 		put_swap_device(si);
 		return false;
 	}
@@ -3298,7 +3299,8 @@ static int setup_swap_extents(struct swap_info_struct *sis,
 	} else {
 		ret = generic_swapfile_activate(sis, swap_file, span);
 	}
-	if (ret >= 0 && sis->bdev &&
+	/* Only subpage swap needs the reserve for splitting large folio I/O. */
+	if (IS_ENABLED(CONFIG_MM_SUBPAGE) && ret >= 0 && sis->bdev &&
 	    sis->ops == &swap_bdev_ops && swap_extent_io_init()) {
 		destroy_swap_extents(sis, swap_file);
 		return -ENOMEM;

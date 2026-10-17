@@ -368,6 +368,7 @@ static void swap_add_folio(struct swap_io_ctx *ctx, struct folio *folio, int rw)
 	}
 }
 
+#ifdef CONFIG_MM_SUBPAGE
 static DEFINE_MUTEX(swap_extent_io_mutex);
 static struct bio_set swap_extent_bioset;
 
@@ -420,6 +421,23 @@ static void swap_submit_bio(struct bio *bio, void *private)
 	}
 	submit_bio(bio);
 }
+
+static void swap_submit_bio_wait(struct bio *bio, struct folio *folio)
+{
+	bio_await(bio, folio, swap_submit_bio);
+}
+#else
+/* Without subpage support, large folios never reach a swap file. */
+static inline void swap_submit_bio(struct bio *bio, void *private)
+{
+	submit_bio(bio);
+}
+
+static inline void swap_submit_bio_wait(struct bio *bio, struct folio *folio)
+{
+	submit_bio_wait(bio);
+}
+#endif
 
 void __swap_writepage(struct swap_io_ctx *ctx, struct folio *folio)
 {
@@ -653,7 +671,7 @@ static void swap_bdev_submit_write(struct swap_io_ctx *ctx)
 	bio_associate_blkg_from_page(bio, bio_first_folio_all(bio));
 
 	if (ctx->sis->flags & SWP_SYNCHRONOUS_IO) {
-		bio_await(bio, bio_first_folio_all(bio), swap_submit_bio);
+		swap_submit_bio_wait(bio, bio_first_folio_all(bio));
 		end_swap_bio_write(bio);
 	} else {
 		bio->bi_end_io = end_swap_bio_write;
@@ -678,7 +696,7 @@ static void swap_bdev_submit_read(struct swap_io_ctx *ctx)
 		 * time check.
 		 */
 		get_task_struct(current);
-		bio_await(bio, bio_first_folio_all(bio), swap_submit_bio);
+		swap_submit_bio_wait(bio, bio_first_folio_all(bio));
 		swap_bio_read_end_io(bio);
 		put_task_struct(current);
 	} else {
@@ -693,7 +711,7 @@ static bool swap_bdev_can_merge(struct folio *folio, struct folio *prev_folio,
 	struct swap_info_struct *sis = __swap_entry_to_info(folio->swap);
 
 	/* swap_submit_bio() splits a large folio at swap-file extent ends. */
-	if (!(READ_ONCE(sis->flags) & SWP_BLKDEV) &&
+	if (IS_ENABLED(CONFIG_MM_SUBPAGE) && !(READ_ONCE(sis->flags) & SWP_BLKDEV) &&
 	    (folio_test_large(folio) || folio_test_large(prev_folio)))
 		return false;
 	if (swap_folio_sector(folio) !=
