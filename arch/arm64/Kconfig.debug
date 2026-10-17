@@ -82,6 +82,7 @@ config ARM64_USER4K_VFIO_ACCOUNT_TEST
 	bool "VFIO type1 pinning harness for mixed userspace granules"
 	depends on ARM64_USER4K_EXPERIMENTAL && KUNIT=y
 	depends on IOMMUFD != m
+	depends on TMPFS
 	select VFIO
 	select VFIO_GROUP
 	select VFIO_CONTAINER
@@ -99,6 +100,7 @@ config ARM64_USER4K_VFIO_IOCTL_TEST
 	depends on ARM64_USER4K_EXPERIMENTAL && KUNIT=y && DEBUG_KERNEL
 	depends on RUNTIME_TESTING_MENU
 	depends on IOMMUFD != m
+	depends on TMPFS
 	select ARM64_USER4K_VFIO_ACCOUNT_TEST
 	default n
 	help
