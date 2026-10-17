@@ -15,6 +15,7 @@
 #include <linux/cgroup.h>
 #include <linux/delay.h>
 #include <linux/binfmts.h>
+#include <linux/hugetlb.h>
 #include <linux/init.h>
 #include <linux/io.h>
 #include <linux/iova_bitmap.h>
@@ -43,6 +44,7 @@
 #include <linux/umh.h>
 #include <linux/userfaultfd_k.h>
 #include <linux/uio.h>
+#include <linux/syscalls.h>
 
 #include <asm/cpufeature.h>
 #include <asm/daifflags.h>
@@ -5489,6 +5491,52 @@ static void user4k_exec_secure_granule_test(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, mm_page_shift(bprm->mm), compat ? 12U : PAGE_SHIFT);
 		test_expect_exec_strings(test, bprm, copied);
 	}
+}
+
+/* HugeTLB tables use native geometry; a small-granule mm must not map them. */
+static void user4k_hugetlb_refused_test(struct kunit *test)
+{
+#ifdef CONFIG_HUGETLBFS
+	const unsigned long prot = PROT_READ | PROT_WRITE;
+	const unsigned long flags = MAP_SHARED | MAP_NORESERVE | MAP_FIXED_NOREPLACE;
+	const unsigned long addr = SZ_1G;
+	struct mm_struct *small, *native;
+	unsigned long len, result[3];
+	struct file *file;
+
+	if (!user4k_test_enabled && !IS_ENABLED(CONFIG_KASAN)) {
+		kunit_skip(test, "borrowed-mm mapping fixture requires hardware opt-in");
+		return;
+	}
+	len = huge_page_size(&default_hstate);
+	file = hugetlb_file_setup(HUGETLB_ANON_FILE, len, mk_vma_flags(VMA_NORESERVE_BIT),
+				  HUGETLB_ANONHUGE_INODE, 0);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, file);
+	small = test_vma_mm(test);
+	native = mm_alloc();
+	KUNIT_ASSERT_NOT_NULL(test, small);
+	KUNIT_ASSERT_NOT_NULL(test, native);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, user4k_vma_mm_free, native), 0);
+
+	kthread_use_mm(small);
+	result[0] = vm_mmap(file, addr, len, prot, flags, 0);
+	result[1] = ksys_mmap_pgoff(addr, len, prot, MAP_PRIVATE | MAP_ANONYMOUS |
+				    MAP_HUGETLB | MAP_NORESERVE | MAP_FIXED_NOREPLACE,
+				    -1, 0);
+	kthread_unuse_mm(small);
+	kthread_use_mm(native);
+	result[2] = vm_mmap(file, addr, len, prot, flags, 0);
+	kthread_unuse_mm(native);
+	fput(file);
+
+	KUNIT_EXPECT_EQ(test, result[0], (unsigned long)-EINVAL);
+	KUNIT_EXPECT_EQ(test, result[1], (unsigned long)-EINVAL);
+	KUNIT_EXPECT_EQ(test, small->map_count, 0);
+	/* The same mapping is accepted with native tables. */
+	KUNIT_EXPECT_EQ(test, result[2], addr);
+#else
+	kunit_skip(test, "requires CONFIG_HUGETLBFS");
+#endif
 }
 
 static struct vm_area_struct *test_special_vma(struct mm_struct *mm,
@@ -14442,6 +14490,7 @@ static struct kunit_case user4k_test_cases[] = {
 	KUNIT_CASE(user4k_exec_arguments_test),
 	KUNIT_CASE(user4k_exec_privileged_test),
 	KUNIT_CASE(user4k_exec_secure_granule_test),
+	KUNIT_CASE(user4k_hugetlb_refused_test),
 	KUNIT_CASE(user4k_special_mapping_test),
 	KUNIT_CASE(native_callback_mapping_test),
 	KUNIT_CASE(user4k_callback_mapping_test),
