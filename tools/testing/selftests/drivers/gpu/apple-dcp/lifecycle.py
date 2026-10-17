@@ -3,7 +3,7 @@
 """Actual disconnect authority, DWC3 teardown and firmware resource admission."""
 from pathlib import Path
 import re
-from common import block, atc_mux_without_pm, source_defines, ATC_POST_TUNABLE
+from common import block, atc_mux_without_pm, source_defines, ATC_POST_TUNABLE, tipd_pm_header
 
 def disconnect(root):
     # Copyright 2026 Ryan Murray
@@ -21,8 +21,7 @@ def disconnect(root):
             pos += 1
         return s[m.start():pos]
 
-    pm = (r / 'drivers/usb/typec/tipd/cd321x-pm.h').read_text()
-    pm = pm.replace('#include <linux/types.h>', '')
+    pm = tipd_pm_header(r)
     core = 'drivers/usb/typec/tipd/core.c'
     dcp = 'drivers/gpu/drm/apple/dcp.c'
     funcs = '\n'.join(function(f, n) for f, n in (
