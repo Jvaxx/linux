@@ -3131,10 +3131,241 @@ static void tb_test_property_merge(struct kunit *test)
 	tb_property_free_dir(dir1);
 }
 
+struct tb_test_pci_host {
+	struct tb_nhi nhi;
+	unsigned int prepares;
+	unsigned int connects;
+	unsigned int disconnects;
+	int result;
+};
+
+static int tb_test_pci_host_prepare(struct tb_nhi *nhi)
+{
+	struct tb_test_pci_host *host = container_of(nhi, struct tb_test_pci_host, nhi);
+
+	host->prepares++;
+	return host->result;
+}
+
+static int tb_test_pci_host_connect(struct tb_nhi *nhi)
+{
+	struct tb_test_pci_host *host = container_of(nhi, struct tb_test_pci_host, nhi);
+
+	host->connects++;
+	return host->result;
+}
+
+static int tb_test_pci_host_disconnect(struct tb_nhi *nhi)
+{
+	struct tb_test_pci_host *host = container_of(nhi, struct tb_test_pci_host, nhi);
+
+	host->disconnects++;
+	return host->result;
+}
+
+static void tb_test_pci_host_teardown(struct kunit *test)
+{
+	static const struct tb_nhi_ops ops = {
+		.pci_tunnel_deactivate = tb_test_pci_host_disconnect,
+	};
+	struct tb_test_pci_host *host;
+	struct tb_tunnel *tunnel;
+	struct tb *tb;
+
+	host = kunit_kzalloc(test, sizeof(*host), GFP_KERNEL);
+	tunnel = kunit_kzalloc(test, sizeof(*tunnel), GFP_KERNEL);
+	tb = kunit_kzalloc(test, sizeof(*tb), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, host);
+	KUNIT_ASSERT_NOT_NULL(test, tunnel);
+	KUNIT_ASSERT_NOT_NULL(test, tb);
+	host->nhi.ops = &ops;
+	tb->nhi = &host->nhi;
+	tunnel->tb = tb;
+
+	/* A discovered firmware tunnel does not own Linux's PCIe hierarchy. */
+	KUNIT_EXPECT_EQ(test, tb_pci_tunnel_deactivate_host(tunnel), 0);
+	KUNIT_EXPECT_EQ(test, host->disconnects, 0U);
+
+	/* An activated tunnel must release the hierarchy exactly once. */
+	tunnel->host_pci_activated = true;
+	KUNIT_EXPECT_EQ(test, tb_pci_tunnel_deactivate_host(tunnel), 0);
+	KUNIT_EXPECT_EQ(test, host->disconnects, 1U);
+	KUNIT_EXPECT_FALSE(test, tunnel->host_pci_activated);
+	KUNIT_EXPECT_EQ(test, tb_pci_tunnel_deactivate_host(tunnel), 0);
+	KUNIT_EXPECT_EQ(test, host->disconnects, 1U);
+
+	/* Failed teardown keeps ownership so a later attempt can retry. */
+	tunnel->host_pci_activated = true;
+	host->result = -EIO;
+	KUNIT_EXPECT_EQ(test, tb_pci_tunnel_deactivate_host(tunnel), -EIO);
+	KUNIT_EXPECT_TRUE(test, tunnel->host_pci_activated);
+	KUNIT_EXPECT_EQ(test, host->disconnects, 2U);
+	host->result = 0;
+	KUNIT_EXPECT_EQ(test, tb_pci_tunnel_deactivate_host(tunnel), 0);
+	KUNIT_EXPECT_FALSE(test, tunnel->host_pci_activated);
+	KUNIT_EXPECT_EQ(test, host->disconnects, 3U);
+}
+
+static void tb_test_pci_host_daisy_chain(struct kunit *test)
+{
+	static const struct tb_nhi_ops ops = {
+		.pci_tunnel_pre_activate = tb_test_pci_host_prepare,
+		.pci_tunnel_post_activate = tb_test_pci_host_connect,
+		.pci_tunnel_deactivate = tb_test_pci_host_disconnect,
+	};
+	struct tb_tunnel *root_tunnel, *downstream_tunnel;
+	struct tb_switch *root, *dev1, *dev2;
+	struct tb_test_pci_host *host;
+	struct tb *tb;
+
+	host = kunit_kzalloc(test, sizeof(*host), GFP_KERNEL);
+	tb = kunit_kzalloc(test, sizeof(*tb), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, host);
+	KUNIT_ASSERT_NOT_NULL(test, tb);
+	host->nhi.ops = &ops;
+	tb->nhi = &host->nhi;
+	root = alloc_host(test);
+	KUNIT_ASSERT_NOT_NULL(test, root);
+	dev1 = alloc_dev_default(test, root, 0x1, true);
+	KUNIT_ASSERT_NOT_NULL(test, dev1);
+	dev2 = alloc_dev_default(test, dev1, 0x501, true);
+	KUNIT_ASSERT_NOT_NULL(test, dev2);
+	root_tunnel = tb_tunnel_alloc_pci(tb, &dev1->ports[9], &root->ports[8]);
+	KUNIT_ASSERT_NOT_NULL(test, root_tunnel);
+	downstream_tunnel = tb_tunnel_alloc_pci(tb, &dev2->ports[9], &dev1->ports[10]);
+	KUNIT_ASSERT_NOT_NULL(test, downstream_tunnel);
+
+	KUNIT_EXPECT_EQ(test, root_tunnel->pre_activate(root_tunnel), 0);
+	KUNIT_EXPECT_EQ(test, tb_pci_tunnel_activate_host(root_tunnel), 0);
+	KUNIT_EXPECT_TRUE(test, root_tunnel->host_pci_activated);
+	KUNIT_EXPECT_EQ(test, host->prepares, 1U);
+	KUNIT_EXPECT_EQ(test, host->connects, 1U);
+
+	/* A second dock must not acquire or tear down the host's PCIe port. */
+	KUNIT_EXPECT_EQ(test, downstream_tunnel->pre_activate(downstream_tunnel), 0);
+	KUNIT_EXPECT_EQ(test, tb_pci_tunnel_activate_host(downstream_tunnel), 0);
+	KUNIT_EXPECT_FALSE(test, downstream_tunnel->host_pci_activated);
+	KUNIT_EXPECT_EQ(test, host->prepares, 1U);
+	KUNIT_EXPECT_EQ(test, host->connects, 1U);
+	KUNIT_EXPECT_EQ(test, tb_pci_tunnel_deactivate_host(downstream_tunnel), 0);
+	KUNIT_EXPECT_EQ(test, host->disconnects, 0U);
+	KUNIT_EXPECT_TRUE(test, root_tunnel->host_pci_activated);
+	KUNIT_EXPECT_EQ(test, tb_pci_tunnel_deactivate_host(root_tunnel), 0);
+	KUNIT_EXPECT_EQ(test, host->disconnects, 1U);
+
+	/* A failed host activation may still need to unwind partial setup. */
+	host->result = -EIO;
+	KUNIT_EXPECT_EQ(test, tb_pci_tunnel_activate_host(root_tunnel), -EIO);
+	KUNIT_EXPECT_TRUE(test, root_tunnel->host_pci_activated);
+	host->result = 0;
+	KUNIT_EXPECT_EQ(test, tb_pci_tunnel_deactivate_host(root_tunnel), 0);
+	KUNIT_EXPECT_EQ(test, host->disconnects, 2U);
+
+	tb_tunnel_put(downstream_tunnel);
+	tb_tunnel_put(root_tunnel);
+}
+
+struct tb_test_dp_host {
+	struct tb_nhi nhi;
+	unsigned int disconnects;
+};
+
+static void tb_test_dp_host_disconnect(struct tb_nhi *nhi, struct tb_port *in,
+				       struct tb_port *out)
+{
+	struct tb_test_dp_host *host = container_of(nhi, struct tb_test_dp_host, nhi);
+
+	host->disconnects++;
+}
+
+static void tb_test_dp_host_teardown_once(struct kunit *test)
+{
+	static const struct tb_nhi_ops ops = {
+		.dp_tunnel_deactivate = tb_test_dp_host_disconnect,
+	};
+	struct tb_test_dp_host *host;
+	struct tb_tunnel *tunnel;
+	struct tb *tb;
+
+	host = kunit_kzalloc(test, sizeof(*host), GFP_KERNEL);
+	tunnel = kunit_kzalloc(test, sizeof(*tunnel), GFP_KERNEL);
+	tb = kunit_kzalloc(test, sizeof(*tb), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, host);
+	KUNIT_ASSERT_NOT_NULL(test, tunnel);
+	KUNIT_ASSERT_NOT_NULL(test, tb);
+	host->nhi.ops = &ops;
+	tb->nhi = &host->nhi;
+	tunnel->tb = tb;
+	tunnel->host_dp_activated = true;
+
+	/* Domain removal must release the display even without adapter I/O. */
+	tb_dp_tunnel_deactivate_host(tunnel);
+	KUNIT_EXPECT_EQ(test, host->disconnects, 1U);
+	KUNIT_EXPECT_FALSE(test, tunnel->host_dp_activated);
+
+	/* A late tunnel cleanup must not access the already removed domain. */
+	tunnel->tb = NULL;
+	tb_dp_tunnel_deactivate_host(tunnel);
+	KUNIT_EXPECT_EQ(test, host->disconnects, 1U);
+}
+
+static void tb_test_dp_host_teardown_unannounced(struct kunit *test)
+{
+	struct tb_tunnel *tunnel;
+
+	tunnel = kunit_kzalloc(test, sizeof(*tunnel), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, tunnel);
+	/* A failed allocation or a domain-less test has no host state to undo. */
+	tb_dp_tunnel_deactivate_host(tunnel);
+	KUNIT_EXPECT_FALSE(test, tunnel->host_dp_activated);
+}
+
+static void tb_test_tunnel_dp_host_credits(struct kunit *test)
+{
+	struct tb_switch *host, *dev;
+	struct tb_tunnel *tunnel;
+	struct tb_nhi *nhi;
+	struct tb *tb;
+
+	host = alloc_host(test);
+	KUNIT_ASSERT_NOT_NULL(test, host);
+	dev = alloc_dev_with_dpin(test, host, 0x3, true);
+	KUNIT_ASSERT_NOT_NULL(test, dev);
+	tb = kunit_kzalloc(test, sizeof(*tb), GFP_KERNEL);
+	nhi = kunit_kzalloc(test, sizeof(*nhi), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, tb);
+	KUNIT_ASSERT_NOT_NULL(test, nhi);
+	tb->nhi = nhi;
+	host->tb = tb;
+	dev->tb = tb;
+
+	KUNIT_EXPECT_FALSE(test, tb_port_needs_host_dp_credits(&host->ports[5]));
+	/* j416s has no dp_tunnel_changed hook; the quirk must be sufficient. */
+	nhi->quirks = QUIRK_HOST_DP_NFC_CREDITS;
+	KUNIT_EXPECT_TRUE(test, tb_port_needs_host_dp_credits(&host->ports[5]));
+	KUNIT_EXPECT_FALSE(test, tb_port_needs_host_dp_credits(&host->ports[1]));
+	KUNIT_EXPECT_FALSE(test, tb_port_needs_host_dp_credits(&dev->ports[13]));
+
+	dev->ports[14].config.type = TB_TYPE_DP_HDMI_OUT;
+	tunnel = tb_tunnel_alloc_dp(NULL, &host->ports[5], &dev->ports[14],
+				    1, 0, 0, tb_test_dp_tunnel_active);
+	KUNIT_ASSERT_NOT_NULL(test, tunnel);
+	KUNIT_EXPECT_EQ(test, tunnel->paths[0]->hops[0].nfc_credits, 5U);
+	tb_tunnel_put(tunnel);
+
+	host->tb = NULL;
+	KUNIT_EXPECT_FALSE(test, tb_port_needs_host_dp_credits(&host->ports[5]));
+}
+
 static struct kunit_case tb_test_cases[] = {
 	KUNIT_CASE(tb_test_property_parse_u32_wrap),
 	KUNIT_CASE(tb_test_property_parse_recursion),
 	KUNIT_CASE(tb_test_property_parse_dir_len_underflow),
+	KUNIT_CASE(tb_test_pci_host_teardown),
+	KUNIT_CASE(tb_test_pci_host_daisy_chain),
+	KUNIT_CASE(tb_test_tunnel_dp_host_credits),
+	KUNIT_CASE(tb_test_dp_host_teardown_once),
+	KUNIT_CASE(tb_test_dp_host_teardown_unannounced),
 	KUNIT_CASE(tb_test_path_basic),
 	KUNIT_CASE(tb_test_path_not_connected_walk),
 	KUNIT_CASE(tb_test_path_single_hop_walk),

@@ -76,6 +76,7 @@ xhci-pci-$(CONFIG_USB_XHCI_PCI_ASMEDIA)	+= xhci-pci-asmedia.o
 obj-$(CONFIG_USB_XHCI_PCI_PROM21)	+= xhci-pci-prom21.o
 obj-$(CONFIG_USB_XHCI_PCI_RENESAS)	+= xhci-pci-renesas.o
 obj-$(CONFIG_USB_XHCI_PLATFORM) += xhci-plat-hcd.o
+obj-$(CONFIG_USB_XHCI_PLATFORM_KUNIT_TEST) += xhci-plat-test.o
 obj-$(CONFIG_USB_XHCI_HISTB)	+= xhci-histb.o
 obj-$(CONFIG_USB_XHCI_RCAR)	+= xhci-rcar-hcd.o
 obj-$(CONFIG_USB_XHCI_MTK)	+= xhci-mtk-hcd.o
