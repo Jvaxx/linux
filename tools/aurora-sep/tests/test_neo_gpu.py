@@ -127,7 +127,8 @@ neo_gpu_restore "$STATE/neo-transaction.json"
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.original_m1n1.read_bytes(), b'original own stage2')
 
-    def hook(self, intent=True, profile='j700-g17p-hal200', abi=0, display=True):
+    def hook(self, intent=True, profile='j700-g17p-hal200', abi=0, display=True,
+             gpu_driver='asahi', kms_driver='apple-drm'):
         for path in ['libexec', 'share/mesa-neo']:
             (self.prefix / path).mkdir(parents=True, exist_ok=True)
         (self.prefix / 'share/mesa-neo/profile').write_text('j700-g17p-hal200\n')
@@ -144,9 +145,11 @@ neo_gpu_restore "$STATE/neo-transaction.json"
         (self.tmp / 'dev').mkdir(exist_ok=True)
         (self.tmp / 'dev/renderD128').touch()
         gpu = render.parent
-        driver = self.tmp / 'drivers/asahi'
-        driver.mkdir(parents=True, exist_ok=True)
-        if not (gpu / 'driver').is_symlink():
+        if (gpu / 'driver').is_symlink():
+            (gpu / 'driver').unlink()
+        if gpu_driver is not None:
+            driver = self.tmp / 'drivers' / gpu_driver
+            driver.mkdir(parents=True, exist_ok=True)
             (gpu / 'driver').symlink_to(driver)
         primary = self.tmp / 'sys/card1'
         primary.mkdir(exist_ok=True)
@@ -156,10 +159,11 @@ neo_gpu_restore "$STATE/neo-transaction.json"
             kms = self.tmp / 'sys/card2/device/of_node'
             kms.mkdir(parents=True, exist_ok=True)
             (kms / 'compatible').write_bytes(b'apple,t8140-display-subsystem\0')
-            dcp = self.tmp / 'drivers/apple-drm'
+            dcp = self.tmp / 'drivers' / kms_driver
             dcp.mkdir(parents=True, exist_ok=True)
-            if not (kms.parent / 'driver').is_symlink():
-                (kms.parent / 'driver').symlink_to(dcp)
+            if (kms.parent / 'driver').is_symlink():
+                (kms.parent / 'driver').unlink()
+            (kms.parent / 'driver').symlink_to(dcp)
             (self.tmp / 'dev/card2').touch()
             connector = self.tmp / 'sys/card2-eDP-1'
             connector.mkdir(exist_ok=True)
@@ -208,11 +212,33 @@ neo_gpu_restore "$STATE/neo-transaction.json"
         self.assertNotIn('MESA_NEO_PROFILE', env)
         self.assertEqual(env['LD_LIBRARY_PATH'], '/keep/lib')
 
+    def test_hook_accepts_separate_and_shared_driver_names(self):
+        for gpu_driver, kms_driver in [('asahi_neo', 'apple-drm-neo'), ('asahi', 'apple-drm')]:
+            with self.subTest(gpu=gpu_driver, kms=kms_driver):
+                env = self.hook(gpu_driver=gpu_driver, kms_driver=kms_driver)
+                self.assertEqual(env['GALLIUM_DRIVER'], 'asahi')
+                self.assertEqual(env['MESA_NEO_PROFILE'], 'j700-g17p-hal200')
+                self.assertNotIn('LIBGL_ALWAYS_SOFTWARE', env)
+
+    def test_hook_refuses_other_drivers(self):
+        for args in [dict(kms_driver='simple-framebuffer'), dict(kms_driver='apple-drm-neox'),
+                     dict(gpu_driver='asahi-neo'), dict(gpu_driver=None)]:
+            with self.subTest(args=args):
+                env = self.hook(**args)
+                self.assertEqual(env['LIBGL_ALWAYS_SOFTWARE'], '1')
+                self.assertEqual(env['MESA_NEO_FALLBACK_REASON'], 'native-display-unavailable')
+                self.assertNotIn('MESA_NEO_PROFILE', env)
+
     def test_hook_leaves_other_macs_unchanged(self):
-        self.mac('j613', 't8122')
-        env = self.hook()
-        self.assertEqual(env['GALLIUM_DRIVER'], 'zink')
-        self.assertEqual(env['VK_DRIVER_FILES'], '/stale/m3.json')
+        for board, soc in [('j613', 't8122'), ('j514s', 't6030'), ('j313', 't8103'), ('j414s', 't6020')]:
+            for gpu_driver, kms_driver in [('asahi', 'apple-drm'), ('asahi_neo', 'apple-drm-neo')]:
+                with self.subTest(board=board, gpu=gpu_driver):
+                    self.mac(board, soc)
+                    env = self.hook(gpu_driver=gpu_driver, kms_driver=kms_driver)
+                    self.assertEqual(env['GALLIUM_DRIVER'], 'zink')
+                    self.assertEqual(env['VK_DRIVER_FILES'], '/stale/m3.json')
+                    self.assertNotIn('MESA_NEO_PROFILE', env)
+                    self.assertNotIn('LIBGL_ALWAYS_SOFTWARE', env)
 
 
 if __name__ == '__main__':

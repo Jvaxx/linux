@@ -47,8 +47,14 @@ mesa_neo_display_admit() {
         case "${_neo_card##*/}" in card*[!0-9]*) continue;; esac
         [ -e "$_neo_card" ] || continue
         if mesa_neo_has_compatible "$_neo_card/device/of_node/compatible" apple,agx-t8140; then
-            [ "$(readlink -f "$_neo_card/device" 2>/dev/null)" = "$_neo_gpu_device" ] &&
-                [ "$(basename "$(readlink -f "$_neo_card/device/driver" 2>/dev/null)")" = asahi ] || return 1
+            [ "$(readlink -f "$_neo_card/device" 2>/dev/null)" = "$_neo_gpu_device" ] || return 1
+            # Kernels with separate T8140 drivers name them asahi_neo and
+            # apple-drm-neo; the shared drivers are asahi and apple-drm.
+            # The compatible checks keep both spellings T8140-only.
+            case "$(basename "$(readlink -f "$_neo_card/device/driver" 2>/dev/null)")" in
+                asahi|asahi_neo) ;;
+                *) return 1;;
+            esac
             # The GPU primary node has no KMS connectors.
             for _neo_connector in "$_neo_card"-*; do
                 [ ! -e "$_neo_connector" ] || return 1
@@ -57,7 +63,10 @@ mesa_neo_display_admit() {
         fi
         _neo_cards=$((_neo_cards+1))
         # A firmware framebuffer cannot use the Asahi render-only KMS route.
-        [ "$(basename "$(readlink -f "$_neo_card/device/driver" 2>/dev/null)")" = apple-drm ] || return 1
+        case "$(basename "$(readlink -f "$_neo_card/device/driver" 2>/dev/null)")" in
+            apple-drm|apple-drm-neo) ;;
+            *) return 1;;
+        esac
         mesa_neo_has_compatible "$_neo_card/device/of_node/compatible" apple,t8140-display-subsystem || return 1
         [ -r "$_neo_root/dev/dri/${_neo_card##*/}" ] && [ -w "$_neo_root/dev/dri/${_neo_card##*/}" ] || return 1
         for _neo_connector in "$_neo_card"-*; do
