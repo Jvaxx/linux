@@ -58,7 +58,8 @@ static void observed_controller_write(void) {
  else {assert(d==&controller.dev&&controller_locked);if(!remover)atomic_store(&handoff_active,false);controller_locked=false;pthread_mutex_unlock(&controller_mutex);}
 }'''
  unit=unit.replace(old,new)
- # The scheduler injection is a child-lookup interleaving, as in the review.
+ # The scheduler injection is a child-lookup interleaving, as in the review, or
+ # the root resume for a source that takes the SuperSpeed port down instead.
  unit=unit.replace('if(detach_at_lookup)usb_set_device_state(u,USB_STATE_NOTATTACHED);','if(inject_remove){inject_remove=false;start_remove();}\n if(detach_at_lookup)usb_set_device_state(u,USB_STATE_NOTATTACHED);',1)
  unit=unit.replace('static void pm_runtime_put_noidle(struct device *d) {','static void pm_runtime_put_noidle(struct device *d) {\n if(remover&&d==&host_device)return;',1)
  # Old source lacks platform-lock helpers. Keep fixture-only API definitions
