@@ -120,6 +120,9 @@ typedef u32 __le32;
 #undef static_assert
 #define static_assert(c) _Static_assert(c, #c)
 #define IS_ENABLED(x) 0
+/* <kunit/visibility.h> without CONFIG_KUNIT, as IS_ENABLED() above */
+#define VISIBLE_IF_KUNIT static
+#define EXPORT_SYMBOL_IF_KUNIT(symbol)
 #define U32_MAX UINT32_MAX
 #define U16_MAX UINT16_MAX
 #define S64_MAX INT64_MAX

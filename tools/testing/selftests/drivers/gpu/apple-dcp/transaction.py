@@ -301,12 +301,13 @@ def probe(root):
 #define enable_irq_wake(...) ((void)0)
 #define dev_err_probe(...) (-EINVAL)
 struct fwnode_handle { int unused; };
-static int connect_error,irq_error,register_error,node_puts,mux_get_error;
+static int connect_error,irq_error,register_error,node_puts,mux_get_error,controller_mode;
 static void *devm_gpiod_get_optional(void *d,const char *s,int v) { (void)d;(void)s;(void)v;return NULL; }
 static void msleep(unsigned ms) { (void)ms; }
 static bool device_is_compatible(void *d,const char *s) { (void)d;(void)s;return false; }
 static int tps6598x_read32(struct tps6598x *t,int reg,u32 *v) { (void)t;(void)reg;*v=1;return 0; }
-static int tps6598x_check_mode(struct tps6598x *t) { (void)t;return 0; }
+static int tps6598x_check_mode(struct tps6598x *t) { (void)t;return controller_mode; }
+static int apply_patch(struct tps6598x *t) { (void)t;return 0; }
 static int tps6598x_write64(struct tps6598x *t,int reg,unsigned v) { (void)t;(void)reg;(void)v;return 0; }
 static bool tps6598x_read_status(struct tps6598x *t,u32 *s) { (void)t;*s=TPS_STATUS_PLUG_PRESENT;return true; }
 static bool tps6598x_read_power_status(struct tps6598x *t) { (void)t;return true; }
@@ -331,6 +332,8 @@ static int connect(struct tps6598x *t,u32 status) { (void)t;(void)status;return 
 static void probe_initial(struct cd321x *c) {
  initial(c);ordinary_port=true;phy_provider.safe_after_role=true;c->tps.irq=1;data.register_port=register_port;data.read_data_status=read_data_status;data.connect=connect;
  connect_error=irq_error=register_error=node_puts=mux_get_error=0;
+ /* tipd_init() resets only a controller it patched (stable a2b95607926d, mainline c5df31f10880) */
+ controller_mode=TPS_MODE_PTCH;data.init=apply_patch;
 }
 int main(void) {
  struct cd321x c;
@@ -340,11 +343,13 @@ int main(void) {
  assert(tipd_init(&c.tps)==-EAGAIN&&reset_calls==0&&gpio_calls==0&&phy_calls==0&&port.owner==&route&&port.safe_pending);
  probe_initial(&c);irq_error=-ENOSPC;
  assert(tipd_init(&c.tps)==-ENOSPC&&reset_calls==1&&!port.owner&&!port.safe_pending&&unregisters==1);
+ probe_initial(&c);irq_error=-ENOSPC;controller_mode=0;
+ assert(tipd_init(&c.tps)==-ENOSPC&&reset_calls==0&&!port.owner&&!port.safe_pending&&unregisters==1);
  probe_initial(&c);mux_get_error=-ENODEV;
  assert(tipd_init(&c.tps)==-ENODEV&&reset_calls==0&&stops==0&&phy_calls==0&&unregisters==0&&node_puts==1);
  probe_initial(&c);register_error=-EIO;
  assert(tipd_init(&c.tps)==-EIO&&reset_calls==0&&stops==0&&phy_calls==0&&unregisters==0);
- puts("PASS actual probe rollback preserves primary errors and blocks reset after SAFE/role/registration errors");
+ puts("PASS actual probe rollback preserves primary errors, blocks reset after SAFE/role/registration errors and resets only a patched controller");
 }
 """
     return unit

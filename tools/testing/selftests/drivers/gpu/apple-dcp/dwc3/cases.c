@@ -32,6 +32,11 @@ static int dwc3_apple_core_probe(struct dwc3_apple *a)
 static void dwc3_apple_set_role(struct dwc3_apple *a, enum dwc3_apple_state s)
 { assert(atcphy_usb3_set_mode(a->usb3_phy, s == DWC3_APPLE_HOST ? PHY_MODE_USB_HOST : PHY_MODE_USB_DEVICE, 0) == 0); }
 struct fixture { struct apple_atcphy atc; struct phy p2, p3, extra; struct dwc3_apple apple; };
+/* The post-tunable callback of each modelled SoC: T8103, T8122, T8140 */
+static void (*const post_tunable[])(struct apple_atcphy *, enum atcphy_mode) = {
+    atcphy_configure_post_tunable_t8103, atcphy_configure_post_tunable_t8122,
+    atcphy_configure_post_tunable_all_modes,
+};
 static void initial(struct fixture *f, unsigned int gen, bool fixed, bool pm)
 {
     memset(f, 0, sizeof(*f));
@@ -44,6 +49,7 @@ static void initial(struct fixture *f, unsigned int gen, bool fixed, bool pm)
         .pipe_mux_clk = PIPEHANDLER_MUX_CTRL_CLK_T8103,
         .pipe_mux_data = PIPEHANDLER_MUX_CTRL_DATA_T8103,
     };
+    hardware.configure_post_tunable = post_tunable[gen];
     f->atc = (struct apple_atcphy){ .hw = &hardware,
         .regs.core = (unsigned char *)core_regs, .regs.lpdptx = (unsigned char *)core_regs,
         .regs.pipehandler = (unsigned char *)pipe_regs, .regs.usb2phy = (unsigned char *)usb2_regs,
