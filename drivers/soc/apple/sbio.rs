@@ -2664,31 +2664,31 @@ impl SepData {
         let generation = self.sbio_rx.lock().generation();
 
         // notification and the enclave's DMA are not ordered; buffer may still be poison
-        if !self.ool_await_written(&self.ool_sbio, 0, transfer::HEADER_LEN) {
-            self.sbio_fail_unwritten();
-            return;
-        }
-
-        let header = match self.ool_read(&self.ool_sbio, 0, transfer::HEADER_LEN) {
-            Ok(h) => h,
-            Err(_) => {
-                self.sbio_fail();
-                return;
-            }
-        };
-        let packet = match transfer::Packet::decode(&header) {
+        let packet = match transfer::take_header(
+            &SbioHeader(self),
+            marker,
+            OOL_POISON_OUTBOUND,
+            OOL_WRITE_POLL_ATTEMPTS,
+        ) {
             Ok(p) => p,
-            Err(_) => {
-                self.sbio_fail();
+            Err(status) => {
+                self.sbio_fail_with(status);
                 return;
             }
         };
 
-        let chunk = packet.chunk as usize;
+        let chunk = if transfer::carries_payload(marker) {
+            packet.chunk as usize
+        } else {
+            0
+        };
         let payload = if chunk == 0 {
             KVec::new()
+        } else if chunk > OOL_SIZE_SBIO - transfer::HEADER_LEN {
+            self.sbio_fail_with(transfer::DeviceStatus::Malformed);
+            return;
         } else if !self.ool_await_written(&self.ool_sbio, transfer::HEADER_LEN, chunk) {
-            self.sbio_fail_unwritten();
+            self.sbio_fail_with(transfer::DeviceStatus::BufferNeverWritten);
             return;
         } else {
             match self.ool_read(&self.ool_sbio, transfer::HEADER_LEN, chunk) {
@@ -2741,10 +2741,8 @@ impl SepData {
         self.sbio_wq.notify_all();
     }
 
-    fn sbio_fail_unwritten(&self) {
-        self.sbio_rx
-            .lock()
-            .abort_with(transfer::DeviceStatus::BufferNeverWritten);
+    fn sbio_fail_with(&self, status: transfer::DeviceStatus) {
+        self.sbio_rx.lock().abort_with(status);
         self.sbio_wq.notify_all();
     }
 
@@ -3457,6 +3455,20 @@ impl SepData {
 
     pub(crate) fn bio_ready(&self) -> bool {
         self.bio_session.lock().ready()
+    }
+}
+
+/// The SBIO reply header, as [`transfer::take_header`] samples it.
+struct SbioHeader<'a>(&'a SepData);
+
+impl transfer::HeaderSlot for SbioHeader<'_> {
+    fn sample(&self, header: &mut [u8; transfer::HEADER_LEN]) -> bool {
+        self.0.ool_peek(&self.0.ool_sbio, 0, header)
+    }
+
+    fn pause(&self) {
+        let poll = kernel::time::Delta::from_millis(i64::from(OOL_WRITE_POLL_MS));
+        kernel::time::delay::fsleep(poll);
     }
 }
 

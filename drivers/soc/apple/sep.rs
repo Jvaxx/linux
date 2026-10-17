@@ -169,6 +169,10 @@ const OOL_WRITE_POLL_ATTEMPTS: u32 = 200;
 const OOL_POISON_INBOUND: u8 = 0xA5;
 const OOL_POISON_OUTBOUND: u8 = 0x5A;
 
+// transfer::take_header() tells a landed SBIO header from the fill by its
+// words, which a valid reply cannot hold as four equal nonzero bytes.
+static_assert!(OOL_POISON_OUTBOUND != 0);
+
 const PROTECTED_DATA_AVAILABLE: bool = true;
 
 const RNG_MAX_WORDS_PER_READ: usize = 16;
@@ -1525,6 +1529,22 @@ impl SepData {
         }
 
         Ok(payload)
+    }
+
+    /// Copies `out.len()` bytes at `off` of the outbound buffer into `out`;
+    /// `false` once the buffers are gone or the range is outside them.
+    fn ool_peek(&self, slot: &Mutex<Option<OolPair>>, off: usize, out: &mut [u8]) -> bool {
+        let guard = slot.lock();
+        let Some(buffers) = guard.as_ref() else {
+            return false;
+        };
+        if off + out.len() > buffers.allocated {
+            return false;
+        }
+        // SAFETY: the region is within the allocation as checked above, and
+        // the driver is the only host-side accessor.
+        out.copy_from_slice(unsafe { &buffers.outbound.as_ref()[off..off + out.len()] });
+        true
     }
 
     fn ool_await_written(&self, slot: &Mutex<Option<OolPair>>, off: usize, len: usize) -> bool {
