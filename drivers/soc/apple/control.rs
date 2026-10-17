@@ -358,6 +358,13 @@ impl ControlState {
         self.entropy.busy
     }
 
+    /// Whether a request claimed by [`Self::entropy_begin`] may still be
+    /// written: not once the system has begun going to sleep. Such a
+    /// request ends as [`EntropyEnd::NotSent`], not full.
+    pub(crate) fn entropy_may_send(&self) -> bool {
+        !self.entropy.asleep
+    }
+
     pub(crate) fn entropy_wake(&mut self) {
         self.entropy.asleep = false;
     }
@@ -426,6 +433,27 @@ mod tests {
         assert_eq!(state.entropy_begin(0), Err(EAGAIN));
         state.entropy_wake();
         assert_eq!(draw(&mut state, 0, 6), Some(6));
+    }
+
+    #[test]
+    fn a_request_not_yet_written_when_sleep_begins_is_not_sent() {
+        let mut state = ControlState::new();
+        assert!(state.entropy_begin(0).is_ok());
+        assert!(state.entropy_may_send());
+        // The sleep begins while the request waits for the mailbox.
+        assert!(state.entropy_sleep());
+        assert!(!state.entropy_may_send());
+        state.entropy_end(EntropyEnd::not_sent(EAGAIN), 0);
+        // That ends the drain, and the request is not held against the
+        // enclave: nothing is owed, and nothing is held back after the wake.
+        assert!(!state.entropy_busy());
+        assert_eq!(state.entropy_begin(0), Err(EAGAIN));
+        state.entropy_wake();
+        assert!(state.entropy_begin(0).is_ok());
+        assert!(state.entropy_may_send());
+        assert!(matches!(state.deliver(entropy(3)), Delivery::Entropy));
+        assert_eq!(state.entropy_take(), Some(3));
+        state.entropy_end(EntropyEnd::Answered, 0);
     }
 
     #[test]
