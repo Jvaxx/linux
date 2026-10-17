@@ -54,6 +54,9 @@ static void release(struct held *h)
 {
 	mutex_unlock(h->m);
 }
+#define CONFIG_PHY_APPLE_ATC_KUNIT_TEST 0
+#define IS_ENABLED(option) (option)
+#define KUNIT_STATIC_STUB_REDIRECT(...) ((void)0)
 #define guard(kind) \
 	struct held held_guard __attribute__((cleanup(release))) = hold
 enum phy_mode { PHY_MODE_USB_HOST, PHY_MODE_USB_DEVICE };

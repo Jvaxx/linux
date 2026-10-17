@@ -3,7 +3,7 @@
 """Actual PHY parking, failure/retry, masked context and OFF controls."""
 from pathlib import Path
 import re
-from common import block, source_defines
+from common import block, source_defines, atc_mux_without_pm
 
 def parking(root):
 
@@ -13,8 +13,7 @@ def parking(root):
 
     def function(source, name):
         if name == 'atcphy_mux_set' and 'static int atcphy_mux_set_locked(' in source:
-            marker = re.search(r'^static [^\n]+\batcphy_mux_set_locked\(', source, re.M).group()
-            return block(source, marker).replace('atcphy_mux_set_locked(', 'atcphy_mux_set(', 1)
+            return atc_mux_without_pm(source)
         return block(source, re.search(r'^static [^\n]+\b' + name + r'\(', source, re.M).group())
 
 
@@ -133,7 +132,7 @@ static void atc_tunnel_restore(struct apple_atcphy *p) { (void)p; }
     parts.append(dp)
     for name in ('atcphy_configure_lanes', 'j700_aux_enable', 'j700_aux_disable',
                  'atcphy_enable_dp_aux', 'atcphy_disable_dp_aux', 'atcphy_power_off',
-                 'atcphy_power_on', 'atcphy_configure', 'atcphy_sw_set', 'atcphy_mux_set',
+                 'atcphy_power_on', 'atcphy_configure', 'atcphy_set_orientation', 'atcphy_sw_set', 'atcphy_mux_set',
                  'atcphy_usb3_set_mode', 'atcphy_usb3_power_off'):
         parts.append(function(atc, name))
     production = '\n'.join(parts)
@@ -163,6 +162,9 @@ static void report(void *dev, const char *fmt, ...) { (void)dev; (void)fmt; }
 #define dev_err report
 #define lockdep_assert_held(...) ((void)0)
 #define WARN_ON_ONCE(v) assert(!(v))
+#define CONFIG_PHY_APPLE_ATC_KUNIT_TEST 0
+#define IS_ENABLED(option) (option)
+#define KUNIT_STATIC_STUB_REDIRECT(...) ((void)0)
 #define guard(kind) (void)
 #define fallthrough __attribute__((fallthrough))
 #define ndelay(n) ((void)(n))
@@ -1672,8 +1674,7 @@ def pipe(root):
 
     def function(name):
         if name == 'atcphy_mux_set' and 'static int atcphy_mux_set_locked(' in source:
-            marker = re.search(r'^static [^\n]+\batcphy_mux_set_locked\(', source, re.M).group()
-            return block(marker).replace('atcphy_mux_set_locked(', 'atcphy_mux_set(', 1)
+            return atc_mux_without_pm(source)
         return block(re.search(r'^static [^\n]+\b' + name + r'\(', source, re.M).group())
 
 
@@ -1773,6 +1774,9 @@ typedef uint16_t u16;
 #define dev_err(...) ((void)0)
 #define lockdep_assert_held(...) ((void)0)
 #define WARN_ON_ONCE(v) assert(!(v))
+#define CONFIG_PHY_APPLE_ATC_KUNIT_TEST 0
+#define IS_ENABLED(option) (option)
+#define KUNIT_STATIC_STUB_REDIRECT(...) ((void)0)
 #define guard(kind) (void)
 #define fallthrough __attribute__((fallthrough))
 #define usleep_range(...) ((void)0)
@@ -2023,8 +2027,7 @@ def unwind(root):
 
     def function(source, name):
         if name == 'atcphy_mux_set' and 'static int atcphy_mux_set_locked(' in source:
-            marker = re.search(r'^static [^\n]+\batcphy_mux_set_locked\(', source, re.M).group()
-            return block(source, marker).replace('atcphy_mux_set_locked(', 'atcphy_mux_set(', 1)
+            return atc_mux_without_pm(source)
         return block(source, re.search(r'^static [^\n]+\b' + name + r'\(', source, re.M).group())
 
 
@@ -2131,6 +2134,9 @@ static void report(void *dev, const char *fmt, ...) { (void)dev; (void)fmt; }
 #define dev_err report
 #define lockdep_assert_held(...) ((void)0)
 #define WARN_ON_ONCE(v) assert(!(v))
+#define CONFIG_PHY_APPLE_ATC_KUNIT_TEST 0
+#define IS_ENABLED(option) (option)
+#define KUNIT_STATIC_STUB_REDIRECT(...) ((void)0)
 #define guard(kind) (void)
 #define fallthrough __attribute__((fallthrough))
 #define ndelay(n) ((void)(n))
