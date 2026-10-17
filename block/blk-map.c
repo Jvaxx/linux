@@ -260,7 +260,9 @@ out_bmd:
 static int bio_map_user_iov(struct request *rq, struct iov_iter *iter,
 		gfp_t gfp_mask)
 {
-	unsigned int nr_vecs = bio_iov_vecs_to_alloc(iter, BIO_MAX_VECS);
+	unsigned int nr_vecs = IS_ENABLED(CONFIG_MM_SUBPAGE) ?
+		bio_iov_vecs_to_alloc(iter, BIO_MAX_VECS) :
+		iov_iter_npages(iter, BIO_MAX_VECS);
 	struct bio *bio;
 	int ret;
 
