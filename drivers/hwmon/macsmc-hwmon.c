@@ -151,31 +151,42 @@ static int macsmc_hwmon_read_f32_scaled(struct apple_smc *smc, smc_key key,
 	if (ret < 0)
 		return ret;
 
-	val = ((u64)((fval & FLT_MANT_MASK) | BIT(23)));
-	exp = ((fval >> 23) & 0xff) - FLT_EXP_BIAS - FLT_MANT_BIAS;
+	exp = FIELD_GET(FLT_EXP_MASK, fval);
+	/* NaN and infinity are unavailable readings, not extreme temperatures. */
+	if (exp == 0xff)
+		return -ENODATA;
+
+	val = fval & FLT_MANT_MASK;
+	if (exp)
+		val |= BIT(23);
+	else
+		exp = 1; /* Zero and subnormal values have no implicit leading one. */
+	exp -= FLT_EXP_BIAS + FLT_MANT_BIAS;
 
 	/* We never have negatively scaled SMC floats */
 	val *= scale;
 
 	if (exp > 63)
-		val = U64_MAX;
+		return -ERANGE;
 	else if (exp < -63)
 		val = 0;
 	else if (exp < 0)
 		val >>= -exp;
 	else if (exp != 0 && (val & ~((1ULL << (64 - exp)) - 1))) /* overflow */
-		val = U64_MAX;
+		return -ERANGE;
 	else
 		val <<= exp;
 
 	if (fval & FLT_SIGN_MASK) {
 		if (val > (u64)LONG_MAX + 1)
+			return -ERANGE;
+		if (val == (u64)LONG_MAX + 1)
 			*p = LONG_MIN;
 		else
 			*p = -(long)val;
 	} else {
 		if (val > (u64)LONG_MAX)
-			*p = LONG_MAX;
+			return -ERANGE;
 		else
 			*p = (long)val;
 	}
@@ -425,6 +436,10 @@ static umode_t macsmc_hwmon_is_visible(const void *data,
 		return 0;
 	}
 
+	/* A sensor without a key could not be set up; see macsmc_hwmon_add_temp_channel(). */
+	if (!sensor->macsmc_key)
+		return 0;
+
 	/* Sensors only register ro attributes */
 	if (sensor->attrs & BIT(attr))
 		return 0444;
@@ -486,6 +501,89 @@ static int macsmc_hwmon_create_sensor(struct device *dev, struct apple_smc *smc,
 		dev_dbg(dev, "No label found for sensor %s\n", key);
 	else
 		strscpy_pad(sensor->label, label, sizeof(sensor->label));
+
+	return 0;
+}
+
+/*
+ * Account for the temperature sensor just set up at the end of @temp.
+ *
+ * Thermal zones refer to a temperature channel by the index of its node
+ * among the temperature-* nodes, so every node takes a channel. A sensor
+ * that could not be set up keeps its channel with no key, which hides it:
+ * hwmon creates no attributes and no thermal sensor for it, and only the
+ * zones that use it fail to register, instead of every later channel
+ * moving onto the wrong sensor.
+ */
+static void macsmc_hwmon_add_temp_channel(struct macsmc_hwmon_sensors *temp,
+					  int create_ret)
+{
+	struct macsmc_hwmon_sensor *sensor = &temp->sensors[temp->count++];
+
+	if (create_ret)
+		memset(sensor, 0, sizeof(*sensor));
+
+	/* A zero entry would end the list of channels here. */
+	sensor->attrs = HWMON_T_INPUT;
+	if (*sensor->label)
+		sensor->attrs |= HWMON_T_LABEL;
+}
+
+/* Discover reporting-only temperatures without a board-specific key table. */
+static int macsmc_hwmon_discover_temperatures(struct macsmc_hwmon *hwmon)
+{
+	struct apple_smc *smc = hwmon->smc;
+	struct macsmc_hwmon_sensor *sensor;
+	struct apple_smc_key_info info;
+	smc_key key, previous = 0;
+	u32 i;
+	int ret;
+
+	if (!of_property_read_bool(hwmon->dev->of_node, "apple,discover-temperatures"))
+		return 0;
+
+	/* Dynamic channel numbers must not replace DT-described channels. */
+	if (hwmon->temp.count)
+		return -EINVAL;
+
+	/* Bound both allocation and mailbox transactions for invalid firmware data. */
+	if (!smc->key_count || smc->key_count > U16_MAX)
+		return -EINVAL;
+
+	hwmon->temp.sensors = devm_kcalloc(hwmon->dev, smc->key_count,
+					   sizeof(*sensor), GFP_KERNEL);
+	if (!hwmon->temp.sensors)
+		return -ENOMEM;
+
+	for (i = 0; i < smc->key_count; i++) {
+		ret = apple_smc_get_key_by_index(smc, i, &key);
+		if (ret < 0)
+			return ret;
+		/* SMC key tables are strictly ordered; reject duplicates as well. */
+		if (i && key <= previous)
+			return -EINVAL;
+		previous = key;
+		if ((key >> 24) < 'T')
+			continue;
+		if ((key >> 24) > 'T')
+			break;
+
+		ret = apple_smc_get_key_info(smc, key, &info);
+		if (ret < 0)
+			return ret;
+		if (!(info.flags & APPLE_SMC_READABLE) ||
+		    (info.flags & APPLE_SMC_FUNCTION) ||
+		    info.type_code != __SMC_KEY('f', 'l', 't', ' ') || info.size != 4)
+			continue;
+
+		sensor = &hwmon->temp.sensors[hwmon->temp.count++];
+		sensor->macsmc_key = key;
+		sensor->info = info;
+		sensor->attrs = HWMON_T_INPUT | HWMON_T_LABEL;
+		/* Key identity only: do not invent locations or calibration. */
+		snprintf(sensor->label, sizeof(sensor->label), "%c%c%c%c",
+			 key >> 24, (key >> 16) & 0xff, (key >> 8) & 0xff, key & 0xff);
+	}
 
 	return 0;
 }
@@ -567,6 +665,7 @@ static int macsmc_hwmon_populate_sensors(struct macsmc_hwmon *hwmon,
 	struct device_node *key_node __maybe_unused;
 	struct macsmc_hwmon_sensor *sensor;
 	u32 n_current = 0, n_fan = 0, n_power = 0, n_temperature = 0, n_voltage = 0;
+	int ret;
 
 	for_each_child_of_node_with_prefix(hwmon_node, key_node, "current-") {
 		n_current++;
@@ -643,14 +742,12 @@ static int macsmc_hwmon_populate_sensors(struct macsmc_hwmon *hwmon,
 
 		for_each_child_of_node_with_prefix(hwmon_node, key_node, "temperature-") {
 			sensor = &hwmon->temp.sensors[hwmon->temp.count];
-			if (!macsmc_hwmon_create_sensor(hwmon->dev, hwmon->smc, key_node, sensor)) {
-				sensor->attrs = HWMON_T_INPUT;
-
-				if (*sensor->label)
-					sensor->attrs |= HWMON_T_LABEL;
-
-				hwmon->temp.count++;
-			}
+			ret = macsmc_hwmon_create_sensor(hwmon->dev, hwmon->smc,
+							 key_node, sensor);
+			if (ret)
+				dev_warn(hwmon->dev, "%pOFn unavailable (%d), temp%u hidden\n",
+					 key_node, ret, hwmon->temp.count + 1);
+			macsmc_hwmon_add_temp_channel(&hwmon->temp, ret);
 		}
 	}
 
@@ -799,6 +896,10 @@ static int macsmc_hwmon_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	ret = macsmc_hwmon_discover_temperatures(hwmon);
+	if (ret)
+		return dev_err_probe(hwmon->dev, ret, "Temperature discovery failed\n");
+
 	if (!hwmon->curr.count && !hwmon->fan.count &&
 	    !hwmon->power.count && !hwmon->temp.count &&
 	    !hwmon->volt.count) {
@@ -846,6 +947,10 @@ static struct platform_driver macsmc_hwmon_driver = {
 	},
 };
 module_platform_driver(macsmc_hwmon_driver);
+
+#if IS_ENABLED(CONFIG_SENSORS_MACSMC_HWMON_KUNIT_TEST)
+#include "macsmc-hwmon-test.c"
+#endif
 
 MODULE_DESCRIPTION("Apple Silicon SMC hwmon driver");
 MODULE_AUTHOR("James Calligeros <jcalligeros99@gmail.com>");
