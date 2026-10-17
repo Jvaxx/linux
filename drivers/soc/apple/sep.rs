@@ -1226,6 +1226,46 @@ impl SepData {
         result
     }
 
+    /// As [`Self::get_entropy_word`], for a reader that blocks. While requests
+    /// are held back, wait for that to end, for as long as a request waits
+    /// for its reply, rather than fail at once. EAGAIN if it does not end
+    /// in that time, ERESTARTSYS if a signal comes.
+    fn get_entropy_word_blocking(&self) -> Result<u32> {
+        let limit = u64::from(proto::CONTROL_TIMEOUT_MS);
+        let deadline = boottime_ms().saturating_add(limit);
+        loop {
+            // As `hwrng_fill()` checks before each word: a removal wakes the
+            // wait below, and no request may go out after it.
+            if self.rng_shutdown.load(Relaxed) {
+                return Err(ENODEV);
+            }
+            match self.get_entropy_word() {
+                Err(e) if e == EAGAIN => {}
+                done => return done,
+            }
+            let mut guard = self.control.lock();
+            let now = boottime_ms();
+            let left = deadline.saturating_sub(now);
+            match guard.entropy_held_ms(now, left) {
+                // It ended since; ask now.
+                None if left > 0 => continue,
+                None | Some(0) => return Err(EAGAIN),
+                Some(ms) => {
+                    if self.rng_shutdown.load(Relaxed) {
+                        return Err(ENODEV);
+                    }
+                    let ms = u32::try_from(ms).unwrap_or(proto::CONTROL_TIMEOUT_MS);
+                    if let CondVarTimeoutResult::Signal { .. } = self
+                        .control_wq
+                        .wait_interruptible_timeout(&mut guard, time::msecs_to_jiffies(ms))
+                    {
+                        return Err(ERESTARTSYS);
+                    }
+                }
+            }
+        }
+    }
+
     /// Sends an entropy request claimed by `entropy_begin()`, or EAGAIN if
     /// the system has begun going to sleep since. The check is made with the
     /// mailbox lock held. A sender can wait for that lock behind others, such
@@ -1271,6 +1311,8 @@ impl SepData {
     /// The system has resumed, or the suspend was aborted.
     pub(crate) fn rng_sleep_finished(&self) {
         self.control.lock().entropy_wake();
+        // A blocking hwrng reader may be waiting for this.
+        self.control_wq.notify_all();
     }
 
     fn control_survey(&self) {
@@ -1942,7 +1984,13 @@ impl SepData {
                 failure = Some(ENODEV);
                 break;
             }
-            match self.get_entropy_word() {
+            // Only a read that has nothing yet waits while requests are held.
+            let word = if written == 0 {
+                self.get_entropy_word_blocking()
+            } else {
+                self.get_entropy_word()
+            };
+            match word {
                 Ok(value) => {
                     // SAFETY: the core guarantees `buf` is valid for `max`
                     // bytes and aligned for any type, and `i < max / 4`.
@@ -1958,7 +2006,7 @@ impl SepData {
 
         let e = match control::read_end(written, failure) {
             control::ReadEnd::Bytes(n) => return n as c_int,
-            // Asleep, or holding back after a request that went unanswered.
+            // Held back for as long as the read could wait, or interrupted.
             control::ReadEnd::Held(e) => return e.to_errno(),
             control::ReadEnd::Failed(e) => e,
         };
@@ -2209,10 +2257,14 @@ impl SepData {
             control::Delivery::Entropy => {
                 self.control_wq.notify_all();
             }
-            control::Delivery::EntropyLate { recovered: true } => dev_info!(
-                self.dev,
-                "hwrng: the enclave answered a request that had timed out; reads resume\n"
-            ),
+            control::Delivery::EntropyLate { recovered: true } => {
+                dev_info!(
+                    self.dev,
+                    "hwrng: the enclave answered a request that had timed out; reads resume\n"
+                );
+                // A blocking hwrng reader may be waiting for this.
+                self.control_wq.notify_all();
+            }
             control::Delivery::EntropyLate { recovered: false } => {}
             control::Delivery::Matched => self.control_wq.notify_all(),
             control::Delivery::Unmatched => {}
