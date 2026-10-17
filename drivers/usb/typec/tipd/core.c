@@ -579,8 +579,30 @@ static void tps6598x_handle_plug_event(struct tps6598x *tps, u32 status)
 	}
 }
 
+/* The mux held the change up, see cd321x_pm_mux_held(). */
+static bool cd321x_mux_held(struct cd321x *cd321x, int ret)
+{
+	return ret == -ETIMEDOUT && typec_mux_timeout_transient(cd321x->mux);
+}
+
+/* Set the mux to the mode state, telling whether a provider held it up */
+static int cd321x_mux_set(struct cd321x *cd321x, bool *held)
+{
+	int ret = typec_mux_set(cd321x->mux, &cd321x->state);
+
+	*held = cd321x_mux_held(cd321x, ret);
+	return ret;
+}
+
+/* A held mux is retried: report only the first failure of the series. */
+static bool cd321x_mux_still_held(struct cd321x *cd321x, bool held)
+{
+	return held && cd321x->pm.mux_retry_ms;
+}
+
 static int cd321x_typec_update_mode(struct tps6598x *tps,
-				    struct cd321x_status *st, bool *display_busy)
+				    struct cd321x_status *st, bool *display_busy,
+				    bool *held)
 {
 	struct cd321x *cd321x = container_of(tps, struct cd321x, tps);
 	struct typec_mux_state old_state = cd321x->state;
@@ -590,6 +612,7 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 	int ret = 0;
 
 	*display_busy = false;
+	*held = false;
 	if (!(st->data_status & TPS_DATA_STATUS_DATA_CONNECTION)) {
 		if (cd321x->state_valid && cd321x->state.mode == TYPEC_STATE_SAFE)
 			return 0;
@@ -599,7 +622,7 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 		ret = typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
 		if (ret)
 			goto out;
-		ret = typec_mux_set(cd321x->mux, &cd321x->state);
+		ret = cd321x_mux_set(cd321x, held);
 	} else if (st->data_status & CD321X_DATA_STATUS_USB4_CONNECTION) {
 		struct enter_usb_data eusb_data;
 
@@ -614,7 +637,7 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 		cd321x->state.alt = NULL;
 		cd321x->state.data = &eusb_data;
 		cd321x->state.mode = TYPEC_MODE_USB4;
-		ret = typec_mux_set(cd321x->mux, &cd321x->state);
+		ret = cd321x_mux_set(cd321x, held);
 		if (ret)
 			goto out;
 
@@ -647,7 +670,7 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 		cd321x->state.alt = cd321x->port_altmode_tbt;
 		cd321x->state.mode = TYPEC_TBT_MODE;
 		cd321x->state.data = &tbt_data;
-		ret = typec_mux_set(cd321x->mux, &cd321x->state);
+		ret = cd321x_mux_set(cd321x, held);
 		if (ret)
 			goto out;
 
@@ -704,7 +727,7 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 		ret = typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
 		if (ret)
 			goto out;
-		ret = typec_mux_set(cd321x->mux, &cd321x->state);
+		ret = cd321x_mux_set(cd321x, held);
 		*display_busy = cd321x_display_taken(ret);
 		if (!ret) {
 			cd321x->dp_status = dp_data.status;
@@ -720,7 +743,7 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 		ret = typec_thunderbolt_switch_set(cd321x->tbt_switch, &tbt_switch_data);
 		if (ret)
 			goto out;
-		ret = typec_mux_set(cd321x->mux, &cd321x->state);
+		ret = cd321x_mux_set(cd321x, held);
 	}
 
 out:
@@ -733,6 +756,8 @@ out:
 		/* A provider that is not ready yet asks for a retry. */
 		if (ret == -EAGAIN)
 			dev_dbg(tps->dev, "Type-C connection deferred\n");
+		else if (cd321x_mux_still_held(cd321x, *held))
+			dev_dbg(tps->dev, "Type-C connection still held up: %d\n", ret);
 		else
 			dev_warn(tps->dev, "failed to configure Type-C connection: %d\n", ret);
 	} else if (cd321x->state.alt != cd321x->port_altmode_dp) {
@@ -761,6 +786,31 @@ static void cd321x_retry_revalidation(struct cd321x *cd321x, bool reconnect)
 			CD321X_RESUME_ATTEMPTS);
 }
 
+static void cd321x_retry_held_mux(struct cd321x *cd321x)
+{
+	unsigned int delay;
+
+	lockdep_assert_held(&cd321x->tps.lock);
+	cd321x->state_valid = false;
+	if (!cd321x->pm.mux_retry_ms)
+		dev_info(cd321x->tps.dev, "Type-C mux held up, retrying\n");
+	delay = cd321x_pm_mux_held(&cd321x->pm);
+	if (delay)
+		mod_delayed_work(system_freezable_wq, &cd321x->resume_work,
+				 msecs_to_jiffies(delay));
+	else
+		dev_warn(cd321x->tps.dev,
+			 "Type-C mux still held up after %u retries, waiting for the next event\n",
+			 CD321X_MUX_RETRIES);
+}
+
+static void cd321x_update_done(struct cd321x *cd321x)
+{
+	if (cd321x_pm_mux_done(&cd321x->pm))
+		dev_info(cd321x->tps.dev, "Type-C mux change went through after retrying\n");
+	cd321x_pm_complete(&cd321x->pm);
+}
+
 static void cd321x_update_work(struct work_struct *work)
 {
 	struct cd321x *cd321x = container_of(to_delayed_work(work),
@@ -770,7 +820,7 @@ static void cd321x_update_work(struct work_struct *work)
 	struct typec_thunderbolt_switch_data tbt_switch_data = {
 		.state = TYPEC_THUNDERBOLT_SWITCH_OFF,
 	};
-	bool display_busy;
+	bool display_busy, held = false;
 	int ret;
 
 	guard(mutex)(&tps->lock);
@@ -878,12 +928,16 @@ static void cd321x_update_work(struct work_struct *work)
 		cd321x->state.alt = NULL;
 		cd321x->state.mode = TYPEC_STATE_SAFE;
 		cd321x->state.data = NULL;
-		ret = typec_set_mode(tps->port, TYPEC_STATE_SAFE);
+		/* Through cd321x->mux, which can then tell if SAFE was held up */
+		ret = cd321x_mux_set(cd321x, &held);
 		cd321x->state_valid = !ret;
 		if (ret) {
-			dev_warn(tps->dev,
-				 "failed to place Type-C mux in safe mode: %d\n",
-				 ret);
+			if (cd321x_mux_still_held(cd321x, held))
+				dev_dbg(tps->dev, "Type-C mux still held up: %d\n", ret);
+			else
+				dev_warn(tps->dev,
+					 "failed to place Type-C mux in safe mode: %d\n",
+					 ret);
 			cd321x->state = old_state;
 			goto retry;
 		}
@@ -900,7 +954,7 @@ static void cd321x_update_work(struct work_struct *work)
 
 	/* If the plug is disconnected, we are done */
 	if (!new_connected) {
-		cd321x_pm_complete(&cd321x->pm);
+		cd321x_update_done(cd321x);
 		return;
 	}
 
@@ -936,7 +990,7 @@ static void cd321x_update_work(struct work_struct *work)
 	}
 
 	/* Update the TypeC MUX/PHY state */
-	ret = cd321x_typec_update_mode(tps, &st, &display_busy);
+	ret = cd321x_typec_update_mode(tps, &st, &display_busy, &held);
 	if (ret && !display_busy)
 		goto retry;
 	/* A shared display route can be busy while the dock's USB path is usable. */
@@ -953,10 +1007,14 @@ static void cd321x_update_work(struct work_struct *work)
 						connector_status_connected);
 
 	power_supply_changed(tps->psy);
-	cd321x_pm_complete(&cd321x->pm);
+	cd321x_update_done(cd321x);
 	return;
 
 retry:
+	if (held) {
+		cd321x_retry_held_mux(cd321x);
+		return;
+	}
 	/* A deferred PCIe activation is not evidence of a failed cable. */
 	cd321x_retry_revalidation(cd321x, ret != -EAGAIN);
 }
@@ -988,6 +1046,10 @@ static int cd321x_connect(struct tps6598x *tps, u32 status)
 	/* A plug or power IRQ alone does not refresh the cached cable metadata. */
 	if (cd321x_pm_event(&cd321x->pm))
 		mod_delayed_work(system_freezable_wq, &cd321x->resume_work, 0);
+	/* A held mux waits out its backoff only while nothing else happens. */
+	if (cd321x_pm_mux_event(&cd321x->pm))
+		mod_delayed_work(system_freezable_wq, &cd321x->resume_work,
+				 msecs_to_jiffies(CD321X_DEBOUNCE_DELAY_MS));
 	if (!cd321x_pm_can_update(&cd321x->pm))
 		return 0;
 

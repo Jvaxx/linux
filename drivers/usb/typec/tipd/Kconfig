@@ -42,6 +42,11 @@ config TYPEC_TIPD_KUNIT_TEST
 	  controller keeps raising its interrupt.
 	  Also test that a USB4/Thunderbolt router which never registers its
 	  switch does not keep the port from probing.
+	  Also test that a Type-C state which a mux provider with transient
+	  timeouts holds up is applied again until it goes through, for up to
+	  about two minutes, also next to a display route that declares
+	  nothing, and that other providers and errors keep the bounded
+	  retries.
 	  These tests run without accessing a physical Type-C controller.
 
 config TYPEC_SN201202X_KUNIT_TEST

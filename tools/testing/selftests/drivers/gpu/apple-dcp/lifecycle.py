@@ -24,6 +24,10 @@ def disconnect(root):
     pm = tipd_pm_header(r)
     core = 'drivers/usb/typec/tipd/core.c'
     dcp = 'drivers/gpu/drm/apple/dcp.c'
+    # The retry of a change that a mux with transient timeouts held up
+    held = [n for n in ('cd321x_mux_held', 'cd321x_mux_set', 'cd321x_mux_still_held',
+                        'cd321x_retry_held_mux', 'cd321x_update_done')
+            if re.search(r'^static \w+ ' + n + r'\(', (r / core).read_text(), re.M)]
     funcs = '\n'.join(function(f, n) for f, n in (
         ('drivers/gpu/drm/apple/iomfb.c', 'iomfb_pause_presentation'),
         (dcp, 'dcp_external_report_disconnected'),
@@ -35,6 +39,7 @@ def disconnect(root):
         (dcp, 'dcp_external_link_locked'),
         (dcp, 'dcp_dptx_connect_oob'),
         (core, 'cd321x_retry_revalidation'),
+        *((core, n) for n in held),
         (core, 'cd321x_update_work')))
     prefix = r'''
 #include <assert.h>
@@ -167,7 +172,11 @@ struct tps6598x { void *partner, *dev, *port, *psy; int lock; u32 data_status; e
 struct cd321x { struct tps6598x tps; struct cd321x_status update_status;
  struct cd321x_pm_state pm; struct delayed_work update_work, resume_work;
  struct typec_mux_state state; bool state_valid, display_route_active, cur_partner_is_pd;
- struct usb_pd_identity cur_partner_identity; void *connector_fwnode, *tbt_switch; };
+ struct usb_pd_identity cur_partner_identity; void *connector_fwnode, *tbt_switch, *mux; };
+/* No mux here declares its timeouts transient: every failure is budgeted. */
+static bool typec_mux_timeout_transient(void *m) { (void)m; return false; }
+#define dev_dbg(...) ((void)0)
+#define dev_info(...) ((void)0)
 static int tbt_error, role_error, safe_error, mode_error;
 static int tbts, roles, safes;
 static enum usb_role usb_role_switch_get_role(enum usb_role *r) { return *r; }
@@ -179,6 +188,9 @@ static int typec_set_mode(void *p, int s)
 { (void)p; assert(s == TYPEC_STATE_SAFE); safes++; return safe_error; }
 static int cd321x_typec_update_mode(struct tps6598x *t, struct cd321x_status *s, bool *busy)
 { (void)t; (void)s; *busy = mode_error == -EBUSY; return mode_error; }
+/* SAFE through the driver's own mux handle is the same SAFE request. */
+static int __attribute__((unused)) typec_mux_set(void *m, struct typec_mux_state *s)
+{ (void)m; return typec_set_mode(NULL, s->mode); }
 static void typec_unregister_partner(void *p) { (void)p; }
 static void *typec_register_partner(void *p, struct typec_partner_desc *d)
 { (void)p; (void)d; return (void *)1; }
@@ -370,6 +382,14 @@ int main(void)
  printf("%d assertions, %d failures\n", checks, failures); return !!failures;
 }
 '''
+    # The mode update also tells whether a mux held it up.
+    if re.search(r'bool \*display_busy,\s*bool \*held\)', (r / core).read_text()):
+        old = ('static int cd321x_typec_update_mode(struct tps6598x *t, struct cd321x_status *s, bool *busy)\n'
+               '{ (void)t; (void)s; *busy = mode_error == -EBUSY; return mode_error; }')
+        assert shim.count(old) == 1
+        shim = shim.replace(old, 'static int cd321x_typec_update_mode(struct tps6598x *t, struct cd321x_status *s, bool *busy,\n'
+                            ' bool *held)\n'
+                            '{ (void)t; (void)s; *busy = mode_error == -EBUSY; *held = false; return mode_error; }')
     source = prefix + pm + shim + funcs + tests
     return source
 
