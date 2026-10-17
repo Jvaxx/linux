@@ -152,8 +152,22 @@ static struct device *xhci_plat_test_rpm_device(struct kunit *test, int rpm_ret)
 	xhci_plat_test_rpm_ret = rpm_ret;
 	dev->pm_domain = &xhci_plat_test_pm_domain;
 	pm_runtime_set_suspended(dev);
+	/*
+	 * System suspend runs the suspend callbacks with a runtime PM reference
+	 * held (device_prepare()). Hold one here too, or the idle check queued
+	 * after a resume starts a runtime suspend while the test looks at the
+	 * state.
+	 */
+	pm_runtime_get_noresume(dev);
 	pm_runtime_enable(dev);
 	return dev;
+}
+
+static void xhci_plat_test_rpm_release(struct device *dev)
+{
+	pm_runtime_disable(dev);
+	pm_runtime_put_noidle(dev);
+	dev->pm_domain = NULL;
 }
 
 /* A runtime resume that fails before system sleep fails the system suspend. */
@@ -163,8 +177,7 @@ static void xhci_plat_resume_from_runtime_error_test(struct kunit *test)
 
 	KUNIT_EXPECT_EQ(test, xhci_plat_resume_from_runtime(dev), -ETIMEDOUT);
 	KUNIT_EXPECT_TRUE(test, pm_runtime_suspended(dev));
-	pm_runtime_disable(dev);
-	dev->pm_domain = NULL;
+	xhci_plat_test_rpm_release(dev);
 }
 
 /* A successful one, and an active controller, let it go ahead. */
@@ -175,8 +188,7 @@ static void xhci_plat_resume_from_runtime_ok_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, xhci_plat_resume_from_runtime(dev), 0);
 	KUNIT_EXPECT_TRUE(test, pm_runtime_active(dev));
 	KUNIT_EXPECT_EQ(test, xhci_plat_resume_from_runtime(dev), 0);
-	pm_runtime_disable(dev);
-	dev->pm_domain = NULL;
+	xhci_plat_test_rpm_release(dev);
 }
 #endif /* CONFIG_PM */
 
