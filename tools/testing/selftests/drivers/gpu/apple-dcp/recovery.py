@@ -294,7 +294,7 @@ def check(root, output):
     #define complete_all(p) complete(p)
     ''')
     queued=queued.replace('struct apple_dcp_afkep { u8 *command_tags;bool lock,stopping;',
-                          'struct apple_dcp_afkep { u8 *command_tags;int started,stopped,txbfr,rxbfr;void *debugfs_entry;bool lock,stopping;')
+                          'struct apple_dcp_afkep { u8 *command_tags;int started,stopped,txbfr;struct { u32 bufsz,stride,*rptr,*wptr;bool ready; } rxbfr;void *debugfs_entry;bool lock,stopping;')
     queued=queued.replace('bool external_physically_absent,hpd_mutex,quiescing,typec_cable_connected;',
                           'bool retain_dma,external_physically_absent,hpd_mutex,quiescing,typec_cable_connected;')
     queued=queued.replace('static void run_retries(void) { assert(!ep.lock);if(ep.service_work.pending) { ep.service_work.pending=false;afk_service_worker(&ep.service_work); } }',
@@ -305,8 +305,9 @@ def check(root, output):
     queued+=r'''
     struct afk_receive_message_work { struct apple_dcp_afkep *ep;u64 message;struct work_struct work; };
     static void afk_getbuf(struct apple_dcp_afkep *e,u64 m) { (void)e;(void)m;assert(!"unexpected GETBUF"); }
-    static void afk_init_rxtx(struct apple_dcp_afkep *e,u64 m,int *r) { (void)e;(void)m;(void)r;assert(!"unexpected INIT"); }
+    static void afk_init_rxtx(struct apple_dcp_afkep *e,u64 m,void *r) { (void)e;(void)m;(void)r;assert(!"unexpected INIT"); }
     static unsigned int rx_step;static bool close_pending;
+    #define dev_warn_ratelimited(...) ((void)0)
     static bool afk_recv(struct apple_dcp_afkep *e) {
         assert(e==&ep);rx_running=true;
         if(rx_step==0) closed(13,0x6a01,0);
@@ -318,11 +319,16 @@ def check(root, output):
     }
     '''
     af=(root/'drivers/gpu/drm/apple/afk.c').read_text()
-    for signature in ['static void afk_receive_message_worker(', 'int afk_receive_message(', 'void afk_quiesce(', 'static void afk_release_context(']:
+    ah=(root/'drivers/gpu/drm/apple/afk.h').read_text()
+    # RECV drains the ring through the production budget helpers.
+    for signature in ['static inline unsigned int afk_ring_drain_budget(', 'static inline unsigned int afk_ring_drain(']:
+        queued+=extract(ah,signature)+'\n'
+    for signature in ['static bool afk_recv_entry(', 'static void afk_recv_drain(', 'static void afk_receive_message_worker(', 'int afk_receive_message(', 'void afk_quiesce(', 'static void afk_release_context(']:
         queued+=extract(af,signature)+'\n'
     queued+=r'''
     int main(int argc,char **argv) {
         assert(argc==2);setup();reuse_dma=true;INIT_WORK(&ep.service_work,afk_service_worker);
+        ep.rxbfr.bufsz=0x1000;ep.rxbfr.stride=0x40;
         announce(13,name,native_class,13);struct apple_epic_service *old=d.dcpavserv.service;assert(old);
         assert(send_actual(old,false,false)==-ETIMEDOUT);save_ack();run_retries();
         unsigned int before=opens;
