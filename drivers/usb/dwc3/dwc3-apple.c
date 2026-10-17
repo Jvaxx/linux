@@ -13,6 +13,7 @@
 #include <linux/mutex.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
+#include <linux/pm_wakeup.h>
 #include <linux/reset.h>
 #include <linux/usb/phy.h>
 
@@ -78,7 +79,8 @@
  * Type-C mux for the SuperSpeed lanes, and the PHY follows those mode changes on its own.
  *
  * Whenever the core is up, for either kind of port, it is kept running across system sleep, see
- * dwc3_apple_init().
+ * dwc3_apple_init(). In host mode xHCI then keeps running in suspend-to-idle when a USB device
+ * may wake the system, as a halted xHC could not signal the wakeup.
  *
  * enum dwc3_apple_state is defined in dwc3-apple-state.h.
  */
@@ -208,6 +210,12 @@ static int dwc3_apple_core_probe(struct dwc3_apple *appledwc)
 	probe_data.ignore_clocks_and_resets = true;
 	probe_data.skip_core_init_mode = true;
 	probe_data.properties = DWC3_DEFAULT_PROPERTIES;
+	/*
+	 * The controller has no wake signal of its own, and a halted xHC writes no events, so its
+	 * interrupt cannot fire either. xHCI keeps running instead and decides which of its events
+	 * wake the system; the core stays powered across system sleep, see dwc3_apple_init().
+	 */
+	probe_data.properties.xhci_run_in_s2idle = true;
 
 	/*
 	 * This runs from the role switch callback, so a failure leaves the glue
@@ -621,6 +629,14 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	if (IS_ERR(appledwc->apple_regs))
 		return dev_err_probe(dev, PTR_ERR(appledwc->apple_regs),
 				     "Failed to map Apple-specific MMIO\n");
+
+	/*
+	 * Like a PCI xHCI controller, allow USB devices to wake the system by default. This has
+	 * to be set before dwc3_core_probe(), which hands it on to the xHCI device.
+	 */
+	ret = devm_device_init_wakeup(dev);
+	if (ret)
+		return dev_err_probe(dev, ret, "Failed to set up wakeup\n");
 
 	/*
 	 * On this platform, DWC3 can only be brought up after parts of the PHY have been
