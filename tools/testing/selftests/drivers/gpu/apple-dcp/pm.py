@@ -611,6 +611,44 @@ int main(void) {
 }
 '''
 
+    # A mux that holds a change up is retried outside the cable-state budget.
+    if 'cd321x_pm_mux_held(' in pm:
+        lost = ' puts("PASS actual lost events reopen a stale port; unacknowledged events keep their budget with capped backoff");\n'
+        assert controls.count(lost) == 1
+        controls = controls.replace(lost, lost + r''' struct cd321x_pm_state held={0};
+ held.phase=CD321X_PM_RUNNING;
+ for(unsigned int i=0,delay=0;i<4*CD321X_RESUME_ATTEMPTS;i++){
+  unsigned int expected=i?(2*delay<CD321X_MUX_RETRY_MAX_MS?2*delay:CD321X_MUX_RETRY_MAX_MS):CD321X_MUX_RETRY_MS;
+  delay=cd321x_pm_mux_held(&held);
+  assert(delay==expected&&held.attempts_left==CD321X_RESUME_ATTEMPTS&&held.force_reconnect&&!cd321x_pm_can_update(&held));
+  /* An event brings the retry forward, but not a read already under way. */
+  assert(cd321x_pm_mux_event(&held)&&cd321x_pm_begin_read(&held));
+  cd321x_pm_snapshot_ready(&held);assert(!cd321x_pm_mux_event(&held));
+ }
+ assert(held.mux_retry_ms==CD321X_MUX_RETRY_MAX_MS&&cd321x_pm_mux_done(&held)&&!cd321x_pm_mux_done(&held));
+ cd321x_pm_complete(&held);assert(held.phase==CD321X_PM_RUNNING&&!held.force_reconnect);
+ cd321x_pm_mux_held(&held);cd321x_pm_prepare(&held);assert(!held.mux_retry_ms&&!cd321x_pm_mux_event(&held));
+ puts("PASS actual held mux keeps the cable-state budget with capped backoff");
+''')
+    # ...for a bounded number of retries, and any other failure ends the hold-up.
+    if 'CD321X_MUX_RETRIES' in pm:
+        held = ' puts("PASS actual held mux keeps the cable-state budget with capped backoff");\n'
+        assert controls.count(held) == 1
+        controls = controls.replace(held, held + r''' struct cd321x_pm_state stuck={0};
+ stuck.phase=CD321X_PM_RUNNING;
+ for(unsigned int i=0;i<CD321X_MUX_RETRIES;i++){
+  assert(cd321x_pm_mux_held(&stuck)&&cd321x_pm_begin_read(&stuck));cd321x_pm_snapshot_ready(&stuck);
+ }
+ assert(!cd321x_pm_mux_held(&stuck)&&stuck.phase==CD321X_PM_STALE&&stuck.force_reconnect);
+ assert(!stuck.mux_retry_ms&&!stuck.mux_retries&&!cd321x_pm_mux_event(&stuck)&&!cd321x_pm_begin_read(&stuck));
+ assert(cd321x_pm_event(&stuck)&&cd321x_pm_begin_read(&stuck));cd321x_pm_snapshot_ready(&stuck);
+ assert(cd321x_pm_mux_held(&stuck)==CD321X_MUX_RETRY_MS);
+ assert(cd321x_pm_begin_read(&stuck));cd321x_pm_snapshot_ready(&stuck);
+ assert(cd321x_pm_retry(&stuck,true)&&!stuck.mux_retry_ms&&!stuck.mux_retries&&!cd321x_pm_mux_event(&stuck));
+ cd321x_pm_mux_held(&stuck);cd321x_pm_remove(&stuck);assert(!stuck.mux_retry_ms&&!stuck.mux_retries);
+ puts("PASS actual held mux gives up after its retries until an event; other failures end the hold-up");
+''')
+
     return prefix + pm + mocks + production + '\n#define TEST_DEFER 1\n#define TEST_FWNODE 1\n' + controls
 
 
@@ -670,7 +708,9 @@ def probe_dispatch(root):
     # the separate probe group exercises the complete retry state machine.
     used = {'cd321x_pm_new_connection', 'cd321x_pm_init', 'cd321x_pm_remove', 'cd321x_pm_ready',
             'cd321x_pm_begin_read', 'cd321x_pm_snapshot_ready',
-            'cd321x_pm_complete', 'cd321x_pm_can_update'}
+            'cd321x_pm_complete', 'cd321x_pm_can_update',
+            # which, once retries of a held mux exist, ends them on removal
+            'cd321x_pm_mux_done'}
     for match in list(re.finditer(r'^static inline (?:void|bool|unsigned int) (cd321x_\w+)\(', port, re.M))[::-1]:
         if match.group(1) not in used:
             body = block(port, match.group())
