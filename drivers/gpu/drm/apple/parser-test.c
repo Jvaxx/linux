@@ -809,7 +809,7 @@ static void parser_route_programming_guard(struct kunit *test)
 	dcp->typec_follow_gen = 4;
 	KUNIT_EXPECT_FALSE(test, dcp_crtc_needs_route_start(dcp));
 	dcp->typec_follow_gen = 5;
-	/* A Thunderbolt route follows its CRTC too since afbcf8083b. */
+	/* A moved Thunderbolt tunnel starts its link as a direct route does. */
 	dcp->active_typec_route->tunnel = true;
 	KUNIT_EXPECT_TRUE(test, dcp_crtc_needs_route_start(dcp));
 	dcp->active_typec_route->tunnel = false;
