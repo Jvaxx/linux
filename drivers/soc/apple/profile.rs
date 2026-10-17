@@ -451,6 +451,12 @@ fn parse_iboot_build(raw: &[u8]) -> Option<(u32, u32)> {
     }
 }
 
+fn t6020_uses_sepos13(iboot: Option<&[u8]>) -> bool {
+    iboot
+        .and_then(parse_iboot_build)
+        .is_some_and(|build| build < T6020_SEPOS13_BEFORE)
+}
+
 fn chosen_string(name: &CStr) -> Option<KVec<u8>> {
     of::chosen()?.get_property::<KVec<u8>>(name).ok()
 }
@@ -470,10 +476,7 @@ fn t6020_profile() -> &'static PlatformProfile {
     let iboot = chosen_string(c"asahi,iboot1-version");
     let firmware = chosen_string(c"asahi,system-fw-version");
     let os_firmware = chosen_string(c"asahi,os-fw-version");
-    let sepos13 = iboot
-        .as_deref()
-        .and_then(parse_iboot_build)
-        .is_some_and(|build| build < T6020_SEPOS13_BEFORE);
+    let sepos13 = t6020_uses_sepos13(iboot.as_deref());
     let profile = if sepos13 { &T6020_SEPOS13 } else { &T6020 };
     pr_info_once!(
         "M2 Pro/Max on system firmware {} ({}), OS firmware {}: using {}\n",
@@ -532,4 +535,48 @@ pub(crate) fn detect() -> Result<&'static PlatformProfile> {
         return Ok(&T8122);
     }
     Err(ENODEV)
+}
+
+#[cfg(CONFIG_APPLE_SEP_KUNIT_TEST)]
+#[::kernel::macros::kunit_tests(apple_sep_profile)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_firmware_uses_the_legacy_key_store() {
+        assert!(t6020_uses_sepos13(Some(b"iBoot-13822.79.1\0")));
+        assert!(t6020_uses_sepos13(Some(b"iBoot-13821.999\0")));
+        assert!(!t6020_uses_sepos13(Some(b"iBoot-13822.80\0")));
+        assert!(!t6020_uses_sepos13(Some(b"iBoot-13822.81.2\0")));
+    }
+
+    #[test]
+    fn unknown_firmware_preserves_the_current_dialect() {
+        assert!(!t6020_uses_sepos13(None));
+        for raw in [
+            &b""[..],
+            &b"mBoot-1.2"[..],
+            &b"iBoot-.2"[..],
+            &b"iBoot-1."[..],
+            &b"iBoot-1234567.2"[..],
+            &b"iBoot-1.1234567"[..],
+            &b"iBoot-1.2x"[..],
+        ] {
+            assert!(!t6020_uses_sepos13(Some(raw)));
+        }
+    }
+
+    #[test]
+    fn profile_extensions_preserve_authenticated_neo_geometry() {
+        assert!(T8140.nonce_session);
+        assert!(T8140.wide_dma_mask);
+        assert!(!T6020_SEPOS13.nonce_session);
+        assert!(matches!(T6020_SEPOS13.key_store, KeyStore::Sepos13 { .. }));
+        assert!(T6020_SEPOS13.shmem_capacity == T6020.shmem_capacity);
+        assert!(T6020_SEPOS13.sensor.controller_base == T6020.sensor.controller_base);
+        assert!(!T8122.nonce_session);
+        assert!(T8122.wide_dma_mask);
+        assert!(T8122.shmem_capacity == T8112.shmem_capacity);
+        assert!(T8122.sensor.controller_base == 0x2_a110_8000);
+    }
 }
