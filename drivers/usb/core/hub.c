@@ -10,6 +10,7 @@
  * Released under the GPLv2 only.
  */
 
+#include <kunit/visibility.h>
 #include <linux/kernel.h>
 #include <linux/errno.h>
 #include <linux/module.h>
@@ -48,6 +49,8 @@
 #define USB_PRODUCT_USB5534B			0x5534
 #define USB_VENDOR_CYPRESS			0x04b4
 #define USB_PRODUCT_CY7C65632			0x6570
+#define USB_VENDOR_VIA_LABS			0x2109
+#define USB_PRODUCT_VL122			0x2122
 #define USB_VENDOR_TEXAS_INSTRUMENTS		0x0451
 #define USB_PRODUCT_TUSB8041_USB3		0x8140
 #define USB_PRODUCT_TUSB8041_USB2		0x8142
@@ -55,9 +58,6 @@
 #define USB_PRODUCT_USB4913			0x4913
 #define USB_PRODUCT_USB4914			0x4914
 #define USB_PRODUCT_USB4915			0x4915
-#define HUB_QUIRK_CHECK_PORT_AUTOSUSPEND	BIT(0)
-#define HUB_QUIRK_DISABLE_AUTOSUSPEND		BIT(1)
-#define HUB_QUIRK_REDUCE_FRAME_INTR_BINTERVAL	BIT(2)
 
 #define USB_TP_TRANSMISSION_DELAY	40	/* ns */
 #define USB_TP_TRANSMISSION_DELAY_MAX	65535	/* ns */
@@ -3468,6 +3468,44 @@ unsigned usb_wakeup_enabled_descendants(struct usb_device *udev)
 }
 EXPORT_SYMBOL_GPL(usb_wakeup_enabled_descendants);
 
+/**
+ * usb_wakeup_reaches - Whether a remote wakeup from below reaches a hub
+ * @hdev: The hub, with the devices below it suspended for system sleep
+ *
+ * A device signals a remote wakeup only if the USB core enabled that when it
+ * suspended it: resume signalling, or for a hub, a connect, disconnect or
+ * over-current change on one of its ports. A hub passes on the remote wakeup
+ * of a device below it whatever its own wakeup setting (USB 2.0, section
+ * 7.1.7.7). While it is suspended, a hub with USB_QUIRK_HUB_NO_SUSPENDED_WAKEUP
+ * does not, and one with USB_QUIRK_HUB_NO_SUSPENDED_PORT_WAKEUP does not signal
+ * its own; a hub kept awake does both.
+ *
+ * Context: System sleep, once the devices below @hdev are suspended, so that
+ * neither they nor their wakeup settings change. Takes no locks.
+ *
+ * Return: true if a device below @hdev can wake it up.
+ */
+bool usb_wakeup_reaches(struct usb_device *hdev)
+{
+	struct usb_device *child;
+	int port1;
+
+	usb_hub_for_each_child(hdev, port1, child) {
+		/* A hub kept awake reports any change on its status endpoint */
+		u32 quirks = child->awake_in_sleep ? 0 : child->quirks;
+
+		if (child->do_remote_wakeup &&
+		    !(quirks & USB_QUIRK_HUB_NO_SUSPENDED_PORT_WAKEUP))
+			return true;
+		if (!(quirks & USB_QUIRK_HUB_NO_SUSPENDED_WAKEUP) &&
+		    usb_wakeup_reaches(child))
+			return true;
+	}
+
+	return false;
+}
+EXPORT_SYMBOL_GPL(usb_wakeup_reaches);
+
 /*
  * usb_port_suspend - suspend a usb device's upstream port
  * @udev: device that's no longer in active use, not a root hub
@@ -6044,6 +6082,11 @@ static const struct usb_device_id hub_id_table[] = {
       .idVendor = USB_VENDOR_TEXAS_INSTRUMENTS,
       .idProduct = USB_PRODUCT_TUSB8041_USB3,
       .driver_info = HUB_QUIRK_DISABLE_AUTOSUSPEND},
+    { .match_flags = USB_DEVICE_ID_MATCH_VENDOR
+			| USB_DEVICE_ID_MATCH_PRODUCT,
+      .idVendor = USB_VENDOR_VIA_LABS,
+      .idProduct = USB_PRODUCT_VL122,
+      .driver_info = HUB_QUIRK_DISABLE_AUTOSUSPEND},
 	{ .match_flags = USB_DEVICE_ID_MATCH_VENDOR
 			| USB_DEVICE_ID_MATCH_PRODUCT,
 	  .idVendor = USB_VENDOR_MICROCHIP,
@@ -6065,6 +6108,17 @@ static const struct usb_device_id hub_id_table[] = {
       .bInterfaceClass = USB_CLASS_HUB},
     { }						/* Terminating entry */
 };
+
+#if IS_ENABLED(CONFIG_KUNIT)
+/* The HUB_QUIRK_* flags that hub_id_table gives a hub interface */
+unsigned long usb_hub_id_quirks(struct usb_interface *intf)
+{
+	const struct usb_device_id *id = usb_match_id(intf, hub_id_table);
+
+	return id ? id->driver_info : 0;
+}
+EXPORT_SYMBOL_IF_KUNIT(usb_hub_id_quirks);
+#endif
 
 MODULE_DEVICE_TABLE(usb, hub_id_table);
 
