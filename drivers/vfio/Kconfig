@@ -55,9 +55,9 @@ config VFIO_IOMMU_TYPE1
 
 config VFIO_TYPE1_ACCOUNT_KUNIT_TEST
 	bool "Test VFIO type1 pin accounting and retained fragments" if !KUNIT_ALL_TESTS
-	depends on KUNIT=y && VFIO_IOMMU_TYPE1=y
+	depends on KUNIT=y && VFIO_IOMMU_TYPE1=y && MM_SUBPAGE
 	# The retained-fragment tests write their source pages to a shmem file
-	depends on TMPFS || !MM_SUBPAGE
+	depends on TMPFS
 	default KUNIT_ALL_TESTS
 	help
 	  Exercise locked-memory refunds after source-mm exit and DMA owner

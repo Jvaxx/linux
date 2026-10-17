@@ -547,22 +547,6 @@ static int vfio_fragments_rw(struct vfio_dma *dma, unsigned long offset, void *d
 	return ret;
 }
 #else
-static struct vfio_fragment_provider *
-vfio_fragments_prepare_native(struct vfio_iommu *iommu, struct vfio_dma *dma)
-{
-	return ERR_PTR(-EOPNOTSUPP);
-}
-static void vfio_fragments_abort_native(struct vfio_fragment_provider *provider)
-{
-}
-static unsigned long vfio_fragments_native_pages(struct vfio_fragment_provider *provider)
-{
-	return 0;
-}
-static void vfio_fragments_commit_native(struct vfio_dma *dma,
-					 struct vfio_fragment_provider *provider)
-{
-}
 static void vfio_fragments_put_native_pin(struct vfio_dma *dma, unsigned long pfn)
 {
 }

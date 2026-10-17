@@ -470,11 +470,11 @@ static int mm_lock_acct(struct task_struct *task, struct mm_struct *mm,
 {
 	int ret;
 
-	if (!npage)
+	if (IS_ENABLED(CONFIG_MM_SUBPAGE) && !npage)
 		return 0;
 
 	/* A released pin must be refunded even if the caller is interrupted. */
-	if (npage < 0) {
+	if (IS_ENABLED(CONFIG_MM_SUBPAGE) && npage < 0) {
 		mmap_write_lock(mm);
 	} else {
 		ret = mmap_write_lock_killable(mm);
@@ -490,7 +490,7 @@ static int mm_lock_acct(struct task_struct *task, struct mm_struct *mm,
 static int vfio_lock_acct(struct vfio_dma *dma, long npage, bool async)
 {
 	struct mm_struct *mm;
-	bool get_mm = async && npage > 0;
+	bool get_mm = async && (!IS_ENABLED(CONFIG_MM_SUBPAGE) || npage > 0);
 	int ret;
 
 	if (!npage)
@@ -1881,6 +1881,7 @@ static bool vfio_iommu_iova_dma_valid(struct vfio_iommu *iommu,
 	return list_empty(iova);
 }
 
+#ifdef CONFIG_MM_SUBPAGE
 static int vfio_change_dma_mm_pages(struct vfio_dma *dma, struct task_struct *task,
 				    struct mm_struct *mm, bool lock_cap, unsigned long pages)
 {
@@ -1950,6 +1951,40 @@ static int vfio_change_dma_owner(struct vfio_iommu *iommu, struct vfio_dma *dma,
 		vfio_fragments_commit_native(dma, provider);
 	return ret;
 }
+#else
+static int vfio_change_dma_owner(struct vfio_iommu *iommu, struct vfio_dma *dma,
+				 unsigned long vaddr)
+{
+	struct task_struct *task = current->group_leader;
+	struct mm_struct *mm = current->mm;
+	long npage = dma->locked_vm;
+	bool lock_cap;
+	int ret;
+
+	if (mm == dma->mm)
+		return 0;
+
+	lock_cap = capable(CAP_IPC_LOCK);
+	ret = mm_lock_acct(task, mm, lock_cap, npage);
+	if (ret)
+		return ret;
+
+	if (mmget_not_zero(dma->mm)) {
+		mm_lock_acct(dma->task, dma->mm, dma->lock_cap, -npage);
+		mmput(dma->mm);
+	}
+
+	if (dma->task != task) {
+		put_task_struct(dma->task);
+		dma->task = get_task_struct(task);
+	}
+	mmdrop(dma->mm);
+	dma->mm = mm;
+	mmgrab(dma->mm);
+	dma->lock_cap = lock_cap;
+	return 0;
+}
+#endif
 
 static int vfio_dma_do_map(struct vfio_iommu *iommu,
 			   struct vfio_iommu_type1_dma_map *map)
