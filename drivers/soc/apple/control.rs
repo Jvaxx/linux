@@ -71,8 +71,8 @@ impl EntropyEnd {
 pub(crate) enum ReadEnd {
     /// It took this many bytes.
     Bytes(usize),
-    /// None, as requests are being held back: nothing failed, and the core
-    /// tries again later.
+    /// None, but nothing failed: requests are being held back, or a signal
+    /// ended the wait for that to end. The core tries again later.
     Held(Error),
     /// None, as the request failed.
     Failed(Error),
@@ -86,7 +86,12 @@ pub(crate) fn read_end(written: usize, failure: Option<Error>) -> ReadEnd {
     }
     // must return a negative errno, not 0: a blocking reader would spin on 0
     match failure.unwrap_or(EIO) {
-        e if e == EAGAIN => ReadEnd::Held(e),
+        // The reader blocked while requests were held back, as long as a
+        // request waits for its reply. Tell it that it timed out, as an
+        // unanswered request would. EAGAIN would invite it to read again
+        // at once.
+        e if e == EAGAIN => ReadEnd::Held(ETIMEDOUT),
+        e if e == ERESTARTSYS => ReadEnd::Held(e),
         e => ReadEnd::Failed(e),
     }
 }
@@ -358,6 +363,18 @@ impl ControlState {
         self.entropy.busy
     }
 
+    /// How long from `now_ms` requests are held back, up to `limit_ms`, or
+    /// `None` if [`Self::entropy_begin`] would not refuse one for that.
+    pub(crate) fn entropy_held_ms(&self, now_ms: u64, limit_ms: u64) -> Option<u64> {
+        if self.entropy.asleep {
+            return Some(limit_ms);
+        }
+        match self.entropy.retry_at {
+            Some(at) if now_ms < at => Some(core::cmp::min(at - now_ms, limit_ms)),
+            _ => None,
+        }
+    }
+
     /// Whether a request claimed by [`Self::entropy_begin`] may still be
     /// written: not once the system has begun going to sleep. Such a
     /// request ends as [`EntropyEnd::NotSent`], not full.
@@ -592,8 +609,49 @@ mod tests {
 
     #[test]
     fn a_held_read_is_not_a_failure() {
-        assert_eq!(read_end(0, Some(EAGAIN)), ReadEnd::Held(EAGAIN));
+        assert_eq!(read_end(0, Some(ERESTARTSYS)), ReadEnd::Held(ERESTARTSYS));
         assert_eq!(read_end(8, Some(EAGAIN)), ReadEnd::Bytes(8));
+    }
+
+    #[test]
+    fn a_read_held_until_it_gives_up_is_told_it_timed_out() {
+        // Not EAGAIN: a blocking reader that retries on it would spin.
+        assert_eq!(read_end(0, Some(EAGAIN)), ReadEnd::Held(ETIMEDOUT));
+    }
+
+    #[test]
+    fn a_held_read_knows_how_long_to_wait() {
+        let limit = u64::from(proto::CONTROL_TIMEOUT_MS);
+        let mut state = ControlState::new();
+        assert_eq!(state.entropy_held_ms(0, limit), None);
+        // Held back after a request went unanswered: until the retry time,
+        // or the reader's limit if that comes first.
+        assert!(state.entropy_begin(0).is_ok());
+        state.entropy_end(EntropyEnd::TimedOut, 0);
+        let at = ENTROPY_RETRY_MIN_MS;
+        assert_eq!(
+            state.entropy_held_ms(0, limit),
+            Some(core::cmp::min(at, limit))
+        );
+        assert_eq!(state.entropy_held_ms(at - 10, limit), Some(10));
+        assert_eq!(state.entropy_held_ms(at - 10, 0), Some(0));
+        assert_eq!(state.entropy_held_ms(at, limit), None);
+        // The hold ends early when the enclave answers again.
+        assert!(matches!(
+            state.deliver(entropy(1)),
+            Delivery::EntropyLate { recovered: true }
+        ));
+        assert_eq!(state.entropy_held_ms(0, limit), None);
+        // Asleep: for as long as the reader may wait.
+        assert!(!state.entropy_sleep());
+        assert_eq!(state.entropy_held_ms(0, limit), Some(limit));
+        state.entropy_wake();
+        assert_eq!(state.entropy_held_ms(0, limit), None);
+        // Whenever begin refuses with EAGAIN, the reader has a hold to wait on.
+        assert!(state.entropy_begin(0).is_ok());
+        state.entropy_end(EntropyEnd::TimedOut, 0);
+        assert_eq!(state.entropy_begin(1), Err(EAGAIN));
+        assert!(state.entropy_held_ms(1, limit).is_some());
     }
 
     #[test]
