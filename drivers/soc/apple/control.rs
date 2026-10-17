@@ -35,6 +35,8 @@ struct EntropySink {
     // out may still be answered, and every reply carries the reserved tag,
     // so only their order tells them apart.
     owed: u32,
+    // The system is going to sleep: no request may be sent.
+    asleep: bool,
     // A request went unanswered: none is sent before this time, in ms.
     retry_at: Option<u64>,
     retry_ms: u64,
@@ -84,6 +86,7 @@ impl ControlState {
                 value: None,
                 busy: false,
                 owed: 0,
+                asleep: false,
                 retry_at: None,
                 retry_ms: ENTROPY_RETRY_MIN_MS,
             },
@@ -203,14 +206,17 @@ impl ControlState {
 
     /// Claims the entropy exchange for a request to be sent at `now_ms`.
     ///
-    /// Refused with EAGAIN after a request the enclave did not answer, until
-    /// it answers or the retry time comes. A request that fails then doubles
-    /// the wait. Each claim counts as owed until [`Self::entropy_end`],
-    /// because the reply can arrive before the sender returns from the
-    /// mailbox.
+    /// Refused with EAGAIN while the system sleeps, and after a request the
+    /// enclave did not answer, until it answers or the retry time comes. A
+    /// request that fails then doubles the wait. Each claim counts as owed
+    /// until [`Self::entropy_end`], because the reply can arrive before the
+    /// sender returns from the mailbox.
     pub(crate) fn entropy_begin(&mut self, now_ms: u64) -> Result<()> {
         if self.entropy.busy {
             return Err(EBUSY);
+        }
+        if self.entropy.asleep {
+            return Err(EAGAIN);
         }
         if let Some(at) = self.entropy.retry_at {
             if now_ms < at {
@@ -254,6 +260,21 @@ impl ControlState {
                 core::cmp::min(entropy.retry_ms.saturating_mul(2), ENTROPY_RETRY_MAX_MS);
         }
     }
+
+    /// The system is going to sleep: refuse requests until
+    /// [`Self::entropy_wake`]. Returns whether one is still in flight.
+    pub(crate) fn entropy_sleep(&mut self) -> bool {
+        self.entropy.asleep = true;
+        self.entropy.busy
+    }
+
+    pub(crate) fn entropy_busy(&self) -> bool {
+        self.entropy.busy
+    }
+
+    pub(crate) fn entropy_wake(&mut self) {
+        self.entropy.asleep = false;
+    }
 }
 
 #[kernel::macros::kunit_tests(apple_sep_control)]
@@ -292,6 +313,32 @@ mod tests {
         let mut state = ControlState::new();
         assert_eq!(draw(&mut state, 0, 0x1234_5678), Some(0x1234_5678));
         assert_eq!(draw(&mut state, 1, 0x9abc_def0), Some(0x9abc_def0));
+    }
+
+    #[test]
+    fn no_request_is_sent_while_the_system_sleeps() {
+        let mut state = ControlState::new();
+        assert!(!state.entropy_sleep());
+        assert_eq!(state.entropy_begin(0), Err(EAGAIN));
+        assert_eq!(state.entropy_begin(ENTROPY_RETRY_MAX_MS * 10), Err(EAGAIN));
+        state.entropy_wake();
+        assert_eq!(draw(&mut state, 1, 7), Some(7));
+    }
+
+    #[test]
+    fn a_request_in_flight_finishes_before_sleep() {
+        let mut state = ControlState::new();
+        assert!(state.entropy_begin(0).is_ok());
+        // The sleep has to wait for this one.
+        assert!(state.entropy_sleep());
+        assert!(matches!(state.deliver(entropy(5)), Delivery::Entropy));
+        assert_eq!(state.entropy_take(), Some(5));
+        state.entropy_end(EntropyEnd::Answered, 0);
+        assert!(!state.entropy_busy());
+        // And nothing new starts until the system is awake.
+        assert_eq!(state.entropy_begin(0), Err(EAGAIN));
+        state.entropy_wake();
+        assert_eq!(draw(&mut state, 0, 6), Some(6));
     }
 
     #[test]
