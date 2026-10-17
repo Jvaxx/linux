@@ -2859,7 +2859,9 @@ impl SepData {
                 crate::sbio::encode_sbio_next(opcode, seq)
             }
             .ok_or(EPERM)?;
-            self.send(msg)?;
+            // The last grant's header may sit in the outbound buffer; the
+            // reply to this chunk must not take it.
+            transfer::send_for_reply(&SbioHeader(self), || self.send(msg))?;
 
             offset += chunk;
             first = false;
