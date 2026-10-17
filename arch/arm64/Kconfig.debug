@@ -36,12 +36,20 @@ config ARM64_USER4K_EXPERIMENTAL
 	help
 	  Build the in-development MM support for alternative 4K user tables
 	  on 16K/64K kernels and 16K user tables on 64K kernels.
-	  Ordinary address spaces and kernel tables retain the native granule. An experimental
-	  one-shot prctl selects a supported granule for the next exec.
-	  This is a development ABI: several MM interfaces and device mappings
-	  still require integration and validation. The private prctl numbers
-	  are not upstream assignments or a stable ABI promise.
-	  Programs that do not use the prctl keep the native granule.
+
+	  This is experimental. The code is built in, but the feature is off
+	  at run time unless the kernel is booted with user4k=on. While it is
+	  off, the page-size prctls refuse every non-native size with EINVAL,
+	  every exec gets the native granule and the CPUs report no
+	  alternative user granule. The shared MM code paths remain compiled
+	  in either way.
+
+	  With user4k=on, an experimental prctl selects a supported granule
+	  for the next exec. Ordinary address spaces and kernel tables retain
+	  the native granule. This is a development ABI: several MM interfaces
+	  and device mappings still require integration and validation. The
+	  private prctl numbers are not upstream assignments or a stable ABI
+	  promise. Programs that do not use the prctl keep the native granule.
 
 config ARM64_USER4K_KUNIT_TEST
 	bool "Test mixed userspace granules with larger kernel pages"
@@ -55,9 +63,11 @@ config ARM64_USER4K_KUNIT_TEST
 	help
 	  Exercise independent TTBR0 translation granules, subpage permissions
 	  and invalidation while TTBR1 retains the normal native kernel tables.
-	  Hardware translation/uaccess fixtures require arm64.user4k_test=1
-	  as a second opt-in and are disabled with KASAN. Software MM fixtures
-	  can run with KASAN without borrowing or replacing TTBR0.
+	  Boot the test kernel with user4k=on (kunit.py --kernel_args
+	  user4k=on); only the arm64-user4k-policy suite is meant to run
+	  without it. Hardware translation/uaccess fixtures also require
+	  arm64.user4k_test=1 and are disabled with KASAN. Software MM
+	  fixtures can run with KASAN without borrowing or replacing TTBR0.
 	  Run only in a disposable test VM. This regression harness does not
 	  establish hardware qualification or production ABI readiness.
 	  Say N for normal kernels.
@@ -118,3 +128,4 @@ config ARM64_USER4K_DATA_KUNIT_TEST
 	  Exercise packed allocation, slot reuse, copying and deferred lifetime.
 	  These tests use native kernel addresses without changing TTBR0, and
 	  can run with KASAN even when the architectural tests are disabled.
+	  Boot the test kernel with user4k=on.

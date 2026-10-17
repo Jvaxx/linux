@@ -11,14 +11,16 @@ fixed for its lifetime; exec can create a new address space with another
 supported granule. See :doc:`../../mm/user_page_size` for the generic launch
 policy and architecture integration contract.
 
-This is an experimental ABI. The launch commands use private prctl numbers,
-not assigned upstream UAPI. The implementation and tests do not establish
-complete application, device or hardware qualification.
+This is an experimental feature and ABI. It is built into the kernel but
+stays off unless the kernel is booted with ``user4k=on``. The launch
+commands use private prctl numbers, not assigned upstream UAPI. The
+implementation and tests do not establish complete application, device or
+hardware qualification.
 
 Configuration and supported combinations
 ========================================
 
-Enable ``CONFIG_ARM64_USER4K_EXPERIMENTAL`` with 48-bit VA and PA and a native
+``CONFIG_ARM64_USER4K_EXPERIMENTAL`` requires 48-bit VA and PA and a native
 16K or 64K page size. The option is on by default and selects the generic
 ``MM_SUBPAGE`` backing and ``ARCH_HAS_USER_PAGE_SIZE`` exec policy support.
 LPA2 and ``NO_PAGE_MAPCOUNT`` configurations are excluded by Kconfig.
@@ -33,11 +35,12 @@ Native kernel size  AArch64 default    AArch64 alternatives
 64K                 64K                4K and 16K, subject to support
 =================== ================== ============================
 
-Capability detection uses the sanitized system-wide granule intersection.
-AArch32 executables select 4K when that capability is available and retain
-the native granule otherwise, regardless of launch preferences. The latter
-case still enforces native mapping/protection alignment. AArch32 mmap2 file
-offsets retain their 4K ABI unit in either case.
+Capability detection uses the sanitized system-wide granule intersection,
+and only runs with ``user4k=on``. AArch32 executables select 4K when that
+capability is available and retain the native granule otherwise, regardless
+of launch preferences. The latter case still enforces native
+mapping/protection alignment. AArch32 mmap2 file offsets retain their 4K
+ABI unit in either case.
 
 An AArch32 executable running under an arm64 kernel is distinct from an
 ``arch/arm`` kernel. The latter retains its existing native ABI; this series
@@ -49,10 +52,34 @@ Larger-than-native process granules are not exposed. Internal 64K-on-16K
 fixtures exercise allocation, mappings and argument staging, but those
 fixtures do not enable a public 64K process ABI on a 16K kernel.
 
+Enabling at boot
+================
+
+Building the option in does not enable it. Add ``user4k=on`` to the kernel
+command line to enable it for that boot; ``user4k=off`` or no parameter
+leaves it off. The value is parsed with ``kstrtobool()``, so ``1``/``0``
+and ``y``/``n`` also work, and it cannot be changed after boot.
+
+While it is off:
+
+* ``PR_AURORA_SET_EXEC_PAGE_SIZE`` and ``PR_AURORA_SET_DEFAULT_PAGE_SIZE``
+  fail with ``EINVAL`` for every non-native size; a native or zero size
+  still succeeds. The GET commands report the native default (zero).
+* Every exec, including AArch32 executables, gets the native granule.
+* The CPUs report no alternative user granule: the boot log has no
+  ``4K userspace translation granule`` capability line.
+
+The shared MM code paths that serve every process are compiled in either
+way and do not change with the parameter.
+
+With ``user4k=on`` the CPU capability line appears on CPUs that support
+the 4K translation granule, and the launcher below can select 4K pages.
+
 Selecting an executable's page size
 ===================================
 
-Build the development launcher with::
+The kernel must be booted with ``user4k=on``. Build the development
+launcher with::
 
     make -C tools/aurora-userpages
 
@@ -163,14 +190,19 @@ Test coverage
 =============
 
 The arm64 selftests are in ``tools/testing/selftests/arm64/user4k``. The
-``page-contract`` executable checks the exposed userspace contract. Extended
+fixtures that select another page size need a guest booted with
+``user4k=on``. The ``page-contract`` executable checks the exposed
+userspace contract. Extended
 fixtures cover exec policy, AArch32, shared mappings, accounting, reclaim,
 I/O and device-facing interfaces. Several are disposable-guest PID1 programs
 with companion executables or storage requirements; they are not ordinary
 host test commands.
 
 ``CONFIG_ARM64_USER4K_KUNIT_TEST`` and the data/TLB suites exercise internal
-geometry and ownership. Some fixtures require ``arm64.user4k_test=1`` and
+geometry and ownership. Boot them with ``user4k=on``, for example
+``kunit.py run --kernel_args user4k=on``. The ``arm64-user4k-policy`` suite
+also runs without it and checks that the feature stays closed while off.
+Some fixtures additionally require ``arm64.user4k_test=1`` and
 some hardware translation tests are disabled under KASAN. Check individual
 KTAP results and skips rather than treating boot success as a suite pass.
 Private IOMMUFD/VFIO test-device options are separate and should remain off

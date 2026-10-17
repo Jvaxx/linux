@@ -59,8 +59,8 @@ An architecture selecting ``ARCH_HAS_USER_PAGE_SIZE`` must implement:
 
 * ``arch_exec_page_size_shift(size)``: return zero for a native request, a
   validated alternative shift, or a negative errno. Validation includes
-  the supported hardware and kernel configuration, not just whether the
-  requested byte size is a power of two.
+  the supported hardware, the kernel configuration and any boot-time
+  switch, not just whether the requested byte size is a power of two.
 * ``arch_mm_init_exec(mm, shift)``: initialize the private address space's
   geometry before allocating its page-table root. Zero denotes native
   geometry. The hook receives the request explicitly and does not read

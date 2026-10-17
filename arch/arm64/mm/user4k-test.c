@@ -35,6 +35,7 @@
 #include <linux/pagemap.h>
 #include <linux/pagewalk.h>
 #include <linux/personality.h>
+#include <linux/prctl.h>
 #include <linux/perf_event.h>
 #include <linux/preempt.h>
 #include <linux/rmap.h>
@@ -13745,6 +13746,123 @@ static void user4k_exec_granule_policy_test(struct kunit *test)
 	}
 }
 
+/* Exec page-size requests are refused unless booted with user4k=on. */
+static void user4k_page_size_request_test(struct kunit *test)
+{
+	static const struct {
+		unsigned long size;
+		int off, on, on_no4k;
+	} cases[] = {
+		{ 0, 0, 0, 0 },
+		{ PAGE_SIZE, 0, 0, 0 },
+		{ SZ_4K, -EINVAL, 12, -EOPNOTSUPP },
+		{ SZ_8K, -EINVAL, -EINVAL, -EINVAL },
+		{ SZ_2M, -EINVAL, -EINVAL, -EINVAL },
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		unsigned long size = cases[i].size;
+
+		KUNIT_EXPECT_EQ(test, arm64_exec_page_size_request(size, false, true, true),
+				cases[i].off);
+		KUNIT_EXPECT_EQ(test, arm64_exec_page_size_request(size, false, false, false),
+				cases[i].off);
+		KUNIT_EXPECT_EQ(test, arm64_exec_page_size_request(size, true, true, true),
+				cases[i].on);
+		KUNIT_EXPECT_EQ(test, arm64_exec_page_size_request(size, true, false, false),
+				cases[i].on_no4k);
+	}
+	/* Larger-than-native process granules are never offered. */
+	if (PAGE_SIZE == SZ_16K) {
+		KUNIT_EXPECT_EQ(test, arm64_exec_page_size_request(SZ_64K, false, true, true),
+				-EINVAL);
+		KUNIT_EXPECT_EQ(test, arm64_exec_page_size_request(SZ_64K, true, true, true),
+				-EINVAL);
+	}
+}
+
+asmlinkage long __arm64_sys_prctl(const struct pt_regs *regs);
+
+static long test_prctl(unsigned long option, unsigned long arg2)
+{
+	struct pt_regs regs = { .regs = { option, arg2 } };
+
+	return __arm64_sys_prctl(&regs);
+}
+
+/* Both SET prctls follow the boot switch; native requests always succeed. */
+static void user4k_boot_switch_prctl_test(struct kunit *test)
+{
+	static const unsigned long options[][2] = {
+		{ PR_AURORA_SET_EXEC_PAGE_SIZE, PR_AURORA_GET_EXEC_PAGE_SIZE },
+		{ PR_AURORA_SET_DEFAULT_PAGE_SIZE, PR_AURORA_GET_DEFAULT_PAGE_SIZE },
+	};
+	unsigned int saved_exec = current->exec_page_shift;
+	unsigned int saved_default = current->default_exec_page_shift;
+	bool has_4k = cpus_have_final_cap(ARM64_HAS_USER4K_GRANULE);
+	long expect = !user4k_enabled() ? -EINVAL : has_4k ? 0 : -EOPNOTSUPP;
+	unsigned int i;
+
+	/* Without user4k=on the CPUs report no 4K user granule either. */
+	if (!user4k_enabled())
+		KUNIT_EXPECT_FALSE(test, has_4k);
+	for (i = 0; i < ARRAY_SIZE(options); i++) {
+		unsigned long set = options[i][0], get = options[i][1];
+
+		current->exec_page_shift = 0;
+		current->default_exec_page_shift = 0;
+		KUNIT_EXPECT_EQ(test, test_prctl(set, SZ_4K), expect);
+		KUNIT_EXPECT_EQ(test, test_prctl(get, 0), expect ? 0L : (long)SZ_4K);
+		if (PAGE_SIZE == SZ_16K) {
+			KUNIT_EXPECT_EQ(test, test_prctl(set, SZ_64K), (long)-EINVAL);
+			KUNIT_EXPECT_EQ(test, test_prctl(get, 0), expect ? 0L : (long)SZ_4K);
+		}
+		KUNIT_EXPECT_EQ(test, test_prctl(set, PAGE_SIZE), 0L);
+		KUNIT_EXPECT_EQ(test, test_prctl(set, 0), 0L);
+		KUNIT_EXPECT_EQ(test, test_prctl(get, 0), 0L);
+	}
+	current->exec_page_shift = saved_exec;
+	current->default_exec_page_shift = saved_default;
+}
+
+/* With the switch off, exec ignores any preference and stays native. */
+static void user4k_boot_switch_exec_test(struct kunit *test)
+{
+	unsigned int saved_exec = current->exec_page_shift;
+	unsigned int saved_default = current->default_exec_page_shift;
+	struct mm_struct *mm;
+	unsigned int compat;
+
+	mm = mm_alloc_exec_page_shift(12);
+	KUNIT_ASSERT_NOT_NULL(test, mm);
+	KUNIT_EXPECT_EQ(test, mm_page_shift(mm), user4k_enabled() ? 12U : PAGE_SHIFT);
+	mmput(mm);
+	/* With user4k=on, user4k_exec_secure_granule_test covers staging. */
+	if (user4k_enabled())
+		return;
+	for (compat = 0; compat < 2; compat++) {
+		struct linux_binprm *bprm = kunit_kzalloc(test, sizeof(*bprm), GFP_KERNEL);
+		int ret;
+
+		KUNIT_ASSERT_NOT_NULL(test, bprm);
+		mm = mm_alloc_exec_page_shift(PAGE_SHIFT);
+		KUNIT_ASSERT_NOT_NULL(test, mm);
+		bprm->mm = mm;
+		current->exec_page_shift = 12;
+		current->default_exec_page_shift = 12;
+		ret = arm64_bprm_prepare_mm(bprm, compat);
+		current->exec_page_shift = saved_exec;
+		current->default_exec_page_shift = saved_default;
+		KUNIT_EXPECT_EQ(test, ret, 0);
+		KUNIT_EXPECT_PTR_EQ(test, bprm->mm, mm);
+		KUNIT_EXPECT_EQ(test, mm_page_shift(bprm->mm), PAGE_SHIFT);
+		/* AArch32 also keeps the native granule. */
+		KUNIT_EXPECT_EQ(test, bprm->secure_page_shift, PAGE_SHIFT);
+		mmput(mm);
+	}
+}
+
 static void user_granule_zero_region_test(struct kunit *test)
 {
 	unsigned long base_pfn = zero_pfn(0);
@@ -14606,12 +14724,26 @@ static struct kunit_suite user4k_test_suite = {
 	.test_cases = user4k_test_cases,
 };
 
+/* Safe with or without user4k=on; the other suites need user4k=on. */
+static struct kunit_case user4k_policy_cases[] = {
+	KUNIT_CASE(user4k_page_size_request_test),
+	KUNIT_CASE(user4k_boot_switch_prctl_test),
+	KUNIT_CASE(user4k_boot_switch_exec_test),
+	{}
+};
+
+static struct kunit_suite user4k_policy_suite = {
+	.name = "arm64-user4k-policy",
+	.test_cases = user4k_policy_cases,
+};
+
 #if defined(CONFIG_SHMEM) && defined(CONFIG_MM_SUBPAGE) && defined(CONFIG_USERFAULTFD)
-kunit_test_suites(&user4k_test_suite, &user4k_swap_suite, &user4k_shmem_swap_suite,
-		  &user4k_coarse_shmem_suite,
+kunit_test_suites(&user4k_policy_suite, &user4k_test_suite, &user4k_swap_suite,
+		  &user4k_shmem_swap_suite, &user4k_coarse_shmem_suite,
 		  &user4k_nonlinear_swap_suite);
 #else
-kunit_test_suites(&user4k_test_suite, &user4k_swap_suite, &user4k_nonlinear_swap_suite);
+kunit_test_suites(&user4k_policy_suite, &user4k_test_suite, &user4k_swap_suite,
+		  &user4k_nonlinear_swap_suite);
 #endif
 
 MODULE_LICENSE("GPL");
