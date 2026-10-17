@@ -24,12 +24,16 @@ properties:
       - apple,t8112-display-crossbar
       - apple,t6000-display-crossbar
       - apple,t6020-display-crossbar
+      - apple,t6030-display-crossbar
 
   reg:
     maxItems: 1
 
   '#mux-control-cells':
     const: 1
+
+  power-domains:
+    maxItems: 1
 
 required:
   - compatible
