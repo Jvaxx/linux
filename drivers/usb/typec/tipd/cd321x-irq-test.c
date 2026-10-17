@@ -326,8 +326,9 @@ static void cd321x_ack_retry_across_sleep_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&t->cd.resume_work));
 	tipd_complete(dev);
 	for (i = 0; i < 2 * CD321X_RESUME_ATTEMPTS; i++) {
-		KUNIT_ASSERT_TRUE(test, delayed_work_pending(&t->cd.resume_work));
+		/* Queued first without delay: a worker may already be running it. */
 		flush_delayed_work(&t->cd.resume_work);
+		KUNIT_ASSERT_TRUE(test, delayed_work_pending(&t->cd.resume_work));
 	}
 
 	t->ctrl.failing_event_reads = 0;
