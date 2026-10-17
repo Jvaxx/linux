@@ -380,7 +380,7 @@ struct apple_connector {
     u64 drm_edid_generation, drm_edid_service_epoch;
     const struct drm_edid *drm_edid;
     struct { int registration_state; } base;
-    struct work_struct hotplug_wq;
+    struct work_struct hotplug_wq, bl_sync_wq;
 };
 struct apple_epic { struct apple_dcp *dcp; unsigned endpoint; bool wire_v2; };
 struct apple_epic_service { struct apple_epic *ep; void *cookie; bool enabled; };
@@ -398,6 +398,7 @@ struct apple_dcp {
     u64 typec_generation; unsigned int nr_modes;
     struct dcp_display_mode *modes;
     struct { bool holding, stopped; } announce;
+    bool ext_backlight, has_panel;
 };
 struct rate_guard { bool *lock; };
 static struct rate_guard rate_lock(bool *p) { assert(!*p);*p=true;return (struct rate_guard){p}; }
@@ -405,6 +406,7 @@ static void rate_unlock(struct rate_guard *g) { assert(*g->lock);*g->lock=false;
 #define guard(kind) struct rate_guard __attribute__((cleanup(rate_unlock))) _guard = rate_lock
 static bool dcp_is_usb4_output(struct apple_dcp *d) { return d->usb4; }
 static void schedule_work(struct work_struct *w) { w->scheduled++; }
+static bool __attribute__((unused)) dcp_has_panel(struct apple_dcp *d) { return d->has_panel; }
 static const struct edid *drm_edid_raw(const struct drm_edid *e) { return (const void *)e->data; }
 static bool dcpavserv_edid_current(struct apple_dcp *d, u64 generation) {
     assert(d->hpd_mutex);return d->typec_cable_connected&&generation==d->typec_generation&&!d->quiescing;

@@ -23,6 +23,7 @@ typedef unsigned u32;
 #define guard(k) (void)
 #define scoped_guard(k,l) for(int once=((void)(l),1);once;once=0)
 #define READ_ONCE(x) (x)
+#define schedule_work(w) ((void)(w))
 #define WARN_ON_ONCE(x) (x)
 #define container_of(p,t,m) ((t *)((char *)(p)-offsetof(t,m)))
 #define to_platform_device(p) (p)
@@ -55,7 +56,7 @@ static int mutex_trylock(struct mutex *m) { return pthread_mutex_trylock(&m->val
 static void mutex_unlock(struct mutex *m) { assert(!pthread_mutex_unlock(&m->value)); }
 struct typec_mux { struct typec_mux_context *context; struct typec_mux_state transaction; struct task_struct *owner; int srcu_index; unsigned prepared; bool applied; unsigned num_mux_devs; struct typec_mux_dev *mux_devs[3]; bool timeout_transient; };
 struct connector { bool connected; };
-struct apple_dcp { int external_lock,external_error; bool external_cable,external_stopped; struct { bool connected; } dptxport[1]; void *hdmi_hpd; bool active; bool external,typec_cable_connected; void *dev; struct connector *typec_connector; };
+struct apple_dcp { int external_lock,external_error; bool external_cable,external_stopped; struct { bool connected; } dptxport[1]; void *hdmi_hpd; bool active; bool external,typec_cable_connected; void *dev; struct connector *typec_connector; bool ext_backlight; };
 struct apple_dcp_typec_route;
 struct apple_dcp_typec_port { int link; void *connector_np; struct apple_dcp_typec_route *owner,*target,*secondary_target,*preferred_route; void *applied_alt; unsigned long applied_mode; unsigned applied_status,applied_conf; bool applied_valid,safe_pending,safe_finish_ready,dp_wanted,dp_hpd,hpd; };
 struct apple_dcp_typec_route { struct apple_dcp_typec_port *port; struct apple_dcp *dcp; void *xbar; bool deactivate_xbar_done; int deactivate_error; bool selected,tunnel; };

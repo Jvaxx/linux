@@ -35,7 +35,7 @@ def controls(ROOT):
     dcp=(ROOT/'drivers/gpu/drm/apple/dcp.c').read_text()
     actual=base.replace(block(base,'int main('),block(base,'int main(').replace('int main(','int __attribute__((unused)) prior_main(',1),1)
     actual=actual.replace('struct typec_mux_state { void *alt;', 'struct typec_altmode { unsigned svid; };\nstruct typec_mux_state { struct typec_altmode *alt;',1)
-    actual=actual.replace('struct connector { bool connected; };','struct encoder { unsigned possible_crtcs; };\nstruct connector { bool connected; void *dcp; struct encoder *port_encoder; unsigned candidate_crtcs; };\n#define apple_connector connector\nstruct mux_control { int unused; };',1)
+    actual=actual.replace('struct connector { bool connected; };','struct encoder { unsigned possible_crtcs; };\nstruct connector { bool connected; void *dcp; struct encoder *port_encoder; unsigned candidate_crtcs; int bl_sync_wq; };\n#define apple_connector connector\nstruct mux_control { int unused; };',1)
     actual=actual.replace('struct apple_dcp { int external_lock,external_error;', '''struct apple_dcp { int external_lock,external_error;
      bool external_power_attempted,dptx_tunnel,tb_clock_ok,fixed_route_selected;
      int tb_lock; unsigned typec_generation,dptx_dfp_port,dptx_phy,fixed_dptx_phy,fixed_mux_index;
@@ -68,7 +68,8 @@ static int mux_control_deselect(struct mux_control *m) { (void)m;event('C');xbar
     static void dpavservep_detach(struct apple_dcp *d) { (void)d; }
     static void dcp_firmware_metadata_connection(struct apple_dcp *d,unsigned n,bool c) { (void)d;(void)n;(void)c; }
     static bool dcp_typec_keep_order(void) { return false; }
-    static struct apple_dcp_typec_route *dcp_typec_lowest_free(struct apple_dcp_typec_port *p) { (void)p;return &route; }
+    static struct apple_dcp_typec_route * __attribute__((unused)) dcp_typec_lowest_free(struct apple_dcp_typec_port *p) { (void)p;return &route; }
+    static struct apple_dcp_typec_route * __attribute__((unused)) dcp_typec_free_route(struct apple_dcp_typec_port *p) { (void)p;return &route; }
     static int connect_calls;
     static int dcp_dptx_connect_oob(void *dev,unsigned n) { (void)dev;(void)n;connect_calls++;display.external_cable=true;display.dptxport[0].connected=true;display.typec_cable_connected=true;connector.connected=true;return 0; }
     static void dcp_retrain_oob(struct connector *c) { (void)c; }
