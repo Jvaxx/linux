@@ -254,9 +254,9 @@ impl<F: StoreIo> Store<F> {
             generation: 0,
         };
 
-        // Only a new, empty file is initialised. An existing file may hold the
-        // only copy of the host state, so one that does not validate is
-        // refused and left as it is.
+        // New files and interrupted empty or all-zero creations hold no state.
+        // Any other existing file may hold the only copy of the host state,
+        // so one that does not validate is refused and left as it is.
         let size = store.file.size()?;
         if created && size == 0 {
             store.create()?;
@@ -273,7 +273,17 @@ impl<F: StoreIo> Store<F> {
             Err(Damage::Size)
         };
         if let Err(damage) = decoded {
-            return Err(store.refuse(damage, size));
+            if matches!(damage, Damage::Size | Damage::Header) {
+                if let Some(what) = describe(&store.file, size) {
+                    pr_warn!(
+                        "host-state store file is {} and holds no state; initialising it\n",
+                        what
+                    );
+                    store.create()?;
+                    return Ok(store);
+                }
+            }
+            return Err(store.refuse(damage));
         }
 
         // Writes are copy-on-write, so an interrupted one is discarded, never
@@ -285,22 +295,11 @@ impl<F: StoreIo> Store<F> {
 
     /// Logs why the existing file is refused, and returns the error. Nothing
     /// is written to the file.
-    fn refuse(&self, damage: Damage, size: u64) -> Error {
-        let what = match damage {
-            Damage::Size | Damage::Header => describe(&self.file, size),
-            _ => None,
-        };
-        match what {
-            Some(what) => pr_err!(
-                "host-state store failed validation ({:?}, {}), refusing it\n",
-                damage,
-                what
-            ),
-            None => pr_err!(
-                "host-state store failed validation ({:?}), refusing it\n",
-                damage
-            ),
-        }
+    fn refuse(&self, damage: Damage) -> Error {
+        pr_err!(
+            "host-state store failed validation ({:?}), refusing it\n",
+            damage
+        );
         EIO
     }
 
@@ -621,19 +620,21 @@ mod tests {
     }
 
     #[test]
-    fn existing_files_are_never_initialised() -> Result {
-        // Empty, short, long and all-zero files are what an interrupted
-        // creation or damage leaves; none of them may be erased.
-        for len in [0, 1, BLOCK_SIZE, STORE_SIZE - 1, STORE_SIZE, STORE_SIZE + 1] {
+    fn existing_empty_and_zero_files_are_initialised() -> Result {
+        for len in [0, 1, BLOCK_SIZE, STORE_SIZE - 1, STORE_SIZE] {
             let file = MemoryFile::new();
             file.bytes.borrow_mut().resize(len, 0, GFP_KERNEL)?;
-            assert!(refused(&file)?);
+            let store = Store::from_file(&file, false)?;
+            assert!(store.slots.iter().all(|slot| !slot.used));
+            assert_eq!((&file).size()?, STORE_SIZE as u64);
+            assert!(damage(&file).is_none());
+            assert!(reopen(&file)?.read(&Key::root(0xf1))?.is_none());
         }
         Ok(())
     }
 
     #[test]
-    fn only_an_empty_new_file_is_initialised() -> Result {
+    fn a_created_flag_keeps_valid_records_and_retries_blank_files() -> Result {
         // Should a file that was there be reported as created, a store in it
         // is still opened in place, and anything else refused.
         let key = Key::root(0xf1);
@@ -645,9 +646,9 @@ mod tests {
 
         let file = MemoryFile::new();
         file.bytes.borrow_mut().resize(BLOCK_SIZE, 0, GFP_KERNEL)?;
-        assert!(Store::from_file(&file, true).is_err());
-        assert_eq!(file.writes.get(), 0);
-        assert_eq!(file.bytes.borrow().len(), BLOCK_SIZE);
+        assert!(Store::from_file(&file, true).is_ok());
+        assert!(file.writes.get() > 0);
+        assert_eq!(file.bytes.borrow().len(), STORE_SIZE);
         Ok(())
     }
 
@@ -657,7 +658,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_creation_is_refused() -> Result {
+    fn interrupted_creation_is_retried() -> Result {
         // Creation writes every block and then the superblock. Until the
         // superblock is on disk the file is not a store, and holds nothing.
         for nth in [0, 1, BLOCK_COUNT - 1, BLOCK_COUNT] {
@@ -669,8 +670,9 @@ mod tests {
                 if nth == BLOCK_COUNT && keep > 0 {
                     assert!(reopen(&file).is_ok());
                 } else {
-                    assert!(refused(&file)?);
                     assert!(described(&file)?.is_some());
+                    assert!(Store::from_file(&file, false).is_ok());
+                    assert!(damage(&file).is_none());
                 }
             }
         }
@@ -678,7 +680,17 @@ mod tests {
     }
 
     #[test]
-    fn refusals_tell_an_interrupted_creation_from_a_store() -> Result {
+    fn nonblank_short_files_and_bad_headers_are_refused_untouched() -> Result {
+        for len in [100, STORE_SIZE] {
+            let file = MemoryFile::new();
+            file.bytes.borrow_mut().resize(len, 0x5a, GFP_KERNEL)?;
+            assert!(refused(&file)?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn blank_creation_is_distinguished_from_damaged_state() -> Result {
         for (len, what) in [
             (0, Some("empty")),
             (1, Some("all zero")),
@@ -689,8 +701,12 @@ mod tests {
         ] {
             let file = MemoryFile::new();
             file.bytes.borrow_mut().resize(len, 0, GFP_KERNEL)?;
-            assert!(refused(&file)?);
             assert!(described(&file)? == what);
+            if what.is_some() {
+                assert!(Store::from_file(&file, false).is_ok());
+            } else {
+                assert!(refused(&file)?);
+            }
         }
 
         // A truncated store, and a single byte of data, may be what is left of
