@@ -61,6 +61,10 @@ use kernel::{
             Atomic,
             Relaxed, //
         },
+        barrier::{
+            dma_rmb,
+            dma_wmb, //
+        },
         new_condvar,
         Arc,
         CondVar,
@@ -956,7 +960,7 @@ impl SepData {
         }
         self.registered.store(true, Relaxed);
 
-        self.mbox.lock().as_ref().ok_or(EINVAL)?.send(msg, false)?;
+        Self::ring(self.mbox.lock().as_ref().ok_or(EINVAL)?, msg)?;
 
         // no ack on 0xFE; success is the discovery burst on 0xFD
         Ok(())
@@ -1109,7 +1113,20 @@ impl SepData {
         if self.shutting_down.load(Relaxed) {
             return Err(ENODEV);
         }
-        self.mbox.lock().as_ref().ok_or(ENODEV)?.send(msg, false)
+        Self::ring(self.mbox.lock().as_ref().ok_or(ENODEV)?, msg)
+    }
+
+    /// Puts `msg` in the mailbox once the enclave can see what the CPU wrote
+    /// to the buffers before it: a request payload, an SBIO header's poison,
+    /// the shared memory a registration hands over. Those are coherent
+    /// allocations, which have no sync call to order them, and the mailbox
+    /// write is relaxed MMIO, which is not ordered after them either.
+    /// Without the barrier the enclave could read old bytes, or have its
+    /// reply's header overwritten by a refill that lands late. dma_wmb() is
+    /// what writel() would put there, and what RTKit puts before its sends.
+    fn ring(mbox: &Mailbox<SepData>, msg: Message) -> Result<()> {
+        dma_wmb();
+        mbox.send(msg, false)
     }
 
 
@@ -2360,6 +2377,9 @@ impl MailCallback for SepData {
         if data.shutting_down.load(Relaxed) {
             return;
         }
+        // The message was read from the mailbox with relaxed MMIO. Read the
+        // buffers the enclave wrote before it only after that, as RTKit does.
+        dma_rmb();
         if !data.rx.push(msg) && data.rx.dropped() == 1 {
             dev_err!(
                 data.dev,
