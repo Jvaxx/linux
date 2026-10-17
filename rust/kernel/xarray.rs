@@ -655,13 +655,14 @@ mod tests {
 
     fn test_alloc_kind(kind: AllocKind, expected_index: usize) -> Result {
         stack_pin_init!(let xa = XArray::new(kind));
+        let value = new_kbox(0x1337)?;
         let mut guard = xa.lock();
 
         let reservation = guard.reserve_limit(.., GFP_KERNEL)?;
         assert_eq!(reservation.index(), expected_index);
         reservation.release_locked(&mut guard)?;
 
-        let insertion = guard.insert_limit(.., new_kbox(0x1337)?, GFP_KERNEL);
+        let insertion = guard.insert_limit(.., value, GFP_KERNEL);
         assert!(insertion.is_ok());
         let insertion_index = insertion.unwrap();
         assert_eq!(insertion_index, expected_index);
@@ -680,10 +681,9 @@ mod tests {
     }
 
     #[track_caller]
-    fn check_not_vacant<'a>(guard: &mut Guard<'a, KBox<usize>>) -> Result {
+    fn check_not_vacant<'a>(guard: &mut Guard<'a, KBox<usize>>, beef: KBox<usize>) -> Result {
         // Insertion fails.
         {
-            let beef = new_kbox(0xbeef)?;
             let ret = insert(guard, beef);
             assert!(ret.is_err());
             let StoreError { error, value } = ret.unwrap_err();
@@ -704,6 +704,12 @@ mod tests {
     #[test]
     fn test_insert_and_reserve_interaction() -> Result {
         stack_pin_init!(let xa = XArray::new(Default::default()));
+        // Allocate the test values before taking the XArray spinlock.
+        let busy_reserved = new_kbox(0xbeef)?;
+        let dead = new_kbox(0xdead)?;
+        let busy_inserted = new_kbox(0xbeef)?;
+        let beef = new_kbox(0xbeef)?;
+        let busy_filled = new_kbox(0xbeef)?;
         let mut guard = xa.lock();
 
         // Vacant.
@@ -719,7 +725,7 @@ mod tests {
         // Reserved presents as vacant.
         assert_eq!(guard.get(IDX), None);
 
-        check_not_vacant(&mut guard)?;
+        check_not_vacant(&mut guard, busy_reserved)?;
 
         // Release reservation.
         {
@@ -733,20 +739,18 @@ mod tests {
 
         // Insert succeeds.
         {
-            let dead = new_kbox(0xdead)?;
             let ret = insert(&mut guard, dead);
             assert!(ret.is_ok());
             let () = ret.unwrap();
         }
 
-        check_not_vacant(&mut guard)?;
+        check_not_vacant(&mut guard, busy_inserted)?;
 
         // Remove.
         assert_eq!(guard.remove(IDX).as_deref(), Some(&0xdead));
 
         // Reserve and fill.
         {
-            let beef = new_kbox(0xbeef)?;
             let ret = reserve(&mut guard);
             assert!(ret.is_ok());
             let reservation = ret.unwrap();
@@ -755,7 +759,7 @@ mod tests {
             let () = ret.unwrap();
         };
 
-        check_not_vacant(&mut guard)?;
+        check_not_vacant(&mut guard, busy_filled)?;
 
         // Remove.
         assert_eq!(guard.remove(IDX).as_deref(), Some(&0xbeef));
