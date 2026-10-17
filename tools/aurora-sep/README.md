@@ -49,8 +49,9 @@ for example with `systemctl edit aurora-sep.service`:
 Environment=AURORA_SEP_READY_TIMEOUT=180
 ```
 
-The driver defaults to `xart_writes=1` and exports the `apple,sep` module
-alias for automatic loading. Writes are accepted only when the APFS `.gl`
+The driver defaults to `xart_writes=1`. It exports no module alias, so udev
+never loads it on its own: the service above loads it, once the iBoot system
+container is reachable. Writes are accepted only when the APFS `.gl`
 extent passes the driver's narrow ownership checks: one physical extent, no snapshots or revert
 state, and a single extent reference owned by the `.gl` inode. The kernel
 resolves that extent from checksum-validated APFS metadata; unsupported layouts

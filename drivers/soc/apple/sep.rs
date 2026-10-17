@@ -2541,11 +2541,12 @@ impl WorkItem<VERIFY_WORK_ID> for SepData {
 
 struct SepDriver(Arc<SepData>);
 
-kernel::of_device_table!(
-    OF_TABLE,
-    (),
-    [(of::DeviceId::new(c"apple,sep"), ())]
-);
+// Deliberately not exported as a module alias: udev must not load the driver
+// on its own. The loader service loads it once the iBoot system container's
+// partition link exists, which the xART store needs at probe, and only after
+// the owner has enabled it (or chosen read-only) for this Mac.
+const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, (), 1> =
+    kernel::device_id::IdArray::new([(of::DeviceId::new(c"apple,sep"), &())]);
 
 impl platform::Driver for SepDriver {
     type IdInfo = ();
