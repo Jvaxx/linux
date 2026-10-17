@@ -87,8 +87,9 @@ config TRUSTED_SOURCE_KUNIT_TEST
 	default KUNIT_ALL_TESTS
 	help
 	  This builds unit tests for register_trusted_key_source() and
-	  unregister_trusted_key_source(), using a synthetic source that
-	  touches no hardware and no real key material.
+	  unregister_trusted_key_source(), called before and after the
+	  core's own init, using synthetic sources that touch no hardware
+	  and no real key material.
 
 	  Built in, they run before mark_readonly(), while read-only-after-init
 	  data can still be written. Build them as a module and load it after
