@@ -26,6 +26,13 @@ struct dcp_parse_ctx {
 	 * repetition.  In the tail padding.
 	 */
 	bool v14_7_rgb8;
+	/*
+	 * J514S DCPEXT: a timing's DSC-required 8-bit RGB colour the sink
+	 * takes compressed (SupportsDSC) is admissible, the firmware
+	 * compressing it on the wire; an uncompressed colour of the timing is
+	 * still preferred.
+	 */
+	bool v14_7_dsc;
 #endif
 };
 
@@ -34,6 +41,16 @@ static inline bool dcp_parse_v14_7_rgb8(const struct dcp_parse_ctx *ctx)
 {
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_EXT)
 	return ctx->v14_7_rgb8;
+#else
+	return false;
+#endif
+}
+
+/* The J514S DCPEXT DSC admission (DRM_APPLE_DCP_T6030_EXT only). */
+static inline bool dcp_parse_v14_7_dsc(const struct dcp_parse_ctx *ctx)
+{
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_EXT)
+	return ctx->v14_7_dsc;
 #else
 	return false;
 #endif
@@ -126,6 +143,11 @@ struct dcp_display_mode {
 	/* Immutable receipt provenance; never retag a cached exception. */
 	struct dcp_metadata_ticket unsafe_rgb8_ticket;
 	u64 unsafe_rgb8_service_epoch;
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_EXT)
+	/* The timing's best DSC-required colour, and whether it was taken. */
+	struct dcp_color_mode dsc_rgb;
+	bool dsc;
+#endif
 };
 
 struct dimension {

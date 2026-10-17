@@ -22,8 +22,18 @@
 #define DCP_PROPERTY_KEY_LEN		64
 #define DCP_PROPERTY_SCALARS		256
 #define DCP_PROPERTY_RAWS		32
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_EXT)
+/*
+ * The external role publishes the sink's TimingElements as one chunked
+ * transfer: an HDMI 2.1 (FRL) sink's catalog exceeds 1 MiB (a 4K120 TV's is
+ * 1.38 MB), so a property may take 8 MiB and a store 24 MiB.
+ */
+#define DCP_PROPERTY_RAW_LIMIT		(8U << 20)
+#define DCP_PROPERTY_RAW_TOTAL		(24U << 20)
+#else
 #define DCP_PROPERTY_RAW_LIMIT		(1U << 20)
 #define DCP_PROPERTY_RAW_TOTAL		(8U << 20)
+#endif
 
 struct dcp_property_scalar {
 	char key[DCP_PROPERTY_KEY_LEN];

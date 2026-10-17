@@ -831,6 +831,25 @@ static bool dcpep_cb_set_property_v14_7_ext(struct apple_dcp *dcp, int tag,
 	return true;
 }
 
+/*
+ * As the common path, the connector keeps a copy of the sink's dictionaries
+ * it shows in debugfs (TimingElements, ColorElements, DisplayAttributes,
+ * Transport). A copy that cannot be allocated is not kept.
+ */
+static void v14_7_ext_keep_dict(struct apple_dcp *dcp, const char *key,
+				const void *blob, u32 size)
+{
+	struct apple_connector *connector = READ_ONCE(dcp->connector);
+	struct dcp_chunks chunks = { .length = size };
+
+	if (!connector || (strcmp(key, "TimingElements") && strcmp(key, "ColorElements") &&
+			   strcmp(key, "DisplayAttributes") && strcmp(key, "Transport")))
+		return;
+	chunks.data = kmemdup(blob, size, GFP_KERNEL | __GFP_NOWARN);
+	if (chunks.data)
+		dcp_connector_update_dict(connector, key, &chunks);
+}
+
 /* D129: TimingElements and DisplayAttributes describe the connected sink. */
 static bool dcpep_cb_prop_end_v14_7_ext(struct apple_dcp *dcp, int tag,
 					void *out, void *in)
@@ -848,6 +867,8 @@ static bool dcpep_cb_prop_end_v14_7_ext(struct apple_dcp *dcp, int tag,
 		dcp_ext_v14_7_catalog(dcp, blob, size);
 	else if (blob && !strcmp(key, "DisplayAttributes"))
 		dcp_ext_v14_7_attributes(dcp, blob, size);
+	if (blob)
+		v14_7_ext_keep_dict(dcp, key, blob, size);
 	put_unaligned_le32(1, out);
 	return true;
 }
@@ -1241,6 +1262,12 @@ int iomfb_v14_7_ext_modeset(struct apple_dcp *dcp, struct drm_crtc_state *crtc_s
 	}
 	if (!READ_ONCE(ext->hpd_delivered))
 		return -ENODEV;
+	/* The firmware withdrew the sink's modes since: set the mode again. */
+	if (xchg(&ext->mode_lost, false)) {
+		ext->display_on = false;
+		ext->timing_id = 0;
+		ext->color_id = 0;
+	}
 	if (ext->display_on && (ext->color_id != mode->color_mode_id ||
 				ext->timing_id != mode->timing_mode_id)) {
 		ret = iomfb_v14_7_ext_power(dcp, false);

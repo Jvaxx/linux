@@ -7,6 +7,7 @@
 #include <linux/backlight.h>
 #include <linux/device.h>
 #include <linux/ioport.h>
+#include <linux/irqreturn.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
@@ -774,12 +775,15 @@ void dcp_ext_v14_7_irq_hpd(struct apple_dcp *dcp);
 int dcp_ext_v14_7_route_select(struct apple_dcp_typec_route *route);
 int dcp_ext_v14_7_route_release(struct apple_dcp_typec_route *route);
 int dcp_ext_v14_7_route_deselect(struct apple_dcp_typec_route *route);
+irqreturn_t dcp_ext_v14_7_hpd_irq(int irq, void *data);
 void dcp_ext_v14_7_poweroff(struct apple_dcp *dcp);
 int dcp_ext_v14_7_suspend(struct apple_dcp *dcp);
 int dcp_ext_v14_7_resume(struct apple_dcp *dcp);
 bool dcp_ext_v14_7_presentable(struct apple_dcp *dcp);
 void dcp_ext_v14_7_failed(struct apple_dcp *dcp);
 void dcp_ext_v14_7_av_published(struct apple_dcp *dcp);
+void dcp_ext_v14_7_av_report(struct apple_epic_service *service, u32 type,
+			     const void *data, size_t size);
 void dcp_ext_v14_7_catalog(struct apple_dcp *dcp, const void *blob, u32 size);
 void dcp_ext_v14_7_attributes(struct apple_dcp *dcp, const void *blob, u32 size);
 u32 dcp_ext_v14_7_stride(struct apple_dcp *dcp);

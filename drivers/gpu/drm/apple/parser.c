@@ -402,6 +402,10 @@ struct color_mode {
 	s64 id;
 	s64 pixel_encoding;
 	s64 score;
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_EXT)
+	/* fw14 SupportsDSC: the sink takes this colour compressed (absent: no). */
+	s64 supports_dsc;
+#endif
 };
 
 static int fill_color_mode(struct dcp_color_mode *color,
@@ -473,7 +477,12 @@ static bool v14_7_rgb8_color(const struct color_mode *color,
 }
 
 /* Firmware lists color element IDs which this timing cannot safely use. */
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_EXT)
+/* An HDMI 2.1 (FRL) sink's timing lists up to 68. */
+#define DCP_TIMING_COLOR_ID_LIMIT 128
+#else
 #define DCP_TIMING_COLOR_ID_LIMIT 64
+#endif
 
 struct timing_color_ids {
 	u32 ids[DCP_TIMING_COLOR_ID_LIMIT];
@@ -567,6 +576,9 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 	out->sdr_rgb.score = -1;
 	out->sdr.score = -1;
 	out->best.score = -1;
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_EXT)
+	out->dsc_rgb.score = -1;
+#endif
 
 	ret = iterator_begin(handle, &outer_it, false);
 	if (ret)
@@ -620,6 +632,10 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 				ret = parse_int(it.handle, &cmode.pixel_encoding);
 			else if (!strcmp(key, "Score"))
 				ret = parse_int(it.handle, &cmode.score);
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_EXT)
+			else if (dcp_parse_v14_7_dsc(handle) && !strcmp(key, "SupportsDSC"))
+				ret = parse_int(it.handle, &cmode.supports_dsc);
+#endif
 			else
 				ret = skip(it.handle);
 
@@ -643,8 +659,20 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 			unsigned int rank;
 
 			if (cmode.id <= U32_MAX &&
-			    timing_color_contains(&limits->dsc_required, cmode.id))
+			    timing_color_contains(&limits->dsc_required, cmode.id)) {
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_EXT)
+				/*
+				 * The same 8-bit RGB selection among the DSC-required
+				 * colours the sink takes compressed (SupportsDSC), never
+				 * an unsafe one.
+				 */
+				if (dcp_parse_v14_7_dsc(handle) && cmode.supports_dsc > 0 &&
+				    !timing_color_contains(&limits->unsafe, cmode.id) &&
+				    v14_7_rgb8_color(&cmode, &out->dsc_rgb))
+					fill_color_mode(&out->dsc_rgb, &cmode);
+#endif
 				continue;
+			}
 			rank = external_sdr_rank(&cmode);
 			if (cmode.id <= U32_MAX &&
 			    timing_color_contains(&limits->unsafe, cmode.id)) {
@@ -735,6 +763,9 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		.sdr_444.score = -1,
 		.sdr.score = -1,
 		.best.score = -1,
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_EXT)
+		.dsc_rgb.score = -1,
+#endif
 	};
 	*score = -1;
 	handle->ambiguous_180hz = false;
@@ -852,6 +883,13 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		best_color_mode = out->sdr.id;
 	else if (out->best.score >= 0)
 		best_color_mode = out->best.id;
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_EXT)
+	/* No uncompressed colour: the DSC-required one, compressed by the firmware. */
+	if (best_color_mode < 0 && dcp_parse_v14_7_dsc(handle) && out->dsc_rgb.score >= 0) {
+		best_color_mode = out->dsc_rgb.id;
+		out->dsc = true;
+	}
+#endif
 
 	trace_iomfb_parse_mode_success(id, &horiz, &vert, best_color_mode,
 				       is_virtual, *score);

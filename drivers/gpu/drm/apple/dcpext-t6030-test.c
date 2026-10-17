@@ -319,7 +319,35 @@ static void dcpext_link_refusals_test(struct kunit *test)
 			-EMSGSIZE);
 }
 
+/* A route whose PHY reports HBR3 (every T6030 ATC). */
+static void dcpext_link_hdmi_hbr3_test(struct kunit *test)
+{
+	struct dcpext_link link = link_routed(4);
+	struct dcpext_link_op op;
+	u8 data[32] = {}, reply[32];
+
+	link.rate_max = DCPEXT_RATE_HBR3;
+	/* Callback 7 reports HBR3. */
+	KUNIT_ASSERT_EQ(test, link_cb(test, &link, 7, data, 32, reply, &op, true), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(reply + 16), DCPEXT_RATE_HBR3);
+	/* Callback 9 programs HBR3 and parks the crossbar first. */
+	put_unaligned_le32(DCPEXT_RATE_HBR3, data + 16);
+	KUNIT_ASSERT_EQ(test, link_cb(test, &link, 9, data, 32, reply, &op, true), 0);
+	KUNIT_EXPECT_EQ(test, op.hw, DCPEXT_HW_RATE);
+	KUNIT_EXPECT_EQ(test, op.value, DCPEXT_RATE_HBR3);
+	KUNIT_EXPECT_EQ(test, link.rate, DCPEXT_RATE_HBR3);
+	KUNIT_EXPECT_FALSE(test, link.xbar_up);
+	/* A PHY that reports no rate: HBR2, and HBR3 is refused. */
+	link = link_routed(4);
+	memset(data, 0, sizeof(data));
+	KUNIT_ASSERT_EQ(test, link_cb(test, &link, 7, data, 32, reply, &op, true), 0);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(reply + 16), DCPEXT_RATE_HBR2);
+	put_unaligned_le32(DCPEXT_RATE_HBR3, data + 16);
+	KUNIT_EXPECT_EQ(test, dcpext_link_plan(&link, 9, data, 32, &op), -EINVAL);
+}
+
 static struct kunit_case dcpext_link_cases[] = {
+	KUNIT_CASE(dcpext_link_hdmi_hbr3_test),
 	KUNIT_CASE(dcpext_link_pin_c_training_test),
 	KUNIT_CASE(dcpext_link_pin_d_test),
 	KUNIT_CASE(dcpext_link_dpms_test),
@@ -488,7 +516,7 @@ static void oss_knum(struct oss *o, const char *key, u64 value)
 /* A colour element as fw14 publishes it; score < 0 omits Score (virtual). */
 struct fix_color {
 	u32 id;
-	bool virtual;
+	bool virtual, supports_dsc;
 	s64 score;
 	u32 depth, encoding, range, eotf, colorimetry;
 };
@@ -543,7 +571,7 @@ static void fix_color(struct oss *o, const struct fix_color *c)
 	oss_knum(o, "DynamicRange", c->range);
 	oss_knum(o, "EOTF", c->eotf);
 	oss_knum(o, "Colorimetry", c->colorimetry);
-	oss_knum(o, "SupportsDSC", 0);
+	oss_knum(o, "SupportsDSC", c->supports_dsc);
 	oss_knum(o, "StandardType", 2);
 	if (metadata) {
 		/* Nested metadata the selection skips. */
@@ -636,12 +664,24 @@ static const struct fix_color philips_colors[] = {
 
 #define CEA_1080_H { 1920, 2200, 88, 44, 148, 1, 0, 4423680 }
 
-/* The Sony TV's admissible colours: 8-bit sRGB, AdobeRGB, 10-bit sRGB. */
+/*
+ * The Sony TV's admissible colours: 8-bit sRGB, AdobeRGB, 10-bit sRGB, each
+ * taken compressed by the TV (SupportsDSC 1, as published on the HDMI port).
+ */
 static const struct fix_color sony_colors[] = {
-	{ .id = 202, .score = 242999, .depth = 8, .colorimetry = 10 },
-	{ .id = 204, .score = 242999, .depth = 8, .range = 1, .colorimetry = 10 },
+	{ .id = 202, .score = 242999, .depth = 8, .colorimetry = 10, .supports_dsc = true },
+	{ .id = 204, .score = 242999, .depth = 8, .range = 1, .colorimetry = 10,
+	  .supports_dsc = true },
 	{ .id = 5, .virtual = true, .score = -1, .depth = 8, .encoding = 3, .range = 1,
 	  .colorimetry = 1 },
+	{ .id = 203, .score = 244999, .depth = 8, .colorimetry = 13, .supports_dsc = true },
+	{ .id = 211, .score = 442999, .depth = 10, .colorimetry = 10, .supports_dsc = true },
+};
+
+/* The same colours from a sink path without DSC (SupportsDSC 0). */
+static const struct fix_color sony_colors_no_dsc[] = {
+	{ .id = 202, .score = 242999, .depth = 8, .colorimetry = 10 },
+	{ .id = 204, .score = 242999, .depth = 8, .range = 1, .colorimetry = 10 },
 	{ .id = 203, .score = 244999, .depth = 8, .colorimetry = 13 },
 	{ .id = 211, .score = 442999, .depth = 10, .colorimetry = 10 },
 };
@@ -732,17 +772,24 @@ static void *build_catalog(struct kunit *test, const struct fix_timing *t,
 	return o.buf;
 }
 
-static struct dcp_display_mode *catalog_modes(struct kunit *test, const void *blob,
-					      size_t size, unsigned int *count)
+static struct dcp_display_mode *catalog_parse(struct kunit *test, const void *blob,
+					      size_t size, unsigned int *count, bool dsc)
 {
 	struct dcp_display_mode *modes;
 	struct dcp_parse_ctx ctx;
 
 	KUNIT_ASSERT_EQ(test, parse(blob, size, &ctx), 0);
 	ctx.v14_7_rgb8 = true;
+	ctx.v14_7_dsc = dsc;
 	modes = enumerate_modes(&ctx, count, 0, 0, 0, false, true);
 	KUNIT_ASSERT_FALSE(test, IS_ERR_OR_NULL(modes));
 	return modes;
+}
+
+static struct dcp_display_mode *catalog_modes(struct kunit *test, const void *blob,
+					      size_t size, unsigned int *count)
+{
+	return catalog_parse(test, blob, size, count, false);
 }
 
 static const struct dcp_display_mode *find_timing(const struct dcp_display_mode *modes,
@@ -805,7 +852,7 @@ static void dcpext_catalog_fw14_shape_test(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, find_timing(modes, count, 94));
 
 	/* Four lanes of HBR2: 4K60 fits; 4096 wide and 23.976 Hz do not. */
-	kept = dcpext_catalog_filter(modes, count, 4, &rejected);
+	kept = dcpext_catalog_filter(modes, count, 4, 0, &rejected);
 	KUNIT_EXPECT_EQ(test, kept, 6);
 	KUNIT_EXPECT_EQ(test, rejected, 2);
 	KUNIT_EXPECT_NULL(test, find_timing(modes, kept, 173));
@@ -829,7 +876,7 @@ static void dcpext_catalog_budget_test(struct kunit *test)
 
 	blob = build_catalog(test, catalog, ARRAY_SIZE(catalog), &size);
 	modes = catalog_modes(test, blob, size, &count);
-	kept = dcpext_catalog_filter(modes, count, 2, &rejected);
+	kept = dcpext_catalog_filter(modes, count, 2, 0, &rejected);
 	KUNIT_EXPECT_EQ(test, kept, 5);
 	KUNIT_EXPECT_EQ(test, rejected, 3);
 	KUNIT_EXPECT_NULL(test, find_timing(modes, kept, 167));
@@ -840,7 +887,18 @@ static void dcpext_catalog_budget_test(struct kunit *test)
 		preferred += !!(modes[i].mode.type & DRM_MODE_TYPE_PREFERRED);
 	KUNIT_EXPECT_EQ(test, preferred, 1);
 	/* No route: nothing fits. */
-	KUNIT_EXPECT_EQ(test, dcpext_catalog_filter(modes, kept, 0, &rejected), 0);
+	KUNIT_EXPECT_EQ(test, dcpext_catalog_filter(modes, kept, 0, 0, &rejected), 0);
+	kfree(modes);
+
+	/* Two lanes of HBR3 (12.96 Gb/s) carry 4K60 (14.26 Gb/s) neither. */
+	modes = catalog_modes(test, blob, size, &count);
+	kept = dcpext_catalog_filter(modes, count, 2, DCPEXT_RATE_HBR3, &rejected);
+	KUNIT_EXPECT_NULL(test, find_timing(modes, kept, 167));
+	kfree(modes);
+	/* Four lanes of HBR3 do, as four of HBR2. */
+	modes = catalog_modes(test, blob, size, &count);
+	kept = dcpext_catalog_filter(modes, count, 4, DCPEXT_RATE_HBR3, &rejected);
+	KUNIT_EXPECT_NOT_NULL(test, find_timing(modes, kept, 167));
 	kfree(modes);
 }
 
@@ -856,7 +914,7 @@ static void dcpext_catalog_preferred_test(struct kunit *test)
 	blob = build_catalog(test, catalog, 2, &size);
 	modes = catalog_modes(test, blob, size, &count);
 	KUNIT_ASSERT_EQ(test, count, 2);
-	kept = dcpext_catalog_filter(modes, count, 2, &rejected);
+	kept = dcpext_catalog_filter(modes, count, 2, 0, &rejected);
 	KUNIT_EXPECT_EQ(test, kept, 2);
 	m = find_timing(modes, kept, 60);
 	KUNIT_ASSERT_NOT_NULL(test, m);
@@ -908,12 +966,78 @@ static void dcpext_catalog_color_tie_test(struct kunit *test)
 	kfree(modes);
 }
 
+/*
+ * DSC: Sony 164 (2160p120, 1188 MHz) has only DSC-required colours. It is
+ * admitted with its 8-bit sRGB colour when the sink takes it compressed and
+ * 8 bpp fits the lanes less FEC: four lanes of HBR2 (pin C) or HBR3 (the
+ * HDMI port), not two of HBR2 (pin D). 4K60 stays uncompressed.
+ */
+static void dcpext_catalog_dsc_test(struct kunit *test)
+{
+	struct fix_timing sony[] = { catalog[4], catalog[6] };
+	const struct dcp_display_mode *m;
+	struct dcp_display_mode *modes;
+	unsigned int count, kept, rejected;
+	size_t size;
+	void *blob;
+
+	blob = build_catalog(test, sony, ARRAY_SIZE(sony), &size);
+	modes = catalog_parse(test, blob, size, &count, true);
+	KUNIT_ASSERT_EQ(test, count, 2);
+	m = find_timing(modes, count, 164);
+	KUNIT_ASSERT_NOT_NULL(test, m);
+	KUNIT_EXPECT_TRUE(test, m->dsc);
+	KUNIT_EXPECT_EQ(test, m->color_mode_id, 202);
+	KUNIT_EXPECT_EQ(test, m->mode.clock, 1188000);
+	m = find_timing(modes, count, 167);
+	KUNIT_ASSERT_NOT_NULL(test, m);
+	KUNIT_EXPECT_FALSE(test, m->dsc);
+	KUNIT_EXPECT_EQ(test, m->color_mode_id, 202);
+
+	kept = dcpext_catalog_filter(modes, count, 4, DCPEXT_RATE_HBR2, &rejected);
+	KUNIT_EXPECT_EQ(test, kept, 2);
+	KUNIT_EXPECT_EQ(test, rejected, 0);
+	kfree(modes);
+	modes = catalog_parse(test, blob, size, &count, true);
+	kept = dcpext_catalog_filter(modes, count, 4, DCPEXT_RATE_HBR3, &rejected);
+	KUNIT_EXPECT_NOT_NULL(test, find_timing(modes, kept, 164));
+	kfree(modes);
+	/* Pin D: 1188 MHz at 8 bpp is 9.5 Gb/s, over 8.64 less FEC; 4K60 too. */
+	modes = catalog_parse(test, blob, size, &count, true);
+	kept = dcpext_catalog_filter(modes, count, 2, DCPEXT_RATE_HBR2, &rejected);
+	KUNIT_EXPECT_EQ(test, kept, 0);
+	KUNIT_EXPECT_EQ(test, rejected, 2);
+	kfree(modes);
+
+	/* A sink path without DSC: 164 is refused, 167 unchanged. */
+	sony[0].colors = sony[1].colors = sony_colors_no_dsc;
+	sony[0].ncolors = sony[1].ncolors = ARRAY_SIZE(sony_colors_no_dsc);
+	blob = build_catalog(test, sony, ARRAY_SIZE(sony), &size);
+	modes = catalog_parse(test, blob, size, &count, true);
+	KUNIT_EXPECT_EQ(test, count, 1);
+	KUNIT_EXPECT_NULL(test, find_timing(modes, count, 164));
+	KUNIT_EXPECT_NOT_NULL(test, find_timing(modes, count, 167));
+	kfree(modes);
+
+	/* An unsafe DSC colour is never taken (202 is the only full-range sRGB). */
+	sony[0].colors = sony[1].colors = sony_colors;
+	sony[0].ncolors = sony[1].ncolors = ARRAY_SIZE(sony_colors);
+	sony[1].unsafe = sony_dsc;
+	sony[1].nunsafe = 1;
+	blob = build_catalog(test, sony, ARRAY_SIZE(sony), &size);
+	modes = catalog_parse(test, blob, size, &count, true);
+	KUNIT_EXPECT_EQ(test, count, 1);
+	KUNIT_EXPECT_NULL(test, find_timing(modes, count, 164));
+	kfree(modes);
+}
+
 static struct kunit_case dcpext_catalog_cases[] = {
 	KUNIT_CASE(dcpext_catalog_fw14_shape_test),
 	KUNIT_CASE(dcpext_catalog_budget_test),
 	KUNIT_CASE(dcpext_catalog_preferred_test),
 	KUNIT_CASE(dcpext_catalog_profile_scope_test),
 	KUNIT_CASE(dcpext_catalog_color_tie_test),
+	KUNIT_CASE(dcpext_catalog_dsc_test),
 	{}
 };
 

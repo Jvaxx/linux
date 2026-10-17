@@ -32,11 +32,20 @@
  *
  * The session is never stopped once RUN: unplugging keeps it, and a protocol
  * failure latches this controller only (iomfb_v14_7_fail()).
+ *
+ * The built-in HDMI port (DCPEXT0) has one fixed route instead: its own DP
+ * PHY (ATC3, four lanes up to HBR3), the crossbar's selector 0 and the HDMI
+ * converter, whose HPD line drives the same lifecycle (debounced HPD high:
+ * route up, then the sink connection; low: the release, then the route
+ * down). The firmware needs the converter service (DPTX group 8 command 9)
+ * every 100 ms while it holds the sink.
  */
 
 #include <linux/bitfield.h>
 #include <linux/cleanup.h>
 #include <linux/debugfs.h>
+#include <linux/gpio/consumer.h>
+#include <linux/interrupt.h>
 #include <linux/iommu.h>
 #include <linux/module.h>
 #include <linux/mux/consumer.h>
@@ -79,15 +88,34 @@
 #define DCPEXT_SINK_MS		5000
 #define DCPEXT_SETTLE_MS	500
 
+/*
+ * Built-in HDMI: the converter's HPD is high for a sink after 400 ms, gone
+ * after 2 s low (its short low pulses are interrupts for the converter
+ * service, not removal), and the firmware needs the converter service every
+ * 100 ms from REQUEST_DISPLAY to the release: without it, it never learns of
+ * converter events (sink metadata, FRL readiness).
+ */
+#define DCPEXT_HDMI_HPD_HIGH_MS	400
+#define DCPEXT_HDMI_HPD_LOW_MS	2000
+#define DCPEXT_HDMI_SERVICE_MS	100
+
 /* AV EDID object: 8-byte OSSerialize prefix + 1024 bytes. */
 #define DCPEXT_EDID_CAPACITY	1032
 #define DCPEXT_EDID_MAX		1024
 #define DCPEXT_EDID_OBJECT	(64 + 48 + DCPEXT_EDID_CAPACITY)
 
+/* The built-in HDMI output: its DP PHY, the converter's HPD line, HDMI-A. */
+static bool dcp_t6030_ext_hdmi(struct device_node *np)
+{
+	return of_property_match_string(np, "apple,connector-type", "HDMI-A") >= 0 &&
+	       of_property_match_string(np, "phy-names", "dp-phy") >= 0 &&
+	       of_property_present(np, "hdmi-hpd-gpios");
+}
+
 /*
  * The handoff, from the device tree alone: the board, the qualified 14.7.0
  * image, one of the two controllers' coprocessor windows, the firmware
- * reservations and the Type-C routes.
+ * reservations and the outputs: Type-C routes or the built-in HDMI port.
  */
 static int dcp_t6030_ext_handoff(struct device_node *np, u64 *coproc)
 {
@@ -116,7 +144,7 @@ static int dcp_t6030_ext_handoff(struct device_node *np, u64 *coproc)
 	if (of_count_phandle_with_args(np, "memory-region", NULL) <= 0)
 		return -ENOENT;
 	routes = of_get_child_by_name(np, "typec-routes");
-	if (!routes)
+	if (!routes && !dcp_t6030_ext_hdmi(np))
 		return -ENOENT;
 	*coproc = res.start;
 	return 0;
@@ -238,10 +266,11 @@ int dcpext_link_plan(const struct dcpext_link *link, u32 index,
 		return 0;
 	case DPTX_APCALL_SET_LINK_RATE:
 		value = dcpext_get32(data, DCPEXT_CB_VALUE);
-		/* No down-spread; RBR, HBR and HBR2 only on USB-C. */
+		/* No down-spread; RBR, HBR and HBR2, HBR3 where the PHY has it. */
 		if (dcpext_get32(data, DCPEXT_CB_VALUE2) ||
 		    (value && value != DCPEXT_RATE_RBR && value != DCPEXT_RATE_HBR &&
-		     value != DCPEXT_RATE_HBR2))
+		     value != DCPEXT_RATE_HBR2 &&
+		     (value != DCPEXT_RATE_HBR3 || link->rate_max != DCPEXT_RATE_HBR3)))
 			return -EINVAL;
 		op->hw = DCPEXT_HW_RATE;
 		op->value = value;
@@ -335,7 +364,7 @@ int dcpext_link_reply(struct dcpext_link *link, u32 index,
 			link->inactive = false;
 		break;
 	case DPTX_APCALL_GET_MAX_LINK_RATE:
-		put_unaligned_le32(DCPEXT_RATE_MAX, r + DCPEXT_CB_VALUE);
+		put_unaligned_le32(link->rate_max ?: DCPEXT_RATE_MAX, r + DCPEXT_CB_VALUE);
 		break;
 	case DPTX_APCALL_GET_LINK_RATE:
 		put_unaligned_le32(link->rate, r + DCPEXT_CB_VALUE);
@@ -426,16 +455,26 @@ static u64 dcpext_rate16(const struct drm_display_mode *mode)
 	return total ? div64_u64((u64)mode->clock * 1000 * 65536 + total / 2, total) : 0;
 }
 
+/* Payload of one lane at a link rate code: 0.27 Gb/s per unit, 8b/10b. */
+static u64 dcpext_lane_kbps(u32 rate)
+{
+	return (u64)rate * 270000 * 8 / 10;
+}
+
 /*
  * Keep the timings the routed link can carry uncompressed (24 bpp within the
- * lanes' HBR2 payload) and the external pipe is qualified with (at most
- * 3840x2160, 24 to 120 Hz).  If the firmware's best timing goes, the largest,
- * then fastest, remaining one becomes preferred.
+ * lanes' payload at the link's highest rate @rate, 0 for HBR2)
+ * or compressed by the firmware (a DSC-required colour the sink takes
+ * compressed, at least DCPEXT_DSC_MIN_BPP within the payload less FEC), and
+ * the external pipe is qualified with (at most 3840x2160, 24 to 120 Hz). If
+ * the firmware's best timing goes, the largest, then fastest, remaining one
+ * becomes preferred.
  */
 unsigned int dcpext_catalog_filter(struct dcp_display_mode *modes, unsigned int count,
-				   u32 lanes, unsigned int *rejected)
+				   u32 lanes, u32 rate, unsigned int *rejected)
 {
-	u64 budget = (u64)lanes * DCPEXT_LANE_KBPS;
+	u64 budget = lanes * dcpext_lane_kbps(rate ?: DCPEXT_RATE_MAX);
+	u64 dsc_budget = budget - budget * DCPEXT_FEC_PERMILLE / 1000;
 	unsigned int i, kept = 0, best = 0;
 	bool preferred = false;
 
@@ -443,9 +482,11 @@ unsigned int dcpext_catalog_filter(struct dcp_display_mode *modes, unsigned int 
 	for (i = 0; i < count; i++) {
 		const struct drm_display_mode *m = &modes[i].mode;
 		u64 rate = dcpext_rate16(m);
+		bool fits = modes[i].dsc ?
+			(u64)m->clock * DCPEXT_DSC_MIN_BPP <= dsc_budget :
+			(u64)m->clock * DCPEXT_WIRE_BPP <= budget;
 
-		if ((u64)m->clock * DCPEXT_WIRE_BPP > budget ||
-		    m->hdisplay > DCPEXT_MAX_WIDTH || m->vdisplay > DCPEXT_MAX_HEIGHT ||
+		if (!fits || m->hdisplay > DCPEXT_MAX_WIDTH || m->vdisplay > DCPEXT_MAX_HEIGHT ||
 		    rate < DCPEXT_MIN_RATE_16 || rate > DCPEXT_MAX_RATE_16) {
 			(*rejected)++;
 			continue;
@@ -597,6 +638,8 @@ static int dcp_ext_link_hw(struct dcp_ext_v14_7 *ext, struct dcpext_link_op *op)
 	}
 }
 
+static void dcp_ext_update_connector(struct dcp_ext_v14_7 *ext);
+
 /*
  * A DPTX callback of the external profile (EP 0x2a, AFK receive worker).  The
  * callback index decides; the group is only logged.  A refused callback gets
@@ -609,7 +652,7 @@ int dcp_ext_v14_7_dptx_call(struct apple_epic_service *service, u16 group, u32 c
 	struct apple_dcp *dcp = service->ep->dcp;
 	struct dcp_ext_v14_7 *ext = dcp_ext(dcp);
 	struct dcpext_link_op op;
-	bool linked = false;
+	bool linked = false, was_inactive, inactive;
 	int ret;
 
 	if (command < ARRAY_SIZE(ext->callbacks))
@@ -617,6 +660,7 @@ int dcp_ext_v14_7_dptx_call(struct apple_epic_service *service, u16 group, u32 c
 	dev_dbg(dcp->dev, "DPTX callback %u:%u (%zu bytes)\n", group, command, size);
 
 	scoped_guard(mutex, &ext->link_lock) {
+		was_inactive = ext->link.inactive;
 		ret = dcpext_link_plan(&ext->link, command, data, size, &op);
 		if (ret) {
 			ext->callbacks_refused++;
@@ -633,9 +677,20 @@ int dcp_ext_v14_7_dptx_call(struct apple_epic_service *service, u16 group, u32 c
 		}
 		ret = dcpext_link_reply(&ext->link, command, &op, data, size, reply, room);
 		linked = ext->link.lanes && ext->link.rate;
+		inactive = ext->link.inactive;
 	}
 	if (ret)
 		return ret;
+
+	/*
+	 * An inactive sink (a TV in standby or on another input) is reported
+	 * disconnected until its link is up again.
+	 */
+	if (inactive != was_inactive) {
+		dev_info(dcp->dev, inactive ? "DPTX sink inactive: disconnected until it is active again\n" :
+					      "DPTX sink active again\n");
+		dcp_ext_update_connector(ext);
+	}
 
 	switch (command) {
 	case DPTX_APCALL_SET_LINK_RATE:
@@ -649,9 +704,6 @@ int dcp_ext_v14_7_dptx_call(struct apple_epic_service *service, u16 group, u32 c
 		if (linked)
 			dev_info(dcp->dev, "DPTX link up: %u lanes at %#x\n",
 				 ext->link.lanes, ext->link.rate);
-		break;
-	case DPTX_APCALL_INACTIVE_SINK_DETECTED:
-		dev_info(dcp->dev, "DPTX sink inactive: presents held until the link is up\n");
 		break;
 	case DPTX_APCALL_SET_TILED_DISPLAY_HINTS:
 		if (size >= 68)
@@ -770,7 +822,9 @@ static u64 dcp_ext_generation(struct dcp_ext_v14_7 *ext, bool *high)
 
 /*
  * The connector reports the sink once the firmware has its HPD and the
- * sink's catalog of this HPD generation is admitted.
+ * sink's catalog of this HPD generation is admitted, unless the sink of a
+ * powered display is inactive (DPTX callback 20 until its link is up or it is
+ * described again; a display powered off has no link to keep).
  */
 static void dcp_ext_update_connector(struct dcp_ext_v14_7 *ext)
 {
@@ -782,7 +836,9 @@ static void dcp_ext_update_connector(struct dcp_ext_v14_7 *ext)
 
 	connected = high && READ_ONCE(ext->hpd_delivered) && READ_ONCE(ext->catalog_valid) &&
 		    READ_ONCE(ext->catalog_generation) == generation &&
-		    READ_ONCE(dcp->nr_modes) && !READ_ONCE(dcp->crashed);
+		    READ_ONCE(dcp->nr_modes) &&
+		    !(READ_ONCE(ext->link.inactive) && READ_ONCE(ext->display_on)) &&
+		    !READ_ONCE(dcp->crashed);
 	if (!connected && connector)
 		WRITE_ONCE(connector->edid_invalidation_pending, true);
 	action = dcp_mode_hotplug(&dcp->mode_state, connected,
@@ -812,18 +868,26 @@ void dcp_ext_v14_7_catalog(struct apple_dcp *dcp, const void *blob, u32 size)
 {
 	struct dcp_ext_v14_7 *ext = dcp_ext(dcp);
 	struct dcp_display_mode *modes = NULL;
-	unsigned int count = 0, kept = 0, rejected = 0;
+	unsigned int count = 0, kept = 0, rejected = 0, dsc = 0, i;
 	struct dcp_parse_ctx ctx;
-	u32 lanes;
+	u32 lanes, rate;
 	int ret;
 
-	scoped_guard(mutex, &ext->link_lock)
+	scoped_guard(mutex, &ext->link_lock) {
 		lanes = ext->link.lanes_max;
+		rate = ext->link.rate_max;
+	}
 	if (blob) {
 		ret = parse(blob, size, &ctx);
 		if (!ret) {
 			ctx.dcp = dcp;
 			ctx.v14_7_rgb8 = true;
+			/*
+			 * DSC-required colours the sink takes compressed, on
+			 * either port, within the link's budget: the firmware
+			 * compresses them itself.
+			 */
+			ctx.v14_7_dsc = true;
 			modes = enumerate_modes(&ctx, &count, dcp->width_mm, dcp->height_mm,
 						0, false, true);
 			if (IS_ERR(modes)) {
@@ -835,13 +899,35 @@ void dcp_ext_v14_7_catalog(struct apple_dcp *dcp, const void *blob, u32 size)
 			dev_warn(dcp->dev, "TimingElements (%u bytes) not admitted: %d\n",
 				 size, ret);
 		if (modes)
-			kept = dcpext_catalog_filter(modes, count, lanes, &rejected);
-		dev_info(dcp->dev, "TimingElements: %u timings admitted, %u over the %u-lane budget or limits\n",
-			 kept, rejected, lanes);
+			kept = dcpext_catalog_filter(modes, count, lanes, rate, &rejected);
+		for (i = 0; i < kept; i++)
+			dsc += modes[i].dsc;
+		dev_info(dcp->dev, "TimingElements: %u timings admitted (%u with DSC), %u over the %u-lane budget or limits\n",
+			 kept, dsc, rejected, lanes);
 	}
 	if (!kept) {
 		kfree(modes);
 		modes = NULL;
+	}
+	/*
+	 * The firmware withdrew the sink's modes (D107), as it does when it
+	 * re-plugs the sink by itself: the mode it had set is gone with them,
+	 * and its display is off. The next modeset sets the mode again.
+	 */
+	if (!blob)
+		WRITE_ONCE(ext->mode_lost, true);
+	/*
+	 * A sink the firmware describes again is active: it publishes a
+	 * catalog only for a sink it reads. Its link trains with the next
+	 * modeset (a display powered off meanwhile has no link to train).
+	 */
+	if (kept) {
+		scoped_guard(mutex, &ext->link_lock) {
+			if (ext->link.inactive) {
+				ext->link.inactive = false;
+				dev_info(dcp->dev, "DPTX sink described again: active\n");
+			}
+		}
 	}
 	dcp_ext_publish_modes(dcp, modes, kept);
 	WRITE_ONCE(ext->catalog_admitted, kept);
@@ -978,7 +1064,53 @@ failed:
 	return ret ?: -EIO;
 }
 
+/* ---- Built-in HDMI converter service ---- */
+
+/*
+ * InterruptRequestOccurred (DPTX group 8, command 9) every 100 ms while the
+ * firmware holds the sink, one outstanding with its 1 s reply bound. It runs
+ * beside every other DPTX and IOMFB call, which do not wait for it.
+ */
+static void dcp_ext_service_work(struct work_struct *work)
+{
+	struct dcp_ext_v14_7 *ext = container_of(to_delayed_work(work), struct dcp_ext_v14_7,
+						 service_work);
+	struct apple_dcp *dcp = ext->dcp;
+	int ret;
+
+	if (!READ_ONCE(ext->service_armed) || READ_ONCE(dcp->crashed))
+		return;
+	ret = dcp_ext_dptx_command(dcp, DCPEXT_DPTX_IRQ, 0);
+	if (ret) {
+		ext->service_failed++;
+		dev_warn_ratelimited(dcp->dev, "HDMI converter service: %d\n", ret);
+	} else {
+		ext->service_ok++;
+	}
+	if (READ_ONCE(ext->service_armed))
+		queue_delayed_work(system_freezable_wq, &ext->service_work,
+				   msecs_to_jiffies(DCPEXT_HDMI_SERVICE_MS));
+}
+
+/* From REQUEST_DISPLAY on, on the built-in HDMI route. */
+static void dcp_ext_service_arm(struct dcp_ext_v14_7 *ext)
+{
+	if (!ext->fixed || ext->route != ext->fixed || READ_ONCE(ext->service_armed))
+		return;
+	WRITE_ONCE(ext->service_armed, true);
+	mod_delayed_work(system_freezable_wq, &ext->service_work, 0);
+}
+
+/* No service request while the sink is released (or the session suspended). */
+static void dcp_ext_service_disarm(struct dcp_ext_v14_7 *ext)
+{
+	WRITE_ONCE(ext->service_armed, false);
+	cancel_delayed_work_sync(&ext->service_work);
+}
+
 /* ---- Sink connection ---- */
+
+static void dcp_ext_av_close(struct dcp_ext_v14_7 *ext);
 
 /* HPD low and RELEASE_DISPLAY for what the firmware holds; firmware cb 1 stops the link. */
 static int dcp_ext_release_locked(struct dcp_ext_v14_7 *ext)
@@ -987,6 +1119,12 @@ static int dcp_ext_release_locked(struct dcp_ext_v14_7 *ext)
 	int ret;
 
 	lockdep_assert_held(&dcp->external_lock);
+	/*
+	 * The AV client goes first: the firmware completes the HPD low only once
+	 * the sink's AV device has no client left.
+	 */
+	dcp_ext_av_close(ext);
+	dcp_ext_service_disarm(ext);
 	if (ext->dptx == DCPEXT_DPTX_HPD) {
 		ret = dcp_ext_command(ext, DCPEXT_DPTX_HPD_LOW, 0);
 		if (ret)
@@ -1037,6 +1175,16 @@ static int dcp_ext_link_locked(struct dcp_ext_v14_7 *ext, u64 generation)
 	if (!dptx_service_available(&dcp->dptxport[0]))
 		return -ENODEV;
 
+	/*
+	 * The firmware still holds an earlier sink: its release failed at the
+	 * HPD low (the next HPD edge retries it). Release it before this one.
+	 */
+	if (ext->dptx != DCPEXT_DPTX_NONE && ext->dptx_generation != generation) {
+		ret = dcp_ext_release_locked(ext);
+		if (ret)
+			goto failed;
+	}
+
 	if (ext->dptx != DCPEXT_DPTX_HPD) {
 		scoped_guard(mutex, &ext->link_lock) {
 			if (!ext->route)
@@ -1061,6 +1209,7 @@ static int dcp_ext_link_locked(struct dcp_ext_v14_7 *ext, u64 generation)
 			if (ret)
 				goto failed;
 			ext->dptx = DCPEXT_DPTX_CONNECTED;
+			ext->dptx_generation = generation;
 		}
 		if (ext->dptx == DCPEXT_DPTX_CONNECTED) {
 			ret = dcp_ext_command(ext, DCPEXT_DPTX_REQUEST, 0);
@@ -1068,6 +1217,8 @@ static int dcp_ext_link_locked(struct dcp_ext_v14_7 *ext, u64 generation)
 				goto failed;
 			ext->dptx = DCPEXT_DPTX_REQUESTED;
 		}
+		/* The converter service runs from REQUEST on, before HPD. */
+		dcp_ext_service_arm(ext);
 		/* An HPD low meanwhile: its disconnect releases what is held. */
 		if (dcp_ext_generation(ext, NULL) != generation)
 			return -ECANCELED;
@@ -1082,6 +1233,8 @@ static int dcp_ext_link_locked(struct dcp_ext_v14_7 *ext, u64 generation)
 		WRITE_ONCE(ext->hpd_delivered, true);
 		dev_info(dcp->dev, "sink HPD delivered: target %#x, %u lanes\n", target,
 			 ext->link.lanes_max);
+		/* The AV client again, if its instance outlived the last release. */
+		queue_work(system_freezable_wq, &ext->av_work);
 	}
 
 	if (!dcp->v14_7->opened) {
@@ -1215,9 +1368,39 @@ void dcp_ext_v14_7_irq_hpd(struct apple_dcp *dcp)
 
 /* ---- Route activation ---- */
 
+/* A link rate code from a PHY's rate in Mb/s per lane; 0 if it has none. */
+static u32 dcpext_rate_code(unsigned int link_rate)
+{
+	return link_rate / 270;
+}
+
 /*
- * Activation: the PHY's DP hold freezes the negotiated mode and orientation,
- * then the crossbar connection comes up at rate 0.  A PHY not yet in its DP
+ * The fixed HDMI route starts with AUX on and HBR on all four lanes before
+ * its crossbar comes up; the firmware then trains the rate it wants.
+ */
+static int dcp_ext_fixed_prepare(struct dcp_ext_v14_7 *ext, struct apple_dcp_typec_route *route)
+{
+	union phy_configure_opts opts = {};
+	int ret;
+
+	lockdep_assert_held(&ext->link_lock);
+	ret = phy_set_mode_ext(route->phy, PHY_MODE_DP, 0);
+	/* An incomplete AUX power-up is undone like a complete one. */
+	ext->link.aux = true;
+	if (ret)
+		return ret;
+	opts.dp.link_rate = 2700;
+	opts.dp.set_rate = 1;
+	ret = phy_configure(route->phy, &opts);
+	if (!ret)
+		ext->link.rate = DCPEXT_RATE_HBR;
+	return ret;
+}
+
+/*
+ * Activation: the PHY's DP hold freezes the negotiated mode and orientation
+ * (on the fixed HDMI route: the PHY's power-up), then the crossbar
+ * connection comes up at rate 0 (HDMI: at HBR).  A PHY not yet in its DP
  * mode is retried by the Type-C driver; after the hold, a crossbar error
  * keeps it (hardware was written).
  */
@@ -1243,9 +1426,20 @@ int dcp_ext_v14_7_route_select(struct apple_dcp_typec_route *route)
 			return -EAGAIN;
 		}
 		ext->route = route;
-		ext->link = (struct dcpext_link) { .lanes_max = opts.dp.lanes };
-		dev_info(dcp->dev, "Type-C route of ATC%u: %u DP lanes held, crossbar input %u\n",
-			 route->dptx_phy, opts.dp.lanes, route->mux_index);
+		ext->link = (struct dcpext_link) {
+			.lanes_max = opts.dp.lanes,
+			.rate_max = dcpext_rate_code(opts.dp.link_rate),
+		};
+		dev_info(dcp->dev, "%s route of ATC%u: %u DP lanes held, crossbar input %u\n",
+			 route == ext->fixed ? "HDMI" : "Type-C", route->dptx_phy, opts.dp.lanes,
+			 route->mux_index);
+		if (route == ext->fixed) {
+			ret = dcp_ext_fixed_prepare(ext, route);
+			if (ret) {
+				dev_err(dcp->dev, "HDMI link not prepared: %d\n", ret);
+				return ret;
+			}
+		}
 	}
 	if (ext->xbar_selected)
 		return 0;
@@ -1344,33 +1538,141 @@ int dcp_ext_v14_7_route_deselect(struct apple_dcp_typec_route *route)
 	}
 	ext->route = NULL;
 	ext->link = (struct dcpext_link) {};
-	dev_info(dcp->dev, "Type-C route of ATC%u released\n", route->dptx_phy);
+	dev_info(dcp->dev, "%s route of ATC%u released\n",
+		 route == ext->fixed ? "HDMI" : "Type-C", route->dptx_phy);
+	return 0;
+}
+
+/* ---- The built-in HDMI port: the converter's HPD ---- */
+
+/*
+ * Debounced HPD: high brings the route up (PHY, link at HBR, crossbar) and
+ * connects the sink; low releases the sink, parks and stops the link and
+ * takes the route down. A failure is retried at the next HPD edge.
+ */
+static void dcp_ext_hdmi_hpd_work(struct work_struct *work)
+{
+	struct dcp_ext_v14_7 *ext = container_of(to_delayed_work(work), struct dcp_ext_v14_7,
+						 hpd_work);
+	struct apple_dcp *dcp = ext->dcp;
+	bool high = gpiod_get_value_cansleep(dcp->hdmi_hpd) > 0;
+	int ret;
+
+	if (high == ext->hdmi_hpd || READ_ONCE(dcp->crashed))
+		return;
+	if (high) {
+		ret = dcp_ext_v14_7_route_select(ext->fixed);
+		if (ret) {
+			dev_err(dcp->dev, "HDMI sink present, route not up: %d\n", ret);
+			return;
+		}
+		ext->hdmi_hpd = true;
+		dev_info(dcp->dev, "HDMI sink present\n");
+		dcp_ext_v14_7_connect(dcp);
+		return;
+	}
+
+	ext->hdmi_hpd = false;
+	dev_info(dcp->dev, "HDMI sink gone\n");
+	ret = dcp_ext_v14_7_disconnect(dcp, true);
+	if (!ret) {
+		guard(mutex)(&dcp->external_lock);
+		ret = dcp_ext_v14_7_route_release(ext->fixed);
+	}
+	if (!ret)
+		ret = dcp_ext_v14_7_route_deselect(ext->fixed);
+	if (ret)
+		dev_err(dcp->dev, "HDMI route not released: %d\n", ret);
+}
+
+/*
+ * Both edges of the converter's HPD line restart the debounce. An edge that
+ * leaves the line high while the firmware holds the sink is a converter
+ * pulse: it runs the converter service at once.
+ */
+irqreturn_t dcp_ext_v14_7_hpd_irq(int irq, void *data)
+{
+	struct apple_dcp *dcp = data;
+	struct dcp_ext_v14_7 *ext = dcp_ext(dcp);
+	bool high = gpiod_get_value_cansleep(dcp->hdmi_hpd) > 0;
+
+	ext->hpd_edges++;
+	if (high && READ_ONCE(ext->service_armed)) {
+		ext->service_kicks++;
+		mod_delayed_work(system_freezable_wq, &ext->service_work, 0);
+	}
+	mod_delayed_work(system_freezable_wq, &ext->hpd_work,
+			 msecs_to_jiffies(high ? DCPEXT_HDMI_HPD_HIGH_MS : DCPEXT_HDMI_HPD_LOW_MS));
+	return IRQ_HANDLED;
+}
+
+/* The fixed output of a controller with the HDMI port (bound DRM device). */
+static int dcp_ext_hdmi_init(struct dcp_ext_v14_7 *ext)
+{
+	struct apple_dcp *dcp = ext->dcp;
+	struct apple_dcp_typec_route *route;
+
+	if (ext->fixed || !dcp->fixed_phy || !dcp->xbar || !dcp->hdmi_hpd || !dcp->hdmi_hpd_irq)
+		return 0;
+	route = devm_kzalloc(dcp->dev, sizeof(*route), GFP_KERNEL);
+	if (!route)
+		return -ENOMEM;
+	route->dcp = dcp;
+	route->phy = dcp->fixed_phy;
+	route->xbar = dcp->xbar;
+	route->mux_index = dcp->fixed_mux_index;
+	route->dptx_phy = dcp->fixed_dptx_phy;
+	ext->fixed = route;
 	return 0;
 }
 
 /* ---- AV service and EDID ---- */
 
+/*
+ * The AV service's client: the host opens the published instance (DCPAV Open)
+ * to read the sink's EDID through it, and closes it (DCPAV Close) when it
+ * releases the sink or the firmware terminates the instance. An open client
+ * is one the firmware waits for, up to 10 s, before it removes the instance:
+ * the DPTX controller holds an HPD low's reply until the instance's device
+ * has closed ("timeout while waiting for DCPDPDevice close"), and with it the
+ * sink's release and the next sink.
+ */
 static void dcp_ext_av_work(struct work_struct *work)
 {
 	struct dcp_ext_v14_7 *ext = container_of(work, struct dcp_ext_v14_7, av_work);
 	struct apple_dcp *dcp = ext->dcp;
 	struct apple_epic_service *service;
 	struct apple_connector *connector;
+	u8 reply[32] = {};
 	u64 epoch;
 	int ret;
 
+	guard(mutex)(&ext->av_lock);
 	scoped_guard(mutex, &dcp->dcpavserv.lock) {
-		service = dcp->dcpavserv.enabled ? afk_service_get(dcp->dcpavserv.service) : NULL;
 		epoch = dcp->dcpavserv.epoch;
+		if (ext->av_opened && ext->av_epoch == epoch)
+			return;
+		service = dcp->dcpavserv.enabled ? afk_service_get(dcp->dcpavserv.service) : NULL;
 	}
 	if (!service)
 		return;
-	/* Open: group 4, command 6, 96-byte object; it never gates DPTX. */
-	ret = afk_service_call_timeout(service, 4, 6, NULL, 0, 32, NULL, 0, 32, DCPEXT_RPC_MS);
+	/*
+	 * DCPAV Open: command 4, a zero 32-byte body; the reply carries a
+	 * status at +0 and the opened Boolean at +16. It never gates DPTX.
+	 * (Command 6 is SetVirtualEDIDMode: with the service's interfaces
+	 * present it removes and recreates them, a software unplug of the
+	 * sink.)
+	 */
+	ret = afk_service_call_timeout(service, 0, 4, NULL, 0, 32, reply, sizeof(reply), 0,
+				       DCPEXT_RPC_MS);
+	if (!ret && (get_unaligned_le32(reply) || !get_unaligned_le64(reply + 16)))
+		ret = -EIO;
 	scoped_guard(mutex, &dcp->dcpavserv.lock) {
 		ext->av_result = ret;
+		/* An instance gone meanwhile took its open with it. */
 		if (!ret && dcp->dcpavserv.service == service && dcp->dcpavserv.epoch == epoch) {
 			ext->av_opened = true;
+			ext->av_terminated = false;
 			ext->av_epoch = epoch;
 		}
 	}
@@ -1381,14 +1683,125 @@ static void dcp_ext_av_work(struct work_struct *work)
 		schedule_work(&connector->hotplug_wq);
 }
 
+/*
+ * DCPAV Close (command 5, a zero 16-byte body, status at +0) on the instance
+ * the client opened, and only on it: a removed instance took its open with
+ * it, and its successor is never closed for it. The endpoint
+ * keeps receiving meanwhile: neither lock here is taken on its receive path.
+ */
+static void dcp_ext_av_close(struct dcp_ext_v14_7 *ext)
+{
+	struct apple_dcp *dcp = ext->dcp;
+	struct apple_epic_service *service = NULL;
+	u8 reply[16] = {};
+	int ret;
+
+	guard(mutex)(&ext->av_lock);
+	scoped_guard(mutex, &dcp->dcpavserv.lock) {
+		if (ext->av_opened && ext->av_epoch == dcp->dcpavserv.epoch)
+			service = afk_service_get(dcp->dcpavserv.service);
+		ext->av_opened = false;
+		ext->av_terminated = false;
+	}
+	if (!service)
+		return;
+	ret = afk_service_call_timeout(service, 0, 5, NULL, 0, 16, reply, sizeof(reply), 0,
+				       DCPEXT_RPC_MS);
+	afk_service_put(service);
+	/* Removed while the Close was on its way: nothing is left open. */
+	if (ret == -ENODEV)
+		return;
+	if (!ret && get_unaligned_le32(reply))
+		ret = -EIO;
+	ext->av_closes++;
+	if (ret)
+		dev_err(dcp->dev, "AV service close failed: %d\n", ret);
+	else
+		dev_info(dcp->dev, "AV service closed\n");
+}
+
+static void dcp_ext_av_close_work(struct work_struct *work)
+{
+	dcp_ext_av_close(container_of(work, struct dcp_ext_v14_7, av_close_work));
+}
+
+/*
+ * A report of the AV service (EP 0x28 receive path). Terminate (report
+ * group 2, command 1) on the opened instance: no new use of it, and the
+ * client's Close from a work item, so the endpoint keeps receiving. An
+ * instance never opened has nothing to close, and a REPORT gets no
+ * acknowledgement.
+ */
+void dcp_ext_v14_7_av_report(struct apple_epic_service *service, u32 type,
+			     const void *data, size_t size)
+{
+	struct apple_dcp *dcp = service->ep->dcp;
+	struct dcp_ext_v14_7 *ext = dcp_ext(dcp);
+	const struct epic_service_call *call = data;
+	bool terminate = false;
+
+	if (type != EPIC_SUBTYPE_STD_SERVICE || size < sizeof(*call) ||
+	    le32_to_cpu(call->magic) != EPIC_SERVICE_CALL_MAGIC ||
+	    le16_to_cpu(call->group) != 2 || le32_to_cpu(call->command) != 1)
+		return;
+	scoped_guard(mutex, &dcp->dcpavserv.lock) {
+		if (dcp->dcpavserv.service == service && ext->av_opened &&
+		    ext->av_epoch == dcp->dcpavserv.epoch && !ext->av_terminated) {
+			ext->av_terminated = true;
+			ext->av_terminates++;
+			terminate = true;
+		}
+	}
+	if (!terminate)
+		return;
+	dev_info(dcp->dev, "AV service terminated: closing the client\n");
+	queue_work(system_freezable_wq, &ext->av_close_work);
+}
+
 /* The AV service was published (or re-published after a replug): open it. */
 void dcp_ext_v14_7_av_published(struct apple_dcp *dcp)
 {
 	queue_work(system_freezable_wq, &dcp_ext(dcp)->av_work);
 }
 
-/* The sink's EDID through the opened AV service: group 1, command 7. */
+static const struct drm_edid *dcp_ext_copy_edid(struct apple_epic_service *service);
+
+/*
+ * The sink's EDID through the opened AV service, read once per HPD generation
+ * and service instance: a re-plug inside the firmware keeps it, and later
+ * reconnections take the cached one. A CopyEDID has the firmware report the
+ * sink's physical address again (it sets it, repeats included).
+ */
 const struct drm_edid *dcp_ext_v14_7_read_edid(struct apple_epic_service *service)
+{
+	struct apple_dcp *dcp = service->ep->dcp;
+	struct dcp_ext_v14_7 *ext = dcp_ext(dcp);
+	const struct drm_edid *edid;
+	u64 generation, epoch;
+
+	scoped_guard(mutex, &dcp->dcpavserv.lock) {
+		if (!ext->av_opened || ext->av_terminated || ext->av_epoch != dcp->dcpavserv.epoch)
+			return ERR_PTR(-ENODEV);
+		epoch = ext->av_epoch;
+	}
+	generation = dcp_ext_generation(ext, NULL);
+
+	guard(mutex)(&ext->edid_lock);
+	if (ext->edid && ext->edid_generation == generation && ext->edid_epoch == epoch)
+		return drm_edid_dup(ext->edid);
+
+	edid = dcp_ext_copy_edid(service);
+	if (IS_ERR(edid))
+		return edid;
+	drm_edid_free(ext->edid);
+	ext->edid = drm_edid_dup(edid);
+	ext->edid_generation = generation;
+	ext->edid_epoch = epoch;
+	return edid;
+}
+
+/* CopyEDID: group 1, command 7. */
+static const struct drm_edid *dcp_ext_copy_edid(struct apple_epic_service *service)
 {
 	struct apple_dcp *dcp = service->ep->dcp;
 	struct dcp_ext_v14_7 *ext = dcp_ext(dcp);
@@ -1398,10 +1811,6 @@ const struct drm_edid *dcp_ext_v14_7_read_edid(struct apple_epic_service *servic
 	u32 retcode;
 	int ret;
 
-	scoped_guard(mutex, &dcp->dcpavserv.lock) {
-		if (!ext->av_opened || ext->av_epoch != dcp->dcpavserv.epoch)
-			return ERR_PTR(-ENODEV);
-	}
 	object = kzalloc(DCPEXT_EDID_OBJECT, GFP_KERNEL);
 	if (!object)
 		return ERR_PTR(-ENOMEM);
@@ -1440,10 +1849,15 @@ int dcp_ext_v14_7_init(struct apple_dcp *dcp)
 	ext->stride = 7680;
 	spin_lock_init(&ext->lock);
 	mutex_init(&ext->link_lock);
+	mutex_init(&ext->edid_lock);
+	mutex_init(&ext->av_lock);
 	init_waitqueue_head(&ext->wq);
 	INIT_WORK(&ext->connect_work, dcp_ext_connect_work);
 	INIT_WORK(&ext->irq_work, dcp_ext_irq_work);
 	INIT_WORK(&ext->av_work, dcp_ext_av_work);
+	INIT_WORK(&ext->av_close_work, dcp_ext_av_close_work);
+	INIT_DELAYED_WORK(&ext->hpd_work, dcp_ext_hdmi_hpd_work);
+	INIT_DELAYED_WORK(&ext->service_work, dcp_ext_service_work);
 	dcp->v14_7->ext = ext;
 	return 0;
 }
@@ -1453,12 +1867,22 @@ int dcp_ext_v14_7_start(struct apple_dcp *dcp)
 {
 	struct dcp_ext_v14_7 *ext = dcp_ext(dcp);
 	bool high;
+	int ret;
 
+	ret = dcp_ext_hdmi_init(ext);
+	if (ret)
+		return ret;
 	scoped_guard(mutex, &dcp->external_lock)
 		ext->drm_ready = true;
 	dcp_ext_generation(ext, &high);
 	if (high)
 		queue_work(system_freezable_wq, &ext->connect_work);
+	/* The HDMI port: its HPD from now on, and a sink already there. */
+	if (ext->fixed) {
+		enable_irq(dcp->hdmi_hpd_irq);
+		mod_delayed_work(system_freezable_wq, &ext->hpd_work,
+				 msecs_to_jiffies(DCPEXT_HDMI_HPD_HIGH_MS));
+	}
 	return 0;
 }
 
@@ -1466,12 +1890,22 @@ void dcp_ext_v14_7_unbind(struct apple_dcp *dcp)
 {
 	struct dcp_ext_v14_7 *ext = dcp_ext(dcp);
 
+	if (ext->fixed) {
+		disable_irq(dcp->hdmi_hpd_irq);
+		cancel_delayed_work_sync(&ext->hpd_work);
+	}
 	scoped_guard(mutex, &dcp->external_lock)
 		ext->drm_ready = false;
 	wake_up_all(&ext->wq);
 	disable_work_sync(&ext->connect_work);
 	disable_work_sync(&ext->irq_work);
 	disable_work_sync(&ext->av_work);
+	disable_work_sync(&ext->av_close_work);
+	dcp_ext_service_disarm(ext);
+	scoped_guard(mutex, &ext->edid_lock) {
+		drm_edid_free(ext->edid);
+		ext->edid = NULL;
+	}
 }
 
 /* CRTC off (DPMS, disable): A472 off; route, client and buffers stay. */
@@ -1485,10 +1919,36 @@ void dcp_ext_v14_7_poweroff(struct apple_dcp *dcp)
 	dcp_mode_invalidate(&dcp->mode_state);
 	if (!ext->display_on || READ_ONCE(dcp->crashed))
 		return;
+	/*
+	 * An inactive sink's connector goes away (TV standby, another input),
+	 * but the firmware keeps its display powered: it retrains only a
+	 * powered display's link, and that link-up is how the sink comes back.
+	 * Its release (HPD low) powers it off.
+	 */
+	scoped_guard(mutex, &ext->link_lock) {
+		if (ext->link.inactive)
+			return;
+	}
 	ret = iomfb_v14_7_ext_power(dcp, false);
 	if (ret)
 		dev_err(dcp->dev, "A472 off failed: %d\n", ret);
 	ext->display_on = false;
+}
+
+/* The HDMI port after sleep: its service if the sink is held, its HPD again. */
+static void dcp_ext_hdmi_resume(struct dcp_ext_v14_7 *ext)
+{
+	struct apple_dcp *dcp = ext->dcp;
+
+	if (!ext->fixed)
+		return;
+	scoped_guard(mutex, &dcp->external_lock) {
+		if (ext->dptx != DCPEXT_DPTX_NONE)
+			dcp_ext_service_arm(ext);
+	}
+	enable_irq(dcp->hdmi_hpd_irq);
+	mod_delayed_work(system_freezable_wq, &ext->hpd_work,
+			 msecs_to_jiffies(DCPEXT_HDMI_HPD_HIGH_MS));
 }
 
 /*
@@ -1501,12 +1961,17 @@ int dcp_ext_v14_7_suspend(struct apple_dcp *dcp)
 	struct dcp_ext_v14_7 *ext = dcp_ext(dcp);
 	int ret;
 
+	if (ext->fixed) {
+		disable_irq(dcp->hdmi_hpd_irq);
+		cancel_delayed_work_sync(&ext->hpd_work);
+	}
 	disable_work_sync(&ext->connect_work);
 	disable_work_sync(&ext->irq_work);
 	disable_work_sync(&ext->av_work);
 	device_set_wakeup_path(dcp->dev);
 	if (!ext->started || READ_ONCE(dcp->crashed))
 		return 0;
+	dcp_ext_service_disarm(ext);
 	iomfb_pause_presentation(dcp, true);
 	ret = iomfb_queue_settle(dcp, msecs_to_jiffies(500));
 	if (ret) {
@@ -1514,6 +1979,7 @@ int dcp_ext_v14_7_suspend(struct apple_dcp *dcp)
 		enable_work(&ext->connect_work);
 		enable_work(&ext->irq_work);
 		enable_work(&ext->av_work);
+		dcp_ext_hdmi_resume(ext);
 		return ret;
 	}
 	apple_rtkit_hold_rx(dcp->rtk);
@@ -1538,6 +2004,8 @@ int dcp_ext_v14_7_resume(struct apple_dcp *dcp)
 	dcp_ext_generation(ext, &high);
 	if (high)
 		queue_work(system_freezable_wq, &ext->connect_work);
+	/* The HDMI port reports it through its HPD line. */
+	dcp_ext_hdmi_resume(ext);
 	return 0;
 }
 
@@ -1577,20 +2045,27 @@ static int dcp_ext_status_show(struct seq_file *m, void *unused)
 		   dcpext_dptx_states[ext->dptx], ext->connects, ext->releases,
 		   ext->link_error);
 	if (route)
-		seq_printf(m, "route atc=%u input=%u held=1 lanes_max=%u lanes=%u rate=%#x aux=%d xbar_up=%d linked=%d inactive=%d\n",
-			   route->dptx_phy, route->mux_index, link.lanes_max, link.lanes,
-			   link.rate, link.aux, link.xbar_up, link.linked, link.inactive);
+		seq_printf(m, "route %s atc=%u input=%u held=1 lanes_max=%u lanes=%u rate=%#x rate_max=%#x aux=%d xbar_up=%d linked=%d inactive=%d\n",
+			   route == ext->fixed ? "hdmi" : "typec", route->dptx_phy,
+			   route->mux_index, link.lanes_max, link.lanes, link.rate,
+			   link.rate_max ?: DCPEXT_RATE_MAX, link.aux, link.xbar_up, link.linked,
+			   link.inactive);
 	else
 		seq_puts(m, "route=none\n");
+	if (ext->fixed)
+		seq_printf(m, "hdmi hpd_line=%d hpd=%d edges=%u service armed=%d ok=%u failed=%u kicks=%u\n",
+			   gpiod_get_value_cansleep(dcp->hdmi_hpd), ext->hdmi_hpd, ext->hpd_edges,
+			   READ_ONCE(ext->service_armed), ext->service_ok, ext->service_failed,
+			   ext->service_kicks);
 	seq_puts(m, "drive=");
 	for (i = 0; i < link.lanes_max && i < DCPEXT_MAX_LANES; i++)
 		seq_printf(m, "%s%u/%u", i ? "," : "", link.drive[i][0], link.drive[i][1]);
 	seq_puts(m, "\n");
-	seq_printf(m, "sink catalog=%d generation=%llu admitted=%u rejected=%u lanes=%u modes=%u width_mm=%d height_mm=%d av_opened=%d av_result=%d edid_reads=%u edid_errors=%u\n",
+	seq_printf(m, "sink catalog=%d generation=%llu admitted=%u rejected=%u lanes=%u modes=%u width_mm=%d height_mm=%d av_opened=%d av_result=%d av_closes=%u av_terminates=%u edid_reads=%u edid_errors=%u\n",
 		   ext->catalog_valid, ext->catalog_generation, ext->catalog_admitted,
 		   ext->catalog_rejected, ext->catalog_lanes, dcp->nr_modes, dcp->width_mm,
-		   dcp->height_mm, ext->av_opened, ext->av_result, ext->edid_reads,
-		   ext->edid_errors);
+		   dcp->height_mm, ext->av_opened, ext->av_result, ext->av_closes,
+		   ext->av_terminates, ext->edid_reads, ext->edid_errors);
 	seq_printf(m, "display on=%d timing=%u color=%u stride=%u presents_refused=%u\n",
 		   ext->display_on, ext->timing_id, ext->color_id, ext->stride,
 		   ext->presents_refused);

@@ -11,6 +11,8 @@
  * port controller reports the pin assignment and HPD to the controller's
  * Type-C routes, the ATC PHY of the port carries AUX and the main link, and
  * the port's display crossbar connects the controller's output to that PHY.
+ * DCPEXT0 drives the built-in HDMI port: a fixed four-lane DP PHY (ATC3) into
+ * the HDMI converter, whose HPD line and power supplies are GPIOs.
  *
  * The helpers below hold no driver state, so that KUnit can check the DPTX
  * callback replies, the HPD/IRQ_HPD bookkeeping and the catalog's link
@@ -32,20 +34,27 @@
 #define J514S_DCPEXT1_COPROC	0x2d6c00000ULL
 
 /*
- * DPTX link profile of the USB-C route: RBR, HBR and HBR2 only, at most two
- * lanes on pin D and four on pin C, drive levels 0..3 with voltage +
- * pre-emphasis <= 3.
+ * DPTX link profile: RBR, HBR, HBR2 and HBR3, two lanes on pin D and four on
+ * pin C or the built-in HDMI route, drive levels 0..3 with voltage +
+ * pre-emphasis <= 3.  A link's highest rate is its PHY's (T6030 ATCs: HBR3
+ * on every route), HBR2 for a PHY that reports none.
  */
 #define DCPEXT_RATE_RBR		0x06
 #define DCPEXT_RATE_HBR		0x0a
 #define DCPEXT_RATE_HBR2	0x14
+#define DCPEXT_RATE_HBR3	0x1e
 #define DCPEXT_RATE_MAX		DCPEXT_RATE_HBR2
 #define DCPEXT_MAX_LANES	4
 #define DCPEXT_DRIVE_MAX	3
-/* Payload of one lane at the highest admitted rate: 5.4 Gb/s, 8b/10b. */
-#define DCPEXT_LANE_KBPS	4320000U
 /* Uncompressed wire bits per pixel the catalog is budgeted with (RGB8). */
 #define DCPEXT_WIRE_BPP		24
+/*
+ * A DSC timing must fit the lanes at the fewest bits per pixel an 8-bit RGB
+ * DSC stream can take (VESA DSC 1.2: 8 for 4:4:4), less the FEC that carries
+ * DSC on DP (2.4 % of the link).  The firmware picks the actual rate.
+ */
+#define DCPEXT_DSC_MIN_BPP	8
+#define DCPEXT_FEC_PERMILLE	24
 /* Timings the external pipe is qualified with. */
 #define DCPEXT_MAX_WIDTH	3840
 #define DCPEXT_MAX_HEIGHT	2160
@@ -60,6 +69,7 @@
 /* The routed port's DPTX link, as the external profile reports it. */
 struct dcpext_link {
 	u32 lanes_max;		/* the pin assignment's width: 2 (D), 4 (C) */
+	u32 rate_max;		/* highest rate code; 0: DCPEXT_RATE_MAX */
 	u32 lanes;		/* active lanes (callback 12) */
 	u32 rate;		/* link-rate code (callback 9) */
 	u32 drive[DCPEXT_MAX_LANES][2];	/* programmed voltage, pre-emphasis */
@@ -116,7 +126,7 @@ int dcpext_edid_object(const u8 *object, size_t len, const u8 **edid);
 
 struct dcp_display_mode;
 unsigned int dcpext_catalog_filter(struct dcp_display_mode *modes, unsigned int count,
-				   u32 lanes, unsigned int *rejected);
+				   u32 lanes, u32 rate, unsigned int *rejected);
 
 /* DPTX port commands of the external role. */
 enum dcpext_dptx_cmd {
@@ -148,6 +158,7 @@ struct dcp_ext_v14_7 {
 	bool started;		/* RUN issued: the session is never stopped */
 	bool display_on;	/* A472 on */
 	enum dcpext_dptx_state dptx;
+	u64 dptx_generation;	/* the HPD generation that CONNECTed it */
 	int link_error;		/* last failed lifecycle RPC of this generation */
 	u64 link_error_generation;
 	u32 timing_id, color_id;	/* the last A411 */
@@ -165,6 +176,8 @@ struct dcp_ext_v14_7 {
 	/* The held route and its link, under link_lock (DPTX callbacks). */
 	struct mutex link_lock;
 	struct apple_dcp_typec_route *route;
+	/* The built-in HDMI output: its fixed route, or NULL (USB-C only). */
+	struct apple_dcp_typec_route *fixed;
 	bool xbar_selected;	/* the route holds its crossbar selection */
 	struct dcpext_link link;
 
@@ -174,10 +187,29 @@ struct dcp_ext_v14_7 {
 	unsigned int catalog_admitted, catalog_rejected;
 	u32 catalog_lanes;
 
-	/* AV service (EP 0x28): opened once per publication, under dcpavserv.lock. */
+	/*
+	 * The AV service's client (EP 0x28): opened on instance av_epoch while
+	 * the host holds the sink, until the release or the instance's
+	 * Terminate (dcp_ext_av_close()). Open and Close are serialized by
+	 * av_lock, which the endpoint's receive path never takes; the state is
+	 * written under dcpavserv.lock as well (av_lock first).
+	 */
+	struct mutex av_lock;
 	bool av_opened;
+	bool av_terminated;	/* Terminate reported: no new use, Close pending */
 	u64 av_epoch;
 	int av_result;
+	u32 av_closes, av_terminates;
+	struct work_struct av_close_work;
+	/*
+	 * The sink's EDID, read once per HPD generation and AV service
+	 * instance (under edid_lock; see dcp_ext_v14_7_read_edid()).
+	 */
+	struct mutex edid_lock;
+	const struct drm_edid *edid;
+	u64 edid_generation, edid_epoch;
+	/* The firmware withdrew the sink's modes: the next modeset is a full one. */
+	bool mode_lost;
 
 	/* Startup, connection and failure waits. */
 	wait_queue_head_t wq;
@@ -185,11 +217,21 @@ struct dcp_ext_v14_7 {
 	struct work_struct irq_work;
 	struct work_struct av_work;
 
+	/*
+	 * Built-in HDMI: the converter's debounced HPD (hpd_work only), and the
+	 * converter service from REQUEST_DISPLAY until the release.
+	 */
+	bool hdmi_hpd;
+	struct delayed_work hpd_work;
+	bool service_armed;
+	struct delayed_work service_work;
+
 	/* Reported by the dcpext debugfs file. */
 	u32 callbacks[32];
 	u32 callbacks_refused;
 	u32 sink_errors;
 	u32 irq_sent, irq_ok, irq_failed;
+	u32 hpd_edges, service_kicks, service_ok, service_failed;
 	u32 presents_refused;
 	u32 edid_reads, edid_errors;
 };

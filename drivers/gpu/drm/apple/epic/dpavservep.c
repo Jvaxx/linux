@@ -301,6 +301,9 @@ static int dcpavserv_report(struct apple_epic_service *service,
 			    enum epic_subtype type, const void *data,
 			    size_t data_size)
 {
+	/* fw14 external: Terminate releases the host's client. */
+	if (iomfb_is_v14_7_external(service->ep->dcp))
+		dcp_ext_v14_7_av_report(service, type, data, data_size);
 	return parse_report(service, type, data, data_size);
 }
 

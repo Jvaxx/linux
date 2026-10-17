@@ -5111,8 +5111,8 @@ static int dcp_platform_probe(struct platform_device *pdev)
 			}
 			dcp->hdmi_hpd_irq = irq;
 
-			ret = devm_request_threaded_irq(dev, dcp->hdmi_hpd_irq,
-						NULL, dcp_dp2hdmi_hpd,
+			ret = devm_request_threaded_irq(dev, dcp->hdmi_hpd_irq, NULL,
+						iomfb_is_v14_7_external(dcp) ? dcp_ext_v14_7_hpd_irq : dcp_dp2hdmi_hpd,
 						IRQF_ONESHOT | IRQF_NO_AUTOEN |
 						IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING,
 						"dp2hdmi-hpd-irq", dcp);
@@ -5154,11 +5154,11 @@ static int dcp_platform_probe(struct platform_device *pdev)
 			ret = devm_add_action_or_reset(dev, dcp_release_fixed_route, dcp);
 			if (ret)
 				return ret;
-			ret = mux_control_select(dcp->xbar, mux_index);
+			ret = iomfb_is_v14_7_external(dcp) ? 0 : mux_control_select(dcp->xbar, mux_index);
 			if (ret)
 				dev_warn(dev, "mux_control_select failed: %d\n", ret);
-			else
-				dcp->fixed_route_selected = true;
+			else	/* 14.7 external: selected with the sink's route (dcpext-t6030.c) */
+				dcp->fixed_route_selected = !iomfb_is_v14_7_external(dcp);
 
 			/*
 			 * Switch atcphy to DP-only. should move to a Macbook Pro
