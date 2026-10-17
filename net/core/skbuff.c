@@ -1774,7 +1774,9 @@ struct ubuf_info *msg_zerocopy_realloc(struct sock *sk, size_t size,
 
 		/* there might be non MSG_ZEROCOPY users */
 		if (uarg->ops != &msg_zerocopy_ubuf_ops) {
-			if (sk->sk_type == SOCK_STREAM)
+			/* A retained-subpage owner may sit on a stream skb. */
+			if (IS_ENABLED(CONFIG_MM_SUBPAGE) &&
+			    sk->sk_type == SOCK_STREAM)
 				goto new_alloc;
 			return NULL;
 		}
