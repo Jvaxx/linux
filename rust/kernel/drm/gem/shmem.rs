@@ -778,11 +778,18 @@ mod tests {
     impl drm::file::DriverFile for KunitFile {
         type Driver = KunitDriver;
 
-        fn open(_dev: &drm::Device<KunitDriver>) -> Result<Pin<KBox<Self>>> {
-            Ok(KBox::new(Self, GFP_KERNEL)?.into())
+        fn open(_dev: &drm::Device<KunitDriver, drm::Registered>) -> Result<Pin<KBox<Self>>> {
+            // These object tests never create client files.
+            Err(ENODEV)
+        }
+
+        fn as_raw(&self) -> *mut bindings::drm_file {
+            // A successful open is required before a raw file can be requested.
+            unreachable!("KUnit object tests do not open DRM files")
         }
     }
 
+    #[vtable]
     impl gem::DriverObject for KunitObject {
         type Driver = KunitDriver;
         type Args = ();
