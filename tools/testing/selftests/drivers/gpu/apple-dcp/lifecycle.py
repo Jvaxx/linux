@@ -28,7 +28,22 @@ def disconnect(root):
     held = [n for n in ('cd321x_mux_held', 'cd321x_mux_set', 'cd321x_mux_still_held',
                         'cd321x_retry_held_mux', 'cd321x_update_done')
             if re.search(r'^static \w+ ' + n + r'\(', (r / core).read_text(), re.M)]
-    funcs = '\n'.join(function(f, n) for f, n in (
+    # The DisplayPort hotplug decisions live in cd321x-dp.h when present.
+    dp_header = r / 'drivers/usb/typec/tipd/cd321x-dp.h'
+    dp = ''
+    if dp_header.exists():
+        dp = '\n'.join(l for l in dp_header.read_text().splitlines()
+                       if not l.startswith('#include'))
+        dp = r'''
+#ifndef BIT
+#define BIT(n) (1U << (n))
+#endif
+#define CD321X_DATA_STATUS_HPD_IRQ (1U << 9)
+#define DP_STATUS_IRQ_HPD BIT(8)
+#define trace_cd321x_dp_hotplug(...) ((void)0)
+''' + dp + '\n'
+    notify = (('drivers/usb/typec/tipd/core.c', 'cd321x_dp_notify'),) if dp else ()
+    funcs = '\n'.join(function(f, n) for f, n in notify + (
         ('drivers/gpu/drm/apple/iomfb.c', 'iomfb_pause_presentation'),
         (dcp, 'dcp_external_report_disconnected'),
         (dcp, 'dcp_external_publish_generation'),
@@ -155,8 +170,8 @@ static int dcp_external_disconnect(struct apple_dcp *, bool);
 static struct apple_dcp display;
 static void drm_connector_oob_hotplug_event(void *node, int status)
 { assert(node); if (!status) dcp_external_disconnect(&display, true); }
-#define connector_status_disconnected 0
-#define connector_status_connected 1
+enum drm_connector_status { connector_status_disconnected, connector_status_connected,
+ connector_status_unknown };
 '''
     shim = r'''
 enum usb_role { USB_ROLE_NONE, USB_ROLE_HOST, USB_ROLE_DEVICE };
@@ -172,6 +187,7 @@ struct tps6598x { void *partner, *dev, *port, *psy; int lock; u32 data_status; e
 struct cd321x { struct tps6598x tps; struct cd321x_status update_status;
  struct cd321x_pm_state pm; struct delayed_work update_work, resume_work;
  struct typec_mux_state state; bool state_valid, display_route_active, cur_partner_is_pd;
+ bool dp_irq_hpd, dp_sink_reported;
  struct usb_pd_identity cur_partner_identity; void *connector_fwnode, *tbt_switch, *mux; };
 /* No mux here declares its timeouts transient: every failure is budgeted. */
 static bool typec_mux_timeout_transient(void *m) { (void)m; return false; }
@@ -390,7 +406,7 @@ int main(void)
         shim = shim.replace(old, 'static int cd321x_typec_update_mode(struct tps6598x *t, struct cd321x_status *s, bool *busy,\n'
                             ' bool *held)\n'
                             '{ (void)t; (void)s; *busy = mode_error == -EBUSY; *held = false; return mode_error; }')
-    source = prefix + pm + shim + funcs + tests
+    source = prefix + pm + shim + dp + funcs + tests
     return source
 
 def bounce(root):
