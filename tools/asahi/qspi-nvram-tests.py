@@ -57,7 +57,7 @@ static int apple_qspi_policy_lock;
 struct kernel_param { void *arg; };
 static int kstrtobool(const char*s,bool*v){if(!strcmp(s,"Y"))*v=true;else if(!strcmp(s,"N"))*v=false;else return -EINVAL;return 0;}
 static int param_get_bool(char*b,const struct kernel_param*p){b[0]=*(bool*)p->arg?'Y':'N';return 1;}
-struct apple_qspi { bool nvram_write_candidate, write_fault; };
+struct apple_qspi { bool nvram_policy, nvram_write_candidate, write_fault; };
 struct spi_controller { struct apple_qspi *q; };
 struct spi_device { struct spi_controller *controller; unsigned int cs; int dev; };
 struct spi_mem { struct spi_device *spi; };
@@ -112,7 +112,7 @@ static struct spi_device spi={&ctl};
 static struct spi_mem mem={&spi};
 static struct kernel_param parameter={&read_only};
 static void reset(void){
- memset(flash,0xff,sizeof(flash));memset(sr,0,sizeof(sr));q=(struct apple_qspi){.nvram_write_candidate=true};
+ memset(flash,0xff,sizeof(flash));memset(sr,0,sizeof(sr));q=(struct apple_qspi){.nvram_policy=true,.nvram_write_candidate=true};
  read_only=true;runtime_ready=false;write_fault_latched=false;wire_count=0;fail_opcode=0;spi.cs=0;
  corrupt_readback=false;stuck_busy=false;programmed=false;deny_alloc=false;jiffies=0;
  jedec[0]=0xef;jedec[1]=0x65;jedec[2]=0x17;
@@ -126,6 +126,15 @@ static bool sent(unsigned int o){for(unsigned int i=0;i<wire_count;i++)if(wire[i
 static void denied(struct spi_mem_op o){wire_count=0;assert(apple_qspi_exec_op(&mem,&o)<0);assert(!wire_count);}
 int main(void){
  u8 data[256];memset(data,0x55,sizeof(data));reset();
+ struct spi_mem_op wren=SPI_MEM_OP(SPI_MEM_OP_CMD(0x06,1),SPI_MEM_OP_NO_ADDR,SPI_MEM_OP_NO_DUMMY,SPI_MEM_OP_NO_DATA);
+ /* The Neo transport keeps raw writes even while the J613 policy is read-only. */
+ q.nvram_policy=false;
+ assert(!apple_qspi_mem_exec_op(&mem,&wren) && wire_count==1 && sr[0]==2);
+ reset();
+ assert(apple_qspi_mem_exec_op(&mem,&wren)==-EACCES && !wire_count);
+ arm();
+ assert(!apple_qspi_mem_exec_op(&mem,&wren) && !wire_count && !sr[0]);
+ reset();
  assert(apple_qspi_set_read_only("N",&parameter)==-EPERM&&read_only);
  struct spi_mem_op o=program(0x700000,256,data);denied(o);
  u8 id[3];struct spi_mem_op rd=SPI_MEM_OP(SPI_MEM_OP_CMD(0x9f,1),SPI_MEM_OP_NO_ADDR,SPI_MEM_OP_NO_DUMMY,SPI_MEM_OP_DATA_IN(3,id,1));
@@ -188,7 +197,8 @@ def main():
                   'static int apple_qspi_shape_op(', 'static bool apple_qspi_supports_op(',
                   'static int apple_qspi_read_register(', 'static int apple_qspi_command(',
                   'static int apple_qspi_read_array(', 'static int apple_qspi_status(',
-                  'static int apple_qspi_nvram_modify(', 'static int apple_qspi_exec_op(']
+                  'static int apple_qspi_nvram_modify(', 'static int apple_qspi_exec_op(',
+                  'static int apple_qspi_mem_exec_op(']
     code = PREFIX + policy + '\n'.join(function(source, s) for s in signatures) + CONTROLS
     with tempfile.TemporaryDirectory(prefix='qspi-nvram-') as directory:
         current = run(code, Path(directory) / 'current.c')
