@@ -9,6 +9,7 @@
 #include "dcp-fabric-core.h"
 #include "dcp-fabric-effects.h"
 #include "dcp-fabric-session.h"
+#include "dcp-relink.h"
 
 struct fabric_fixture {
 	struct dcp_fabric_pipeline pipeline[2];
@@ -2138,7 +2139,142 @@ static void fabric_binding_drain_test(struct kunit *test)
 	}
 }
 
+static unsigned long relink_ms(unsigned long t, unsigned int ms)
+{
+	return t + msecs_to_jiffies(ms);
+}
+
+/* An enabled state for attachment @generation, whose link came up @t. */
+static void relink_fresh(struct dcp_relink_state *s, u64 generation,
+			 unsigned long t)
+{
+	*s = (struct dcp_relink_state){};
+	dcp_relink_enable(s, true);
+	dcp_relink_attach(s, generation);
+	dcp_relink_link_up(s, generation, t);
+}
+
+/* DCP dropping a sink right after its link came up, and only then. */
+static void relink_unplug_test(struct kunit *test)
+{
+	unsigned long t = 100000;
+	struct dcp_relink_state s;
+
+	relink_fresh(&s, 5, t);
+	KUNIT_EXPECT_TRUE(test, dcp_relink_unplug(&s, 5, relink_ms(t, 2000)));
+	KUNIT_EXPECT_EQ(test, s.tries, 1U);
+	KUNIT_EXPECT_TRUE(test, s.active);
+
+	/* a sink dropped long after its link came up is unplugged */
+	relink_fresh(&s, 5, t);
+	KUNIT_EXPECT_FALSE(test, dcp_relink_unplug(&s, 5,
+				relink_ms(t, DCP_RELINK_LINKUP_MS + 1)));
+	/* also one of an attachment whose link-up was not seen */
+	KUNIT_EXPECT_FALSE(test, dcp_relink_unplug(&s, 6, relink_ms(t, 10)));
+	KUNIT_EXPECT_FALSE(test, s.active);
+	KUNIT_EXPECT_EQ(test, s.tries, 0U);
+
+	/* a link that came up late, after a failed first connect */
+	relink_fresh(&s, 5, t);
+	dcp_relink_link_up(&s, 5, relink_ms(t, 30000));
+	KUNIT_EXPECT_TRUE(test, dcp_relink_unplug(&s, 5, relink_ms(t, 32000)));
+
+	/* a reconnect under a new generation is no link-up of the attachment */
+	relink_fresh(&s, 5, t);
+	dcp_relink_link_up(&s, 6, relink_ms(t, 30000));
+	KUNIT_EXPECT_FALSE(test, dcp_relink_unplug(&s, 6, relink_ms(t, 32000)));
+	dcp_relink_attach(&s, 7);
+	KUNIT_EXPECT_FALSE(test, dcp_relink_unplug(&s, 7, relink_ms(t, 32000)));
+
+	/* a DPMS wake brings the link up again */
+	dcp_relink_wake(&s, 7, relink_ms(t, 60000));
+	KUNIT_EXPECT_TRUE(test, dcp_relink_unplug(&s, 7, relink_ms(t, 62000)));
+}
+
+/* One relink at a time; the replay keeps the retries of its attachment. */
+static void relink_running_test(struct kunit *test)
+{
+	unsigned long t = 100000;
+	struct dcp_relink_state s;
+
+	relink_fresh(&s, 5, t);
+	KUNIT_EXPECT_TRUE(test, dcp_relink_unplug(&s, 5, t));
+	/* another drop meanwhile is an unplug, and starts nothing */
+	KUNIT_EXPECT_FALSE(test, dcp_relink_unplug(&s, 5, t));
+	KUNIT_EXPECT_EQ(test, s.tries, 1U);
+	KUNIT_EXPECT_TRUE(test, s.active);
+
+	/* its own unplug and replug change the generation */
+	dcp_relink_reattach(&s, 7, relink_ms(t, 1000));
+	dcp_relink_link_up(&s, 7, relink_ms(t, 1200));
+	dcp_relink_end(&s);
+	KUNIT_EXPECT_FALSE(test, s.active);
+	KUNIT_EXPECT_EQ(test, s.tries, 1U);
+
+	/* dropped again right after the relink: the next try */
+	KUNIT_EXPECT_TRUE(test, dcp_relink_unplug(&s, 7, relink_ms(t, 3200)));
+	KUNIT_EXPECT_EQ(test, s.tries, 2U);
+}
+
+/* Three relinks per attachment or wake; a new attachment starts afresh. */
+static void relink_budget_test(struct kunit *test)
+{
+	unsigned long t = 100000;
+	struct dcp_relink_state s;
+	unsigned int i;
+
+	relink_fresh(&s, 5, t);
+	for (i = 0; i < DCP_RELINK_RETRIES; i++) {
+		KUNIT_EXPECT_TRUE(test, dcp_relink_unplug(&s, 5, t));
+		dcp_relink_reattach(&s, 5, t);
+		dcp_relink_end(&s);
+	}
+	KUNIT_EXPECT_FALSE(test, dcp_relink_unplug(&s, 5, t));
+	KUNIT_EXPECT_EQ(test, s.tries, (u32)DCP_RELINK_RETRIES);
+
+	dcp_relink_wake(&s, 5, t);
+	KUNIT_EXPECT_EQ(test, s.tries, 0U);
+	KUNIT_EXPECT_TRUE(test, dcp_relink_unplug(&s, 5, t));
+	dcp_relink_end(&s);
+
+	dcp_relink_attach(&s, 9);
+	dcp_relink_link_up(&s, 9, t);
+	KUNIT_EXPECT_EQ(test, s.tries, 0U);
+	KUNIT_EXPECT_TRUE(test, dcp_relink_unplug(&s, 9, t));
+	KUNIT_EXPECT_EQ(test, s.tries, 1U);
+}
+
+/* Disabled relinks are never queued, and a queued one is dropped. */
+static void relink_disabled_test(struct kunit *test)
+{
+	struct dcp_relink_state s;
+
+	relink_fresh(&s, 5, 1000);
+	KUNIT_EXPECT_TRUE(test, dcp_relink_unplug(&s, 5, 1000));
+	dcp_relink_enable(&s, false);
+	KUNIT_EXPECT_FALSE(test, s.active);
+	KUNIT_EXPECT_FALSE(test, dcp_relink_unplug(&s, 5, 1000));
+	KUNIT_EXPECT_FALSE(test, s.active);
+	dcp_relink_enable(&s, true);
+	KUNIT_EXPECT_TRUE(test, dcp_relink_unplug(&s, 5, 1000));
+}
+
+/* A jiffies value of 0 still marks the link-up time. */
+static void relink_stamp_test(struct kunit *test)
+{
+	struct dcp_relink_state s;
+
+	relink_fresh(&s, 1, 0);
+	KUNIT_EXPECT_NE(test, s.linked, 0UL);
+	KUNIT_EXPECT_TRUE(test, dcp_relink_unplug(&s, 1, 3));
+}
+
 static struct kunit_case fabric_tests[] = {
+	KUNIT_CASE(relink_unplug_test),
+	KUNIT_CASE(relink_running_test),
+	KUNIT_CASE(relink_budget_test),
+	KUNIT_CASE(relink_disabled_test),
+	KUNIT_CASE(relink_stamp_test),
 	KUNIT_CASE(fabric_t6030_clock_routes_test),
 	KUNIT_CASE(fabric_t6030_plan_test),
 	KUNIT_CASE(fabric_t6030_follow_test),

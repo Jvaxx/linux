@@ -102,6 +102,7 @@ static struct announce_test *announce_test_init(struct kunit *test)
 	dcp->hw.iomfb_method_profile = DCP_IOMFB_METHODS_H17P_EXTERNAL;
 	iomfb_queue_init(dcp);
 	mutex_init(&dcp->hpd_mutex);
+	spin_lock_init(&dcp->relink_lock);
 	mutex_init(&dcp->dcpavserv.lock);
 	spin_lock_init(&dcp->metadata.lock);
 	INIT_DELAYED_WORK(&dcp->announce_wq, dcp_announce_work);

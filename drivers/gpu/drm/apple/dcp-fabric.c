@@ -1536,7 +1536,8 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 		/*
 		 * A T6030 external processor services the request itself, and
 		 * reads the display again if it changed; elsewhere the active
-		 * mode is applied again. H17P always applies it again.
+		 * mode is applied again. H17P always applies it again. A running
+		 * relink connects the sink anew; see dcp_typec_sink_relink().
 		 */
 		if (dcp->typec_connector && dcp->fw_compat == DCP_FIRMWARE_H17P)
 			dcp_retrain_oob(dcp->typec_connector);

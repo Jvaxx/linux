@@ -18,6 +18,7 @@
 
 #include "dcp-fabric.h"
 #include "dcp-fabric-session.h"
+#include "dcp-relink.h"
 #include "dptxep.h"
 #include "dcp_backlight.h"
 #include "dcp-announce.h"
@@ -397,11 +398,11 @@ struct apple_dcp {
 	u64 placeholder_generation;
 	struct delayed_work placeholder_edid_wq;
 	/* replugs replayed for a Type-C sink that lost its link */
-	u32 relink_tries;
-	bool relink_active;
-	unsigned long relink_done;
-	u64 relink_generation;
+	spinlock_t relink_lock;
+	struct dcp_relink_state relink;
 	struct delayed_work typec_relink_wq;
+	/* The driver holds the sink HPD low itself; hpd_mutex. */
+	bool typec_hpd_held;
 	bool use_timestamps;
 	bool vrr_enabled;
 	struct dcp_set_digital_out_mode_req mode;
