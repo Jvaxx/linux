@@ -55,8 +55,8 @@ properties:
   '#iommu-cells':
     enum: [1, 5]
     description:
-      Usually one cell describing the stream id emitted by a master. The
-      T6020 NHI DART uses five cells to describe a stream range and its
+      One cell describes the stream ID emitted by a master. Five cells
+      describe the stream ID followed by the 64-bit base and length of its
       device-visible DMA window.
 
   power-domains:
@@ -120,21 +120,6 @@ required:
   - reg
   - '#iommu-cells'
   - interrupts
-
-allOf:
-  - if:
-      properties:
-        compatible:
-          contains:
-            const: apple,t6020-dart
-    then:
-      properties:
-        '#iommu-cells':
-          enum: [1, 5]
-    else:
-      properties:
-        '#iommu-cells':
-          const: 1
 
 additionalProperties: false
 
