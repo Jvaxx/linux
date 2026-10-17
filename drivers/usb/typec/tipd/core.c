@@ -24,6 +24,7 @@
 #include <linux/firmware.h>
 #include <drm/drm_connector.h>
 
+#include "cd321x-dp.h"
 #include "tps6598x.h"
 #include "trace.h"
 
@@ -810,6 +811,18 @@ static void cd321x_update_done(struct cd321x *cd321x)
 	cd321x_pm_complete(&cd321x->pm);
 }
 
+static void cd321x_dp_notify(struct cd321x *cd321x,
+			     const struct cd321x_dp_update *u,
+			     enum drm_connector_status status)
+{
+	if (!IS_REACHABLE(CONFIG_DRM) || !cd321x->connector_fwnode)
+		return;
+
+	trace_cd321x_dp_hotplug(cd321x->tps.dev, u, status);
+	cd321x->dp_sink_reported = status != connector_status_disconnected;
+	drm_connector_oob_hotplug_event(cd321x->connector_fwnode, status);
+}
+
 static void cd321x_update_work(struct work_struct *work)
 {
 	struct cd321x *cd321x = container_of(to_delayed_work(work),
@@ -832,21 +845,32 @@ static void cd321x_update_work(struct work_struct *work)
 
 	bool old_connected = !!tps->partner;
 	bool new_connected = st.status & TPS_STATUS_PLUG_PRESENT;
-	bool was_disconnected = cd321x->pm.force_reconnect ||
-		(st.status_changed & (TPS_STATUS_PLUG_PRESENT | TPS_STATUS_PLUG_UPSIDE_DOWN)) ||
-		(st.data_status_changed & (TPS_DATA_STATUS_TBT_CONNECTION |
-					   CD321X_DATA_STATUS_USB4_CONNECTION));
+	u32 reset = 0;
+
+	if (cd321x->pm.force_reconnect)
+		reset |= CD321X_DP_RESET_FORCED;
+	if (st.status_changed & TPS_STATUS_PLUG_PRESENT)
+		reset |= CD321X_DP_RESET_PLUG;
+	if (st.status_changed & TPS_STATUS_PLUG_UPSIDE_DOWN)
+		reset |= CD321X_DP_RESET_FLIP;
+	if (st.data_status_changed & (TPS_DATA_STATUS_TBT_CONNECTION |
+				      CD321X_DATA_STATUS_USB4_CONNECTION))
+		reset |= CD321X_DP_RESET_TUNNEL;
+
+	bool was_disconnected = reset;
 
 	bool usb_connection = st.data_status &
 			      (TPS_DATA_STATUS_USB2_CONNECTION | TPS_DATA_STATUS_USB3_CONNECTION);
-	bool dp_mode_changed = st.data_status_changed &
-		(TPS_DATA_STATUS_DP_CONNECTION |
-		 TPS_DATA_STATUS_DP_PIN_ASSIGNMENT_MASK);
-	bool dp_route_was_active = cd321x->display_route_active;
+	bool dp_mode_changed = cd321x_dp_mode_changed(st.data_status,
+						       st.data_status_changed);
 	bool dp_connected = st.data_status & TPS_DATA_STATUS_DP_CONNECTION;
-
-	bool dp_hpd = st.data_status & CD321X_DATA_STATUS_HPD_LEVEL;
-	bool dp_hpd_changed = st.data_status_changed & CD321X_DATA_STATUS_HPD_LEVEL;
+	struct cd321x_dp_update dp = {
+		.data_status = st.data_status,
+		.changed = st.data_status_changed,
+		.irq_hpd = cd321x->dp_irq_hpd,
+		.route_active = cd321x->display_route_active,
+		.sink_reported = cd321x->dp_sink_reported,
+	};
 
 	enum usb_role old_role = usb_role_switch_get_role(tps->role_sw);
 	enum usb_role new_role = USB_ROLE_NONE;
@@ -867,13 +891,19 @@ static void cd321x_update_work(struct work_struct *work)
 	}
 
 	bool is_pd = pwr_opmode == TYPEC_PWR_MODE_PD;
-	bool partner_changed = old_connected && new_connected &&
-		(was_disconnected || is_pd != cd321x->cur_partner_is_pd ||
+	bool new_partner = old_connected && new_connected &&
+		(is_pd != cd321x->cur_partner_is_pd ||
 		 (is_pd && memcmp(&st.partner_identity,
 				  &cd321x->cur_partner_identity, sizeof(struct usb_pd_identity))));
+	bool partner_changed = new_partner ||
+		(old_connected && new_connected && was_disconnected);
 
 	/* A different dock must release the old routing before reconfiguration. */
 	was_disconnected |= partner_changed;
+	if (new_partner)
+		reset |= CD321X_DP_RESET_PARTNER;
+	if (!new_connected)
+		reset |= CD321X_DP_RESET_UNPLUG;
 
 	/*
 	 * Report the sink as gone before any hardware transition that can fail:
@@ -883,12 +913,9 @@ static void cd321x_update_work(struct work_struct *work)
 	 * sink can enter Alt Mode while its mux request fails with -ENOSPC, and
 	 * must not tear down the display carried by the other port.
 	 */
-	if (IS_REACHABLE(CONFIG_DRM) && cd321x->connector_fwnode &&
-	    dp_route_was_active &&
-	    (!new_connected || was_disconnected || !dp_connected || !dp_hpd ||
-	     dp_hpd_changed || dp_mode_changed))
-		drm_connector_oob_hotplug_event(cd321x->connector_fwnode,
-						connector_status_disconnected);
+	dp.link_reset = reset;
+	if (cd321x_dp_teardown(&dp))
+		cd321x_dp_notify(cd321x, &dp, connector_status_disconnected);
 
 	/*
 	 * ACIO carries the tunneled PCIe reset handshake over the still-live
@@ -953,6 +980,7 @@ static void cd321x_update_work(struct work_struct *work)
 
 	/* If the plug is disconnected, we are done */
 	if (!new_connected) {
+		cd321x->dp_irq_hpd = false;
 		cd321x_update_done(cd321x);
 		return;
 	}
@@ -999,10 +1027,24 @@ static void cd321x_update_work(struct work_struct *work)
 	if (ret)
 		goto retry;
 
-	if (IS_REACHABLE(CONFIG_DRM) && cd321x->connector_fwnode &&
-	    cd321x->display_route_active && dp_hpd)
-		drm_connector_oob_hotplug_event(cd321x->connector_fwnode,
-						connector_status_connected);
+	/* An IRQ_HPD is delivered now, or overtaken by a connect. */
+	cd321x->dp_irq_hpd = false;
+	switch (cd321x_dp_event(&dp, cd321x->display_route_active)) {
+	case CD321X_DP_EVENT_NONE:
+		break;
+	case CD321X_DP_EVENT_CONNECTED:
+		cd321x_dp_notify(cd321x, &dp, connector_status_connected);
+		break;
+	case CD321X_DP_EVENT_RETRAIN:
+		/*
+		 * Report the HPD level as for any other update, so a connector
+		 * that has lost the sink meanwhile connects it again.  Then an
+		 * unknown status asks the connector to recheck its link.
+		 */
+		cd321x_dp_notify(cd321x, &dp, connector_status_connected);
+		cd321x_dp_notify(cd321x, &dp, connector_status_unknown);
+		break;
+	}
 
 	power_supply_changed(tps->psy);
 	cd321x_update_done(cd321x);
@@ -1019,6 +1061,12 @@ retry:
 
 static void cd321x_queue_status(struct cd321x *cd321x)
 {
+	cd321x->dp_irq_hpd =
+		cd321x_dp_irq_hpd(cd321x->dp_irq_hpd,
+				  cd321x->update_status.data_status,
+				  cd321x->tps.data_status,
+				  le32_to_cpu(cd321x->update_status.dp_sid_status.status_rx),
+				  le32_to_cpu(cd321x->dp_sid_status.status_rx));
 	cd321x->update_status.status_changed |= cd321x->update_status.status ^ cd321x->tps.status;
 	cd321x->update_status.data_status_changed |=
 		cd321x->update_status.data_status ^ cd321x->tps.data_status;

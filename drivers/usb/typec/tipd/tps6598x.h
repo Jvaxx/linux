@@ -415,6 +415,8 @@ struct cd321x {
 	bool tbt_notifier_registered;
 	atomic_t link_event;
 	bool display_route_active;
+	bool dp_sink_reported;
+	bool dp_irq_hpd;
 
 	struct cd321x_status update_status;
 	struct delayed_work update_work;

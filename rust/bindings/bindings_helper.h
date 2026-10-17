@@ -68,6 +68,7 @@
 #include <linux/i2c.h>
 #include <linux/iio/iio.h>
 #include <linux/iio/types.h>
+#include <linux/input.h>
 #include <linux/interrupt.h>
 #include <linux/io-pgtable.h>
 #include <linux/iommu.h>
@@ -109,6 +110,7 @@
 #include <sound/dmaengine_pcm.h>
 #include <linux/pm_domain.h>
 #include <linux/pm_runtime.h>
+#include <sound/jack.h>
 #include <sound/pcm.h>
 #include <sound/soc.h>
 #include <sound/soc-dpcm.h>
