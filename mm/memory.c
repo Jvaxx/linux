@@ -9149,6 +9149,7 @@ int generic_access_phys(struct vm_area_struct *vma, unsigned long addr,
 		.allow_subpage = true
 	};
 
+#ifdef CONFIG_MM_SUBPAGE
 	if (len <= 0)
 		return 0;
 	if (addr < vma->vm_start || addr >= vma->vm_end)
@@ -9157,6 +9158,7 @@ int generic_access_phys(struct vm_area_struct *vma, unsigned long addr,
 	len = min_t(unsigned long, len, vma->vm_end - addr);
 	len = min_t(unsigned long, len, mm_page_size(vma->vm_mm) -
 			(addr & ~mm_page_mask(vma->vm_mm)));
+#endif
 retry:
 	if (follow_pfnmap_start(&args))
 		return -EINVAL;
