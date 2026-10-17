@@ -43,3 +43,19 @@ def run_unit(name, unit, output, cases=((),), includes=(), extra=()):
         (work / ('case-' + str(index) + '.log')).write_text(result.stdout + result.stderr)
         result.check_returncode()
     return hashlib.sha256(unit.encode()).hexdigest()
+
+
+def atc_mux_without_pm(source):
+    """Lane/teardown fixtures omit USB PM, keeping mode mapping and lane work real.
+
+    The PM fixtures replace only this adapter with the actual mux update/callback.
+    """
+    mapping = block(source, 'static enum atcphy_mode atcphy_typec_target_mode(')
+    locked = block(source, 'static int atcphy_mux_set_locked(')
+    return mapping + '\n' + locked + r'''
+static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *state)
+{
+    struct apple_atcphy *atcphy = typec_mux_get_drvdata(mux);
+    return atcphy_mux_set_locked(atcphy, atcphy_typec_target_mode(atcphy, state));
+}
+'''
