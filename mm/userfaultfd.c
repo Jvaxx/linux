@@ -4580,9 +4580,15 @@ static int userfaultfd_copy(struct userfaultfd_ctx *ctx,
 	/*
 	 * COPY reads the pager's address space, which can have a different
 	 * task size and granule from the registered target. Only the target
-	 * range below requires a page-aligned length.
+	 * range below requires a page-aligned length. Without mixed granules,
+	 * keep validating the source against the registered mm.
 	 */
-	ret = validate_byte_range(current->mm, uffdio_copy.src, uffdio_copy.len);
+	if (IS_ENABLED(CONFIG_MM_SUBPAGE))
+		ret = validate_byte_range(current->mm, uffdio_copy.src,
+					  uffdio_copy.len);
+	else
+		ret = validate_unaligned_range(ctx->mm, uffdio_copy.src,
+					       uffdio_copy.len);
 	if (ret)
 		goto out;
 	ret = validate_range(ctx->mm, uffdio_copy.dst, uffdio_copy.len);
