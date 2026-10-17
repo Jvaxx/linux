@@ -8279,9 +8279,11 @@ static int brcmf_setup_wiphy(struct wiphy *wiphy, struct brcmf_if *ifp)
 		gscan = brcmf_feat_is_enabled(ifp, BRCMF_FEAT_GSCAN);
 		brcmf_pno_wiphy_params(wiphy, gscan);
 	}
-	/* vendor commands/events support */
+	/* vendor commands/events support; awdl=0 leaves out the AWDL command */
 	wiphy->vendor_commands = brcmf_vendor_cmds;
-	wiphy->n_vendor_commands = BRCMF_VNDR_CMDS_LAST - 1;
+	wiphy->n_vendor_commands = ifp->drvr->settings->awdl_enable ?
+				   BRCMF_VNDR_CMDS_LAST - 1 :
+				   BRCMF_VNDR_CMDS_AWDL - 1;
 
 	if (brcmf_feat_is_enabled(ifp, BRCMF_FEAT_WOWL))
 		brcmf_wiphy_wowl_params(wiphy, ifp);

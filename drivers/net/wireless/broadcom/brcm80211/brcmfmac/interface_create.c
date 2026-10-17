@@ -27,11 +27,13 @@
  * MAC_USE | IF_INDEX_USE | BSSID_USE together with an explicit BSSID and
  * an interface index (BRCMF_AWDL_CREATE_FLAGS, BRCMF_AWDL_IF_INDEX);
  * brcmfmac otherwise sends MAC_USE alone, which the firmware accepts but
- * leaves the AWDL iovars unusable. The BSSID is set at module load only.
+ * leaves the AWDL iovars unusable. The default BSSID is the fixed one that
+ * every AWDL node uses, so peers accept the interface's frames; awdl_bssid
+ * can override it at module load only.
  */
 static char *brcmf_awdl_bssid = "00:25:00:ff:94:73";
 module_param_named(awdl_bssid, brcmf_awdl_bssid, charp, 0444);
-MODULE_PARM_DESC(awdl_bssid, "interface_create BSSID for AWDL");
+MODULE_PARM_DESC(awdl_bssid, "interface_create BSSID for AWDL (default: the fixed AWDL BSSID)");
 
 #define BRCMF_INTERFACE_CREATE_VER_1 1
 #define BRCMF_INTERFACE_CREATE_VER_2 2
