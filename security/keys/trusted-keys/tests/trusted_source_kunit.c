@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * KUnit tests for trusted-key sources registered at runtime, through
- * register_trusted_key_source() and unregister_trusted_key_source().
+ * register_trusted_key_source() and unregister_trusted_key_source(), before
+ * and after the core's own init.
  *
  * The source under test is synthetic: it touches no hardware and seals
  * nothing for real. A test is skipped when another source holds the slot.
@@ -22,12 +23,17 @@
 #include <linux/string.h>
 
 #define FAKE_NAME "trusted_source_kunit"
+#define FAKE_BUILTIN_NAME "trusted_source_kunit_builtin"
 
 struct trusted_source_fake {
 	struct trusted_key_ops ops;
 	struct trusted_key_source src;
 	int init_ret;
 	int inits, exits, seals, unseals;
+	/* A built-in source for trusted_key_core_init(). */
+	struct trusted_key_ops builtin_ops;
+	struct trusted_key_source builtin;
+	int builtin_inits;
 };
 
 /* The ops have no context argument; the tests run one at a time. */
@@ -42,6 +48,13 @@ static int fake_init(void)
 static void fake_exit(void)
 {
 	fake->exits++;
+}
+
+/* A built-in source that finds no device, as each of them does on Apple. */
+static int fake_builtin_init(void)
+{
+	fake->builtin_inits++;
+	return -ENODEV;
 }
 
 /* Not a cipher: an invertible stand-in, so that unseal can be checked. */
@@ -147,6 +160,56 @@ static void trusted_source_after_mark_readonly(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, fake->inits, 2);
 	KUNIT_EXPECT_EQ(test, fake->exits, 2);
 	KUNIT_EXPECT_EQ(test, fake->seals, 2);
+}
+
+/*
+ * A source module that is built in, as apple_sep can be, registers from its
+ * probe at device_initcall, before init_trusted() runs at late_initcall.
+ * The core then leaves it the slot and the dispatch.
+ */
+static void trusted_source_before_core_init(struct kunit *test)
+{
+	struct key *key;
+
+	fake->ops.migratable = 1;
+	fake_register(test);
+
+	KUNIT_EXPECT_EQ(test, trusted_key_core_init(&fake->builtin, 1), 0);
+	KUNIT_EXPECT_EQ(test, fake->builtin_inits, 0);
+
+	key = fake_key(test, "new 32");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(key));
+	KUNIT_EXPECT_EQ(test, fake->seals, 1);
+	KUNIT_EXPECT_EQ(test, fake_key_migratable(key), 1);
+
+	/* The source still holds the slot, so it can withdraw. */
+	unregister_trusted_key_source(&fake->src);
+	KUNIT_EXPECT_EQ(test, fake->exits, 1);
+	KUNIT_EXPECT_EQ(test, PTR_ERR(fake_key(test, "new 32")), -ENODEV);
+	KUNIT_EXPECT_EQ(test, fake->seals, 1);
+}
+
+/*
+ * A source module registers after the core's init found no built-in
+ * source, as a modular apple_sep does.
+ */
+static void trusted_source_after_core_init(struct kunit *test)
+{
+	KUNIT_EXPECT_EQ(test, trusted_key_core_init(&fake->builtin, 1), 0);
+	if (!fake->builtin_inits)
+		kunit_skip(test, "another trusted-key source holds the slot");
+
+	/* With no source, the absent stubs answer. */
+	KUNIT_EXPECT_EQ(test, PTR_ERR(fake_key(test, "new 32")), -ENODEV);
+
+	fake_register(test);
+	KUNIT_EXPECT_FALSE(test, IS_ERR(fake_key(test, "new 32")));
+	KUNIT_EXPECT_EQ(test, fake->seals, 1);
+
+	unregister_trusted_key_source(&fake->src);
+	KUNIT_EXPECT_EQ(test, fake->inits, 1);
+	KUNIT_EXPECT_EQ(test, fake->exits, 1);
+	KUNIT_EXPECT_EQ(test, fake->builtin_inits, 1);
 }
 
 /* Keys are sealed and unsealed by the source until it withdraws. */
@@ -315,6 +378,11 @@ static int trusted_source_init(struct kunit *test)
 	fake->src.name = FAKE_NAME;
 	fake->src.ops = &fake->ops;
 
+	fake->builtin_ops = fake->ops;
+	fake->builtin_ops.init = fake_builtin_init;
+	fake->builtin.name = FAKE_BUILTIN_NAME;
+	fake->builtin.ops = &fake->builtin_ops;
+
 	/* However the test ends; a no-op unless the fake is registered. */
 	return kunit_add_action_or_reset(test, trusted_source_withdraw,
 					 &fake->src);
@@ -322,6 +390,8 @@ static int trusted_source_init(struct kunit *test)
 
 static struct kunit_case trusted_source_cases[] = {
 	KUNIT_CASE(trusted_source_after_mark_readonly),
+	KUNIT_CASE(trusted_source_before_core_init),
+	KUNIT_CASE(trusted_source_after_core_init),
 	KUNIT_CASE(trusted_source_dispatch),
 	KUNIT_CASE(trusted_source_migratable),
 	KUNIT_CASE(trusted_source_exclusive),
@@ -338,5 +408,6 @@ static struct kunit_suite trusted_source_suite = {
 
 kunit_test_suite(trusted_source_suite);
 
+MODULE_IMPORT_NS("EXPORTED_FOR_KUNIT_TESTING");
 MODULE_DESCRIPTION("KUnit tests for trusted-key sources registered at runtime");
 MODULE_LICENSE("GPL");
