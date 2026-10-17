@@ -58,6 +58,7 @@
 #include <linux/task_work.h>
 #include <linux/percpu-rwsem.h>
 #include <linux/unwind_deferred.h>
+#include <linux/nospec.h>
 #include <linux/kvm_types.h>
 #include <linux/seq_file.h>
 
@@ -7226,7 +7227,9 @@ static int map_range(struct perf_buffer *rb, struct vm_area_struct *vma)
 				err = -EINVAL;
 				break;
 			}
-			page = virt_to_page(rb->aux_pages[pagenum]);
+			/* The mapping length drives pagenum: bound it under speculation. */
+			page = virt_to_page(rb->aux_pages[array_index_nospec(pagenum,
+							   rb->aux_nr_pages)]);
 		} else {
 			page = perf_mmap_to_page(rb, pagenum);
 			if (!pagenum)
