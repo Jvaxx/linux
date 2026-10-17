@@ -613,20 +613,34 @@ static struct apple_atcphy *atcphy_test_alloc_failed_handoff(struct kunit *test)
 }
 
 /* Once dwc3 has stopped, its USB3 PHY power-off parks the PIPE without one */
-static void atcphy_test_stopped_power_off(struct kunit *test)
+static void atcphy_test_stopped_power_off_common(struct kunit *test, bool dp)
 {
 	struct apple_atcphy *atcphy = atcphy_test_alloc_failed_handoff(test);
 	struct phy *phy = kunit_kzalloc(test, sizeof(*phy), GFP_KERNEL);
 
 	KUNIT_ASSERT_NOT_NULL(test, phy);
 	phy_set_drvdata(phy, atcphy);
+	if (!dp)
+		atcphy->mode = APPLE_ATCPHY_MODE_USB3;
 
 	KUNIT_EXPECT_EQ(test, atcphy_usb3_power_off(phy), 0);
 	KUNIT_EXPECT_EQ(test, atcphy->pipe_state, ATCPHY_PIPEHANDLER_STATE_DUMMY);
 	KUNIT_EXPECT_FALSE(test, atcphy->pipe_pending);
-	KUNIT_EXPECT_EQ(test, atcphy->mode, APPLE_ATCPHY_MODE_OFF);
+	KUNIT_EXPECT_EQ(test, atcphy->mode,
+			dp ? APPLE_ATCPHY_MODE_USB3_DP : APPLE_ATCPHY_MODE_OFF);
 	KUNIT_EXPECT_FALSE(test, atcphy->host_active);
 	KUNIT_EXPECT_FALSE(test, atcphy->usb3_port_off);
+}
+
+static void atcphy_test_stopped_power_off(struct kunit *test)
+{
+	atcphy_test_stopped_power_off_common(test, false);
+}
+
+/* USB shutdown must leave an active DisplayPort link powered. */
+static void atcphy_test_stopped_power_off_dp(struct kunit *test)
+{
+	atcphy_test_stopped_power_off_common(test, true);
 }
 
 /* and so does the reset that dwc3 asserts once it has stopped */
@@ -673,6 +687,7 @@ static void atcphy_test_host_start_without_usb3(struct kunit *test)
 
 	/* A Type-C port's controller still waits for the lanes */
 	atcphy = atcphy_test_alloc(test, false);
+	atcphy->hw = &atcphy_hw_t8140;
 	mutex_init(&atcphy->lock);
 	phy_set_drvdata(phy, atcphy);
 	atcphy->mode_dirty = true;
@@ -993,6 +1008,7 @@ static struct kunit_case atcphy_mux_test_cases[] = {
 	KUNIT_CASE(atcphy_test_set_port_on),
 	KUNIT_CASE(atcphy_test_host_start),
 	KUNIT_CASE(atcphy_test_stopped_power_off),
+	KUNIT_CASE(atcphy_test_stopped_power_off_dp),
 	KUNIT_CASE(atcphy_test_stopped_reset),
 	KUNIT_CASE(atcphy_test_host_start_without_usb3),
 	KUNIT_CASE(atcphy_test_election_held_safe),
