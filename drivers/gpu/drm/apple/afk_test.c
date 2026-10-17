@@ -113,4 +113,5 @@ static struct kunit_suite afk_ring_suite = {
 
 kunit_test_suite(afk_ring_suite);
 
+MODULE_DESCRIPTION("KUnit tests for the Apple AFK ring buffers");
 MODULE_LICENSE("Dual MIT/GPL");
