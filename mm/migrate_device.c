@@ -408,7 +408,7 @@ again:
 			if (anon_exclusive) {
 				pte = ptep_clear_flush(vma, addr, ptep);
 
-				if (folio_try_share_anon_rmap_pte(folio, page)) {
+				if (folio_try_share_anon_rmap_pte(folio, page, vma)) {
 					set_pte_at(mm, addr, ptep, pte);
 					if (fault_folio != folio)
 						folio_unlock(folio);
@@ -668,7 +668,7 @@ static void migrate_vma_unmap(struct migrate_vma *migrate)
  * @args: contains the vma, start, and pfns arrays for the migration
  *
  * Returns: negative errno on failures, 0 when 0 or more pages were migrated
- * without an error.
+ * without an error. Non-native MM granules return -EOPNOTSUPP.
  *
  * Prepare to migrate a range of memory virtual address range by collecting all
  * the pages backing each virtual address in the range, saving them inside the
@@ -730,6 +730,10 @@ static void migrate_vma_unmap(struct migrate_vma *migrate)
 int migrate_vma_setup(struct migrate_vma *args)
 {
 	long nr_pages = (args->end - args->start) >> PAGE_SHIFT;
+
+	/* PFN arrays and migration ownership describe whole native pages. */
+	if (args->vma && mm_page_size(args->vma->vm_mm) != PAGE_SIZE)
+		return -EOPNOTSUPP;
 
 	args->start &= PAGE_MASK;
 	args->end &= PAGE_MASK;
