@@ -3,7 +3,7 @@
 """Actual disconnect authority, DWC3 teardown and firmware resource admission."""
 from pathlib import Path
 import re
-from common import block, source_defines
+from common import block, atc_mux_without_pm, source_defines
 
 def disconnect(root):
     # Copyright 2026 Ryan Murray
@@ -749,11 +749,11 @@ def teardown(root):
         s = files[n]
         normalized = n == 'atc' and name == 'atcphy_mux_set' and 'static int atcphy_mux_set_locked(' in s
         if normalized:
-            name = 'atcphy_mux_set_locked'
+            return atc_mux_without_pm(s)
         m = re.search(r'^(?:static [^\n]*\b|(?:int|void) )' + name + r'\(', s, re.M)
         assert m, (n, name)
         result = block(s, m.start())
-        return result.replace('atcphy_mux_set_locked(', 'atcphy_mux_set(', 1) if normalized else result
+        return result
 
     decls = []
     for name in ('atcphy_generation', 'atcphy_lane_mode', 'atcphy_pipehandler_state', 'atcphy_mode', 'atcphy_dp_link_rate'):
