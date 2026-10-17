@@ -1929,9 +1929,13 @@ static int vfio_change_dma_owner(struct vfio_iommu *iommu, struct vfio_dma *dma,
 	int ret;
 
 	if (vfio_dma_has_fragments(dma) ||
-	    (mm_page_size(current->mm) == PAGE_SIZE && IS_ALIGNED(vaddr, PAGE_SIZE)))
+	    (mm_page_size(current->mm) == PAGE_SIZE && IS_ALIGNED(vaddr, PAGE_SIZE))) {
+		/* An unchanged owner needs neither a capability check nor a recharge. */
+		if (current->mm == dma->mm)
+			return 0;
 		return vfio_change_dma_mm(dma, current->group_leader, current->mm,
 					  capable(CAP_IPC_LOCK));
+	}
 
 	/* Prepare only metadata: failure must preserve every legacy pin/charge. */
 	provider = vfio_fragments_prepare_native(iommu, dma);
