@@ -317,6 +317,50 @@ impl AsahiDriver {
     }
 }
 
+#[cfg(CONFIG_DRM_ASAHI_G15)]
+impl AsahiDriver {
+    /// Boots a G15 GPU and registers its DRM device. Called by the G15 platform driver
+    /// ([`crate::g15::Driver`]), which has no module alias: probing happens when userspace loads
+    /// the module after the native display is up.
+    ///
+    /// A G15 firmware session cannot be stopped once started. If registration fails after the
+    /// boot, [`crate::g15::Gpu`] retains everything the firmware can reach until reboot.
+    pub(crate) fn probe_g15(
+        pdev: &platform::Device<Core>,
+        cfg: &'static crate::g15::Config,
+    ) -> Result<Self> {
+        // SAFETY: The GPU performs DMA through a UAT whose output width is part of the SoC config.
+        unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(cfg.uat_oas)?)? };
+        let res = regs::Resources::new(pdev)?;
+        // SAFETY: GPU construction cannot access driver data before init_data().
+        // Failed construction releases the allocation without dropping uninitialized data.
+        let drm: ARef<AsahiDevice> = unsafe { drm::device::Device::new_uninit(pdev.as_ref())? };
+        let gpu = crate::g15::Gpu::new(pdev, &drm, cfg, res.clone())?;
+        let data = try_pin_init!(AsahiData {
+            gpu: gpu as Arc<dyn gpu::Gpu>,
+            pdev: pdev.into(),
+            resources: res,
+        });
+        // SAFETY: This is the sole initializer; no driver-data users have been published.
+        unsafe { drm.init_data(data)? };
+        drm::driver::Registration::new_foreign_owned(&drm, pdev.as_ref(), 0)?;
+        // The G15 firmware statistics have no decoder.
+        let raw_dev = pdev.as_ref().as_raw();
+        let raw_stats = crate::sysfs_exports::register(raw_dev, core::ptr::null(), false)?;
+        Ok(Self {
+            drm,
+            raw_dev,
+            raw_stats,
+            stats: None,
+        })
+    }
+
+    /// The DRM device, for the G15 platform driver.
+    pub(crate) fn drm(&self) -> &AsahiDevice {
+        &self.drm
+    }
+}
+
 impl Drop for AsahiDriver {
     fn drop(&mut self) {
         crate::sysfs_exports::unregister(self.raw_dev, self.raw_stats);

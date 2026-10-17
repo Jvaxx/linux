@@ -25,6 +25,23 @@ config DRM_ASAHI
 	help
 	  DRM driver for Apple AGX GPUs (G13x, found in the M1 SoC family)
 
+config DRM_ASAHI_G15
+	bool "Apple M3 Pro (G15S) support (experimental)"
+	depends on DRM_ASAHI && ARM64
+	depends on APPLE_PMP=y || APPLE_PMP=DRM_ASAHI
+	select CRYPTO_LIB_SHA256
+	help
+	  Support for the G15S GPU of the T6030 MacBook Pros (J514S, J516S),
+	  whose firmware (RTKit 2419) the boot loader leaves loaded. Only the
+	  qualified firmware build is admitted.
+
+	  The G15 platform driver has no module alias: it binds when the
+	  asahi module is loaded explicitly (modprobe asahi), after the
+	  native display is up. The firmware session is retained until
+	  reboot; the module cannot be unloaded once the GPU has started.
+
+	  Say N unless you are bringing up the M3 Pro.
+
 config DRM_ASAHI_DEBUG_ALLOCATOR
 	bool "Use debug allocator"
 	depends on DRM_ASAHI
