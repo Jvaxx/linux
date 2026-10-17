@@ -49,6 +49,8 @@ properties:
               - apple,t6031-pmgr-pwrstate
               - apple,t8122-pmgr-pwrstate
               - apple,t8132-pmgr-pwrstate
+              - apple,t8140-pmgr-pwrstate
+              - apple,t8142-pmgr-pwrstate
           - const: apple,t8103-pmgr-pwrstate
 
   reg:
@@ -75,6 +77,13 @@ properties:
   apple,always-on:
     description:
       Forces this power domain to always be powered up.
+    type: boolean
+
+  apple,firmware-owned:
+    description:
+      The boot loader hands over the coprocessor in this domain running, and its
+      firmware owns the domain's power state; writing it faults. The OS keeps the
+      domain on and never changes its power target, automatic gating or reset.
     type: boolean
 
   apple,min-state:
