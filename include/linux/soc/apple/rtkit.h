@@ -240,6 +240,13 @@ int apple_rtkit_send_message(struct apple_rtkit *rtk, u8 ep, u64 message,
 int apple_rtkit_poll(struct apple_rtkit *rtk);
 
 /*
+ * Stop taking interrupts for messages from the co-processor, which then
+ * stay queued in the mailbox until apple_rtkit_resume_rx().
+ */
+void apple_rtkit_hold_rx(struct apple_rtkit *rtk);
+void apple_rtkit_resume_rx(struct apple_rtkit *rtk);
+
+/*
  * Checks if an endpoint with a given index exists
  *
  * @rtk:            RTKit reference
