@@ -793,6 +793,17 @@
 			/* child nodes are added in t6030-pmgr.dtsi */
 		};
 
+		/*
+		 * PMP device-state requests: the external display controllers
+		 * (cell 8 DISPEXT0, 9 DISPEXT1) are requested and acknowledged
+		 * here before their PMGR chains are powered.
+		 */
+		pmp_ptd: power-controller@3503c0000 {
+			compatible = "apple,t6030-pmp-ptd";
+			reg = <0x3 0x503c0000 0x0 0x14000>;
+			#power-domain-cells = <1>;
+		};
+
 		nco: clock-controller@350044000 {
 			compatible = "apple,t6030-nco", "apple,t8103-nco";
 			reg = <0x3 0x50044000 0x0 0x14000>;
