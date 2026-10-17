@@ -65,6 +65,8 @@ static unsigned char migratable;
 static DEFINE_MUTEX(trusted_key_source_lock);
 static bool trusted_key_source_active;
 static struct trusted_key_source *trusted_key_source_registered;
+/* trusted_key_core_init() has run once, from init_trusted(). */
+static bool trusted_key_core_done;
 
 /* Defined below; registration needs it before its definition. */
 static int kernel_get_random(unsigned char *key, size_t key_len);
@@ -487,9 +489,13 @@ static int kernel_get_random(unsigned char *key, size_t key_len)
  * the absent stubs, so that a source module can register later.
  *
  * init_trusted() calls this once, with trusted_key_sources. The KUnit tests
- * call it with synthetic sources of their own.
+ * call it later, with synthetic sources of their own. Only the first call
+ * gives the slot to a built-in source: one that takes it is never withdrawn,
+ * as unregister_trusted_key_source() withdraws only a registered source,
+ * and a test's source is gone once the test ends.
  *
- * Return: 0, or the error of trusted.rng or of a built-in source's init().
+ * Return: 0, the error of trusted.rng or of a built-in source's init(), or
+ * -EBUSY for a built-in source that initialises after the first call.
  */
 VISIBLE_IF_KUNIT int
 trusted_key_core_init(const struct trusted_key_source *sources, size_t n)
@@ -539,6 +545,12 @@ trusted_key_core_init(const struct trusted_key_source *sources, size_t n)
 			get_random = kernel_get_random;
 
 		ret = sources[i].ops->init();
+		if (!ret && trusted_key_core_done) {
+			if (sources[i].ops->exit)
+				sources[i].ops->exit();
+			ret = -EBUSY;
+			goto out;
+		}
 		if (!ret) {
 			static_call_update(trusted_key_seal, sources[i].ops->seal);
 			static_call_update(trusted_key_unseal, sources[i].ops->unseal);
@@ -573,6 +585,7 @@ trusted_key_core_init(const struct trusted_key_source *sources, size_t n)
 	if (!ret)
 		trusted_key_source_active = true;
 out:
+	trusted_key_core_done = true;
 	mutex_unlock(&trusted_key_source_lock);
 	return ret;
 }
