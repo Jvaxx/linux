@@ -3,7 +3,7 @@
 """Actual disconnect authority, DWC3 teardown and firmware resource admission."""
 from pathlib import Path
 import re
-from common import block, atc_mux_without_pm, source_defines
+from common import block, atc_mux_without_pm, source_defines, ATC_POST_TUNABLE
 
 def disconnect(root):
     # Copyright 2026 Ryan Murray
@@ -779,7 +779,8 @@ def teardown(root):
                 'atcphy_configure_pipehandler', 'atcphy_park_pipehandler',
                 'atcphy_get_mode_config', 'atcphy_dp_configure',
                 'j700_field_update', 'j700_aux_disable', 'atcphy_disable_dp_aux',
-                'atcphy_power_off', 'atcphy_power_on', 'atcphy_configure', 'atcphy_usb2_init', 'atcphy_usb3_power_off',
+                'atcphy_power_off', 'atcphy_power_on', *ATC_POST_TUNABLE, 'atcphy_configure',
+                'atcphy_usb2_init', 'atcphy_usb3_power_off',
                 'atcphy_usb3_set_mode', 'atcphy_usb2_power_off',
                 '_atcphy_dwc3_reset_assert', 'atcphy_dwc3_reset_assert', 'atcphy_mux_set'),
         'phy': ('phy_init', 'phy_exit', 'phy_power_on', 'phy_power_off'),
@@ -1346,11 +1347,12 @@ struct apple_dcp {
 struct platform_device { struct apple_dcp *data; };
 struct drm_crtc { struct platform_device *dcp; };
 struct drm_crtc_state { bool vrr_enabled, modeset; };
-struct drm_atomic_state { struct drm_crtc_state crtc; };
+/* mainline 7.2 renamed struct drm_atomic_state to struct drm_atomic_commit */
+struct drm_atomic_commit { struct drm_crtc_state crtc; };
 #define to_apple_crtc(x) (x)
 #define platform_get_drvdata(x) ((x)->data)
 static struct drm_crtc_state *drm_atomic_get_new_crtc_state(
-    struct drm_atomic_state *s, struct drm_crtc *c)
+    struct drm_atomic_commit *s, struct drm_crtc *c)
 { (void)c; return &s->crtc; }
 static bool drm_atomic_crtc_needs_modeset(struct drm_crtc_state *s)
 { return s->modeset; }
@@ -1362,7 +1364,7 @@ int main(void)
     struct apple_dcp dcp = { .connector = &connector };
     struct platform_device pdev = { .data = &dcp };
     struct drm_crtc crtc = { .dcp = &pdev };
-    struct drm_atomic_state state = {0};
+    struct drm_atomic_commit state = {0};
     unsigned int cases = 0;
     /* Check initial modesets, plane-only commits and link recovery states. */
     for (unsigned int profile = 0; profile < 3; profile++)

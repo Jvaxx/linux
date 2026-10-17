@@ -3,7 +3,7 @@
 """Actual PHY parking, failure/retry, masked context and OFF controls."""
 from pathlib import Path
 import re
-from common import block, source_defines, atc_mux_without_pm
+from common import block, source_defines, atc_mux_without_pm, ATC_POST_TUNABLE
 
 def parking(root):
 
@@ -132,7 +132,8 @@ static void atc_tunnel_restore(struct apple_atcphy *p) { (void)p; }
     parts.append(dp)
     for name in ('atcphy_configure_lanes', 'j700_aux_enable', 'j700_aux_disable',
                  'atcphy_enable_dp_aux', 'atcphy_disable_dp_aux', 'atcphy_power_off',
-                 'atcphy_power_on', 'atcphy_configure', 'atcphy_set_orientation', 'atcphy_sw_set', 'atcphy_mux_set',
+                 'atcphy_power_on', *ATC_POST_TUNABLE, 'atcphy_configure', 'atcphy_set_orientation',
+                 'atcphy_sw_set', 'atcphy_mux_set',
                  'atcphy_usb3_set_mode', 'atcphy_usb3_power_off'):
         parts.append(function(atc, name))
     production = '\n'.join(parts)
@@ -193,6 +194,7 @@ struct reset_controller_dev { int unused; };
     suffix = r'''
 static struct atcphy_hw hw = {
     .has_t8140_dp = true, .gen = ATCPHY_GENERATION_T8122,
+    .configure_post_tunable = atcphy_configure_post_tunable_all_modes,
     .aciophy_lane_mode = ACIOPHY_LANE_MODE_T8122,
     .aciophy_crossbar = ACIOPHY_CROSSBAR_T8122,
     .pipe_mux_clk = PIPEHANDLER_MUX_CTRL_CLK_T8103,
@@ -536,6 +538,9 @@ static void orientation_roundtrip(void)
 
     for (unsigned int generation = 0; generation < 4; generation++) {
         hw.gen = generation == 0 ? ATCPHY_GENERATION_T8103 : ATCPHY_GENERATION_T8122;
+        hw.configure_post_tunable = generation == 0 ? atcphy_configure_post_tunable_t8103 :
+                                    generation == 1 ? atcphy_configure_post_tunable_t8122 :
+                                    atcphy_configure_post_tunable_all_modes;
         hw.has_t8140_dp = generation == 2;
         hw.has_usb4 = !hw.has_t8140_dp;
         hw.aciophy_lane_mode = generation == 0 ? ACIOPHY_LANE_MODE_T8103 :
@@ -1036,6 +1041,33 @@ static void successful_scope(void)
     puts("PASS: all matched hardware profiles fixed/ordinary host/device success and duplicate cache controls");
 }
 
+static void post_tunable_profiles(void)
+{
+    /*
+     * Asahi 7.2 per-SoC setup after the tunables: T8103 sets its overrides in
+     * every mode and never waits for RCAL; T8122 wakes its common block and
+     * waits for RCAL for the USB3 PIPE only; T8140/T8142 do both in every
+     * mode, DisplayPort included, as on 7.1.
+     */
+    const enum atcphy_mode modes[]={APPLE_ATCPHY_MODE_USB3,APPLE_ATCPHY_MODE_USB3_DP,
+                                    APPLE_ATCPHY_MODE_DP};
+    for (unsigned int gen=0; gen<4; gen++)
+    for (unsigned int m=0; m<ARRAY_SIZE(modes); m++) {
+        struct apple_atcphy p;
+        legacy_setup(&p,gen,false);
+        unsigned int before=polls, rcal=0;
+        assert(atcphy_configure(&p,modes[m])==0);
+        for (unsigned int i=before; i<polls; i++)
+            rcal+=!strcmp(poll_caller[i],"atcphy_configure");
+        bool usb3=atcphy_modes[modes[m]].pipehandler_state==ATCPHY_PIPEHANDLER_STATE_USB3;
+        bool wake=gen>=2 || (gen==1 && usb3);
+        assert(rcal==wake);
+        assert(!!(registers[AUS_COMMON_SHIM_BLK_BIAS_REG/4]&AUS_COMMON_SHIM_BLK_BIAS_REG_BGBIAS_OV)==wake);
+        assert(!!(registers[ACIOPHY_SLEEP_CTRL/4]&ACIOPHY_SLEEP_CTRL_TX_CLAMP_OV)==(gen==0));
+    }
+    puts("PASS: actual per-SoC post-tunable callbacks and RCAL wait for every hardware profile");
+}
+
 static void pending_gate(void)
 {
     for (unsigned int gen=0;gen<2;gen++) {
@@ -1129,6 +1161,7 @@ int main(int argc,char **argv)
     else if (!strcmp(argv[1],"init")) retry_callbacks(false);
     else if (!strcmp(argv[1],"mux")) retry_callbacks(true);
     else if (!strcmp(argv[1],"success")) successful_scope();
+    else if (!strcmp(argv[1],"post-tunable")) post_tunable_profiles();
     else assert(false);
     return 0;
 }
@@ -2107,9 +2140,11 @@ static int atcphy_configure_pipehandler(struct apple_atcphy *p, bool host)
     for name in ('core_read32', 'atcphy_get_mode_config', 'j700_field_update', 'j700_pma_idle'):
         parts.append(function(atc, name))
     parts.append(dp)
+    # The fixture hw below is the T8140 profile: only its post-tunable callback.
     for name in ('atcphy_configure_lanes', 'j700_aux_enable', 'j700_aux_disable',
                  'atcphy_enable_dp_aux', 'atcphy_disable_dp_aux', 'atcphy_power_off',
-                 'atcphy_power_on', 'atcphy_configure', 'atcphy_mux_set'):
+                 'atcphy_power_on', 'atcphy_wake_common_t8122',
+                 'atcphy_configure_post_tunable_all_modes', 'atcphy_configure', 'atcphy_mux_set'):
         parts.append(function(atc, name))
     production = '\n'.join(parts)
     prefix = r'''
@@ -2156,6 +2191,7 @@ struct typec_mux_dev { struct apple_atcphy *data; };
     suffix = r'''
 static struct atcphy_hw hw = {
     .has_t8140_dp = true, .gen = ATCPHY_GENERATION_T8122,
+    .configure_post_tunable = atcphy_configure_post_tunable_all_modes,
     .aciophy_lane_mode = 0x60, .aciophy_crossbar = 0x64,
 };
 static void initial(struct apple_atcphy *p, bool fixed, bool swapped)
