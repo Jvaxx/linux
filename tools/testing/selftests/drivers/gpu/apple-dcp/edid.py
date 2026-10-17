@@ -50,6 +50,9 @@ static void bitmap_release_region(unsigned long *p,unsigned int bit,int order) {
 
 static unsigned diagnostic_errors,diagnostic_information,legacy_publishes;
 #define DCP_FIRMWARE_H17P 17
+/* The T6030 14.7 backend never matches these H17P scenarios. */
+#define DCP_FIRMWARE_V_14_7 (DCP_FIRMWARE_H17P + 1)
+#define DCP_FIRMWARE_V_14_7_TEMPLATE (DCP_FIRMWARE_H17P + 2)
 #define EPIC_TYPE_NOTIFY 0
 #define EPIC_CAT_REPORT 0
 #define max(a,b) ((a)>(b)?(a):(b))
@@ -76,7 +79,7 @@ static bool queue_work(void *wq,struct work_struct *w) { assert(wq);bool fresh=!
 struct apple_dcp;struct apple_dcp_afkep;struct apple_epic_service;
 void afk_service_retry(struct apple_dcp_afkep *ep);
 struct apple_epic_service_ops { char name[32];bool reusable,optional;void (*init)(struct apple_epic_service *,const char *,const char *,s64);int (*prepare)(struct apple_epic_service *,const char *,const char *,s64);int (*revalidate)(struct apple_epic_service *,const char *,const char *,s64);void (*teardown)(struct apple_epic_service *); };
-struct epic_cmd_info { u16 tag;u8 type;size_t reply_length;void *rxbuf,*txbuf;dma_addr_t rxbuf_dma,txbuf_dma;size_t rxlen,txlen;u32 retcode;bool done,free_on_ack;int *completion; };
+struct epic_cmd_info { u16 tag;u8 type;size_t reply_length,reply_len;bool reply_len_valid;void *rxbuf,*txbuf;dma_addr_t rxbuf_dma,txbuf_dma;size_t rxlen,txlen;u32 retcode;bool done,free_on_ack;int *completion; };
 struct apple_epic_service {
     struct apple_dcp_afkep *ep;const struct apple_epic_service_ops *ops;
     bool lock,enabled,torndown;unsigned int users;u32 channel;u8 cmd_tag;

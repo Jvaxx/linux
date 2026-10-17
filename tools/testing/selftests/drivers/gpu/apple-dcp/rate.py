@@ -924,9 +924,12 @@ static int phy_configure(void *phy,union phy_configure_opts *o) {
     if(o->dp.set_rate)hardware_rate=o->dp.link_rate;
     return 0;
 }
-static void dcp_tunnel_set_rate(struct apple_dcp *d,void *phy,unsigned rate) {
-    (void)d;(void)phy;(void)rate;assert(false);
+static int dcp_tunnel_set_rate(struct apple_dcp *d,void *phy,unsigned rate) {
+    (void)d;(void)phy;(void)rate;assert(false);return 0;
 }
+/* The T6030 14.7 backend never matches this H17P display. */
+#define DCP_FIRMWARE_V_14_7 (DCP_FIRMWARE_H17P + 1)
+#define DCP_FIRMWARE_V_14_7_TEMPLATE (DCP_FIRMWARE_H17P + 2)
 '''
     real_handlers += block(training, 'static int dptx_j700_validate_lanes(') + '\n'
     real_handlers += block(dptx, 'static int dptxport_call_set_active_lane_count(') + '\n'

@@ -122,3 +122,44 @@ static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *sta
     return ret;
 }
 '''
+
+
+def fabric_core(root):
+    """The real Type-C fabric decisions and effect runners as host C.
+
+    dcp-fabric-core.c and dcp-fabric-effects.h are host-compilable by design
+    (KUnit runs them against fake hardware); only the kernel includes and
+    module boilerplate are dropped.  The unit supplies u32/u64.  Unused
+    static inline helpers are marked so, as they would be in a header.
+    """
+    apple = root / 'drivers/gpu/drm/apple'
+    core = apple / 'dcp-fabric-core.c'
+    if not core.exists():
+        return ''
+
+    def strip(text):
+        return '\n'.join(line for line in text.splitlines()
+                         if not line.startswith(('#include', 'EXPORT_SYMBOL', 'MODULE_'))) + '\n'
+    tunnel = (root / 'include/linux/soc/apple/dp-tunnel.h').read_text()
+    return ('\n#include <limits.h>\n#include <errno.h>\n#include <stdbool.h>\n'
+            '#ifndef BIT\n#define BIT(n) (1UL << (n))\n#endif\n'
+            '#ifndef time_before\n#define time_before(a, b) ((long)((a) - (b)) < 0)\n#endif\n'
+            + block(tunnel, 'static inline bool apple_dp_tunnel_wiring_dual(') + '\n'
+            + strip((apple / 'dcp-fabric-core.h').read_text())
+            + strip(core.read_text())
+            + strip((apple / 'dcp-fabric-effects.h').read_text())).replace(
+                'static inline ', 'static inline __attribute__((unused)) ')
+
+
+def fabric_rebalance(dcp):
+    """dcp_typec_rebalance_locked() with the adapter callbacks it runs through.
+
+    The fabric core split turned the loop into dcp_fabric_run_rebalance() over
+    struct dcp_rebalance_context and dcp_rebalance_ops; older sources keep the
+    loop inline.
+    """
+    marker = 'static struct apple_dcp_typec_route *\ndcp_typec_rebalance_locked('
+    end = dcp.index(marker)
+    end += len(block(dcp, end))
+    start = dcp.find('struct dcp_rebalance_context {')
+    return dcp[start if 0 <= start < end else dcp.index(marker):end] + '\n'

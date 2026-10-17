@@ -430,7 +430,8 @@ def bounce(root):
     swap(' struct { bool connected; void *service; } dptxport[1];',
          ' struct { bool connected, closed; void *service, *atcphy; int linkcfg_completion; } dptxport[1];\n'
          ' void *phy, *dev, *active_typec_route;\n'
-         ' int dptx_die, dptx_phy, dptx_dfp_port, connector_type;')
+         ' int dptx_die, dptx_phy, dptx_dfp_port, connector_type;\n'
+         ' bool external, external_link_ready, crashed;')
     old_raw = unit[unit.index('static int dcp_dptx_connect_raw('):]
     old_raw = old_raw[:old_raw.index('return raw_error; }') + len('return raw_error; }')]
     swap(old_raw, 'static int dcp_dptx_connect_raw(struct apple_dcp *, u32, bool *);')
@@ -473,6 +474,12 @@ static int dptxport_connect(void *s, int core, int atc, int die, bool typec)
 static int dptxport_request_display(void *s)
 { (void)s; fw_display |= request_error != -EINVAL; return request_error; }
 static int dptxport_set_hpd_timeout(void *s, bool on, int t) { (void)t; return dptxport_set_hpd(s, on); }
+/* The pre-split condition: neither a USB4 output nor a T602X tunnel machine here. */
+static bool dcp_uses_t6020_tunnel_flow(struct apple_dcp *d) { return dcp_is_usb4_output(d) && apple_dp_tunnel_t602x(); }
+/* An H17P display is not a T6030 dcpext (dcp->external): no scanout to fault or restore. */
+#define smp_store_release(p, v) (*(p) = (v))
+static bool dcpext_scanout_terminal(struct apple_dcp *d) { (void)d; return false; }
+static void dcpext_scanout_link_restored(struct apple_dcp *d) { (void)d; assert(!"T6030 dcpext path in an H17P scenario"); }
 '''
     tests = r'''
 static struct platform_device device = { .data = &display };
@@ -875,6 +882,8 @@ def profile(root):
     headers = "\n".join(line for name in ("dcp-external-bw.h", "dcp-link.h")
                         for line in (base / name).read_text().splitlines()
                         if not line.startswith("#include"))
+    # Header inline helpers this unit does not call are unused, as in a header.
+    headers = headers.replace("static inline ", "static inline __attribute__((unused)) ")
     prefix = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -884,6 +893,16 @@ def profile(root):
 #include <errno.h>
 typedef uint32_t u32; typedef uint64_t u64;
 typedef uint32_t __le32; typedef uint64_t __le64;
+/* dcp-link.h also carries the T6030 14.7 DCPLink transport encoders. */
+typedef uint8_t u8; typedef uint16_t u16;
+#define le64_to_cpu(v) (v)
+#define BIT_ULL(n) (1ULL << (n))
+#define GENMASK_ULL(h, l) ((~0ULL >> (63 - (h))) & (~0ULL << (l)))
+#define FIELD_GET(m, v) ((__typeof__(m))(((v) & (m)) >> __builtin_ctzll(m)))
+#define FIELD_PREP(m, v) (((__typeof__(m))(v) << __builtin_ctzll(m)) & (m))
+#define check_add_overflow(a, b, d) __builtin_add_overflow(a, b, d)
+#define is_power_of_2(n) ((n) != 0 && (((n) & ((n) - 1)) == 0))
+#define U16_MAX UINT16_MAX
 #define __packed __attribute__((packed))
 #undef static_assert
 #define static_assert(condition, ...) _Static_assert(condition, "wire layout")
@@ -1141,10 +1160,15 @@ static int dcp_comp_ops;
 struct device_node { bool available, external, phys; unsigned int index; u32 firmware[3], compat[3]; int firmware_cells, compat_cells; };
 struct device { struct device_node *of_node; void *data; };
 struct platform_device { struct device dev; bool bound, registered; };
+/* The native T6030 14.7 backend is never selected in these scenarios. */
+enum dcp_firmware_version { DCP_FIRMWARE_UNKNOWN, DCP_FIRMWARE_V_14_7, DCP_FIRMWARE_V_14_7_TEMPLATE };
 struct apple_dcp {
     bool external_prepared, quiescing, crashed;
+    enum dcp_firmware_version fw_compat;
     struct { int iomfb_method_profile; } hw;
 };
+static void __attribute__((unused)) iomfb_v14_7_remove(struct apple_dcp *d)
+{ (void)d; assert(!"14.7 backend on a non-14.7 DCP"); }
 struct drm_device { int unused; };
 struct drm_encoder { int unused; };
 struct apple_drm_private { struct drm_device drm; };
@@ -1373,8 +1397,11 @@ def vrr(root):
 #define READ_ONCE(x) (x)
 #define dev_dbg(...) ((void)0)
 struct apple_connector { bool connected; };
+/* The native T6030 14.7 backend is never selected in these scenarios. */
+enum dcp_firmware_version { DCP_FIRMWARE_UNKNOWN, DCP_FIRMWARE_V_14_7, DCP_FIRMWARE_V_14_7_TEMPLATE };
 struct apple_dcp {
     bool crashed;
+    enum dcp_firmware_version fw_compat;
     struct { int iomfb_method_profile; } hw;
     struct { bool valid; } mode_state;
     struct apple_connector *connector;
@@ -1392,6 +1419,9 @@ static struct drm_crtc_state *drm_atomic_get_new_crtc_state(
 { (void)c; return &s->crtc; }
 static bool drm_atomic_crtc_needs_modeset(struct drm_crtc_state *s)
 { return s->modeset; }
+static int __attribute__((unused)) iomfb_v14_7_atomic_check(struct apple_dcp *d,
+    struct drm_crtc *c, struct drm_atomic_commit *s)
+{ (void)d; (void)c; (void)s; assert(!"14.7 backend on a non-14.7 DCP"); return -EINVAL; }
 """
     suffix = r"""
 int main(void)

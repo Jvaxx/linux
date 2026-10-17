@@ -76,7 +76,20 @@ static int mux_control_deselect(struct mux_control *m) { (void)m;event('C');xbar
     '''
     pos=actual.index('static int dcp_typec_route_deactivate(')
     actual=actual[:pos]+extra+actual[pos:]
-    actual=actual.replace(block(actual,'static bool dcp_typec_route_available('), 'static bool dcp_typec_route_fixed_output_busy(struct apple_dcp_typec_route *r) { (void)r;return false; }\n'+block(dcp,'static bool dcp_typec_route_available('),1)
+    # The fabric core split: availability is the real dcp_fabric_available() over
+    # the real ownership (SAFE lease included) and HDMI presence of the pipeline.
+    available=''.join(block(dcp,marker)+'\n' for marker in (
+        'static bool dcp_typec_safe_held(struct apple_dcp *dcp)\n{', 'bool dcp_typec_dual_stream(void)\n{',
+        'static bool dcp_hdmi_settle_enabled(struct apple_dcp *dcp)\n{',
+        'static enum dcp_fabric_presence_state dcp_hdmi_presence(struct apple_dcp *dcp)\n{') if marker in dcp)
+    if available:
+        actual=actual.replace('struct apple_dcp { int external_lock,external_error;','struct apple_dcp { int external_lock,external_error;\n     struct dcp_fabric_presence hdmi_presence; int hdmi_presence_lock; unsigned nr_typec_routes;',1)
+        available='''#define atomic_read(p) (*(p))
+    #define spin_lock_irqsave(l,f) ((void)(l),(f)=0)
+    #define spin_unlock_irqrestore(l,f) ((void)(l),(void)(f))
+    static int dcp_dual_stream_routes;
+    '''+available
+    actual=actual.replace(block(actual,'static bool dcp_typec_route_available('), 'static bool dcp_typec_route_fixed_output_busy(struct apple_dcp_typec_route *r) { (void)r;return false; }\n'+available+block(dcp,'static bool dcp_typec_route_available('),1)
     actual=actual.replace(block(actual,'static int dcp_typec_route_deactivate('),block(dcp,dcp.rindex('static int dcp_typec_route_deactivate(')),1)
     pos=actual.index('static struct typec_mux_dev phy_provider')
     actual=actual[:pos]+block(dcp,'static bool dcp_typec_route_is_dp(')+'\n'+block(dcp,'static int dcp_typec_route_set(')+'\n'+actual[pos:]

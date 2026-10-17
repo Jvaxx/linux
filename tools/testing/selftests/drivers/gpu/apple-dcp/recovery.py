@@ -26,8 +26,12 @@ def check(root, output):
                            'assert(afk_service_get(old)==old);old->cmd_tag=1;old->cmd_map[0]=1;')
     corrected=corrected.replace('    old->cmd_tag=1;\n','')
 
-    sender=extract((root/'drivers/gpu/drm/apple/afk.c').read_text(),
-                   'static int afk_send_command_timeout_len(')
+    afk=(root/'drivers/gpu/drm/apple/afk.c').read_text()
+    sender=extract(afk,'static int afk_send_command_timeout_len(')
+    # The legacy reply-length variant moved the sender body into
+    # afk_send_command_common(); afk_send_command_timeout_len() wraps it.
+    if 'static int afk_send_command_common(' in afk:
+        sender=extract(afk,'static int afk_send_command_common(')+'\n'+sender
     unit=unit[:unit.index('int main(void)')]
     unit=unit.replace('static unsigned int dma_frees,opens;',r'''
     static unsigned int dma_frees,opens;
@@ -239,6 +243,21 @@ def check(root, output):
     '''
     unit=unit.replace('bool hpd_mutex,quiescing,typec_cable_connected;',
                       'bool external_physically_absent,hpd_mutex,quiescing,typec_cable_connected;')
+    if 'afk_reply_size_valid(' in sender:
+        # The legacy reply-length path checks its size with the real helper; the
+        # T6030 dcpext (dcp->external) timeout diagnostic never runs for H17P.
+        unit=unit.replace('struct apple_dcp_afkep { u8 *command_tags;',
+                          'struct apple_dcp_afkep { struct { bool ready;u32 *rptr,*wptr; } txbfr,rxbfr;u8 *command_tags;',1)
+        unit=unit.replace('bool external_physically_absent,hpd_mutex,quiescing,typec_cable_connected;',
+                          'bool external_physically_absent,hpd_mutex,quiescing,typec_cable_connected;bool external;void *rtk;',1)
+        sender='''#include "afk_reply.h"
+    #define U32_MAX UINT32_MAX
+    #ifndef EOVERFLOW
+    #define EOVERFLOW 75
+    #endif
+    static bool apple_rtkit_is_running(void *r) { (void)r;assert(!"T6030 dcpext diagnostic on H17P");return false; }
+    static bool apple_rtkit_is_crashed(void *r) { (void)r;assert(!"T6030 dcpext diagnostic on H17P");return false; }
+    '''+sender
     unit+=sender+'\n'+tests
 
     out.mkdir(parents=True,exist_ok=True)
@@ -294,6 +313,9 @@ def check(root, output):
     #define complete_all(p) complete(p)
     ''')
     afh=(root/'drivers/gpu/drm/apple/afk.h').read_text()
+    # The actual RX loop uses the real ring buffers instead of the diagnostic mock.
+    queued=queued.replace('struct apple_dcp_afkep { struct { bool ready;u32 *rptr,*wptr; } txbfr,rxbfr;u8 *command_tags;',
+                          'struct apple_dcp_afkep { u8 *command_tags;',1)
     queued=queued.replace('struct apple_dcp_afkep { u8 *command_tags;bool lock,stopping;',
                           'typedef u32 __le32;\n'+extract(afh,'struct afk_ringbuffer {')+';\n'
                           'struct apple_dcp_afkep { u8 *command_tags;int started,stopped;struct afk_ringbuffer txbfr,rxbfr;void *debugfs_entry;bool lock,stopping;')

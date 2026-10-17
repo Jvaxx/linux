@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright 2026 Ryan Murray
 """Actual mux prepare/set and TPS removal ordering; firmware/PHY leaves are mocks."""
-from common import block, atc_function
+from common import block, atc_function, fabric_core, fabric_rebalance
 
 def make_unit(source, parent=False, reference=None):
  reference=source if reference is None else reference
@@ -115,7 +115,7 @@ static void gpiod_set_value_cansleep(void *p,int v) { (void)p;assert(v==1);gpio_
  policy=block(mux,'bool typec_mux_safe_after_role(')+'\n' if 'bool typec_mux_safe_after_role(' in mux else ''
  functions=policy+'\n'.join(block(mux, marker) for marker in ('static void typec_mux_unlock(', 'void typec_mux_abort(', 'int typec_mux_begin(', 'int typec_mux_apply(', 'int typec_mux_end(', 'int typec_mux_prepare(')) if not parent else block((reference/'drivers/usb/typec/mux.c').read_text(),'int typec_mux_prepare(')+'\n'
  functions+=block(mux,'int typec_mux_set(')+'\n'+block(dcp,'static int dcp_typec_route_prepare(')+'\n'+block(dcp,'static int dcp_typec_route_finish(')+'\n'+block(dcp,'static void dcp_typec_route_commit(')+'\n'
- functions+=block(dcp,'static struct apple_dcp_typec_route *\ndcp_typec_rebalance_locked(')+'\n'
+ functions+=fabric_rebalance(dcp)
  if 'static bool tps6598x_safe_after_role(' in core:
   functions+=block(core,'static bool tps6598x_safe_after_role(')+'\n'
  if not parent:functions+=block(core,'static void tps6598x_drop_partner(')+'\n'+block(core,'static int tps6598x_set_data_role(')+'\n'
@@ -279,4 +279,19 @@ int main(int argc,char **argv) {
   prefix=prefix.replace('struct tipd_data {','struct tipd_data { bool role_switch_controls_phy;')
   controls=controls.replace('data=(struct tipd_data){','data=(struct tipd_data){.role_switch_controls_phy=true,')
   controls=controls.replace('c.tps.role_sw=&c;\n  assert(tps6598x_disconnect', 'c.tps.role_sw=&c;data.role_switch_controls_phy=false;\n  assert(tps6598x_disconnect')
+ fabric=fabric_core(reference)
+ if fabric:
+  # The fabric core split: rebalancing runs the real dcp_fabric_run_rebalance()
+  # and dcp_fabric_run_deactivate() over the real decisions, and the adapter
+  # hands the core each route's struct dcp_fabric_route.
+  prefix=prefix.replace('typedef unsigned u32;\n','typedef unsigned u32;\ntypedef unsigned long long u64;\n'+fabric,1)
+  prefix=prefix.replace('struct apple_dcp_typec_route { ','struct apple_dcp_typec_route { struct dcp_fabric_route core; ',1)
+  prefix=prefix.replace('#define lockdep_assert_held(p) ((void)(p))\n','''#define lockdep_assert_held(p) ((void)(p))
+#define list_first_entry_or_null(h,t,m) ((void)(h),sole_port())
+#define list_is_last(p,h) ((void)(p),(void)(h),true)
+#define list_next_entry(p,m) ((void)(p),(struct apple_dcp_typec_port *)NULL)
+''',1)
+  # The real plan snapshots each route into its core before deciding.
+  prefix=prefix.replace('static void dcp_typec_plan(struct drm_device *d,struct apple_dcp_typec_port *p,unsigned n) { (void)d;(void)p;(void)n; }',
+   'static void dcp_typec_plan(struct drm_device *d,struct apple_dcp_typec_port *p,unsigned n) { (void)d;(void)p;(void)n;route.core.tunnel=route.tunnel; }',1)
  return prefix+functions+ordinary_phy+controls
