@@ -84,9 +84,9 @@ struct cd321x_mux_test;
  * A mode switch on the connector. While @held, as the rear port PHY of a J700
  * is through the power elections of a Mac taking another data role, when it
  * cannot park the PIPE, it fails every change with @held_ret. @log records the
- * states asked for: s(afe), u(sb) or o(ther), in capitals when refused. The
- * display route also fails to quiesce, before any provider changes, while
- * @prepare_held.
+ * states asked for: s(afe), u(sb) or o(ther), in capitals when refused, and
+ * @refused counts the refusals. The display route also fails to quiesce,
+ * before any provider changes, while @prepare_held.
  */
 struct cd321x_mux_test_phy {
 	struct cd321x_mux_test *test;
@@ -94,6 +94,7 @@ struct cd321x_mux_test_phy {
 	bool prepare_held;
 	int held_ret;
 	char log[64];
+	unsigned int refused;
 	unsigned int last_refused_ms;
 };
 
@@ -107,6 +108,8 @@ struct cd321x_mux_test {
 	struct cd321x_mux_test_phy display;
 	/* The time the scheduled work has been run at */
 	unsigned int now_ms;
+	/* The time the driver's latest series of retries of a held mux began */
+	unsigned int series_ms;
 };
 
 static int cd321x_mux_test_read(void *context, const void *reg, size_t reg_size,
@@ -165,6 +168,7 @@ static int cd321x_mux_test_set(struct typec_mux_dev *mux, struct typec_mux_state
 		step = 'o';
 	if (phy->held) {
 		step = toupper(step);
+		phy->refused++;
 		phy->last_refused_ms = phy->test->now_ms;
 	}
 	if (len < sizeof(phy->log) - 1)
@@ -371,6 +375,29 @@ static unsigned int cd321x_mux_test_due_ms(struct delayed_work *dwork)
 }
 
 /*
+ * Run @dwork now, rather than after its delay. The driver also measures how
+ * long it has retried a held mux, on its own clock, so a series that is under
+ * way is made as old there as it is in the time of the tests.
+ */
+static void cd321x_mux_test_run(struct cd321x_mux_test *t, struct delayed_work *dwork)
+{
+	struct cd321x_pm_state *pm = &t->cd.pm;
+	bool retrying;
+
+	scoped_guard(mutex, &t->cd.tps.lock) {
+		retrying = pm->mux_retry_ms;
+		if (retrying)
+			pm->mux_since_ms = jiffies_to_msecs(jiffies) -
+					   (t->now_ms - t->series_ms);
+	}
+	flush_delayed_work(dwork);
+	scoped_guard(mutex, &t->cd.tps.lock) {
+		if (!retrying && pm->mux_retry_ms)
+			t->series_ms = t->now_ms;
+	}
+}
+
+/*
  * Run the next work of the port, the one due first, as if its delay had passed.
  * Returns false if none is scheduled.
  */
@@ -394,7 +421,7 @@ static bool cd321x_mux_test_next(struct cd321x_mux_test *t)
 		return false;
 
 	t->now_ms += cd321x_mux_test_due_ms(next);
-	flush_delayed_work(next);
+	cd321x_mux_test_run(t, next);
 	return true;
 }
 
@@ -486,7 +513,7 @@ static void cd321x_mux_held_backs_off_test(struct kunit *test)
 		KUNIT_ASSERT_TRUE(test, cd321x_mux_test_next(t));
 		if (!delayed_work_pending(&t->cd.resume_work))
 			continue;
-		delay = cd321x_mux_test_due_ms(&t->cd.resume_work);
+		delay = cd321x_mux_test_backoff_ms(t);
 		if (!first)
 			first = delay;
 		KUNIT_EXPECT_LE(test, delay, (unsigned int)CD321X_MUX_RETRY_MAX_MS);
@@ -707,9 +734,9 @@ static void cd321x_mux_j700_display_prepare_timeout_test(struct kunit *test)
 }
 
 /*
- * A PHY that stays stuck is taken for a fault after some two minutes of
- * retries. The port then waits for the next controller event, which starts
- * the retries over.
+ * A PHY that stays stuck is taken for a fault two minutes after its first
+ * refusal, at the first retry from then on. The port then waits for the next
+ * controller event, which starts the retries over.
  */
 static void cd321x_mux_held_gives_up_test(struct kunit *test)
 {
@@ -718,14 +745,16 @@ static void cd321x_mux_held_gives_up_test(struct kunit *test)
 
 	t->phy.held = true;
 	cd321x_mux_test_attach(t);
-	for (i = 0; i < 4 * CD321X_MUX_RETRIES && cd321x_mux_test_next(t); i++)
+	while (t->now_ms < 2 * CD321X_MUX_HELD_MS && cd321x_mux_test_next(t))
 		;
 	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&t->cd.resume_work));
 	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&t->cd.update_work));
 	KUNIT_EXPECT_EQ(test, cd321x_mux_test_phase(t), CD321X_PM_STALE);
-	KUNIT_EXPECT_EQ(test, strlen(t->phy.log), (size_t)CD321X_MUX_RETRIES + 1);
+	KUNIT_EXPECT_EQ(test, strlen(t->phy.log), (size_t)t->phy.refused);
 	KUNIT_EXPECT_NULL(test, strpbrk(t->phy.log, "suU"));
-	KUNIT_EXPECT_GE(test, t->phy.last_refused_ms, 120000U);
+	KUNIT_EXPECT_GE(test, t->phy.last_refused_ms, t->series_ms + CD321X_MUX_HELD_MS);
+	KUNIT_EXPECT_LE(test, t->phy.last_refused_ms,
+			t->series_ms + CD321X_MUX_HELD_MS + CD321X_MUX_RETRY_MAX_MS + 1000);
 	KUNIT_EXPECT_EQ(test, t->cd.pm.mux_retry_ms, 0);
 	KUNIT_EXPECT_FALSE(test, t->cd.state_valid);
 
@@ -745,6 +774,92 @@ static void cd321x_mux_held_gives_up_test(struct kunit *test)
 	cd321x_mux_test_settle(test, t);
 	KUNIT_EXPECT_STREQ(test, t->phy.log, "su");
 	cd321x_mux_test_expect_usb(test, t);
+}
+
+/*
+ * Wait for the next refusal of the PHY, which needs a retry to be scheduled,
+ * injecting a controller event, as a partner that keeps renegotiating raises,
+ * into each backoff that started at least @gap_ms after the last event.
+ * Returns the number of events.
+ */
+static unsigned int cd321x_mux_test_refusal_events(struct kunit *test,
+						   struct cd321x_mux_test *t,
+						   unsigned int gap_ms,
+						   unsigned int *last_event_ms)
+{
+	unsigned int refused = t->phy.refused, events = 0;
+
+	while (t->phy.refused == refused) {
+		if (t->now_ms - *last_event_ms >= gap_ms && cd321x_mux_test_backoff_ms(t) &&
+		    cd321x_mux_test_phase(t) == CD321X_PM_REVALIDATE &&
+		    delayed_work_pending(&t->cd.resume_work)) {
+			cd321x_mux_test_event(t, APPLE_CD_REG_INT_DATA_STATUS_UPDATE);
+			*last_event_ms = t->now_ms;
+			events++;
+		}
+		KUNIT_ASSERT_TRUE(test, cd321x_mux_test_next(t));
+	}
+	return events;
+}
+
+/*
+ * An event in every backoff brings each retry forward, to about a second after
+ * the last, but does not make the hold-up any shorter: the port still gives
+ * up only two minutes after the first refusal, not after so many retries.
+ */
+static void cd321x_mux_held_dense_events_test(struct kunit *test)
+{
+	struct cd321x_mux_test *t = cd321x_mux_test_j700_port(test);
+	unsigned int events = 0, last_event_ms = 0;
+
+	t->phy.held = true;
+	cd321x_mux_test_attach(t);
+	cd321x_mux_test_refusal_events(test, t, UINT_MAX, &last_event_ms);
+	KUNIT_ASSERT_EQ(test, t->phy.refused, 1);
+	while (cd321x_mux_test_phase(t) != CD321X_PM_STALE) {
+		KUNIT_ASSERT_LT(test, t->now_ms, t->series_ms + 2 * CD321X_MUX_HELD_MS);
+		events += cd321x_mux_test_refusal_events(test, t, 0, &last_event_ms);
+	}
+	KUNIT_EXPECT_GE(test, t->phy.last_refused_ms, t->series_ms + CD321X_MUX_HELD_MS);
+	KUNIT_EXPECT_LE(test, t->phy.last_refused_ms, t->series_ms + CD321X_MUX_HELD_MS + 1000);
+	/* So the retries came about a second apart, each one brought forward. */
+	KUNIT_EXPECT_GE(test, t->phy.refused, CD321X_MUX_HELD_MS / 1100);
+	KUNIT_EXPECT_EQ(test, events, t->phy.refused - 1);
+	KUNIT_EXPECT_NULL(test, strpbrk(t->phy.log, "suU"));
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&t->cd.resume_work));
+	KUNIT_EXPECT_FALSE(test, delayed_work_pending(&t->cd.update_work));
+	KUNIT_EXPECT_EQ(test, t->cd.pm.mux_retry_ms, 0);
+}
+
+/*
+ * When the PHY lets go after the last of such events, the next retry of the
+ * backoff applies the state, with no further event, provided the hold-up was
+ * shorter than two minutes, however many retries events brought forward.
+ */
+static void cd321x_mux_held_release_after_events_test(struct kunit *test)
+{
+	struct cd321x_mux_test *t = cd321x_mux_test_j700_port(test);
+	unsigned int last_event_ms = 0, released_ms;
+
+	t->phy.held = true;
+	cd321x_mux_test_attach(t);
+	cd321x_mux_test_refusal_events(test, t, UINT_MAX, &last_event_ms);
+	while (t->now_ms < t->series_ms + CD321X_MUX_HELD_MS - 2 * CD321X_MUX_RETRY_MAX_MS) {
+		cd321x_mux_test_refusal_events(test, t, 1500, &last_event_ms);
+		KUNIT_ASSERT_NE(test, cd321x_mux_test_phase(t), CD321X_PM_STALE);
+	}
+	KUNIT_ASSERT_TRUE(test, delayed_work_pending(&t->cd.resume_work));
+	KUNIT_ASSERT_GT(test, t->phy.refused, 16);
+
+	t->phy.held = false;
+	released_ms = t->now_ms;
+	memset(t->phy.log, 0, sizeof(t->phy.log));
+	memset(t->display.log, 0, sizeof(t->display.log));
+	cd321x_mux_test_settle(test, t);
+	KUNIT_EXPECT_STREQ(test, t->phy.log, "su");
+	KUNIT_EXPECT_STREQ(test, t->display.log, "su");
+	cd321x_mux_test_expect_usb(test, t);
+	KUNIT_EXPECT_LE(test, t->now_ms, released_ms + CD321X_MUX_RETRY_MAX_MS + 1000);
 }
 
 /*
@@ -797,6 +912,8 @@ static struct kunit_case cd321x_mux_cases[] = {
 	KUNIT_CASE(cd321x_mux_j700_display_timeout_bounded_test),
 	KUNIT_CASE(cd321x_mux_j700_display_prepare_timeout_test),
 	KUNIT_CASE(cd321x_mux_held_gives_up_test),
+	KUNIT_CASE(cd321x_mux_held_dense_events_test),
+	KUNIT_CASE(cd321x_mux_held_release_after_events_test),
 	KUNIT_CASE(cd321x_mux_held_then_other_error_test),
 	{}
 };

@@ -13,8 +13,15 @@
 #define CD321X_ACK_RETRY_MAX_MS 30000
 #define CD321X_MUX_RETRY_MS 500
 #define CD321X_MUX_RETRY_MAX_MS 10000
-/* About two minutes of backoff, twenty times the longest hold-up seen */
-#define CD321X_MUX_RETRIES 16
+/* Two minutes, over twenty times the longest hold-up seen */
+#define CD321X_MUX_HELD_MS 120000
+/*
+ * Ordinary controller events bring retries about a second apart, with a
+ * debounce for the read and another for the update. Tunnel notifications skip
+ * the read debounce, but the 500 ms update debounce alone keeps this count
+ * from ending a series before CD321X_MUX_HELD_MS. It only bounds its warnings.
+ */
+#define CD321X_MUX_RETRIES 240
 
 enum cd321x_pm_phase {
 	CD321X_PM_RUNNING,
@@ -37,6 +44,8 @@ struct cd321x_pm_state {
 	unsigned int mux_retry_ms;
 	/* The retries of that change so far, up to CD321X_MUX_RETRIES. */
 	unsigned int mux_retries;
+	/* When the change was first held up, in milliseconds. */
+	unsigned int mux_since_ms;
 	bool force_reconnect;
 };
 
@@ -75,6 +84,7 @@ static inline bool cd321x_pm_mux_done(struct cd321x_pm_state *pm)
 
 	pm->mux_retry_ms = 0;
 	pm->mux_retries = 0;
+	pm->mux_since_ms = 0;
 	return retried;
 }
 
@@ -212,15 +222,22 @@ static inline bool cd321x_pm_acked(struct cd321x_pm_state *pm)
  * retry forward, see cd321x_pm_mux_event(); sleep cancels it and the resume
  * read takes it over; removal or any other failure ends it.
  *
- * A hold-up that outlasts CD321X_MUX_RETRIES retries is taken for a fault, as
- * the provider cannot tell its timeouts apart: the retries end as the budget
- * does, and only a later event starts over. Returns the delay in milliseconds,
- * or 0 once the retries have ended.
+ * A hold-up that outlasts CD321X_MUX_HELD_MS is taken for a fault, as the
+ * provider cannot tell its timeouts apart: the retries end as the budget does,
+ * and only a later event starts over. That limit is on time, counted from the
+ * first failure of the series, as events that bring retries forward do not
+ * make the hold-up any shorter. @now_ms is the time of this failure, in
+ * milliseconds on a clock that may wrap. Returns the delay in milliseconds, or
+ * 0 once the retries have ended.
  */
-static inline unsigned int cd321x_pm_mux_held(struct cd321x_pm_state *pm)
+static inline unsigned int cd321x_pm_mux_held(struct cd321x_pm_state *pm,
+					      unsigned int now_ms)
 {
 	pm->force_reconnect = true;
-	if (pm->mux_retries >= CD321X_MUX_RETRIES) {
+	if (!pm->mux_retry_ms)
+		pm->mux_since_ms = now_ms;
+	if (now_ms - pm->mux_since_ms >= CD321X_MUX_HELD_MS ||
+	    pm->mux_retries >= CD321X_MUX_RETRIES) {
 		cd321x_pm_mux_done(pm);
 		pm->phase = CD321X_PM_STALE;
 		pm->attempts_left = 0;
