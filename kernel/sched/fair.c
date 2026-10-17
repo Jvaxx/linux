@@ -2466,7 +2466,7 @@ static unsigned int task_nr_scan_windows(struct task_struct *p)
 	 * on resident pages
 	 */
 	nr_scan_pages = MB_TO_PAGES(sysctl_numa_balancing_scan_size);
-	rss = get_mm_rss(p->mm);
+	rss = mm_pages_to_native(p->mm, get_mm_rss(p->mm));
 	if (!rss)
 		rss = nr_scan_pages;
 
@@ -4479,8 +4479,8 @@ retry_pids:
 			 * areas faster.
 			 */
 			if (nr_pte_updates)
-				pages -= (end - start) >> PAGE_SHIFT;
-			virtpages -= (end - start) >> PAGE_SHIFT;
+				pages -= DIV_ROUND_UP(end - start, PAGE_SIZE);
+			virtpages -= DIV_ROUND_UP(end - start, PAGE_SIZE);
 
 			start = end;
 			if (pages <= 0 || virtpages <= 0)

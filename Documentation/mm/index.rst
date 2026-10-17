@@ -26,6 +26,7 @@ see the :doc:`admin guide <../admin-guide/mm/index>`.
    physical_memory
    page_tables
    process_addrs
+   user_page_size
    bootmem
    page_allocation
    vmalloc
