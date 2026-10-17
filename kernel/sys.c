@@ -2532,22 +2532,18 @@ static int prctl_set_thp_disable(bool thp_disable, unsigned long flags,
 	return 0;
 }
 
+#ifdef CONFIG_ARCH_HAS_USER_PAGE_SIZE
 static int prctl_page_size_get(struct task_struct *task, bool persistent)
 {
-#ifdef CONFIG_ARCH_HAS_USER_PAGE_SIZE
 	unsigned int shift = persistent ? task->default_exec_page_shift :
 					 task->exec_page_shift;
 
 	return shift ? 1U << shift : 0;
-#else
-	return -EINVAL;
-#endif
 }
 
 static int prctl_page_size_set(struct task_struct *task, unsigned long size,
 			       bool persistent)
 {
-#ifdef CONFIG_ARCH_HAS_USER_PAGE_SIZE
 	int shift = arch_exec_page_size_shift(size);
 
 	if (shift < 0)
@@ -2561,10 +2557,8 @@ static int prctl_page_size_set(struct task_struct *task, unsigned long size,
 		task->exec_page_shift = shift;
 	}
 	return 0;
-#else
-	return -EINVAL;
-#endif
 }
+#endif
 
 int __weak arch_prctl_mem_model_get(struct task_struct *t)
 {
@@ -2589,6 +2583,7 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 
 	error = 0;
 	switch (option) {
+#ifdef CONFIG_ARCH_HAS_USER_PAGE_SIZE
 	case PR_AURORA_GET_EXEC_PAGE_SIZE:
 		if (arg2 || arg3 || arg4 || arg5)
 			return -EINVAL;
@@ -2605,6 +2600,7 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 		if (arg3 || arg4 || arg5)
 			return -EINVAL;
 		return prctl_page_size_set(me, arg2, true);
+#endif
 	case PR_GET_MEM_MODEL:
 		if (arg2 || arg3 || arg4 || arg5)
 			return -EINVAL;
