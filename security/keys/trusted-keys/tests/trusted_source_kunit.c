@@ -1,0 +1,342 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * KUnit tests for trusted-key sources registered at runtime, through
+ * register_trusted_key_source() and unregister_trusted_key_source().
+ *
+ * The source under test is synthetic: it touches no hardware and seals
+ * nothing for real. A test is skipped when another source holds the slot.
+ *
+ * Copyright 2026 Ryan Murray
+ */
+
+#include <keys/trusted-type.h>
+#include <kunit/test.h>
+#include <linux/cred.h>
+#include <linux/err.h>
+#include <linux/hex.h>
+#include <linux/kernel.h>
+#include <linux/key.h>
+#include <linux/key-type.h>
+#include <linux/module.h>
+#include <linux/rwsem.h>
+#include <linux/string.h>
+
+#define FAKE_NAME "trusted_source_kunit"
+
+struct trusted_source_fake {
+	struct trusted_key_ops ops;
+	struct trusted_key_source src;
+	int init_ret;
+	int inits, exits, seals, unseals;
+};
+
+/* The ops have no context argument; the tests run one at a time. */
+static struct trusted_source_fake *fake;
+
+static int fake_init(void)
+{
+	fake->inits++;
+	return fake->init_ret;
+}
+
+static void fake_exit(void)
+{
+	fake->exits++;
+}
+
+/* Not a cipher: an invertible stand-in, so that unseal can be checked. */
+static int fake_seal(struct trusted_key_payload *p, char *datablob)
+{
+	unsigned int i;
+
+	for (i = 0; i < p->key_len; i++)
+		p->blob[i] = p->key[i] ^ 0x5a;
+	p->blob_len = p->key_len;
+	fake->seals++;
+	return 0;
+}
+
+static int fake_unseal(struct trusted_key_payload *p, char *datablob)
+{
+	unsigned int i;
+
+	if (p->blob_len < MIN_KEY_SIZE || p->blob_len > MAX_KEY_SIZE)
+		return -EINVAL;
+	for (i = 0; i < p->blob_len; i++)
+		p->key[i] = p->blob[i] ^ 0x5a;
+	p->key_len = p->blob_len;
+	fake->unseals++;
+	return 0;
+}
+
+static int fake_get_random(unsigned char *key, size_t key_len)
+{
+	size_t i;
+
+	for (i = 0; i < key_len; i++)
+		key[i] = i;
+	return key_len;
+}
+
+KUNIT_DEFINE_ACTION_WRAPPER(trusted_source_withdraw,
+			    unregister_trusted_key_source,
+			    struct trusted_key_source *);
+KUNIT_DEFINE_ACTION_WRAPPER(trusted_source_key_put, key_put, struct key *);
+
+/* Register the fake, or skip if another source owns or claims the slot. */
+static void fake_register(struct kunit *test)
+{
+	int ret = register_trusted_key_source(&fake->src);
+
+	if (ret == -EBUSY || ret == -ENODEV)
+		kunit_skip(test, "another trusted-key source holds the slot (%d)",
+			   ret);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+}
+
+/* Instantiate a trusted key from @cmd; it is put when the test ends. */
+static struct key *fake_key(struct kunit *test, const char *cmd)
+{
+	struct key *key;
+	int ret;
+
+	key = key_alloc(&key_type_trusted, FAKE_NAME, GLOBAL_ROOT_UID,
+			GLOBAL_ROOT_GID, current_cred(), KEY_POS_ALL,
+			KEY_ALLOC_NOT_IN_QUOTA, NULL);
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, key);
+
+	ret = key_instantiate_and_link(key, cmd, strlen(cmd), NULL, NULL);
+	if (ret) {
+		key_put(key);
+		return ERR_PTR(ret);
+	}
+	ret = kunit_add_action_or_reset(test, trusted_source_key_put, key);
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	return key;
+}
+
+static unsigned char fake_key_migratable(struct key *key)
+{
+	struct trusted_key_payload *p;
+	unsigned char migratable;
+
+	down_read(&key->sem);
+	p = dereference_key_locked(key);
+	migratable = p->migratable;
+	up_read(&key->sem);
+	return migratable;
+}
+
+/*
+ * Built in, KUnit runs before mark_readonly(), while read-only-after-init
+ * data can still be written. Loaded as a module after boot, as apple_sep
+ * is, every registration in this suite runs with that protection on.
+ */
+static void trusted_source_after_mark_readonly(struct kunit *test)
+{
+	int i;
+
+	if (system_state < SYSTEM_RUNNING)
+		kunit_skip(test, "built in: runs before mark_readonly()");
+
+	for (i = 0; i < 2; i++) {
+		fake_register(test);
+		KUNIT_EXPECT_FALSE(test, IS_ERR(fake_key(test, "new 32")));
+		unregister_trusted_key_source(&fake->src);
+	}
+	KUNIT_EXPECT_EQ(test, fake->inits, 2);
+	KUNIT_EXPECT_EQ(test, fake->exits, 2);
+	KUNIT_EXPECT_EQ(test, fake->seals, 2);
+}
+
+/* Keys are sealed and unsealed by the source until it withdraws. */
+static void trusted_source_dispatch(struct kunit *test)
+{
+	struct trusted_key_payload *p;
+	unsigned char *plain;
+	unsigned int len;
+	struct key *key;
+	char *load;
+
+	plain = kunit_kzalloc(test, MAX_KEY_SIZE, GFP_KERNEL);
+	load = kunit_kzalloc(test, sizeof("load ") + 2 * MAX_BLOB_SIZE,
+			     GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, plain);
+	KUNIT_ASSERT_NOT_NULL(test, load);
+
+	fake_register(test);
+	KUNIT_EXPECT_EQ(test, fake->inits, 1);
+
+	key = fake_key(test, "new 32");
+	KUNIT_ASSERT_FALSE(test, IS_ERR(key));
+	KUNIT_EXPECT_EQ(test, fake->seals, 1);
+
+	down_read(&key->sem);
+	p = dereference_key_locked(key);
+	len = min_t(unsigned int, p->key_len, MAX_KEY_SIZE);
+	memcpy(plain, p->key, len);
+	memcpy(load, "load ", 5);
+	bin2hex(load + 5, p->blob,
+		min_t(unsigned int, p->blob_len, MAX_BLOB_SIZE));
+	up_read(&key->sem);
+	KUNIT_EXPECT_EQ(test, len, 32U);
+
+	key = fake_key(test, load);
+	KUNIT_ASSERT_FALSE(test, IS_ERR(key));
+	KUNIT_EXPECT_EQ(test, fake->unseals, 1);
+
+	down_read(&key->sem);
+	p = dereference_key_locked(key);
+	KUNIT_EXPECT_EQ(test, p->key_len, len);
+	KUNIT_EXPECT_MEMEQ(test, p->key, plain, len);
+	up_read(&key->sem);
+
+	unregister_trusted_key_source(&fake->src);
+	KUNIT_EXPECT_EQ(test, fake->exits, 1);
+
+	/* Dispatch is back on the absent stubs, not on the departed source. */
+	KUNIT_EXPECT_EQ(test, PTR_ERR(fake_key(test, "new 32")), -ENODEV);
+	KUNIT_EXPECT_EQ(test, PTR_ERR(fake_key(test, load)), -ENODEV);
+	KUNIT_EXPECT_EQ(test, fake->seals, 1);
+	KUNIT_EXPECT_EQ(test, fake->unseals, 1);
+}
+
+/* Each registration brings its own policy; a withdrawn one leaves none. */
+static void trusted_source_migratable(struct kunit *test)
+{
+	static const unsigned char policy[] = { 1, 0, 1 };
+	struct key *key;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(policy); i++) {
+		fake->ops.migratable = policy[i];
+		fake_register(test);
+
+		key = fake_key(test, "new 32");
+		KUNIT_ASSERT_FALSE(test, IS_ERR(key));
+		KUNIT_EXPECT_EQ(test, fake_key_migratable(key), policy[i]);
+
+		/* Only a migratable key may be resealed. */
+		KUNIT_EXPECT_EQ(test, key_update(make_key_ref(key, true),
+						 "update", 6),
+				policy[i] ? 0 : -EPERM);
+		KUNIT_EXPECT_EQ(test, fake_key_migratable(key), policy[i]);
+
+		unregister_trusted_key_source(&fake->src);
+	}
+	KUNIT_EXPECT_EQ(test, fake->seals, 3 + 2);
+}
+
+/* A second source is refused, and cannot withdraw the first. */
+static void trusted_source_exclusive(struct kunit *test)
+{
+	struct trusted_key_source other = {
+		.name = FAKE_NAME,
+		.ops = &fake->ops,
+	};
+
+	fake_register(test);
+	KUNIT_EXPECT_EQ(test, register_trusted_key_source(&other), -EBUSY);
+	KUNIT_EXPECT_EQ(test, register_trusted_key_source(&fake->src), -EBUSY);
+	KUNIT_EXPECT_EQ(test, fake->inits, 1);
+
+	unregister_trusted_key_source(&other);
+	KUNIT_EXPECT_EQ(test, fake->exits, 0);
+	KUNIT_EXPECT_FALSE(test, IS_ERR(fake_key(test, "new 32")));
+	KUNIT_EXPECT_EQ(test, fake->seals, 1);
+
+	unregister_trusted_key_source(&fake->src);
+	KUNIT_EXPECT_EQ(test, fake->exits, 1);
+}
+
+/* A failed init() leaves no source behind, and registration can retry. */
+static void trusted_source_init_failure(struct kunit *test)
+{
+	int ret;
+
+	fake->init_ret = -EIO;
+	ret = register_trusted_key_source(&fake->src);
+	if (ret == -EBUSY || ret == -ENODEV)
+		kunit_skip(test, "another trusted-key source holds the slot (%d)",
+			   ret);
+	KUNIT_EXPECT_EQ(test, ret, -EIO);
+	KUNIT_EXPECT_EQ(test, fake->inits, 1);
+	KUNIT_EXPECT_EQ(test, fake->exits, 0);
+	KUNIT_EXPECT_EQ(test, PTR_ERR(fake_key(test, "new 32")), -ENODEV);
+
+	fake->init_ret = 0;
+	fake_register(test);
+	KUNIT_EXPECT_FALSE(test, IS_ERR(fake_key(test, "new 32")));
+	unregister_trusted_key_source(&fake->src);
+	KUNIT_EXPECT_EQ(test, fake->inits, 2);
+	KUNIT_EXPECT_EQ(test, fake->exits, 1);
+}
+
+static void trusted_source_expect_invalid(struct kunit *test,
+					  struct trusted_key_source *src)
+{
+	int ret = register_trusted_key_source(src);
+
+	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
+	if (!ret)
+		unregister_trusted_key_source(src);
+}
+
+/* Incomplete sources are refused before anything is called. */
+static void trusted_source_invalid(struct kunit *test)
+{
+	struct trusted_key_ops no_seal = fake->ops;
+	struct trusted_key_source no_name = { .ops = &fake->ops };
+	struct trusted_key_source no_ops = { .name = FAKE_NAME };
+	struct trusted_key_source bad_ops = {
+		.name = FAKE_NAME,
+		.ops = &no_seal,
+	};
+
+	no_seal.seal = NULL;
+	trusted_source_expect_invalid(test, NULL);
+	trusted_source_expect_invalid(test, &no_name);
+	trusted_source_expect_invalid(test, &no_ops);
+	trusted_source_expect_invalid(test, &bad_ops);
+	KUNIT_EXPECT_EQ(test, fake->inits, 0);
+}
+
+static int trusted_source_init(struct kunit *test)
+{
+	fake = kunit_kzalloc(test, sizeof(*fake), GFP_KERNEL);
+	if (!fake)
+		return -ENOMEM;
+
+	fake->ops.init = fake_init;
+	fake->ops.seal = fake_seal;
+	fake->ops.unseal = fake_unseal;
+	fake->ops.get_random = fake_get_random;
+	fake->ops.exit = fake_exit;
+	fake->src.name = FAKE_NAME;
+	fake->src.ops = &fake->ops;
+
+	/* However the test ends; a no-op unless the fake is registered. */
+	return kunit_add_action_or_reset(test, trusted_source_withdraw,
+					 &fake->src);
+}
+
+static struct kunit_case trusted_source_cases[] = {
+	KUNIT_CASE(trusted_source_after_mark_readonly),
+	KUNIT_CASE(trusted_source_dispatch),
+	KUNIT_CASE(trusted_source_migratable),
+	KUNIT_CASE(trusted_source_exclusive),
+	KUNIT_CASE(trusted_source_init_failure),
+	KUNIT_CASE(trusted_source_invalid),
+	{}
+};
+
+static struct kunit_suite trusted_source_suite = {
+	.name = "trusted_source",
+	.init = trusted_source_init,
+	.test_cases = trusted_source_cases,
+};
+
+kunit_test_suite(trusted_source_suite);
+
+MODULE_DESCRIPTION("KUnit tests for trusted-key sources registered at runtime");
+MODULE_LICENSE("GPL");
