@@ -1386,8 +1386,14 @@ void exit_mmap(struct mm_struct *mm)
 destroy:
 	__mt_destroy(&mm->mm_mt);
 	trace_exit_mmap(mm);
+#ifdef CONFIG_MM_SUBPAGE
+	/* The per-mm commitment is updated under the mmap lock. */
 	mm_unacct_memory(mm, nr_accounted);
 	mmap_write_unlock(mm);
+#else
+	mmap_write_unlock(mm);
+	vm_unacct_memory(nr_accounted);
+#endif
 }
 
 /*
