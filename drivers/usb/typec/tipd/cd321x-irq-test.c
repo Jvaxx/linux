@@ -315,6 +315,7 @@ static void cd321x_ack_retry_across_sleep_test(struct kunit *test)
 	struct cd321x_test *t = cd321x_test_port(test);
 	struct device *dev = t->cd.tps.dev;
 	unsigned int i, left;
+	unsigned int failures;
 
 	cd321x_test_raise(&t->ctrl, APPLE_CD_REG_INT_PLUG_EVENT);
 	t->ctrl.failing_event_reads = UINT_MAX;
@@ -332,13 +333,23 @@ static void cd321x_ack_retry_across_sleep_test(struct kunit *test)
 	 * schedules early, and check that it tried to read the events.
 	 */
 	flush_work(&t->cd.resume_work.work);
-	KUNIT_EXPECT_EQ(test, t->ctrl.failing_event_reads, left - 1);
+	scoped_guard(mutex, &t->cd.tps.lock) {
+		KUNIT_EXPECT_EQ(test, t->ctrl.failing_event_reads, left - 1);
+		KUNIT_EXPECT_LT(test, t->ctrl.failing_event_reads, left);
+	}
 	for (i = 0; i < 2 * CD321X_RESUME_ATTEMPTS; i++) {
-		KUNIT_ASSERT_TRUE(test, delayed_work_pending(&t->cd.resume_work));
+		scoped_guard(mutex, &t->cd.tps.lock)
+			failures = t->ctrl.failing_event_reads;
 		flush_delayed_work(&t->cd.resume_work);
+		scoped_guard(mutex, &t->cd.tps.lock) {
+			KUNIT_EXPECT_LT(test, t->ctrl.failing_event_reads, failures);
+			KUNIT_EXPECT_NE(test, t->cd.pm.phase, CD321X_PM_STALE);
+			KUNIT_EXPECT_GT(test, t->cd.pm.ack_retry_ms, 0U);
+		}
 	}
 
-	t->ctrl.failing_event_reads = 0;
+	scoped_guard(mutex, &t->cd.tps.lock)
+		t->ctrl.failing_event_reads = 0;
 	cd321x_test_recover(test, t);
 	KUNIT_EXPECT_EQ(test, t->ctrl.latched, 0);
 	cd321x_test_raise(&t->ctrl, APPLE_CD_REG_INT_PLUG_EVENT);

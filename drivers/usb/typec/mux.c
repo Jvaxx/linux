@@ -345,8 +345,10 @@ EXPORT_SYMBOL_GPL(typec_mux_safe_after_role);
  * hardware then only held the change up, and the same state can be applied
  * again later. A timeout of any other provider can be permanent.
  *
- * The answer is about the last request on @mux: no other request on the same
- * handle may run in between.
+ * The answer describes the last request on @mux that failed with -ETIMEDOUT,
+ * so ask before any other request on the same handle runs. One that fails
+ * before it owns the providers, such as with -EBUSY, leaves the answer as it
+ * was; any other request changes it.
  *
  * Return: true if the provider that timed out declared its timeouts transient.
  */
