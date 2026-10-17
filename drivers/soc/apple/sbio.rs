@@ -3466,6 +3466,11 @@ impl transfer::HeaderSlot for SbioHeader<'_> {
         self.0.ool_peek(&self.0.ool_sbio, 0, header)
     }
 
+    fn repoison(&self) {
+        self.0
+            .ool_repoison(&self.0.ool_sbio, 0, transfer::HEADER_LEN);
+    }
+
     fn pause(&self) {
         let poll = kernel::time::Delta::from_millis(i64::from(OOL_WRITE_POLL_MS));
         kernel::time::delay::fsleep(poll);
