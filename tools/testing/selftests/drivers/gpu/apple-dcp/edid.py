@@ -158,6 +158,7 @@ static int skip(struct dcp_parse_ctx *h) { assert(!h->key);h->index++;h->key=tru
            function('epic/dpavservep.c','static void dcpavserv_teardown('),function('epic/dpavservep.c','void dpavservep_detach('),
            function('afk.c','static const struct apple_epic_service_ops *\nafk_match_service('),
            function('afk.c','static struct apple_epic_service *afk_epic_find_service('),
+           function('afk.h','static inline bool afk_service_retired('),function('afk.c','static bool afk_epic_channel_retired('),
            function('afk.c','static void afk_discard_pending_open('),function('afk.c','static void afk_retry_service_init('),function('afk.c','static void afk_service_worker('),function('afk.c','static void afk_recv_handle_init('),
            function('epic/dpavservep.c','static int dcpdpserv_prepare('),
            function('epic/dpavservep.c','static void dcpdpserv_teardown('),function('afk.c','static void afk_recv_handle_teardown('),

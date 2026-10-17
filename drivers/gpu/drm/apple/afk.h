@@ -191,6 +191,22 @@ static inline bool afk_service_matches(struct apple_epic_service *service,
 	return found;
 }
 
+/*
+ * True if this slot last served @channel and was retired or discarded on our
+ * side: the co-processor may still close that channel afterwards.
+ */
+static inline bool afk_service_retired(struct apple_epic_service *service,
+				       u32 channel)
+{
+	unsigned long flags;
+	bool retired;
+
+	spin_lock_irqsave(&service->lock, flags);
+	retired = service->channel == channel && service->torndown;
+	spin_unlock_irqrestore(&service->lock, flags);
+	return retired;
+}
+
 /* The caller holds service->lock. */
 static inline bool afk_service_reclaimable(struct apple_epic_service *service)
 {
