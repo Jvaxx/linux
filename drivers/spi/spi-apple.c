@@ -190,22 +190,6 @@ static void apple_spi_init(struct apple_spi *spi)
 	reg_write(spi, APPLE_SPI_DELAY_POST_CYCLES, 0);
 }
 
-static int apple_spi_prepare_message(struct spi_controller *ctlr, struct spi_message *msg)
-{
-	struct apple_spi *spi = spi_controller_get_devdata(ctlr);
-	struct spi_device *device = msg->spi;
-
-	u32 cfg = ((device->mode & SPI_CPHA ? APPLE_SPI_CFG_CPHA : 0) |
-		   (device->mode & SPI_CPOL ? APPLE_SPI_CFG_CPOL : 0) |
-		   (device->mode & SPI_LSB_FIRST ? APPLE_SPI_CFG_LSB_FIRST : 0));
-
-	/* Update core config */
-	reg_mask(spi, APPLE_SPI_CFG,
-		 APPLE_SPI_CFG_CPHA | APPLE_SPI_CFG_CPOL | APPLE_SPI_CFG_LSB_FIRST, cfg);
-
-	return 0;
-}
-
 static void apple_spi_set_cs(struct spi_device *device, bool is_high)
 {
 	struct apple_spi *spi = spi_controller_get_devdata(device->controller);
@@ -232,30 +216,32 @@ static int apple_spi_delay_cycles(struct apple_spi *spi, struct spi_delay *delay
 	return 0;
 }
 
-static int apple_spi_set_cs_timing(struct spi_device *device)
+static int apple_spi_cs_timing_cycles(struct apple_spi *spi,
+				      struct spi_device *device,
+				      u32 *setup_cycles, u32 *hold_cycles)
 {
-	struct apple_spi *spi = spi_controller_get_devdata(device->controller);
-	u32 setup_cycles, hold_cycles;
 	int ret;
 
 	/* This controller path has no hardware representation for inactive time. */
 	if (device->cs_inactive.value)
 		return -EOPNOTSUPP;
 
-	ret = apple_spi_delay_cycles(spi, &device->cs_setup, &setup_cycles);
+	ret = apple_spi_delay_cycles(spi, &device->cs_setup, setup_cycles);
 	if (ret)
 		return ret;
-	ret = apple_spi_delay_cycles(spi, &device->cs_hold, &hold_cycles);
-	if (ret)
-		return ret;
+	return apple_spi_delay_cycles(spi, &device->cs_hold, hold_cycles);
+}
 
+static void apple_spi_write_cs_timing(struct apple_spi *spi, u32 setup_cycles,
+				      u32 hold_cycles)
+{
 	if (!setup_cycles && !hold_cycles) {
 		reg_mask(spi, APPLE_SPI_SHIFTCFG,
 			 APPLE_SPI_SHIFTCFG_OVERRIDE_CS, 0);
 		reg_write(spi, APPLE_SPI_DELAY_PRE, 0);
 		reg_write(spi, APPLE_SPI_DELAY_POST, 0);
 		reg_write(spi, APPLE_SPI_DELAY_POST_CYCLES, 0);
-		return 0;
+		return;
 	}
 
 	reg_write(spi, APPLE_SPI_DELAY_PRE,
@@ -267,14 +253,54 @@ static int apple_spi_set_cs_timing(struct spi_device *device)
 		  APPLE_SPI_DELAY_POST_FLAGS);
 	reg_mask(spi, APPLE_SPI_SHIFTCFG, 0,
 		 APPLE_SPI_SHIFTCFG_OVERRIDE_CS);
+}
 
-	dev_dbg(&device->dev,
-		"hardware CS setup=%u hold=%u cycles: pre=%#08x post=%#08x post_cycles=%#08x shiftcfg=%#08x\n",
-		setup_cycles, hold_cycles,
-		reg_read(spi, APPLE_SPI_DELAY_PRE),
-		reg_read(spi, APPLE_SPI_DELAY_POST),
-		reg_read(spi, APPLE_SPI_DELAY_POST_CYCLES),
-		reg_read(spi, APPLE_SPI_SHIFTCFG));
+/*
+ * Only validate the delays here. The registers are programmed for each
+ * message in apple_spi_prepare_message(): their contents are lost when
+ * runtime PM gates the controller's power domain between messages, and
+ * they are shared by all devices on the bus.
+ */
+static int apple_spi_set_cs_timing(struct spi_device *device)
+{
+	struct apple_spi *spi = spi_controller_get_devdata(device->controller);
+	u32 setup_cycles, hold_cycles;
+	int ret;
+
+	ret = apple_spi_cs_timing_cycles(spi, device, &setup_cycles,
+					 &hold_cycles);
+	if (ret)
+		return ret;
+
+	dev_dbg(&device->dev, "hardware CS setup=%u hold=%u cycles\n",
+		setup_cycles, hold_cycles);
+	return 0;
+}
+
+static int apple_spi_prepare_message(struct spi_controller *ctlr, struct spi_message *msg)
+{
+	struct apple_spi *spi = spi_controller_get_devdata(ctlr);
+	struct spi_device *device = msg->spi;
+
+	u32 cfg = ((device->mode & SPI_CPHA ? APPLE_SPI_CFG_CPHA : 0) |
+		   (device->mode & SPI_CPOL ? APPLE_SPI_CFG_CPOL : 0) |
+		   (device->mode & SPI_LSB_FIRST ? APPLE_SPI_CFG_LSB_FIRST : 0));
+
+	/* Update core config */
+	reg_mask(spi, APPLE_SPI_CFG,
+		 APPLE_SPI_CFG_CPHA | APPLE_SPI_CFG_CPOL | APPLE_SPI_CFG_LSB_FIRST, cfg);
+
+	if (ctlr->set_cs_timing) {
+		u32 setup_cycles, hold_cycles;
+		int ret;
+
+		ret = apple_spi_cs_timing_cycles(spi, device, &setup_cycles,
+						 &hold_cycles);
+		if (ret)
+			return ret;
+		apple_spi_write_cs_timing(spi, setup_cycles, hold_cycles);
+	}
+
 	return 0;
 }
 
