@@ -21,6 +21,7 @@ struct typec_mux_dev {
 	typec_mux_notify_fn_t abort;
 	bool removed;
 	bool safe_after_role;
+	bool transient_timeouts;
 };
 
 #define to_typec_switch_dev(_dev_) container_of(_dev_, struct typec_switch_dev, dev)

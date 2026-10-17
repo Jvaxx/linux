@@ -2120,6 +2120,169 @@ bool usb_device_is_owned(struct usb_device *udev)
 	return !!hub->ports[udev->portnum - 1]->port_owner;
 }
 
+/**
+ * usb_hub_port_power_off - disconnect a hub port and hold its power off
+ * @hdev: USB device belonging to the usb hub
+ * @port1: port number
+ *
+ * For a driver that has to move the data lanes behind a port while the hub
+ * keeps running, such as a Type-C PHY that switches the PIPE interface of a
+ * SuperSpeed root port to another backend. The device on the port is
+ * disconnected and the port is powered off, which takes its link down, as
+ * the port's "disable" attribute does. Connect changes still queued for the
+ * port are dropped. Only hubs that switch the power of each port on its own
+ * are supported.
+ *
+ * The port is then held off until usb_hub_port_power_on(): the hub driver
+ * leaves it off, and the port is kept runtime-active, so that neither its
+ * own runtime resume nor that of its USB2 peer switches it on in between.
+ * Writing 0 to its "disable" attribute fails with -EBUSY; writing 1 takes the
+ * port over, after which usb_hub_port_power_on() leaves it off.
+ *
+ * An administratively disabled port is powered off again, in case it was
+ * repowered before the handover. It stays under administrative ownership:
+ * runtime resume leaves it off, and the caller's hub lock prevents a write
+ * to "disable" from enabling it during the lane change. The return value
+ * distinguishes this from a port held for the caller. Other ports, including
+ * those switched off by runtime PM, are resumed and held off for the caller.
+ *
+ * Context: process context; the caller holds @hdev's device lock.
+ *
+ * Return: 0 if the port is held off for the caller, also if it was already,
+ * 1 if it is administratively disabled, -EOPNOTSUPP if the hub cannot switch the
+ * power of a single port, or another negative error code.
+ */
+int usb_hub_port_power_off(struct usb_device *hdev, int port1)
+{
+	struct usb_hub *hub = usb_hub_to_struct_hub(hdev);
+	struct usb_interface *intf;
+	struct usb_port *port_dev;
+	bool disabled;
+	int ret;
+
+	device_lock_assert(&hdev->dev);
+	if (!hub || hub->disconnected)
+		return -ENODEV;
+	if (port1 < 1 || port1 > hdev->maxchild)
+		return -EINVAL;
+	if ((le16_to_cpu(hub->descriptor->wHubCharacteristics) & HUB_CHAR_LPSM) !=
+	    HUB_CHAR_INDV_PORT_LPSM)
+		return -EOPNOTSUPP;
+
+	port_dev = hub->ports[port1 - 1];
+	if (port_dev->held_off)
+		return 0;
+	disabled = port_dev->disabled;
+
+	intf = to_usb_interface(hub->intfdev);
+	ret = usb_autopm_get_interface(intf);
+	if (ret < 0)
+		return ret;
+
+	/*
+	 * Administrative disable excludes the runtime-resume power writer under
+	 * power_lock. For other ports, wait for any port PM and keep it out
+	 * until power-on. Neither path takes the hub lock in the PM callback.
+	 */
+	if (!disabled) {
+		ret = pm_runtime_resume_and_get(&port_dev->dev);
+		if (ret < 0) {
+			/* After a runtime PM error, nothing resumes the port any more. */
+			if (!pm_runtime_active(&port_dev->dev))
+				goto out;
+			pm_runtime_get_noresume(&port_dev->dev);
+		}
+	}
+
+	if (port_dev->child)
+		usb_disconnect(&port_dev->child);
+
+	ret = usb_hub_set_port_power(hdev, hub, port1, false);
+	if (ret) {
+		/* The link may still be up: have hub_wq look for its device. */
+		set_bit(port1, hub->change_bits);
+		kick_hub_wq(hub);
+		goto put_port;
+	}
+
+	/* The runtime PM reference is dropped once the hold ends. */
+	port_dev->held_off = !disabled;
+	/* Nothing hub_wq still has queued for the port applies to it off. */
+	clear_bit(port1, hub->change_bits);
+	clear_bit(port1, hub->warm_reset_bits);
+	msleep(2 * hub_power_on_good_delay(hub));
+	/* Losing the connection with the power is not an event. */
+	usb_clear_port_feature(hdev, port1, USB_PORT_FEAT_C_CONNECTION);
+	if (!port_dev->is_superspeed)
+		usb_clear_port_feature(hdev, port1, USB_PORT_FEAT_C_ENABLE);
+	ret = disabled;
+	goto out;
+
+put_port:
+	if (!disabled)
+		pm_runtime_put(&port_dev->dev);
+out:
+	usb_autopm_put_interface(intf);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(usb_hub_port_power_off);
+
+/**
+ * usb_hub_port_power_on - switch on a port held off by usb_hub_port_power_off()
+ * @hdev: USB device belonging to the usb hub
+ * @port1: port number
+ *
+ * hub_wq then checks the port for a connection. It warm resets a SuperSpeed
+ * port first: toggling the port power can leave the two ends of the link
+ * out of sync (see usb_port_runtime_resume()), and the warm reset starts
+ * both from a reset. The port is under its usual runtime PM policy again.
+ *
+ * A port that is not held off, because its "disable" attribute took it over
+ * for example, is left alone.
+ *
+ * Context: process context; the caller holds @hdev's device lock.
+ *
+ * Return: 0 if the port was switched on, 1 if it was not held off, or a
+ * negative error code, in which case the port stays held off.
+ */
+int usb_hub_port_power_on(struct usb_device *hdev, int port1)
+{
+	struct usb_hub *hub = usb_hub_to_struct_hub(hdev);
+	struct usb_interface *intf;
+	struct usb_port *port_dev;
+	int ret;
+
+	device_lock_assert(&hdev->dev);
+	if (!hub || hub->disconnected)
+		return -ENODEV;
+	if (port1 < 1 || port1 > hdev->maxchild)
+		return -EINVAL;
+
+	port_dev = hub->ports[port1 - 1];
+	if (!port_dev->held_off)
+		return 1;
+
+	intf = to_usb_interface(hub->intfdev);
+	ret = usb_autopm_get_interface(intf);
+	if (ret < 0)
+		return ret;
+
+	ret = usb_hub_set_port_power(hdev, hub, port1, true);
+	if (!ret) {
+		msleep(hub_power_on_good_delay(hub));
+		if (hub_is_superspeed(hdev))
+			set_bit(port1, hub->warm_reset_bits);
+		set_bit(port1, hub->change_bits);
+		kick_hub_wq(hub);
+		port_dev->held_off = false;
+		pm_runtime_put(&port_dev->dev);
+	}
+
+	usb_autopm_put_interface(intf);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(usb_hub_port_power_on);
+
 static void update_port_device_state(struct usb_device *udev)
 {
 	struct usb_hub *hub;
@@ -5475,11 +5638,13 @@ static void hub_port_connect(struct usb_hub *hub, int port1, u16 portstatus,
 
 		/*
 		 * maybe switch power back on (e.g. root hub was reset)
-		 * but only if the port isn't owned by someone else.
+		 * but only if the port isn't owned by someone else, and
+		 * was not switched off on purpose, see hub_power_on().
 		 */
-		if (hub_is_port_power_switchable(hub)
-				&& !usb_port_is_power_on(hub, portstatus)
-				&& !port_dev->port_owner)
+		if (hub_is_port_power_switchable(hub) &&
+		    !usb_port_is_power_on(hub, portstatus) &&
+		    !port_dev->port_owner &&
+		    test_bit(port1, hub->power_bits))
 			set_port_feature(hdev, port1, USB_PORT_FEAT_POWER);
 
 		if (portstatus & USB_PORT_STAT_ENABLE)

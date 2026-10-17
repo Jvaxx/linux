@@ -54,6 +54,20 @@ def run_unit(name, unit, output, cases=((),), includes=(), extra=()):
     return hashlib.sha256(unit.encode()).hexdigest()
 
 
+# Helpers that the fixed-hub SuperSpeed handover split out of extracted functions
+ATC_SPLIT = ('atcphy_pipe_live', 'atcphy_usb3_route')
+
+
+def atc_function(source, name):
+    """The actual ATC function @name, or nothing for a source that does not have it.
+
+    The fixed-hub SuperSpeed handover splits helpers out of the functions that the
+    fixtures extract; older sources keep that code inline.
+    """
+    marker = re.search(r'^static [^\n]+\b' + name + r'\(', source, re.M)
+    return block(source, marker.start()) + '\n' if marker else ''
+
+
 def atc_mux_without_pm(source):
     """Lane/teardown fixtures omit USB PM, keeping mode mapping and lane work real.
 
@@ -61,10 +75,27 @@ def atc_mux_without_pm(source):
     """
     mapping = block(source, 'static enum atcphy_mode atcphy_typec_target_mode(')
     locked = block(source, 'static int atcphy_mux_set_locked(')
-    return mapping + '\n' + locked + r'''
+    if 'static int atcphy_mux_switch(' not in source:
+        return mapping + '\n' + locked + r'''
 static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *state)
 {
     struct apple_atcphy *atcphy = typec_mux_get_drvdata(mux);
     return atcphy_mux_set_locked(atcphy, atcphy_typec_target_mode(atcphy, state));
+}
+'''
+    # The locked body is atcphy_mux_switch(); atcphy_mux_set_locked() takes the lock
+    # and tells whether a SuperSpeed port that the USB side took down may come up.
+    helpers = ''.join(atc_function(source, name) for name in
+                      ('atcphy_usb3_port_ready', 'atcphy_mux_check', 'atcphy_mux_park'))
+    return mapping + '\n' + helpers + block(source, 'static int atcphy_mux_switch(') + '\n' + locked + r'''
+static int atcphy_mux_set(struct typec_mux_dev *mux, struct typec_mux_state *state)
+{
+    struct apple_atcphy *atcphy = typec_mux_get_drvdata(mux);
+    bool port_on;
+    int ret = atcphy_mux_set_locked(atcphy, atcphy_typec_target_mode(atcphy, state), &port_on);
+
+    /* Without the USB side no SuperSpeed port went down, so none may come up. */
+    assert(!port_on);
+    return ret;
 }
 '''

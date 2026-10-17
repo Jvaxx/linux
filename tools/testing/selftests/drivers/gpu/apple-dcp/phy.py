@@ -3,7 +3,7 @@
 """Actual PHY parking, failure/retry, masked context and OFF controls."""
 from pathlib import Path
 import re
-from common import block, source_defines, atc_mux_without_pm
+from common import block, source_defines, atc_mux_without_pm, atc_function, ATC_SPLIT
 
 def parking(root):
 
@@ -14,6 +14,8 @@ def parking(root):
     def function(source, name):
         if name == 'atcphy_mux_set' and 'static int atcphy_mux_set_locked(' in source:
             return atc_mux_without_pm(source)
+        if name in ATC_SPLIT:
+            return atc_function(source, name)
         return block(source, re.search(r'^static [^\n]+\b' + name + r'\(', source, re.M).group())
 
 
@@ -39,6 +41,7 @@ struct apple_atcphy {
     unsigned int dp_usb_context_valid, dp_usb_context_dirty;
     u32 dp_usb_context[2][27];
     bool pipe_pending, usb_off_pending, usb_off_drained;
+    bool usb3_port_off, park_owed;
     enum atcphy_mode mode, typec_mode;
     enum atcphy_pipehandler_state pipe_state;
 };
@@ -123,7 +126,7 @@ static void atc_tunnel_restore(struct apple_atcphy *p) { (void)p; }
                  'atcphy_configure_pipehandler_usb3_host_t8122',
                  'atcphy_configure_pipehandler_usb3_host_t8103',
                  'atcphy_configure_pipehandler_usb3', 'atcphy_configure_pipehandler_usb4',
-                 'atcphy_enable_dummy_phy', 'atcphy_configure_pipehandler_dummy',
+                 'atcphy_enable_dummy_phy', 'atcphy_pipe_live', 'atcphy_configure_pipehandler_dummy',
                  'atcphy_configure_pipehandler', 'atcphy_park_pipehandler',
                  'atcphy_usb2_power_off', '_atcphy_dwc3_reset_assert', 'atcphy_dwc3_reset_assert'):
         parts.append(function(atc, name))
@@ -133,11 +136,17 @@ static void atc_tunnel_restore(struct apple_atcphy *p) { (void)p; }
     for name in ('atcphy_configure_lanes', 'j700_aux_enable', 'j700_aux_disable',
                  'atcphy_enable_dp_aux', 'atcphy_disable_dp_aux', 'atcphy_power_off',
                  'atcphy_power_on', 'atcphy_configure', 'atcphy_set_orientation', 'atcphy_sw_set', 'atcphy_mux_set',
-                 'atcphy_usb3_set_mode', 'atcphy_usb3_power_off'):
+                 'atcphy_usb3_route', 'atcphy_usb3_set_mode', 'atcphy_usb3_power_off'):
         parts.append(function(atc, name))
     production = '\n'.join(parts)
     if 'static int j700_usb_capture(' in dp:
         production = '#define HAS_USB_CONTEXT\n' + production
+    # With the fixed-hub SuperSpeed handover, dwc3 has left host mode once it
+    # powers the USB3 PHY off or asserts its reset, and a fixed-hub host starts
+    # even if its PIPE cannot be routed.
+    production = ('#define STOPPED_HOST_PARKS ' + str(int('static bool atcphy_pipe_live(' in atc)) +
+                  '\n#define FIXED_HOST_STARTS ' + str(int('static int atcphy_usb3_route(' in atc)) +
+                  '\n' + production)
     prefix = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -272,6 +281,13 @@ static int request(struct apple_atcphy *p, bool safe)
     };
     return atcphy_mux_set(&mux, &state);
 }
+/*
+ * Whether a USB3 power-off or controller reset that failed leaves dwc3 a host.
+ * With the fixed-hub SuperSpeed handover it has left host mode either way.
+ */
+#define FAILED_STOP_HOST (!STOPPED_HOST_PARKS)
+/* A host start whose PIPE cannot be routed fails, except on a fixed-hub port with the handover. */
+#define HOST_START_ERROR(p, err) (FIXED_HOST_STARTS && (p)->fixed_usb2 ? 0 : (err))
 static void unchanged(struct apple_atcphy *p, bool dirty, bool host)
 {
     bool expected_dirty = dirty || (p->hw->has_t8140_dp && p->fixed_usb2 && host);
@@ -344,10 +360,10 @@ static void power_parking(void)
         int ret = atcphy_usb3_power_off(&phy);
         observed("power-off parking failure", ret);
         assert(ret == -ETIMEDOUT);
-        unchanged(&p, dirty, true);
+        unchanged(&p, dirty, FAILED_STOP_HOST);
         if (!fault) {
             assert(atcphy_usb3_power_off(&phy) == -ETIMEDOUT);
-            unchanged(&p, dirty, true);
+            unchanged(&p, dirty, FAILED_STOP_HOST);
         }
         recover();
         assert(atcphy_usb3_power_off(&phy) == 0);
@@ -373,15 +389,15 @@ static void reset_parking(void)
         int ret = atcphy_dwc3_reset_assert(&p.rcdev, 0);
         observed("reset parking failure", ret);
         assert(ret == -ETIMEDOUT);
-        unchanged(&p, dirty, true);
+        unchanged(&p, dirty, FAILED_STOP_HOST);
         if (!fault) {
             assert(atcphy_dwc3_reset_assert(&p.rcdev, 0) == -ETIMEDOUT);
-            unchanged(&p, dirty, true);
+            unchanged(&p, dirty, FAILED_STOP_HOST);
         }
         recover();
         assert(atcphy_dwc3_reset_assert(&p.rcdev, 0) == 0);
         assert(p.pipe_state == ATCPHY_PIPEHANDLER_STATE_DUMMY && !p.host_active);
-        assert(p.mode == APPLE_ATCPHY_MODE_USB3_DP && p.mode_dirty == (dirty || fixed));
+        assert(p.mode == APPLE_ATCPHY_MODE_USB3_DP && p.mode_dirty == (dirty || (fixed && FAILED_STOP_HOST)));
         assert(p.dp_owned_pmas == 3 && p.dp_idle_pmas == (dirty ? 1U : 0U));
         assert(p.aux_power_requested && writes == 0);
         assert(reset_writes == 2 && usb2_writes > 0);
@@ -403,7 +419,7 @@ static void power_cleanup(void)
         fail_poll = 1; /* The first DP stop ACK cannot complete. */
         int ret = atcphy_usb3_power_off(&phy);
         observed("power-off DP cleanup failure", ret);
-        assert(ret == -ETIMEDOUT && p.mode_dirty && p.host_active);
+        assert(ret == -ETIMEDOUT && p.mode_dirty && p.host_active == FAILED_STOP_HOST);
         assert(p.mode == APPLE_ATCPHY_MODE_USB3_DP && p.dp_owned_pmas == 3);
         assert(p.aux_power_requested && usb2_writes == 0 && reset_writes == 0);
         struct phy_configure_opts_dp training = {
@@ -420,7 +436,7 @@ static void power_cleanup(void)
         p.pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
         fail_poll = 1;
         assert(atcphy_usb3_power_off(&phy) == -ETIMEDOUT);
-        assert(p.mode_dirty && p.host_active && p.dp_owned_pmas == 3);
+        assert(p.mode_dirty && p.host_active == FAILED_STOP_HOST && p.dp_owned_pmas == 3);
         recover();
         assert(atcphy_usb3_power_off(&phy) == 0);
         assert(p.mode == APPLE_ATCPHY_MODE_OFF && !p.mode_dirty && !p.host_active);
@@ -433,7 +449,7 @@ static void power_cleanup(void)
             p.aux_power_requested = false;
             fail_poll = fault; /* BIG/SMALL sleep ACK. */
             assert(atcphy_usb3_power_off(&phy) == -ETIMEDOUT);
-            assert(p.mode == APPLE_ATCPHY_MODE_USB2 && p.mode_dirty && p.host_active);
+            assert(p.mode == APPLE_ATCPHY_MODE_USB2 && p.mode_dirty && p.host_active == FAILED_STOP_HOST);
             recover();
             assert(atcphy_usb3_power_off(&phy) == 0 && !p.mode_dirty && !p.host_active);
         }
@@ -447,7 +463,7 @@ static void power_cleanup(void)
             p.pipe_state = ATCPHY_PIPEHANDLER_STATE_DUMMY;
             fail_poll = fault;
             assert(atcphy_usb3_power_off(&phy) == -ETIMEDOUT);
-            assert(p.mode == APPLE_ATCPHY_MODE_USB3_DP && p.mode_dirty && p.host_active);
+            assert(p.mode == APPLE_ATCPHY_MODE_USB3_DP && p.mode_dirty && p.host_active == FAILED_STOP_HOST);
             assert(p.pipe_state == ATCPHY_PIPEHANDLER_STATE_DUMMY);
             assert(usb2_writes == 0 && reset_writes == 0);
             unsigned int owned = p.dp_owned_pmas, idle = p.dp_idle_pmas;
@@ -557,7 +573,7 @@ static void orientation_roundtrip(void)
                             assert(p.mode_dirty);
                             struct phy phy = { &p };
                             unsigned int before = writes;
-                            assert(atcphy_usb3_set_mode(&phy, PHY_MODE_USB_HOST, 0) == -EBUSY);
+                            assert(atcphy_usb3_set_mode(&phy, PHY_MODE_USB_HOST, 0) == HOST_START_ERROR(&p, -EBUSY));
                             assert(writes == before);
                         }
                         require_parked = true;
@@ -998,6 +1014,23 @@ static void retry_callbacks(bool mux)
         struct phy phy={&p};
         if (unlock) hold_unlock_ack=true;
         else poll_errors[2]=-EIO;
+#if FIXED_HOST_STARTS
+        if (fixed) {
+            /* A fixed-hub host starts, with its PIPE parked if the lock lets go. */
+            assert(atcphy_usb3_set_mode(&phy,PHY_MODE_USB_HOST,0)==0);
+            assert(p.mode_dirty && p.pipe_pending==(bool)unlock);
+            if (!unlock) {
+                /* Parked: the next mux update restores the lanes and routes the PIPE. */
+                assert(p.pipe_state==ATCPHY_PIPEHANDLER_STATE_DUMMY);
+                memset(poll_errors,0,sizeof(poll_errors));
+                assert((mux ? select_mode(&p,APPLE_ATCPHY_MODE_USB3) : atcphy_usb2_init(&phy))==0);
+                assert(!p.mode_dirty && !p.pipe_pending);
+                assert(atcphy_usb3_set_mode(&phy,PHY_MODE_USB_HOST,0)==0);
+                assert(p.pipe_state==ATCPHY_PIPEHANDLER_STATE_USB3 && !p.pipe_pending);
+                continue;
+            }
+        } else
+#endif
         assert(atcphy_usb3_set_mode(&phy,PHY_MODE_USB_HOST,0)==
                (unlock ? -ETIMEDOUT : -EIO));
         assert(p.mode_dirty && p.pipe_pending);
@@ -1346,7 +1379,7 @@ static void warm_failure_controls(void)
     assert(p.pipe_state == ATCPHY_PIPEHANDLER_STATE_DUMMY);
     struct phy phy = { &p };
     unsigned int before = writes;
-    assert(atcphy_usb3_set_mode(&phy, PHY_MODE_USB_HOST, 0) == -EBUSY);
+    assert(atcphy_usb3_set_mode(&phy, PHY_MODE_USB_HOST, 0) == HOST_START_ERROR(&p, -EBUSY));
     assert(j700_dp_configure(&p, &rate) == -EBUSY && writes == before);
     fail_caller = NULL;
     assert(select_mode(&p, APPLE_ATCPHY_MODE_USB3_DP) == 0);
@@ -1675,6 +1708,8 @@ def pipe(root):
     def function(name):
         if name == 'atcphy_mux_set' and 'static int atcphy_mux_set_locked(' in source:
             return atc_mux_without_pm(source)
+        if name in ATC_SPLIT:
+            return atc_function(source, name)
         return block(re.search(r'^static [^\n]+\b' + name + r'\(', source, re.M).group())
 
 
@@ -1694,6 +1729,7 @@ struct apple_atcphy {
     unsigned int dp_usb_context_valid, dp_usb_context_dirty;
     u32 dp_usb_context[2][27];
     bool pipe_pending, usb_off_pending, usb_off_drained;
+    bool usb3_port_off, park_owed;
     bool swap_lanes;
     enum atcphy_mode mode, typec_mode;
     enum atcphy_pipehandler_state pipe_state;
@@ -1749,9 +1785,9 @@ static int atcphy_configure(struct apple_atcphy *p, enum atcphy_mode mode)
                  'atcphy_configure_pipehandler_usb3_host_t8122',
                  'atcphy_configure_pipehandler_usb3_host_t8103',
                  'atcphy_configure_pipehandler_usb3', 'atcphy_configure_pipehandler_usb4',
-                 'atcphy_enable_dummy_phy', 'atcphy_configure_pipehandler_dummy',
+                 'atcphy_enable_dummy_phy', 'atcphy_pipe_live', 'atcphy_configure_pipehandler_dummy',
                  'atcphy_configure_pipehandler', 'atcphy_park_pipehandler',
-                 'atcphy_usb3_set_mode', 'atcphy_mux_set'):
+                 'atcphy_usb3_route', 'atcphy_usb3_set_mode', 'atcphy_mux_set'):
         parts.append(function(name))
     production = '\n'.join(parts)
     prefix = r'''
@@ -2028,6 +2064,8 @@ def unwind(root):
     def function(source, name):
         if name == 'atcphy_mux_set' and 'static int atcphy_mux_set_locked(' in source:
             return atc_mux_without_pm(source)
+        if name in ATC_SPLIT:
+            return atc_function(source, name)
         return block(source, re.search(r'^static [^\n]+\b' + name + r'\(', source, re.M).group())
 
 
@@ -2052,6 +2090,7 @@ struct apple_atcphy {
     unsigned int dp_usb_context_valid, dp_usb_context_dirty;
     u32 dp_usb_context[2][27];
     bool pipe_pending, usb_off_pending, usb_off_drained;
+    bool usb3_port_off, park_owed;
     enum atcphy_mode mode, typec_mode;
     enum atcphy_pipehandler_state pipe_state;
 };
