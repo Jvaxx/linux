@@ -163,3 +163,32 @@ def fabric_rebalance(dcp):
     end += len(block(dcp, end))
     start = dcp.find('struct dcp_rebalance_context {')
     return dcp[start if 0 <= start < end else dcp.index(marker):end] + '\n'
+
+
+def apple_function(root, name):
+    """The definition of @name in whichever drivers/gpu/drm/apple source has it.
+
+    Robust to functions moving between files; '' when no source defines it.
+    """
+    pattern = re.compile(r'^(?:[A-Za-z_][\w \t*]*\n)?(?:[A-Za-z_][\w \t*]*?\b)?' + re.escape(name) +
+                         r'\([^;{]*?\)\s*\{', re.M)
+    for path in sorted((root / 'drivers/gpu/drm/apple').glob('*.c')):
+        if 'test' in path.name:
+            continue
+        text = _read_text(path)
+        match = pattern.search(text)
+        if match:
+            return block(text, match.start()) + '\n'
+    return ''
+
+
+def internal_inline(root, name):
+    """A static inline helper from dcp-internal.h, marked unused; '' if absent.
+
+    dcp_fw_is_14_7() reads fw_compat and hw.fw_14_7_endpoints.
+    """
+    text = (root / 'drivers/gpu/drm/apple/dcp-internal.h').read_text()
+    match = re.search(r'^static inline [^\n;]*\b' + re.escape(name) + r'\(', text, re.M)
+    if not match:
+        return ''
+    return block(text, match.start()).replace('static inline ', 'static inline __attribute__((unused)) ', 1) + '\n'

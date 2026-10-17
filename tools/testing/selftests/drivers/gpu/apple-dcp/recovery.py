@@ -405,7 +405,9 @@ def check(root, output):
         if(read_action==4) { dpavservep_detach(&d);d.quiescing=true; }
         struct drm_edid *edid=malloc(sizeof(*edid));assert(edid);edid->marker=1;edid_allocations++;return edid;
     }
-    static const struct drm_edid *dcpavserv_read_edid_legacy(struct apple_epic_service *service) { return dcpavserv_read_edid_inline(service); }
+    static const struct drm_edid *dcpavserv_read_edid_legacy(struct apple_epic_service *service) { return dcpavserv_read_edid_inline(service); }    /* The 14.7 open-before-EDID handshake is for T6030 external processors only. */
+    static int __attribute__((unused)) afk_service_call(struct apple_epic_service *s,u16 group,u32 command,const void *data,size_t data_len,size_t data_pad,void *output,size_t output_len,size_t output_pad)
+{ (void)s;(void)group;(void)command;(void)data;(void)data_len;(void)data_pad;(void)output;(void)output_len;(void)output_pad;assert(!"14.7 open-before-EDID on H17P");return -ENODEV; }
     '''
     dpav=(root/'drivers/gpu/drm/apple/epic/dpavservep.c').read_text()
     for signature in ['bool dcpavserv_edid_current(', 'bool dcpavserv_edid_service_current(', 'const struct drm_edid *dcpavserv_copy_edid(']:

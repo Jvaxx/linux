@@ -3,7 +3,7 @@
 """Actual disconnect authority, DWC3 teardown and firmware resource admission."""
 from pathlib import Path
 import re
-from common import block, atc_mux_without_pm, source_defines, ATC_POST_TUNABLE, tipd_pm_header
+from common import block, apple_function, internal_inline, atc_mux_without_pm, source_defines, ATC_POST_TUNABLE, tipd_pm_header
 
 def disconnect(root):
     # Copyright 2026 Ryan Murray
@@ -132,7 +132,10 @@ struct apple_dcp {
  u64 external_stop_generation, typec_generation;
  int external_error, mode_state; void *avep;
  struct dcp_announce announce;
+ /* T6030 external processors only; an H17P display is never one. */
+ bool external_native; int external_retries; struct delayed_work external_retry_wq;
 };
+#define atomic_set(p, v) (*(p) = (v))
 struct platform_device { struct apple_dcp *data; };
 static struct apple_dcp *platform_get_drvdata(struct platform_device *p) { return p->data; }
 static int raw_error, raw_links;
@@ -406,8 +409,26 @@ int main(void)
         shim = shim.replace(old, 'static int cd321x_typec_update_mode(struct tps6598x *t, struct cd321x_status *s, bool *busy,\n'
                             ' bool *held)\n'
                             '{ (void)t; (void)s; *busy = mode_error == -EBUSY; *held = false; return mode_error; }')
+    # Reconnect sessions (TB binding cookies/generations): the raw connect
+    # checks a session, and the Type-C retry goes through
+    # dcp_queue_typec_reconnect().  An H17P external link is sessionless.
+    if SESSION_RAW.search((r / dcp).read_text()):
+        old = ('static int dcp_dptx_connect_raw(struct apple_dcp *d, u32 port, bool *waiting)\n'
+               '{ assert(port == 0); *waiting = false; raw_links++;')
+        assert prefix.count(old) == 1
+        session = (r / 'drivers/gpu/drm/apple/dcp-fabric-session.h').read_text()
+        prefix = prefix.replace(old, block(session, 'struct dcp_fabric_session {') + ';\n'
+            'static int dcp_dptx_connect_raw(struct apple_dcp *d, u32 port, bool *waiting,\n'
+            ' const struct dcp_fabric_session *session, bool cable, bool recovery)\n'
+            '{ assert(port == 0); assert(!session && !cable && !recovery); *waiting = false; raw_links++;')
+        prefix += ('/* Only a Type-C (non-H17P) output queues the session reconnect. */\n'
+                   'static void dcp_queue_typec_reconnect(struct apple_dcp *d, unsigned long delay)\n'
+                   '{ (void)d; (void)delay; assert(!"Type-C session reconnect for H17P"); }\n')
     source = prefix + pm + shim + dp + funcs + tests
     return source
+
+
+SESSION_RAW = re.compile(r'dcp_dptx_connect_raw\([^)]*const struct dcp_fabric_session \*')
 
 def bounce(root):
     """Fast dock replug: the sink vanishes while the DPTX link trains.
@@ -428,13 +449,17 @@ def bounce(root):
         unit = unit.replace(old, new)
 
     swap(' struct { bool connected; void *service; } dptxport[1];',
-         ' struct { bool connected, closed; void *service, *atcphy; int linkcfg_completion; } dptxport[1];\n'
+         ' struct { bool connected, closed, tile_hint; void *service, *atcphy; int linkcfg_completion; } dptxport[1];\n'
          ' void *phy, *dev, *active_typec_route;\n'
          ' int dptx_die, dptx_phy, dptx_dfp_port, connector_type;\n'
-         ' bool external, external_link_ready, crashed;')
+         ' bool external, external_link_ready, crashed;\n'
+         ' bool typec_work_enabled; int fw_compat; struct { bool fw_14_7_endpoints; } hw;\n'
+         ' struct { bool active; } split;')
     old_raw = unit[unit.index('static int dcp_dptx_connect_raw('):]
     old_raw = old_raw[:old_raw.index('return raw_error; }') + len('return raw_error; }')]
-    swap(old_raw, 'static int dcp_dptx_connect_raw(struct apple_dcp *, u32, bool *);')
+    sessions = bool(SESSION_RAW.search(dcp))
+    swap(old_raw, 'static int dcp_dptx_connect_raw(struct apple_dcp *, u32, bool *' +
+         (', const struct dcp_fabric_session *, bool, bool' if sessions else '') + ');')
     swap('static int dptxport_set_hpd(void *p, bool on)\n{ (void)p; assert(!on); return hpd_error; }',
          'static bool fw_hpd, fw_display, link_trains;\n'
          'static int hpd_drops, connects, release_error_once, assert_error;\n'
@@ -480,6 +505,8 @@ static bool dcp_uses_t6020_tunnel_flow(struct apple_dcp *d) { return dcp_is_usb4
 #define smp_store_release(p, v) (*(p) = (v))
 static bool dcpext_scanout_terminal(struct apple_dcp *d) { (void)d; return false; }
 static void dcpext_scanout_link_restored(struct apple_dcp *d) { (void)d; assert(!"T6030 dcpext path in an H17P scenario"); }
+static bool iomfb_v14_7_external_ready(struct apple_dcp *d) { (void)d; assert(!"T6030 external processor in an H17P scenario"); return false; }
+static int iomfb_v14_7_external_open(struct apple_dcp *d) { (void)d; assert(!"T6030 external processor in an H17P scenario"); return -ENODEV; }
 '''
     tests = r'''
 static struct platform_device device = { .data = &display };
@@ -583,6 +610,18 @@ int main(void)
  printf("%d assertions, %d failures\n", checks, failures); return !!failures;
 }
 '''
+    if sessions:
+        # Not a T8122 dcpext (fw_compat UNKNOWN); the session checks are real.
+        firmware += ('#define DCP_FIRMWARE_V_14_7_TEMPLATE 4\n' + internal_inline(root, 'dcp_ext_dptx_607') +
+                     'struct dcp_fabric_session;\n'
+                     'static bool dcp_session_valid_locked(struct apple_dcp *d, struct dcp_fabric_session s, bool cable);\n'
+                     'static bool __attribute__((unused)) dcp_hdmi_port_attached(struct apple_dcp *d)\n'
+                     '{ (void)d; assert(!"T6030 external HDMI port in an H17P scenario"); return false; }\n' +
+                     apple_function(root, 'dcp_connect_session_valid_locked') +
+                     apple_function(root, 'dcp_connect_session_valid') +
+                     '/* Never reached: the H17P external link passes no session. */\n'
+                     'static bool dcp_session_valid_locked(struct apple_dcp *d, struct dcp_fabric_session s, bool cable)\n'
+                     '{ (void)d; (void)s; (void)cable; assert(!"session check for a sessionless link"); return false; }\n')
     return unit + firmware + raw + '\n' + tests
 
 def dropped(root):
@@ -1126,16 +1165,22 @@ def readiness(root):
 
     # This slice is the production probe's publication boundary, including its
     # failure exits and prepared-before-component_add ordering, not a copied model.
-    probe = function(dcp, 'static int dcp_platform_probe(')
+    # The T8122 dcpext wrapper moved the pipe's probe into dcp_platform_probe_pipe().
+    probe = function(dcp, 'static int dcp_platform_probe_pipe(' if 'static int dcp_platform_probe_pipe(' in dcp
+                     else 'static int dcp_platform_probe(')
     publish = probe[probe.rindex('\tif (dcp->hw.iomfb_method_profile ==\n\t    DCP_IOMFB_METHODS_H17P_EXTERNAL) {'):]
     production = '\n'.join((
         function(dcp, 'bool dcp_h17p_external_supported('),
         function(dcp, 'bool dcp_h17p_external_ready('),
+        # A failed T8122 dcpext stays bound without a pipeline; none fails here.
+        apple_function(root, 'dcp_ext_unusable'),
         function(drm, 'static bool apple_dcp_usable('),
         function(drm, 'static int add_dcp_components('),
         function(drm, 'static int apple_drm_init_dcp('),
         'static int publish_provider(struct platform_device *pdev, struct apple_dcp *dcp)\n'
-        '{\n\tstruct device *dev = &pdev->dev;\n\tint ret;\n' + publish,
+        '{\n\tstruct device *dev = &pdev->dev;\n\tint ret;\n'
+        # Type-C route registration, earlier in probe, succeeded here.
+        + ('\tbool routes_failed = false;\n' if 'routes_failed' in publish else '') + publish,
     ))
     prefix = r'''
 #include <assert.h>
@@ -1161,14 +1206,25 @@ struct device_node { bool available, external, phys; unsigned int index; u32 fir
 struct device { struct device_node *of_node; void *data; };
 struct platform_device { struct device dev; bool bound, registered; };
 /* The native T6030 14.7 backend is never selected in these scenarios. */
-enum dcp_firmware_version { DCP_FIRMWARE_UNKNOWN, DCP_FIRMWARE_V_14_7, DCP_FIRMWARE_V_14_7_TEMPLATE };
+enum dcp_firmware_version { DCP_FIRMWARE_UNKNOWN, DCP_FIRMWARE_V_14_7, DCP_FIRMWARE_V_14_7_TEMPLATE, DCP_FIRMWARE_V_26_6 };
 struct apple_dcp {
-    bool external_prepared, quiescing, crashed;
+    bool external_prepared, quiescing, crashed, external_native, ext_dead;
     enum dcp_firmware_version fw_compat;
     struct { int iomfb_method_profile; } hw;
 };
 static void __attribute__((unused)) iomfb_v14_7_remove(struct apple_dcp *d)
 { (void)d; assert(!"14.7 backend on a non-14.7 DCP"); }
+/* Nor the J613 26.6 backend. */
+static void __attribute__((unused)) iomfb_v26_6_unbind(struct apple_dcp *d)
+{ (void)d; assert(!"26.6 backend on a non-26.6 DCP"); }
+/* No node here is a T6030 dcpext, so no native external processor. */
+struct device_node;
+static bool __attribute__((unused)) dcp_t6030_ext_native(const struct device_node *n)
+{ (void)n; assert(!"T6030 dcpext in a J700 scenario"); return false; }
+static int __attribute__((unused)) iomfb_v14_7_external_prepare(struct apple_dcp *d)
+{ (void)d; assert(!"T6030 external processor in a J700 scenario"); return -ENODEV; }
+static void __attribute__((unused)) iomfb_v14_7_external_refuse(struct apple_dcp *d, const char *why)
+{ (void)d; (void)why; assert(!"T6030 external processor in a J700 scenario"); }
 struct drm_device { int unused; };
 struct drm_encoder { int unused; };
 struct apple_drm_private { struct drm_device drm; };
@@ -1398,9 +1454,11 @@ def vrr(root):
 #define dev_dbg(...) ((void)0)
 struct apple_connector { bool connected; };
 /* The native T6030 14.7 backend is never selected in these scenarios. */
-enum dcp_firmware_version { DCP_FIRMWARE_UNKNOWN, DCP_FIRMWARE_V_14_7, DCP_FIRMWARE_V_14_7_TEMPLATE };
+enum dcp_firmware_version { DCP_FIRMWARE_UNKNOWN, DCP_FIRMWARE_V_12_3, DCP_FIRMWARE_V_13_5,
+    DCP_FIRMWARE_V_14_7, DCP_FIRMWARE_V_14_7_TEMPLATE, DCP_FIRMWARE_V_26_6 };
 struct apple_dcp {
-    bool crashed;
+    bool crashed, external, external_native;
+    unsigned int nr_typec_routes;
     enum dcp_firmware_version fw_compat;
     struct { int iomfb_method_profile; } hw;
     struct { bool valid; } mode_state;
@@ -1409,7 +1467,8 @@ struct apple_dcp {
 };
 struct platform_device { struct apple_dcp *data; };
 struct drm_crtc { struct platform_device *dcp; };
-struct drm_crtc_state { bool vrr_enabled, modeset; };
+struct drm_display_mode { int unused; };
+struct drm_crtc_state { bool enable, vrr_enabled, modeset; struct drm_display_mode mode; };
 /* mainline 7.2 renamed struct drm_atomic_state to struct drm_atomic_commit */
 struct drm_atomic_commit { struct drm_crtc_state crtc; };
 #define to_apple_crtc(x) (x)
@@ -1422,7 +1481,15 @@ static bool drm_atomic_crtc_needs_modeset(struct drm_crtc_state *s)
 static int __attribute__((unused)) iomfb_v14_7_atomic_check(struct apple_dcp *d,
     struct drm_crtc *c, struct drm_atomic_commit *s)
 { (void)d; (void)c; (void)s; assert(!"14.7 backend on a non-14.7 DCP"); return -EINVAL; }
-"""
+static int __attribute__((unused)) iomfb_v26_6_atomic_check(struct apple_dcp *d,
+    struct drm_crtc *c, struct drm_atomic_commit *s)
+{ (void)d; (void)c; (void)s; assert(!"26.6 backend on a non-26.6 DCP"); return -EINVAL; }
+/* Route-follow is for Type-C displays; this DCP has no Type-C routes. */
+static bool __attribute__((unused)) typec_follow_crtc = true;
+static int __attribute__((unused)) dcp_typec_follow_check(struct apple_dcp *d, struct drm_crtc *c,
+    struct drm_atomic_commit *s, const struct drm_display_mode *m)
+{ (void)d; (void)c; (void)s; (void)m; assert(!"route-follow without Type-C routes"); return -EINVAL; }
+""" + apple_function(root, 'dcp_typec_follows_crtc')
     suffix = r"""
 int main(void)
 {
@@ -1441,6 +1508,7 @@ int main(void)
         dcp.hw.iomfb_method_profile = profile;
         dcp.mode_state.valid = valid;
         state.crtc.modeset = modeset;
+        state.crtc.enable = true;
         state.crtc.vrr_enabled = vrr;
         dcp.connector = link == 2 ? NULL : &connector;
         connector.connected = link == 1;

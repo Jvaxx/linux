@@ -58,7 +58,7 @@ struct typec_mux { struct typec_mux_context *context; struct typec_mux_state tra
 struct connector { bool connected; };
 struct apple_dcp { int external_lock,external_error; bool external_cable,external_stopped; struct { bool connected; } dptxport[1]; void *hdmi_hpd; bool active; bool external,typec_cable_connected; void *dev; struct connector *typec_connector; bool ext_backlight; };
 struct apple_dcp_typec_route;
-struct apple_dcp_typec_port { int link; void *connector_np; struct apple_dcp_typec_route *owner,*target,*secondary_target,*preferred_route; void *applied_alt; unsigned long applied_mode; unsigned applied_status,applied_conf; bool applied_valid,safe_pending,safe_finish_ready,dp_wanted,dp_hpd,hpd; };
+struct apple_dcp_typec_port { int link; void *connector_np; struct apple_dcp_typec_route *owner,*target,*secondary_target,*preferred_route; void *applied_alt; unsigned long applied_mode; unsigned applied_status,applied_conf; bool applied_valid,safe_pending,safe_finish_ready,dp_wanted,dp_hpd,hpd,busy_noted; };
 struct apple_dcp_typec_route { struct apple_dcp_typec_port *port; struct apple_dcp *dcp; void *xbar; bool deactivate_xbar_done; int deactivate_error; bool selected,tunnel; };
 static int dcp_typec_fabric_lock,dcp_typec_ports,deactivate_calls;
 struct drm_device { int unused; };
@@ -284,7 +284,7 @@ int main(int argc,char **argv) {
   # The fabric core split: rebalancing runs the real dcp_fabric_run_rebalance()
   # and dcp_fabric_run_deactivate() over the real decisions, and the adapter
   # hands the core each route's struct dcp_fabric_route.
-  prefix=prefix.replace('typedef unsigned u32;\n','typedef unsigned u32;\ntypedef unsigned long long u64;\n'+fabric,1)
+  prefix=prefix.replace('typedef unsigned u32;\n','typedef unsigned u32;\ntypedef unsigned long long u64;\ntypedef unsigned char u8;\n'+fabric,1)
   prefix=prefix.replace('struct apple_dcp_typec_route { ','struct apple_dcp_typec_route { struct dcp_fabric_route core; ',1)
   prefix=prefix.replace('#define lockdep_assert_held(p) ((void)(p))\n','''#define lockdep_assert_held(p) ((void)(p))
 #define list_first_entry_or_null(h,t,m) ((void)(h),sole_port())
