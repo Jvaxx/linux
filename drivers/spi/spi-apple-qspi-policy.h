@@ -35,6 +35,60 @@ static inline int apple_qspi_mutation_allowed(unsigned int opcode,
 	}
 }
 
+/*
+ * T8140 boot NOR: may a request that does not read data reach the flash?
+ * Write-enable control is admitted. A page program, or a 4, 32 or 64 KiB
+ * erase, is admitted only when every byte it can change lies inside
+ * [start, end), the nvram partition. A program counts the whole 4 KiB
+ * blocks it touches, which covers a write that wraps within its page. Status
+ * and configuration register writes, chip erase, address-mode, reset and OTP
+ * commands are refused. The address must fit in addr_bytes: the controller
+ * sends only those bytes, so a wider value would alias a lower address.
+ */
+static inline int apple_qspi_window_allowed(unsigned int opcode,
+		unsigned int addr_bytes, unsigned long long addr,
+		unsigned int len, int data_out,
+		unsigned long long start, unsigned long long end)
+{
+	unsigned long long block, first, last;
+
+	switch (opcode) {
+	case 0x06: /* WREN */
+	case 0x04: /* WRDI */
+		return !addr_bytes && !len && !data_out;
+	case 0x02: /* PP */
+	case 0x12: /* PP_4B */
+		if (!data_out || !len || len > APPLE_QSPI_ERASE_SIZE)
+			return 0;
+		block = APPLE_QSPI_ERASE_SIZE;
+		break;
+	case 0x20: /* BE_4K */
+	case 0x21: /* BE_4K_4B */
+		block = 0x1000;
+		break;
+	case 0x52: /* BE_32K */
+	case 0x5c: /* BE_32K_4B */
+		block = 0x8000;
+		break;
+	case 0xd8: /* SE */
+	case 0xdc: /* SE_4B */
+		block = 0x10000;
+		break;
+	default:
+		return 0;
+	}
+	if (opcode != 0x02 && opcode != 0x12 && (len || data_out))
+		return 0;
+	if ((addr_bytes != 3 && addr_bytes != 4) || addr >> (8 * addr_bytes))
+		return 0;
+
+	/* [first, last) are the blocks the flash can change. */
+	first = addr & ~(block - 1);
+	last = ((addr + (len ? len : 1) - 1) | (block - 1)) + 1;
+	return last <= 1ULL << (8 * addr_bytes) &&
+		start <= first && last <= end;
+}
+
 /* Protection and activity bits must permit a write; JEDEC ID is checked separately. */
 static inline int apple_qspi_status_allows_write(unsigned int sr1,
 		unsigned int sr2, unsigned int sr3)

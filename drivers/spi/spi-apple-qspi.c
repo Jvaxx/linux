@@ -6,6 +6,11 @@
  * It consumes packed transfer descriptors and payload words through a
  * command FIFO. This driver intentionally implements the PIO spi-mem path
  * only; that is sufficient for SPI NOR discovery and access.
+ *
+ * On T8140 reads reach the whole boot NOR, but programs and erases are
+ * admitted only inside its unique, aligned nvram partition. Without that
+ * partition the NOR is read-only.
+ *
  */
 
 #include <linux/bitfield.h>
@@ -144,8 +149,12 @@ static bool apple_qspi_opcode_is_read(u8 opcode)
 }
 
 struct apple_qspi {
-	/* T8140 retains the existing unrestricted, multi-I/O transport. */
+	/* T8122/T8132 use the serialized J613 policy. */
 	bool nvram_policy;
+	/* T8140 admits programs and erases only inside nvram. */
+	bool nvram_window;
+	u64 window_start;
+	u64 window_end;
 	bool nvram_write_candidate;
 	bool write_fault;
 	void __iomem *base;
@@ -793,11 +802,36 @@ out:
 	return ret;
 }
 
-/* Keep the J700 read/write path outside the J613 policy. */
+/* T8140: data reads pass; anything else must stay inside the nvram window. */
+static int apple_qspi_window_exec_op(struct spi_mem *mem,
+				     const struct spi_mem_op *op)
+{
+	struct apple_qspi *qspi = spi_controller_get_devdata(mem->spi->controller);
+
+	if (op->data.dir == SPI_MEM_DATA_IN && op->data.nbytes)
+		return apple_qspi_transfer_op(mem, op);
+	if (!op->dummy.nbytes &&
+	    apple_qspi_window_allowed(op->cmd.opcode, op->addr.nbytes,
+				      op->addr.val, op->data.nbytes,
+				      op->data.dir == SPI_MEM_DATA_OUT,
+				      qspi->window_start, qspi->window_end))
+		return apple_qspi_transfer_op(mem, op);
+
+	dev_warn_ratelimited(&mem->spi->dev,
+		"boot NOR request denied: opcode=%02x addr=%#llx addr_bytes=%u len=%u dir=%u nvram=[%#llx, %#llx)\n",
+		op->cmd.opcode, (unsigned long long)op->addr.val,
+		op->addr.nbytes, op->data.nbytes, op->data.dir,
+		(unsigned long long)qspi->window_start,
+		(unsigned long long)qspi->window_end);
+	return -EACCES;
+}
+
 static int apple_qspi_mem_exec_op(struct spi_mem *mem, const struct spi_mem_op *op)
 {
 	struct apple_qspi *qspi = spi_controller_get_devdata(mem->spi->controller);
 
+	if (qspi->nvram_window)
+		return apple_qspi_window_exec_op(mem, op);
 	if (!qspi->nvram_policy)
 		return apple_qspi_transfer_op(mem, op);
 	return apple_qspi_exec_op(mem, op);
@@ -845,6 +879,61 @@ static bool apple_qspi_nvram_layout(struct device_node *node)
 	return found;
 }
 
+/*
+ * The one "nvram" partition of the flash on CS0, 4 KiB aligned and within
+ * 32-bit addressing. Without it, no program or erase is admitted.
+ */
+static void apple_qspi_nvram_window(struct device *dev, struct apple_qspi *qspi)
+{
+	struct device_node *flash, *parts, *part;
+	const char *label;
+	u32 reg[2], cells[2], cs;
+	u64 start = 0, end = 0;
+	int found = 0;
+
+	flash = of_get_child_by_name(dev->of_node, "flash");
+	if (!flash)
+		goto out;
+	if (!of_device_is_compatible(flash, "jedec,spi-nor") ||
+	    of_property_read_u32(flash, "reg", &cs) || cs) {
+		of_node_put(flash);
+		goto out;
+	}
+	parts = of_get_child_by_name(flash, "partitions");
+	of_node_put(flash);
+	if (!parts)
+		goto out;
+	if (of_device_is_compatible(parts, "fixed-partitions") &&
+	    !of_property_read_u32(parts, "#address-cells", &cells[0]) &&
+	    !of_property_read_u32(parts, "#size-cells", &cells[1]) &&
+	    cells[0] == 1 && cells[1] == 1) {
+		for_each_available_child_of_node(parts, part) {
+			if (of_property_read_string(part, "label", &label) ||
+			    strcmp(label, "nvram"))
+				continue;
+			found++;
+			if (of_property_count_u32_elems(part, "reg") == 2 &&
+			    !of_property_read_u32_array(part, "reg", reg, 2)) {
+				start = reg[0];
+				end = start + reg[1];
+			}
+		}
+	}
+	of_node_put(parts);
+	if (found != 1 || start >= end || end > 1ULL << 32 ||
+	    !IS_ALIGNED(start, APPLE_QSPI_ERASE_SIZE) ||
+	    !IS_ALIGNED(end, APPLE_QSPI_ERASE_SIZE))
+		start = end = 0;
+out:
+	qspi->window_start = start;
+	qspi->window_end = end;
+	if (start < end)
+		dev_dbg(dev, "boot NOR read-only outside nvram [%#llx, %#llx)\n",
+			start, end);
+	else
+		dev_dbg(dev, "boot NOR read-only: no usable nvram partition\n");
+}
+
 static int apple_qspi_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -859,6 +948,9 @@ static int apple_qspi_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	qspi = spi_controller_get_devdata(ctlr);
+	qspi->nvram_window = of_device_is_compatible(dev->of_node, "apple,t8140-qspi");
+	if (qspi->nvram_window)
+		apple_qspi_nvram_window(dev, qspi);
 	qspi->nvram_policy = of_device_is_compatible(dev->of_node, "apple,t8122-qspi") ||
 			     of_device_is_compatible(dev->of_node, "apple,t8132-qspi");
 	qspi->nvram_write_candidate = of_device_is_compatible(dev->of_node, "apple,t8122-qspi");
