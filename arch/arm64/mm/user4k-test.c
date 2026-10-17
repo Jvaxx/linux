@@ -13863,6 +13863,24 @@ static void user4k_boot_switch_exec_test(struct kunit *test)
 	}
 }
 
+/* Native pages never have a 4K owner; without user4k=on there is no record. */
+static void user4k_boot_switch_page_ext_test(struct kunit *test)
+{
+	struct mm_subpage_mapcounts counts;
+	struct page *page = alloc_page(GFP_KERNEL);
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, page);
+	memset(&counts, 0xff, sizeof(counts));
+	KUNIT_EXPECT_EQ(test, mm_subpage_file_mapcounts(page, &counts), 0U);
+	for (i = 0; i < MM_SUBPAGES_PER_PAGE; i++)
+		KUNIT_EXPECT_EQ(test, counts.slots[i], 0U);
+	KUNIT_EXPECT_NULL(test, mm_subpage_get_from_phys(page_to_phys(page)));
+	if (!user4k_enabled())
+		KUNIT_EXPECT_EQ(test, mm_subpage_shmem_missing(page), 0UL);
+	__free_page(page);
+}
+
 static void user_granule_zero_region_test(struct kunit *test)
 {
 	unsigned long base_pfn = zero_pfn(0);
@@ -14729,6 +14747,7 @@ static struct kunit_case user4k_policy_cases[] = {
 	KUNIT_CASE(user4k_page_size_request_test),
 	KUNIT_CASE(user4k_boot_switch_prctl_test),
 	KUNIT_CASE(user4k_boot_switch_exec_test),
+	KUNIT_CASE(user4k_boot_switch_page_ext_test),
 	{}
 };
 

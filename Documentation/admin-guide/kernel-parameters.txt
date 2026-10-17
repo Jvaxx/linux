@@ -8291,8 +8291,9 @@ Kernel parameters
 			(4K userspace pages on a 16K or 64K kernel) built
 			with CONFIG_ARM64_USER4K_EXPERIMENTAL.
 			Default: off. While off, the private page-size
-			prctls refuse every non-native size with EINVAL
-			and every exec uses the native page size.
+			prctls refuse every non-native size with EINVAL,
+			every exec uses the native page size and the 4K
+			ownership record is not reserved in page_ext.
 			See Documentation/arch/arm64/user4k.rst.
 
 	user_debug=	[KNL,ARM]

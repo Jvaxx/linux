@@ -69,12 +69,41 @@ static_assert(SUBPAGES_PER_FOLIO == 1 || sizeof(struct mm_subpage_ext) ==
 		    sizeof(void *)));
 static_assert(SUBPAGES_PER_FOLIO <= sizeof(u16) * BITS_PER_BYTE);
 
+/*
+ * The record is reserved only when this boot may create alternative-granule
+ * mms (on arm64, user4k=on). Otherwise page_ext may still exist for other
+ * users, but mm_subpage_ext_ops has no offset in it and must not be read.
+ */
+static bool __init subpage_ext_needed(void)
+{
+	return arch_mm_alt_granule_enabled();
+}
+
+struct page_ext_operations mm_subpage_ext_ops = {
+	.size = sizeof(struct mm_subpage_ext),
+	.need = subpage_ext_needed,
+};
+
+static struct page_ext *subpage_ext_get(const struct page *page)
+{
+	return arch_mm_alt_granule_enabled() ? page_ext_get(page) : NULL;
+}
+
+static struct page_ext *subpage_ext_from_phys(phys_addr_t phys)
+{
+	return arch_mm_alt_granule_enabled() ? page_ext_from_phys(phys) : NULL;
+}
+
 unsigned long mm_subpage_shmem_missing(struct page *page)
 {
-	struct page_ext *ext = page_ext_get(page);
+	struct page_ext *ext;
 	struct mm_subpage_ext *subext;
 	unsigned long missing;
 
+	/* Without alternative granules no 4K unit is ever missing. */
+	if (!arch_mm_alt_granule_enabled())
+		return 0;
+	ext = subpage_ext_get(page);
 	/* A referenced native page keeps its initialized section online. */
 	VM_BUG_ON(!ext);
 	subext = page_ext_data(ext, &mm_subpage_ext_ops);
@@ -85,25 +114,18 @@ unsigned long mm_subpage_shmem_missing(struct page *page)
 
 void mm_subpage_shmem_set_missing(struct page *page, unsigned long missing)
 {
-	struct page_ext *ext = page_ext_get(page);
+	struct page_ext *ext;
 	struct mm_subpage_ext *subext;
 
-	VM_BUG_ON(!ext);
 	VM_BUG_ON(missing & ~GENMASK(SUBPAGES_PER_FOLIO - 1, 0));
+	if (!arch_mm_alt_granule_enabled())
+		return;
+	ext = subpage_ext_get(page);
+	VM_BUG_ON(!ext);
 	subext = page_ext_data(ext, &mm_subpage_ext_ops);
 	subext->shmem_missing = missing;
 	page_ext_put(ext);
 }
-
-static bool __init subpage_ext_needed(void)
-{
-	return true;
-}
-
-struct page_ext_operations mm_subpage_ext_ops = {
-	.size = sizeof(struct mm_subpage_ext),
-	.need = subpage_ext_needed,
-};
 
 /* Only alternative PTE mappings contribute; native rmap counts stay unchanged. */
 static void subpage_file_map_update(phys_addr_t phys, unsigned long size, int delta)
@@ -115,7 +137,7 @@ static void subpage_file_map_update(phys_addr_t phys, unsigned long size, int de
 
 	VM_BUG_ON(!is_power_of_2(size) || size < MM_SUBPAGE_SIZE ||
 		  size >= PAGE_SIZE || !IS_ALIGNED(phys, size));
-	ext = page_ext_from_phys(phys);
+	ext = subpage_ext_from_phys(phys);
 	if (WARN_ON_ONCE(!ext))
 		return;
 	subext = page_ext_data(ext, &mm_subpage_ext_ops);
@@ -144,11 +166,13 @@ void __mm_subpage_file_map_del(phys_addr_t phys, unsigned long size)
 /* Snapshot for statistics only, never an ownership or pinning decision. */
 unsigned int mm_subpage_file_mapcounts(struct page *page, struct mm_subpage_mapcounts *counts)
 {
-	struct page_ext *ext = page_ext_get(page);
+	struct page_ext *ext = subpage_ext_get(page);
 	struct mm_subpage_ext *subext;
 	unsigned int i, leaves;
 
-	if (WARN_ON_ONCE(!ext)) {
+	/* Without alternative granules there are no alternative leaves. */
+	if (!ext) {
+		WARN_ON_ONCE(arch_mm_alt_granule_enabled());
 		memset(counts, 0, sizeof(*counts));
 		return 0;
 	}
@@ -162,7 +186,7 @@ unsigned int mm_subpage_file_mapcounts(struct page *page, struct mm_subpage_mapc
 
 static int owner_bind(struct mm_subpage_owner *owner)
 {
-	struct page_ext *ext = page_ext_get(&owner->folio->page);
+	struct page_ext *ext = subpage_ext_get(&owner->folio->page);
 	struct mm_subpage_ext *subext;
 	int ret;
 
@@ -176,7 +200,7 @@ static int owner_bind(struct mm_subpage_owner *owner)
 
 static void owner_unbind(struct mm_subpage_owner *owner)
 {
-	struct page_ext *ext = page_ext_get(&owner->folio->page);
+	struct page_ext *ext = subpage_ext_get(&owner->folio->page);
 	struct mm_subpage_ext *subext;
 
 	/* The allocated, referenced folio prevents its section going offline. */
@@ -197,7 +221,7 @@ struct mm_subpage *mm_subpage_get_from_phys(phys_addr_t phys)
 
 	if (!IS_ALIGNED(phys, MM_SUBPAGE_SIZE))
 		return NULL;
-	ext = page_ext_from_phys(phys);
+	ext = subpage_ext_from_phys(phys);
 	if (!ext)
 		return NULL;
 	subext = page_ext_data(ext, &mm_subpage_ext_ops);
@@ -906,7 +930,7 @@ void mm_subpage_move_finish(struct mm_subpage_move *move)
 
 int mm_subpage_snapshot_rmap(struct folio *folio, struct mm_subpage_rmap *maps)
 {
-	struct page_ext *ext = page_ext_get(&folio->page);
+	struct page_ext *ext = subpage_ext_get(&folio->page);
 	struct mm_subpage_ext *subext;
 	struct mm_subpage_owner *owner;
 	unsigned long flags;
@@ -941,7 +965,7 @@ out:
 bool mm_subpage_address_in_vma(const struct folio *folio,
 		const struct vm_area_struct *vma, unsigned long *address)
 {
-	struct page_ext *ext = page_ext_get(&folio->page);
+	struct page_ext *ext = subpage_ext_get(&folio->page);
 	struct mm_subpage_ext *subext;
 	struct mm_subpage_owner *owner;
 	unsigned long flags;
@@ -1491,7 +1515,7 @@ struct mm_subpage *mm_subpage_copy_locked(struct mm_subpage_pool *pool,
 static struct mm_subpage *restore_bound_slot(struct folio *folio, unsigned int offset,
 					      unsigned int shift)
 {
-	struct page_ext *ext = page_ext_get(&folio->page);
+	struct page_ext *ext = subpage_ext_get(&folio->page);
 	struct mm_subpage_owner *owner;
 	struct mm_subpage_pool *pool;
 	struct mm_subpage_ext *subext;
@@ -1639,7 +1663,7 @@ int mm_subpage_migrate_prepare(struct folio *src, struct folio *dst)
 
 	VM_BUG_ON_FOLIO(!folio_test_locked(src), src);
 	VM_BUG_ON_FOLIO(!folio_test_locked(dst), dst);
-	ext = page_ext_get(&src->page);
+	ext = subpage_ext_get(&src->page);
 	if (!ext)
 		return 0;
 	subext = page_ext_data(ext, &mm_subpage_ext_ops);
@@ -1716,7 +1740,7 @@ undo:
 
 bool mm_subpage_migrating(struct folio *folio)
 {
-	struct page_ext *ext = page_ext_get(&folio->page);
+	struct page_ext *ext = subpage_ext_get(&folio->page);
 	struct mm_subpage_owner *owner;
 	struct mm_subpage_ext *subext;
 	bool active = false;
@@ -1756,7 +1780,7 @@ struct mm_subpage *mm_subpage_migrate_restore(struct folio *folio, unsigned int 
 
 void mm_subpage_migrate_finish(struct folio *folio)
 {
-	struct page_ext *ext = page_ext_get(&folio->page);
+	struct page_ext *ext = subpage_ext_get(&folio->page);
 	struct mm_subpage_owner *owner;
 	struct mm_subpage_ext *subext;
 	struct mm_subpage_pool *pool;

@@ -68,6 +68,10 @@ While it is off:
 * Every exec, including AArch32 executables, gets the native granule.
 * The CPUs report no alternative user granule: the boot log has no
   ``4K userspace translation granule`` capability line.
+* The 4K ownership record is not reserved in ``page_ext``. With it on,
+  the record takes 32 bytes for every native page of RAM (about 0.2% with
+  16K pages). ``page_ext`` itself is still allocated if another user, such
+  as page_owner, needs it.
 
 The shared MM code paths that serve every process are compiled in either
 way and do not change with the parameter.

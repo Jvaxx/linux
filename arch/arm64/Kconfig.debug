@@ -40,9 +40,9 @@ config ARM64_USER4K_EXPERIMENTAL
 	  This is experimental. The code is built in, but the feature is off
 	  at run time unless the kernel is booted with user4k=on. While it is
 	  off, the page-size prctls refuse every non-native size with EINVAL,
-	  every exec gets the native granule and the CPUs report no
-	  alternative user granule. The shared MM code paths remain compiled
-	  in either way.
+	  every exec gets the native granule, the CPUs report no alternative
+	  user granule and the per-page 4K ownership record in page_ext is not
+	  reserved. The shared MM code paths remain compiled in either way.
 
 	  With user4k=on, an experimental prctl selects a supported granule
 	  for the next exec. Ordinary address spaces and kernel tables retain

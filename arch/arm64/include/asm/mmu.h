@@ -33,6 +33,7 @@ static inline bool user4k_enabled(void)
 {
 	return arm64_user4k_on;
 }
+#define arch_mm_alt_granule_enabled user4k_enabled
 #else
 static inline bool user4k_enabled(void)
 {
