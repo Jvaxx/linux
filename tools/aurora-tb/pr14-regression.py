@@ -184,6 +184,7 @@ struct apple_cio {
     bool pcie_tunnel_preinitialized, pcie_tunnel_populated;
     bool pcie_tunnel_stopping, pcie_pm_prepared, pcie_quiesce_pending;
     bool pcie_tunnel_requested, pcie_resume_expected;
+    bool resume_link_failed;
     unsigned int pcie_bind_retries;
     struct pd_list *pd_list;
     struct delayed_work pcie_tunnel_work;
@@ -290,7 +291,13 @@ int main(void) {
     work(&c); assert(!ready && fault==1 && !port.enabled && !scans);
     reset(&c); c.pcie_tunnel_preinitialized=false; work(&c);
     assert(!ready && fault==1 && !populations);
-    puts("PASS 12 bind, timeout, failure, PM, cancellation and restore scenarios");
+    reset(&c); c.resume_link_failed=true;
+    assert(apple_cio_check_connection(&c)==-ENOLINK);
+    assert(!ready && !fault && !queued && !refs && !populations);
+    c.resume_link_failed=false;
+    work(&c); assert(ready==1 && !fault && !queued && refs==0);
+    assert(apple_cio_check_connection(&c)==0);
+    puts("PASS 12 bind, timeout, failure, PM, cancellation and restore scenarios, plus failed-resume rejection and recovery");
     return 0;
 }
 '''
@@ -428,6 +435,9 @@ def main():
             ('premature-ready', readiness.replace(
                 'return apple_cio_pcie_tunnel_ready_locked(acio);', 'return 0;'), False),
             ('unbounded-bind', readiness.replace('acio->pcie_bind_retries--;', ''), False),
+            ('ignored-resume-failure', readiness.replace(
+                'if (acio->resume_link_failed)\n\t\treturn -ENOLINK;',
+                'if (false) return -ENOLINK;'), False),
             ('early-irq-open', readiness.replace(
                 'if (ret)\n\t\treturn ret;\n\n\tapple_pcie_tunnel_wait_ready(pcie);',
                 '(void)ret;\n\n\tapple_pcie_tunnel_wait_ready(pcie);'), False)])
