@@ -31,6 +31,9 @@ apple-sep-y := sep.o hwrng_shim.o store_shim.o bio_shim.o sha_shim.o \
 
 obj-$(CONFIG_APPLE_PMP) += pmp.o
 pmp-y := pmp-core.o pmp-display.o
+# Must run before devices are populated, so built in even when pmp is a module.
+# It adds device tree nodes, so it needs OF_DYNAMIC.
+obj-$(if $(CONFIG_APPLE_PMP),$(CONFIG_OF_DYNAMIC)) += j514s-pmp-handoff.o
 
 obj-$(CONFIG_APPLE_MCC) += apple-mcc.o
 apple-mcc-y := mcc.o
