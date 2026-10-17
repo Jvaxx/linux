@@ -36,10 +36,19 @@ properties:
       - items:
           - const: apple,t8140-dcpext
           - const: apple,dcp
+      - description:
+          J514S external display controller (DCPEXT0/1, T6030). The boot
+          loader publishes it with apple,firmware-compat, apple,firmware-uuid
+          and the memory-region of its firmware segments once reserved; no
+          generic fallback, as the controller is driven only in the 14.7
+          external role. Its outputs are Type-C routes (typec-routes) or the
+          HDMI port (DCPEXT0): a fixed dp-phy and dp-xbar with mux-index,
+          apple,dptx-phy and the HDMI converter's GPIOs.
+        const: apple,t6030-dcpext
 
   reg:
     minItems: 2
-    maxItems: 7
+    maxItems: 8
 
   reg-names:
     minItems: 2
@@ -50,6 +59,7 @@ properties:
       - enum: [disp-2, iop-vbar]
       - enum: [disp-3, iop-vbar]
       - enum: [disp-4, iop-vbar]
+      - enum: [disp-5, iop-vbar]
       - const: iop-vbar
 
   mboxes:
