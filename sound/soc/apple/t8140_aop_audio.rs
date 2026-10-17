@@ -1111,7 +1111,7 @@ impl SndSocT8140AopData {
     /// older state is followed by another run.
     fn queue_jack_report(self: ArcBorrow<'_, Self>) {
         // Err = already queued: the pending report reads the new state.
-        let _ = workqueue::system().enqueue::<_, JACK_WORK>(Arc::from(self));
+        let _ = workqueue::system_dfl().enqueue::<_, JACK_WORK>(Arc::from(self));
     }
 
     fn report_mic_jack(&self) {
@@ -1784,7 +1784,7 @@ unsafe extern "C" fn hpai_pcm_trigger(
         | bindings::SNDRV_PCM_TRIGGER_PAUSE_RELEASE => {
             data.hpai_want_run.store(true, Relaxed);
             // Err = already queued: the pending run will see want_run.
-            let _ = workqueue::system().enqueue::<_, HPAI_START_WORK>(Arc::from(data));
+            let _ = workqueue::system_dfl().enqueue::<_, HPAI_START_WORK>(Arc::from(data));
         }
         _ => data.hpai_want_run.store(false, Relaxed),
     }
@@ -2642,7 +2642,7 @@ unsafe extern "C" fn spkr_dai_trigger(
         | bindings::SNDRV_PCM_TRIGGER_PAUSE_RELEASE => {
             context.data.spkr_want_run.store(true, Relaxed);
             // Err = already queued: the pending run will see want_run.
-            let _ = workqueue::system().enqueue::<_, SPKR_START_WORK>(context.data.clone());
+            let _ = workqueue::system_dfl().enqueue::<_, SPKR_START_WORK>(context.data.clone());
             0
         }
         bindings::SNDRV_PCM_TRIGGER_STOP
