@@ -4460,6 +4460,13 @@ F:	kernel/audit*
 F:	lib/*audit.c
 K:	\baudit_[a-z_0-9]\+\b
 
+AURORA APPLE SILICON HOST TOOLS
+M:	Ryan Murray <ryan@aurorasilicon.org>
+S:	Maintained
+F:	tools/asahi-m3/
+F:	tools/asahi/
+F:	tools/aurora-m3/
+
 AURORA DISPLAY NOTIFIER
 M:	Ryan Murray <ryan@aurorasilicon.org>
 S:	Maintained
