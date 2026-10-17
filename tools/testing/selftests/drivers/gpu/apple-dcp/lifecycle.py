@@ -424,6 +424,10 @@ int main(void)
         prefix += ('/* Only a Type-C (non-H17P) output queues the session reconnect. */\n'
                    'static void dcp_queue_typec_reconnect(struct apple_dcp *d, unsigned long delay)\n'
                    '{ (void)d; (void)delay; assert(!"Type-C session reconnect for H17P"); }\n')
+    # How long a held mux has been retried is measured on the driver's clock.
+    if 'jiffies_to_msecs(jiffies)' in funcs:
+        shim += ('\nstatic unsigned long jiffies;\n'
+                 'static unsigned jiffies_to_msecs(unsigned long t) { return t; }\n')
     source = prefix + pm + shim + dp + funcs + tests
     return source
 
@@ -622,6 +626,10 @@ int main(void)
                      '/* Never reached: the H17P external link passes no session. */\n'
                      'static bool dcp_session_valid_locked(struct apple_dcp *d, struct dcp_fabric_session s, bool cable)\n'
                      '{ (void)d; (void)s; (void)cable; assert(!"session check for a sessionless link"); return false; }\n')
+    # unless the update work already needed the clock
+    clock = 'static unsigned jiffies_to_msecs(unsigned long t) { return t; }\n'
+    if clock in unit:
+        firmware = firmware.replace(clock, '')
     return unit + firmware + raw + '\n' + tests
 
 def dropped(root):

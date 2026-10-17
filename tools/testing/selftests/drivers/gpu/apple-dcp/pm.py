@@ -615,11 +615,17 @@ int main(void) {
     if 'cd321x_pm_mux_held(' in pm:
         lost = ' puts("PASS actual lost events reopen a stale port; unacknowledged events keep their budget with capped backoff");\n'
         assert controls.count(lost) == 1
-        controls = controls.replace(lost, lost + r''' struct cd321x_pm_state held={0};
+        controls = controls.replace(lost, lost + r'''/* The time of the failure, once the limit of the retries is on time */
+#ifdef CD321X_MUX_HELD_MS
+#define MUX_HELD(pm,ms) cd321x_pm_mux_held(pm,ms)
+#else
+#define MUX_HELD(pm,ms) ((void)(ms),cd321x_pm_mux_held(pm))
+#endif
+ struct cd321x_pm_state held={0};
  held.phase=CD321X_PM_RUNNING;
- for(unsigned int i=0,delay=0;i<4*CD321X_RESUME_ATTEMPTS;i++){
+ for(unsigned int i=0,delay=0,now=0;i<4*CD321X_RESUME_ATTEMPTS;i++,now+=delay){
   unsigned int expected=i?(2*delay<CD321X_MUX_RETRY_MAX_MS?2*delay:CD321X_MUX_RETRY_MAX_MS):CD321X_MUX_RETRY_MS;
-  delay=cd321x_pm_mux_held(&held);
+  delay=MUX_HELD(&held,now);
   assert(delay==expected&&held.attempts_left==CD321X_RESUME_ATTEMPTS&&held.force_reconnect&&!cd321x_pm_can_update(&held));
   /* An event brings the retry forward, but not a read already under way. */
   assert(cd321x_pm_mux_event(&held)&&cd321x_pm_begin_read(&held));
@@ -627,7 +633,7 @@ int main(void) {
  }
  assert(held.mux_retry_ms==CD321X_MUX_RETRY_MAX_MS&&cd321x_pm_mux_done(&held)&&!cd321x_pm_mux_done(&held));
  cd321x_pm_complete(&held);assert(held.phase==CD321X_PM_RUNNING&&!held.force_reconnect);
- cd321x_pm_mux_held(&held);cd321x_pm_prepare(&held);assert(!held.mux_retry_ms&&!cd321x_pm_mux_event(&held));
+ MUX_HELD(&held,0);cd321x_pm_prepare(&held);assert(!held.mux_retry_ms&&!cd321x_pm_mux_event(&held));
  puts("PASS actual held mux keeps the cable-state budget with capped backoff");
 ''')
     # ...for a bounded number of retries, and any other failure ends the hold-up.
@@ -637,15 +643,24 @@ int main(void) {
         controls = controls.replace(held, held + r''' struct cd321x_pm_state stuck={0};
  stuck.phase=CD321X_PM_RUNNING;
  for(unsigned int i=0;i<CD321X_MUX_RETRIES;i++){
-  assert(cd321x_pm_mux_held(&stuck)&&cd321x_pm_begin_read(&stuck));cd321x_pm_snapshot_ready(&stuck);
+  assert(MUX_HELD(&stuck,0)&&cd321x_pm_begin_read(&stuck));cd321x_pm_snapshot_ready(&stuck);
  }
- assert(!cd321x_pm_mux_held(&stuck)&&stuck.phase==CD321X_PM_STALE&&stuck.force_reconnect);
+ assert(!MUX_HELD(&stuck,0)&&stuck.phase==CD321X_PM_STALE&&stuck.force_reconnect);
  assert(!stuck.mux_retry_ms&&!stuck.mux_retries&&!cd321x_pm_mux_event(&stuck)&&!cd321x_pm_begin_read(&stuck));
  assert(cd321x_pm_event(&stuck)&&cd321x_pm_begin_read(&stuck));cd321x_pm_snapshot_ready(&stuck);
- assert(cd321x_pm_mux_held(&stuck)==CD321X_MUX_RETRY_MS);
+ assert(MUX_HELD(&stuck,0)==CD321X_MUX_RETRY_MS);
  assert(cd321x_pm_begin_read(&stuck));cd321x_pm_snapshot_ready(&stuck);
  assert(cd321x_pm_retry(&stuck,true)&&!stuck.mux_retry_ms&&!stuck.mux_retries&&!cd321x_pm_mux_event(&stuck));
- cd321x_pm_mux_held(&stuck);cd321x_pm_remove(&stuck);assert(!stuck.mux_retry_ms&&!stuck.mux_retries);
+ MUX_HELD(&stuck,0);cd321x_pm_remove(&stuck);assert(!stuck.mux_retry_ms&&!stuck.mux_retries);
+#ifdef CD321X_MUX_HELD_MS
+ /* Retries that events bring forward, a second apart, do not end it sooner. */
+ struct cd321x_pm_state brought={0};
+ brought.phase=CD321X_PM_RUNNING;
+ for(unsigned int now=0;now<CD321X_MUX_HELD_MS;now+=1000){
+  assert(MUX_HELD(&brought,now)&&cd321x_pm_begin_read(&brought));cd321x_pm_snapshot_ready(&brought);
+ }
+ assert(!MUX_HELD(&brought,CD321X_MUX_HELD_MS)&&brought.phase==CD321X_PM_STALE&&!brought.mux_retry_ms);
+#endif
  puts("PASS actual held mux gives up after its retries until an event; other failures end the hold-up");
 ''')
 
