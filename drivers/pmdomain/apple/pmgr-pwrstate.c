@@ -343,8 +343,11 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	 * A domain whose coprocessor the boot loader hands over running (the DCP) is
 	 * owned by that coprocessor's firmware: writing its state faults. Only read
 	 * it, keep it on and never change its target or automatic gating.
+	 * J514S boot loaders built from earlier trees mark their inherited display
+	 * domains with the older name apple,inherited-on.
 	 */
-	ps->firmware_owned = of_property_read_bool(node, "apple,firmware-owned");
+	ps->firmware_owned = of_property_read_bool(node, "apple,firmware-owned") ||
+			     of_property_read_bool(node, "apple,inherited-on");
 
 	ret = of_property_read_u32(node, "apple,min-state", &ps->min_state);
 	if (ret == 0 && ps->min_state <= APPLE_PMGR_PS_ACTIVE && !ps->firmware_owned)
