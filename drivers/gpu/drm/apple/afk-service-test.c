@@ -271,5 +271,6 @@ static struct kunit_suite afk_service_suite = {
 };
 
 kunit_test_suite(afk_service_suite);
+MODULE_DESCRIPTION("KUnit tests for the Apple AFK EPIC service lifetime");
 MODULE_IMPORT_NS("EXPORTED_FOR_KUNIT_TESTING");
 MODULE_LICENSE("Dual MIT/GPL");
