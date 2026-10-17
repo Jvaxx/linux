@@ -2063,7 +2063,7 @@ impl SepData {
             return;
         }
         let delay = time::msecs_to_jiffies(SETTLE_MS);
-        let _ = workqueue::system()
+        let _ = workqueue::system_dfl()
             .enqueue_delayed::<Arc<SepData>, SETTLE_WORK_ID>(this.clone(), delay);
     }
 
@@ -2463,7 +2463,7 @@ impl MailCallback for SepData {
         }
 
         let this: Arc<SepData> = data.into();
-        let _ = workqueue::system().enqueue::<Arc<SepData>, 0>(this);
+        let _ = workqueue::system_dfl().enqueue::<Arc<SepData>, 0>(this);
     }
 }
 
