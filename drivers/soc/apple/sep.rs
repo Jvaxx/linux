@@ -61,6 +61,10 @@ use kernel::{
             Atomic,
             Relaxed, //
         },
+        barrier::{
+            dma_rmb,
+            dma_wmb, //
+        },
         new_condvar,
         Arc,
         CondVar,
@@ -178,7 +182,9 @@ const PROTECTED_DATA_AVAILABLE: bool = true;
 const RNG_MAX_WORDS_PER_READ: usize = 16;
 
 // How long going to sleep waits for an entropy request in flight: the
-// mailbox's 500 ms wait for room, then the wait for the reply.
+// mailbox's 500 ms wait for room, then the wait for the reply. Only a request
+// already being written can still go out once the sleep has begun; see
+// `send_entropy_request()`.
 const RNG_SLEEP_DRAIN_MS: u32 = proto::CONTROL_TIMEOUT_MS + 1000;
 
 extern "C" {
@@ -956,7 +962,7 @@ impl SepData {
         }
         self.registered.store(true, Relaxed);
 
-        self.mbox.lock().as_ref().ok_or(EINVAL)?.send(msg, false)?;
+        Self::ring(self.mbox.lock().as_ref().ok_or(EINVAL)?, msg)?;
 
         // no ack on 0xFE; success is the discovery burst on 0xFD
         Ok(())
@@ -1109,7 +1115,20 @@ impl SepData {
         if self.shutting_down.load(Relaxed) {
             return Err(ENODEV);
         }
-        self.mbox.lock().as_ref().ok_or(ENODEV)?.send(msg, false)
+        Self::ring(self.mbox.lock().as_ref().ok_or(ENODEV)?, msg)
+    }
+
+    /// Puts `msg` in the mailbox once the enclave can see what the CPU wrote
+    /// to the buffers before it: a request payload, an SBIO header's poison,
+    /// the shared memory a registration hands over. Those are coherent
+    /// allocations, which have no sync call to order them, and the mailbox
+    /// write is relaxed MMIO, which is not ordered after them either.
+    /// Without the barrier the enclave could read old bytes, or have its
+    /// reply's header overwritten by a refill that lands late. dma_wmb() is
+    /// what writel() would put there, and what RTKit puts before its sends.
+    fn ring(mbox: &Mailbox<SepData>, msg: Message) -> Result<()> {
+        dma_wmb();
+        mbox.send(msg, false)
     }
 
 
@@ -1175,11 +1194,10 @@ impl SepData {
         self.control.lock().entropy_begin(boottime_ms())?;
 
         let msg = proto::encode_control(&op, proto::TAG_ENTROPY);
-        if let Err(e) = self.send(msg) {
-            let full = e == ETIMEDOUT;
+        if let Err(e) = self.send_entropy_request(msg) {
             self.control
                 .lock()
-                .entropy_end(control::EntropyEnd::NotSent { full }, boottime_ms());
+                .entropy_end(control::EntropyEnd::not_sent(e), boottime_ms());
             return Err(e);
         }
 
@@ -1208,6 +1226,64 @@ impl SepData {
         result
     }
 
+    /// As [`Self::get_entropy_word`], for a reader that blocks. While requests
+    /// are held back, wait for that to end, for as long as a request waits
+    /// for its reply, rather than fail at once. EAGAIN if it does not end
+    /// in that time, ERESTARTSYS if a signal comes.
+    fn get_entropy_word_blocking(&self) -> Result<u32> {
+        let limit = u64::from(proto::CONTROL_TIMEOUT_MS);
+        let deadline = boottime_ms().saturating_add(limit);
+        loop {
+            // As `hwrng_fill()` checks before each word: a removal wakes the
+            // wait below, and no request may go out after it.
+            if self.rng_shutdown.load(Relaxed) {
+                return Err(ENODEV);
+            }
+            match self.get_entropy_word() {
+                Err(e) if e == EAGAIN => {}
+                done => return done,
+            }
+            let mut guard = self.control.lock();
+            let now = boottime_ms();
+            let left = deadline.saturating_sub(now);
+            match guard.entropy_held_ms(now, left) {
+                // It ended since; ask now.
+                None if left > 0 => continue,
+                None | Some(0) => return Err(EAGAIN),
+                Some(ms) => {
+                    if self.rng_shutdown.load(Relaxed) {
+                        return Err(ENODEV);
+                    }
+                    let ms = u32::try_from(ms).unwrap_or(proto::CONTROL_TIMEOUT_MS);
+                    if let CondVarTimeoutResult::Signal { .. } = self
+                        .control_wq
+                        .wait_interruptible_timeout(&mut guard, time::msecs_to_jiffies(ms))
+                    {
+                        return Err(ERESTARTSYS);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sends an entropy request claimed by `entropy_begin()`, or EAGAIN if
+    /// the system has begun going to sleep since. The check is made with the
+    /// mailbox lock held. A sender can wait for that lock behind others, such
+    /// as a Touch ID capture still running, for longer than the drain on the
+    /// way to sleep waits for it. It must not then write its request into
+    /// the suspend. Lock order: mailbox, then control.
+    fn send_entropy_request(&self, msg: Message) -> Result<()> {
+        if self.shutting_down.load(Relaxed) {
+            return Err(ENODEV);
+        }
+        let mbox = self.mbox.lock();
+        let mbox = mbox.as_ref().ok_or(ENODEV)?;
+        if !self.control.lock().entropy_may_send() {
+            return Err(EAGAIN);
+        }
+        Self::ring(mbox, msg)
+    }
+
     /// The system is about to suspend: send no entropy request until it has
     /// resumed, and let one already sent be answered while the enclave can
     /// still answer it. On a T6000 a request sent while devices were
@@ -1217,24 +1293,26 @@ impl SepData {
         if !self.control.lock().entropy_sleep() {
             return;
         }
-        let mut waited: u32 = 0;
-        while self.control.lock().entropy_busy() {
-            if waited >= RNG_SLEEP_DRAIN_MS {
-                dev_warn!(
-                    self.dev,
-                    "hwrng: a request was still in flight after {} ms; suspending anyway\n",
-                    RNG_SLEEP_DRAIN_MS
-                );
-                return;
-            }
-            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(10));
-            waited += 10;
+        let idle = control::wait_idle(
+            RNG_SLEEP_DRAIN_MS,
+            10,
+            || self.control.lock().entropy_busy(),
+            |ms| kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(ms))),
+        );
+        if !idle {
+            dev_warn!(
+                self.dev,
+                "hwrng: a request was still in flight after {} ms; suspending anyway\n",
+                RNG_SLEEP_DRAIN_MS
+            );
         }
     }
 
     /// The system has resumed, or the suspend was aborted.
     pub(crate) fn rng_sleep_finished(&self) {
         self.control.lock().entropy_wake();
+        // A blocking hwrng reader may be waiting for this.
+        self.control_wq.notify_all();
     }
 
     fn control_survey(&self) {
@@ -1265,24 +1343,32 @@ impl SepData {
         if this.rng.lock().is_some() {
             return;
         }
-        let attempt = this.rng_survey_attempts.load(Relaxed) + 1;
-        if attempt > RNG_SURVEY_ATTEMPTS {
+        let used = this.rng_survey_attempts.load(Relaxed);
+        let Some((attempt, next)) =
+            control::survey_step(used, RNG_SURVEY_ATTEMPTS, || this.survey_hwrng())
+        else {
             return;
-        }
+        };
         this.rng_survey_attempts.store(attempt, Relaxed);
-        match this.survey_hwrng() {
-            Ok(()) => dev_info!(this.dev, "hwrng: registered after ready-phase survey (attempt {})\n", attempt),
+        match next {
+            control::Survey::Registered => dev_info!(
+                this.dev,
+                "hwrng: registered after ready-phase survey (attempt {})\n",
+                attempt
+            ),
             // Asleep, or holding back after a request that went unanswered:
             // this attempt did not ask the enclave anything.
-            Err(e) if e == EAGAIN => {
-                this.rng_survey_attempts.store(attempt - 1, Relaxed);
-                Self::arm_settle(this);
-            }
-            Err(e) if attempt < RNG_SURVEY_ATTEMPTS => {
+            control::Survey::Held => Self::arm_settle(this),
+            control::Survey::Retry(e) => {
                 dev_warn!(this.dev, "hwrng: survey attempt {} failed ({:?}); retrying\n", attempt, e);
                 Self::arm_settle(this);
             }
-            Err(e) => dev_err!(this.dev, "hwrng: survey failed after {} attempts ({:?})\n", attempt, e),
+            control::Survey::GiveUp(e) => dev_err!(
+                this.dev,
+                "hwrng: survey failed after {} attempts ({:?})\n",
+                attempt,
+                e
+            ),
         }
     }
 
@@ -1898,7 +1984,13 @@ impl SepData {
                 failure = Some(ENODEV);
                 break;
             }
-            match self.get_entropy_word() {
+            // Only a read that has nothing yet waits while requests are held.
+            let word = if written == 0 {
+                self.get_entropy_word_blocking()
+            } else {
+                self.get_entropy_word()
+            };
+            match word {
                 Ok(value) => {
                     // SAFETY: the core guarantees `buf` is valid for `max`
                     // bytes and aligned for any type, and `i < max / 4`.
@@ -1912,17 +2004,12 @@ impl SepData {
             }
         }
 
-        if written > 0 {
-            return written as c_int;
-        }
-
-        // must return a negative errno, not 0: a blocking reader would spin on 0
-        let e = failure.unwrap_or(EIO);
-        // Asleep, or holding back after a request that went unanswered.
-        // Nothing failed in this read; the core tries again later.
-        if e == EAGAIN {
-            return e.to_errno();
-        }
+        let e = match control::read_end(written, failure) {
+            control::ReadEnd::Bytes(n) => return n as c_int,
+            // Held back for as long as the read could wait, or interrupted.
+            control::ReadEnd::Held(e) => return e.to_errno(),
+            control::ReadEnd::Failed(e) => e,
+        };
         let n = self.rng_failures.load(Relaxed).wrapping_add(1);
         self.rng_failures.store(n, Relaxed);
         if n == 1 {
@@ -2170,10 +2257,14 @@ impl SepData {
             control::Delivery::Entropy => {
                 self.control_wq.notify_all();
             }
-            control::Delivery::EntropyLate { recovered: true } => dev_info!(
-                self.dev,
-                "hwrng: the enclave answered a request that had timed out; reads resume\n"
-            ),
+            control::Delivery::EntropyLate { recovered: true } => {
+                dev_info!(
+                    self.dev,
+                    "hwrng: the enclave answered a request that had timed out; reads resume\n"
+                );
+                // A blocking hwrng reader may be waiting for this.
+                self.control_wq.notify_all();
+            }
             control::Delivery::EntropyLate { recovered: false } => {}
             control::Delivery::Matched => self.control_wq.notify_all(),
             control::Delivery::Unmatched => {}
@@ -2360,6 +2451,9 @@ impl MailCallback for SepData {
         if data.shutting_down.load(Relaxed) {
             return;
         }
+        // The message was read from the mailbox with relaxed MMIO. Read the
+        // buffers the enclave wrote before it only after that, as RTKit does.
+        dma_rmb();
         if !data.rx.push(msg) && data.rx.dropped() == 1 {
             dev_err!(
                 data.dev,

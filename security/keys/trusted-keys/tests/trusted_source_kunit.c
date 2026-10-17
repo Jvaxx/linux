@@ -33,6 +33,7 @@ struct trusted_source_fake {
 	/* A built-in source for trusted_key_core_init(). */
 	struct trusted_key_ops builtin_ops;
 	struct trusted_key_source builtin;
+	int builtin_ret;
 	int builtin_inits;
 };
 
@@ -54,7 +55,7 @@ static void fake_exit(void)
 static int fake_builtin_init(void)
 {
 	fake->builtin_inits++;
-	return -ENODEV;
+	return fake->builtin_ret;
 }
 
 /* Not a cipher: an invertible stand-in, so that unseal can be checked. */
@@ -105,6 +106,32 @@ static void fake_register(struct kunit *test)
 		kunit_skip(test, "another trusted-key source holds the slot (%d)",
 			   ret);
 	KUNIT_ASSERT_EQ(test, ret, 0);
+}
+
+/*
+ * Run the core's init with the built-in fake, or skip, giving the reason, if
+ * the fake is not tried: a source holds the slot, or trusted.source= or
+ * trusted.rng= rules the fake out.
+ */
+static int fake_core_init(struct kunit *test)
+{
+	int ret = trusted_key_core_init(&fake->builtin, 1);
+
+	if (fake->builtin_inits)
+		return ret;
+
+	/* The only error before a source's init(). */
+	if (ret == -EINVAL)
+		kunit_skip(test, "trusted.rng= rules out the built-in source");
+	KUNIT_ASSERT_EQ(test, ret, 0);
+
+	ret = register_trusted_key_source(&fake->src);
+	if (!ret)
+		unregister_trusted_key_source(&fake->src);
+	if (ret == -EBUSY)
+		kunit_skip(test, "another trusted-key source holds the slot");
+	kunit_skip(test, "trusted.source= rules out the built-in source");
+	return 0;
 }
 
 /* Instantiate a trusted key from @cmd; it is put when the test ends. */
@@ -195,9 +222,7 @@ static void trusted_source_before_core_init(struct kunit *test)
  */
 static void trusted_source_after_core_init(struct kunit *test)
 {
-	KUNIT_EXPECT_EQ(test, trusted_key_core_init(&fake->builtin, 1), 0);
-	if (!fake->builtin_inits)
-		kunit_skip(test, "another trusted-key source holds the slot");
+	KUNIT_EXPECT_EQ(test, fake_core_init(test), 0);
 
 	/* With no source, the absent stubs answer. */
 	KUNIT_EXPECT_EQ(test, PTR_ERR(fake_key(test, "new 32")), -ENODEV);
@@ -210,6 +235,28 @@ static void trusted_source_after_core_init(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, fake->inits, 1);
 	KUNIT_EXPECT_EQ(test, fake->exits, 1);
 	KUNIT_EXPECT_EQ(test, fake->builtin_inits, 1);
+}
+
+/*
+ * After the core's init, a built-in source is not given the slot, even one
+ * that initialises: nothing could withdraw it, and this one is gone once the
+ * test ends. The slot stays free for a source module.
+ */
+static void trusted_source_builtin_after_core_init(struct kunit *test)
+{
+	fake->builtin_ret = 0;
+	KUNIT_EXPECT_EQ(test, fake_core_init(test), -EBUSY);
+	KUNIT_EXPECT_EQ(test, fake->builtin_inits, 1);
+	KUNIT_EXPECT_EQ(test, fake->exits, 1);
+	KUNIT_EXPECT_EQ(test, PTR_ERR(fake_key(test, "new 32")), -ENODEV);
+	KUNIT_EXPECT_EQ(test, fake->seals, 0);
+
+	/* The fake was tried, so no source held the slot: no skip here. */
+	KUNIT_ASSERT_EQ(test, register_trusted_key_source(&fake->src), 0);
+	KUNIT_EXPECT_FALSE(test, IS_ERR(fake_key(test, "new 32")));
+	KUNIT_EXPECT_EQ(test, fake->seals, 1);
+	unregister_trusted_key_source(&fake->src);
+	KUNIT_EXPECT_EQ(test, fake->exits, 2);
 }
 
 /* Keys are sealed and unsealed by the source until it withdraws. */
@@ -380,6 +427,7 @@ static int trusted_source_init(struct kunit *test)
 
 	fake->builtin_ops = fake->ops;
 	fake->builtin_ops.init = fake_builtin_init;
+	fake->builtin_ret = -ENODEV;
 	fake->builtin.name = FAKE_BUILTIN_NAME;
 	fake->builtin.ops = &fake->builtin_ops;
 
@@ -397,6 +445,8 @@ static struct kunit_case trusted_source_cases[] = {
 	KUNIT_CASE(trusted_source_exclusive),
 	KUNIT_CASE(trusted_source_init_failure),
 	KUNIT_CASE(trusted_source_invalid),
+	/* Last, as a core without the check would leave the fake in the slot. */
+	KUNIT_CASE(trusted_source_builtin_after_core_init),
 	{}
 };
 
