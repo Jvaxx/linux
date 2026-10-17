@@ -631,10 +631,14 @@ static vm_fault_t try_insert_pfn(struct vm_fault *vmf, unsigned int order,
 	vm_fault_t ret = VM_FAULT_FALLBACK;
 
 	if (!order) {
+#ifdef CONFIG_MM_SUBPAGE
 		struct vm_page_offset pos = vma_page_offset_at(vmf->vma, vmf->address);
 
 		ret = vmf_insert_pfn_prot_mkwrite_offset(vmf->vma, vmf->address,
 			pfn, pos.offset, vmf->vma->vm_page_prot, write);
+#else
+		ret = vmf_insert_pfn_mkwrite(vmf->vma, vmf->address, pfn, write);
+#endif
 #ifdef CONFIG_ARCH_SUPPORTS_PMD_PFNMAP
 	} else if (order == PMD_ORDER) {
 		unsigned long paddr = pfn << PAGE_SHIFT;
@@ -789,6 +793,7 @@ int drm_gem_shmem_mmap(struct drm_gem_shmem_object *shmem, struct vm_area_struct
 	if (vma_is_cow_mapping(vma))
 		return -EINVAL;
 
+#ifdef CONFIG_MM_SUBPAGE
 	/* Validate bytes, including a partial native-page offset from PRIME. */
 	{
 		pgoff_t index = drm_gem_shmem_object_offset(obj, vma->vm_pgoff);
@@ -799,6 +804,7 @@ int drm_gem_shmem_mmap(struct drm_gem_shmem_object *shmem, struct vm_area_struct
 		    offset > obj->size || length > obj->size - offset)
 			return -EINVAL;
 	}
+#endif
 
 	dma_resv_lock(shmem->base.resv, NULL);
 	ret = drm_gem_shmem_get_pages_locked(shmem);
