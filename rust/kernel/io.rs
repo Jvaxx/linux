@@ -275,14 +275,14 @@ pub trait Io {
     ///
     /// # Examples
     /// ```
-    /// use kernel::io::mem::IoMem;
-    /// use kernel::io::mem::Resource;
+    /// use kernel::{device::Core, io::{mem::IoMem, Io}, platform, prelude::*};
     ///
-    /// fn test(device: &Device, res: Resource) -> Result {
+    /// fn test(device: &platform::Device<Core>) -> Result {
     ///     // Create an i/o memory block of at least 100 bytes.
-    ///     let devres_mem = IoMem::<100>::new(res, device)?;
-    ///     // aquire access to memory block
-    ///     let mem = devres_mem.try_access()?;
+    ///     let request = device.io_request_by_index(0).ok_or(ENODEV)?;
+    ///     let devres_mem = KBox::pin_init(IoMem::<100>::new(request), GFP_KERNEL)?;
+    ///     // Acquire access to the memory block.
+    ///     let mem = devres_mem.access(device.as_ref())?;
     ///
     ///     let mut buffer: [u8; 32] = [0; 32];
     ///
