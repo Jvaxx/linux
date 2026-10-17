@@ -11,6 +11,7 @@
  *  Copyright (c) 2011,2016 Samsung Electronics Co., Ltd.
  */
 
+#include <kunit/static_stub.h>
 #include <linux/align.h>
 #include <linux/atomic.h>
 #include <linux/bitfield.h>
@@ -280,6 +281,8 @@ struct apple_dart {
 	u32 tunnel_state_saved : 1;
 	u32 tunnel_state_restored : 1;
 	bool commands_gated;
+	/* Resume restored the translations, but the last steps of its reset failed. */
+	bool reset_incomplete;
 	struct apple_tunable *tunables;
 	u16 version;
 
@@ -1157,6 +1160,8 @@ static int apple_dart_t8110_v2_unlock(struct apple_dart *dart)
 {
 	struct apple_dart_stream_map stream_map = { .dart = dart };
 
+	KUNIT_STATIC_STUB_REDIRECT(apple_dart_t8110_v2_unlock, dart);
+
 	if (!(readl(dart->regs + DART_T8110_DIAG_LOCK) & DART_T8110_DIAG_LOCK_ON_ERR))
 		return 0;
 
@@ -1209,6 +1214,41 @@ static void apple_dart_hw_apply_remaps(struct apple_dart *dart)
 		       dart->regs + DART_TCR(dart, sid));
 }
 
+/*
+ * The last steps of a reset, which leave the translation registers alone:
+ * acknowledge the errors latched so far, unlock a DART that locks on errors,
+ * unmask the error interrupt and flush the TLBs.
+ */
+static int apple_dart_hw_finish_reset(struct apple_dart *dart)
+{
+	struct apple_dart_stream_map stream_map = { .dart = dart };
+	int ret;
+
+	/* Newer revisions expose per-stream exception records. */
+	if (dart->hw->type == DART_T8110 && dart->version >= 0x0202) {
+		apple_dart_drain_stale_exceptions(dart);
+		ret = apple_dart_t8110_v2_unlock(dart);
+		if (ret) {
+			dev_err(dart->dev, "failed to unlock after reset: %d\n", ret);
+			return ret;
+		}
+	} else {
+		/* Clear pending errors before the interrupt is unmasked. */
+		apple_dart_writel(dart, apple_dart_readl(dart, dart->hw->error),
+				  dart->hw->error);
+	}
+
+	if (dart->hw->type == DART_T8110)
+		apple_dart_writel(dart, 0, DART_T8110_ERROR_MASK);
+
+	bitmap_set(stream_map.sidmap, 0, dart->num_streams);
+	ret = dart->hw->invalidate_tlb(&stream_map);
+	if (ret)
+		dev_err(dart->dev, "failed to flush the TLBs after reset: %d\n", ret);
+
+	return ret;
+}
+
 static int apple_dart_hw_reset(struct apple_dart *dart)
 {
 	struct apple_dart_stream_map stream_map;
@@ -1227,24 +1267,7 @@ static int apple_dart_hw_reset(struct apple_dart *dart)
 		apple_dart_writel(dart, U32_MAX,
 				   dart->hw->enable_streams + 4 * i);
 
-	/* Newer revisions expose per-stream exception records. */
-	if (dart->hw->type == DART_T8110 && dart->version >= 0x0202) {
-		int ret;
-
-		apple_dart_drain_stale_exceptions(dart);
-		ret = apple_dart_t8110_v2_unlock(dart);
-		if (ret)
-			return ret;
-	} else {
-		/* Clear pending errors before the interrupt is unmasked. */
-		apple_dart_writel(dart, apple_dart_readl(dart, dart->hw->error),
-				   dart->hw->error);
-	}
-
-	if (dart->hw->type == DART_T8110)
-		apple_dart_writel(dart, 0, DART_T8110_ERROR_MASK);
-
-	return dart->hw->invalidate_tlb(&stream_map);
+	return apple_dart_hw_finish_reset(dart);
 }
 
 static int apple_dart_domain_flush_tlb_range(struct apple_dart_domain *domain,
@@ -3008,6 +3031,66 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 	return 0;
 }
 
+/*
+ * Whether the DART still holds the translation state that apple_dart_suspend()
+ * saved, because its power domain stayed on across system sleep. That is the
+ * case while a consumer that keeps running in suspend-to-idle, such as a DWC3
+ * controller in host mode, holds the domain on. Such a consumer may still be
+ * doing DMA, so the DART must not be reset under it.
+ */
+static bool apple_dart_state_retained(struct apple_dart *dart)
+{
+	bool live = false;
+	unsigned int sid, idx;
+
+	for (sid = 0; sid < dart->num_streams; sid++) {
+		u32 tcr = apple_dart_readl(dart, DART_TCR(dart, sid));
+
+		if (tcr != dart->save_tcr[sid])
+			return false;
+		/* An identity domain bypasses the DART without any page table. */
+		if (dart->supports_bypass && dart->hw->tcr_bypass && tcr == dart->hw->tcr_bypass)
+			live = true;
+
+		for (idx = 0; idx < dart->hw->ttbr_count; idx++) {
+			u32 ttbr = apple_dart_readl(dart, DART_TTBR(dart, sid, idx));
+
+			if (ttbr != dart->save_ttbr[sid][idx])
+				return false;
+			if (ttbr & dart->hw->ttbr_valid)
+				live = true;
+		}
+	}
+
+	/*
+	 * A DART that lost power reads back as reset: no stream bypasses it and
+	 * none has a valid page table.
+	 */
+	return live;
+}
+
+/*
+ * Flush the TLBs of every stream with a command of its own. A stream map flush
+ * is not enough for the whole DART: where the streams of a map are remapped
+ * onto its first stream, it only reaches that first stream.
+ */
+static int apple_dart_invalidate_each_stream(struct apple_dart *dart)
+{
+	unsigned int sid;
+	int ret;
+
+	for (sid = 0; sid < dart->num_streams; sid++) {
+		struct apple_dart_stream_map stream_map = { .dart = dart };
+
+		__set_bit(sid, stream_map.sidmap);
+		ret = dart->hw->invalidate_tlb(&stream_map);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
 static __maybe_unused int apple_dart_resume(struct device *dev)
 {
 	struct apple_dart *dart = dev_get_drvdata(dev);
@@ -3032,12 +3115,25 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	if (dart->locked)
 		return 0;
 
-	ret = apple_dart_hw_reset(dart);
-	if (ret) {
-		dev_err(dev, "Failed to reset DART on resume\n");
+	if (apple_dart_state_retained(dart)) {
+		/* Nothing was lost, only drop what the TLBs may still hold. */
+		if (!dart->reset_incomplete)
+			return apple_dart_invalidate_each_stream(dart);
+
+		/* A failed resume restored the translations: finish its reset. */
+		ret = apple_dart_hw_finish_reset(dart);
+		dart->reset_incomplete = ret;
 		return ret;
 	}
 
+	ret = apple_dart_hw_reset(dart);
+
+	/*
+	 * Restore the translations even if the reset failed. It can only fail
+	 * in its last steps, after clearing them, and the saved registers still
+	 * point to the page tables in use. Leaving them cleared would fault
+	 * every DMA of the consumers until the next reset.
+	 */
 	for (sid = 0; sid < dart->num_streams; sid++) {
 		for (idx = 0; idx < dart->hw->ttbr_count; idx++)
 			apple_dart_writel(dart, dart->save_ttbr[sid][idx],
@@ -3046,7 +3142,19 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 				   DART_TCR(dart, sid));
 	}
 
-	return 0;
+	/*
+	 * Then repeat all of those last steps once. A TLB flush that completes
+	 * now does not show that the DART was unlocked and its error interrupt
+	 * unmasked.
+	 */
+	if (ret) {
+		dev_warn(dev, "reset on resume failed (%d), retrying\n", ret);
+		ret = apple_dart_hw_finish_reset(dart);
+	}
+
+	/* Should they fail again, the next resume repeats them. */
+	dart->reset_incomplete = ret;
+	return ret;
 }
 
 static DEFINE_RUNTIME_DEV_PM_OPS(apple_dart_pm_ops, apple_dart_suspend, apple_dart_resume, NULL);
