@@ -13,6 +13,15 @@ config PHY_APPLE_ATC
 
 	  If M is selected the module will be called 'phy-apple-atc'.
 
+config PHY_APPLE_ATC_T6030_DP
+	bool "Apple T6030 native DisplayPort on the Type-C PHY"
+	depends on PHY_APPLE_ATC
+	help
+	  Drive DisplayPort alternate mode links on the USB-C ports of the
+	  T6030 (M3 Pro): the display hold on the negotiated mode, AUX, the
+	  link rates up to HBR3 and the drive levels, for its external
+	  display controllers.
+
 config PHY_APPLE_ATC_KUNIT_TEST
 	bool "KUnit tests for the Apple Type-C PHY" if !KUNIT_ALL_TESTS
 	depends on PHY_APPLE_ATC && KUNIT

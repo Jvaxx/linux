@@ -626,6 +626,9 @@ struct atcphy_mode_configuration {
  * @pipe_mux_data: PIPE data selection field mask
  * @has_usb2phy_reg: The PHY has the secondary eUSB2 register bank (T8140)
  * @has_t8140_dp: Uses the T8140 DisplayPort tunable bundle
+ * @has_t6030_dp: Drives the T6030 native DisplayPort link (atc-t6030-dp.h)
+ * @t6030_fixed_dp: A T6030 ATC wired as a fixed four-lane DisplayPort
+ *                  transmitter, without Type-C (atc-t6030-dp.h)
  * @optional_tunables: The bootloader may leave out the common-a tunables (this
  *                     generation has none) and the SuperSpeed tunables; USB2
  *                     still works without the latter
@@ -640,6 +643,10 @@ struct atcphy_hw {
 	bool has_usb2phy_reg;
 	bool optional_tunables;
 	bool has_t8140_dp;
+#if IS_ENABLED(CONFIG_PHY_APPLE_ATC_T6030_DP)
+	bool has_t6030_dp;
+	bool t6030_fixed_dp;
+#endif
 };
 
 /**
@@ -710,6 +717,7 @@ struct atcphy_hw {
  * @sw: Type-C switch instance
  * @mux: Type-C mux instance
  * @lock: Mutex for synchronizing register access across PHY, Type-C switch/mux and reset controller
+ * @t6030: T6030 native DisplayPort state: display hold, deferred Type-C changes, AUX and link
  */
 struct apple_atcphy {
 	struct device_node *np;
@@ -781,6 +789,26 @@ struct apple_atcphy {
 	struct reset_controller_dev rcdev;
 
 	struct mutex lock;
+
+#if IS_ENABLED(CONFIG_PHY_APPLE_ATC_T6030_DP)
+	/* T6030 native DisplayPort (atc-t6030-dp.h), under @lock. */
+	struct {
+		/* Display hold: Type-C changes are deferred while set. */
+		bool held;
+		bool deferred;
+		enum atcphy_mode deferred_mode;
+		bool deferred_swap;
+		/* The held route: DP lanes, the pairs carrying them, lanes set. */
+		u8 lanes;
+		u8 pairs;
+		u8 lanes_set;
+		/* AUX on; main link rate (firmware code, 0 = stopped). */
+		bool aux;
+		u32 rate;
+		/* Fixed DP PHY: the boot loader's calibration for its power-up. */
+		struct apple_tunable *calibration;
+	} t6030;
+#endif
 };
 
 static const struct {
@@ -2962,6 +2990,25 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 	return 0;
 }
 
+#if IS_ENABLED(CONFIG_PHY_APPLE_ATC_T6030_DP)
+#include "atc-t6030-dp.h"
+#else
+static inline bool atcphy_t6030_dp_defer(struct apple_atcphy *atcphy, enum atcphy_mode mode)
+{
+	return false;
+}
+
+static inline bool atcphy_t6030_dp_defer_swap(struct apple_atcphy *atcphy, bool swap_lanes)
+{
+	return false;
+}
+
+static inline bool atcphy_t6030_dp_held(const struct apple_atcphy *atcphy)
+{
+	return false;
+}
+#endif
+
 static int atcphy_usb2_set_mode(struct phy *phy, enum phy_mode mode, int submode)
 {
 	struct apple_atcphy *atcphy = phy_get_drvdata(phy);
@@ -3037,7 +3084,9 @@ static int atcphy_usb3_power_off(struct phy *phy)
 	ret = atcphy_park_pipehandler(atcphy);
 	if (ret)
 		return ret;
-	if (atcphy->mode != APPLE_ATCPHY_MODE_OFF || atcphy->mode_dirty) {
+	/* A held display route keeps the PHY up until the display releases it. */
+	if (!atcphy_t6030_dp_defer(atcphy, APPLE_ATCPHY_MODE_OFF) &&
+	    (atcphy->mode != APPLE_ATCPHY_MODE_OFF || atcphy->mode_dirty)) {
 		ret = atcphy_configure(atcphy, APPLE_ATCPHY_MODE_OFF);
 		if (ret)
 			return ret;
@@ -3176,6 +3225,37 @@ static const struct phy_ops apple_atc_dp_phy_ops = {
 	.set_mode = atcphy_dpphy_set_mode,
 };
 
+#if IS_ENABLED(CONFIG_PHY_APPLE_ATC_T6030_DP)
+/* The installed mode's width, up to HBR3 on its DP pairs (atc-t6030-dp.h). */
+static int atcphy_t6030_dpphy_validate(struct phy *phy, enum phy_mode mode, int submode,
+				       union phy_configure_opts *opts)
+{
+	int ret = atcphy_dpphy_validate(phy, mode, submode, opts);
+
+	if (!ret && opts->dp.lanes)
+		opts->dp.link_rate = 8100;
+	return ret;
+}
+
+static const struct phy_ops apple_atc_t6030_dp_phy_ops = {
+	.owner = THIS_MODULE,
+	.power_on = atcphy_t6030_dpphy_power_on,
+	.power_off = atcphy_t6030_dpphy_power_off,
+	.configure = atcphy_t6030_dpphy_configure,
+	.validate = atcphy_t6030_dpphy_validate,
+	.set_mode = atcphy_t6030_dpphy_set_mode,
+};
+#endif
+
+static const struct phy_ops *atcphy_dp_phy_ops(struct apple_atcphy *atcphy)
+{
+#if IS_ENABLED(CONFIG_PHY_APPLE_ATC_T6030_DP)
+	if (atcphy_t6030_dp(atcphy))
+		return &apple_atc_t6030_dp_phy_ops;
+#endif
+	return &apple_atc_dp_phy_ops;
+}
+
 /*
  * Called by appledrm when DCP sets the link rate of a DPTX that feeds
  * Thunderbolt DP IN adapter @dpin (rate is the DP link rate code, 0 = stop).
@@ -3275,7 +3355,7 @@ static int atcphy_probe_phy(struct apple_atcphy *atcphy)
 	} phys[] = {
 		{ &atcphy->phys.usb2, &apple_atc_usb2_phy_ops },
 		{ &atcphy->phys.usb3, &apple_atc_usb3_phy_ops },
-		{ &atcphy->phys.dp, &apple_atc_dp_phy_ops },
+		{ &atcphy->phys.dp, atcphy_dp_phy_ops(atcphy) },
 	};
 
 	for (int i = 0; i < ARRAY_SIZE(phys); i++) {
@@ -3373,6 +3453,8 @@ static int atcphy_set_orientation(struct apple_atcphy *atcphy, enum typec_orient
 	default:
 		return -EINVAL;
 	}
+	if (atcphy_t6030_dp_defer_swap(atcphy, swap_lanes))
+		return 0;
 	/* The mode alone cannot describe a route after its orientation changes. */
 	if (atcphy->swap_lanes != swap_lanes) {
 		atcphy->swap_lanes = swap_lanes;
@@ -3688,7 +3770,8 @@ static enum atcphy_mode atcphy_typec_target_mode(struct apple_atcphy *atcphy,
  */
 static bool atcphy_mux_is_noop(const struct apple_atcphy *atcphy, enum atcphy_mode target_mode)
 {
-	if (atcphy->mode != target_mode || atcphy->mode_dirty)
+	/* A held display route takes every request (atcphy_t6030_dp_defer()). */
+	if (atcphy->mode != target_mode || atcphy->mode_dirty || atcphy_t6030_dp_held(atcphy))
 		return false;
 
 	return !(atcphy->fixed_usb2 && atcphy->host_active &&
@@ -3704,7 +3787,8 @@ static int atcphy_mux_set_locked(struct apple_atcphy *atcphy, enum atcphy_mode t
 	dev_dbg(atcphy->dev, "mux target=%u current=%u dirty=%u\n", target_mode,
 		atcphy->mode, atcphy->mode_dirty);
 
-	if (atcphy->mode == target_mode && !atcphy->mode_dirty) {
+	if (atcphy->mode == target_mode && !atcphy->mode_dirty &&
+	    !atcphy_t6030_dp_held(atcphy)) {
 		atcphy->typec_mode = target_mode;
 		/* Retry a failed PIPE setup without disturbing the configured lanes. */
 		if (atcphy->fixed_usb2 && atcphy->host_active &&
@@ -3745,6 +3829,9 @@ static int atcphy_mux_set_locked(struct apple_atcphy *atcphy, enum atcphy_mode t
 	case APPLE_ATCPHY_MODE_USB2:
 		break;
 	}
+	/* A held display route keeps its mode until the display releases it. */
+	if (atcphy_t6030_dp_defer(atcphy, target_mode))
+		return 0;
 	atcphy->typec_mode = target_mode;
 
 	if (atcphy->fixed_usb2) {
@@ -4113,6 +4200,11 @@ static int atcphy_probe(struct platform_device *pdev)
 	atcphy->np = dev->of_node;
 	mutex_init(&atcphy->lock);
 	platform_set_drvdata(pdev, atcphy);
+#if IS_ENABLED(CONFIG_PHY_APPLE_ATC_T6030_DP)
+	/* A fixed DisplayPort PHY has no Type-C or USB side: only its DP PHY. */
+	if (atcphy->hw->t6030_fixed_dp)
+		return atcphy_t6030_fixed_probe(pdev, atcphy);
+#endif
 
 	ret = atcphy_map_resources(pdev, atcphy);
 	if (ret)
@@ -4147,6 +4239,24 @@ static const struct atcphy_hw atcphy_hw_t8122 = {
 	.has_usb4 = true,
 };
 
+#if IS_ENABLED(CONFIG_PHY_APPLE_ATC_T6030_DP)
+static const struct atcphy_hw atcphy_hw_t6030 = {
+	.gen = ATCPHY_GENERATION_T8122,
+	.aciophy_lane_mode = ACIOPHY_LANE_MODE_T8122,
+	.aciophy_crossbar = ACIOPHY_CROSSBAR_T8122,
+	.pipe_mux_clk = PIPEHANDLER_MUX_CTRL_CLK_T8103,
+	.pipe_mux_data = PIPEHANDLER_MUX_CTRL_DATA_T8103,
+	.has_usb4 = true,
+	.has_t6030_dp = true,
+};
+
+static const struct atcphy_hw atcphy_hw_t6030_dp = {
+	.gen = ATCPHY_GENERATION_T8122,
+	.has_t6030_dp = true,
+	.t6030_fixed_dp = true,
+};
+#endif
+
 static const struct atcphy_hw atcphy_hw_t8140 = {
 	.gen = ATCPHY_GENERATION_T8122,
 	.aciophy_lane_mode = ACIOPHY_LANE_MODE_T8122,
@@ -4168,6 +4278,10 @@ static const struct atcphy_hw atcphy_hw_t8142 = {
 };
 
 static const struct of_device_id atcphy_match[] = {
+#if IS_ENABLED(CONFIG_PHY_APPLE_ATC_T6030_DP)
+	{ .compatible = "apple,t6030-atcphy", .data = &atcphy_hw_t6030 },
+	{ .compatible = "apple,t6030-atcphy-dp", .data = &atcphy_hw_t6030_dp },
+#endif
 	{ .compatible = "apple,t8103-atcphy", .data = &atcphy_hw_t8103 },
 	{ .compatible = "apple,t8122-atcphy", .data = &atcphy_hw_t8122 },
 	{ .compatible = "apple,t8142-atcphy", .data = &atcphy_hw_t8142 },
