@@ -108,20 +108,20 @@ impl Ring {
         // Reject an entry the whole ring cannot take before even writing
         // the wrap header.
         let head_next = self.end(0, len)?;
-        let ptr = if len > self.size - wptr - QEH_SIZE {
-            0
-        } else {
-            wptr
-        };
-        let next = if ptr == 0 {
+        // The entry wraps when it does not fit before the end of the ring.
+        // It then goes at 0, but so does an entry that fits at a write
+        // pointer of 0: where it goes does not tell whether it wrapped.
+        let wrapped = len > self.size - wptr - QEH_SIZE;
+        let ptr = if wrapped { 0 } else { wptr };
+        let next = if wrapped {
             head_next
         } else {
             self.end(ptr, len)?
         };
         if head_next == 0
             || next == rptr
-            || (wptr < rptr && (ptr == 0 || next == 0 || next > rptr))
-            || (ptr < wptr && (rptr == 0 || next > rptr))
+            || (wptr < rptr && (wrapped || next == 0 || next > rptr))
+            || (wrapped && (rptr == 0 || next > rptr))
         {
             return Err(ENOSPC);
         }
@@ -304,6 +304,19 @@ mod tests {
         // the unread entries start at 0x80; the wrapped entry would cover them
         assert!(ring.write_entry(0x80, 0xfc0, 0x100 - QEH_SIZE).is_err());
         assert!(ring.write_entry(0, 0xfc0, 0x100 - QEH_SIZE).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn an_entry_fits_at_a_write_pointer_of_zero() -> Result {
+        let ring = Ring::new(BUF, BLOCK)?;
+        // The last entry ended at the end of the ring and is still unread,
+        // so the write pointer is 0 below the read pointer: [0, rptr) is free.
+        assert_eq!(ring.write_entry(0xf80, 0, 0x40 - QEH_SIZE)?, (0, 0x40));
+        assert_eq!(ring.write_entry(0x80, 0, 0x40 - QEH_SIZE)?, (0, 0x40));
+        // It still never reaches the read pointer.
+        assert!(ring.write_entry(0x40, 0, 0x40 - QEH_SIZE).is_err());
+        assert!(ring.write_entry(0x80, 0, 0x80 - QEH_SIZE).is_err());
         Ok(())
     }
 
