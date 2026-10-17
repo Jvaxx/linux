@@ -1,0 +1,107 @@
+# SPDX-License-Identifier: MIT
+"""Execute the actual wake_sensor body with synthetic status/registration mocks."""
+from pathlib import Path
+import subprocess
+import tempfile
+import unittest
+
+APPLE = Path(__file__).resolve().parents[3] / 'drivers/soc/apple'
+
+
+class SensorWakeTest(unittest.TestCase):
+    def test_post_registration_status_drives_patch_readiness(self):
+        source = (APPLE / 'sbio.rs').read_text()
+        start = source.index('    fn wake_sensor(')
+        opening = source.index('{', start)
+        depth, end = 1, opening + 1
+        while depth:
+            depth += (source[end] == '{') - (source[end] == '}')
+            end += 1
+        function = source[start:end]
+        program = r'''
+#![allow(dead_code, unused_variables)]
+use std::cell::RefCell;
+macro_rules! dev_warn { ($($args:tt)*) => {} }
+macro_rules! dev_info { ($($args:tt)*) => {} }
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+mod shim { pub fn boottime_ns()->u64 {0} }
+mod module_parameters {
+ pub struct Param(u8);
+ impl Param { pub fn value(&self)->&u8 {&self.0} }
+ #[allow(non_upper_case_globals)] pub static sensor_trace: Param = Param(0);
+}
+struct Profile { nonce_session: bool }
+macro_rules! dev_err { ($($args:tt)*) => {} }
+mod kernel { pub mod time {
+ pub struct Delta;
+ impl Delta { pub fn from_millis(_:i64)->Self {Self} }
+ pub mod delay { pub fn fsleep(_:super::Delta) {} }
+}}
+#[derive(Clone, Copy)] struct PatchLoaded(());
+#[derive(Default)] struct Mock {
+ reads: usize, registered: bool, patch: Option<u8>, next: Option<sensor::Status>,
+}
+thread_local! { static MOCK: RefCell<Mock> = RefCell::new(Mock::default()); }
+mod sensor {
+ pub const POWER_ON_READ_DELAYS_MS: [u32;1] = [0];
+ pub const KNOWN_IDENTIFIERS: &[u16] = &[1];
+ pub const PATCH_ACCEPTED: u8 = 0x29;
+ pub const STATE_NEEDS_PATCH: u8 = 9;
+ #[derive(Clone,Copy)] pub struct Status { pub state:u8, pub ack:u8, pub silent:bool }
+ pub struct Identifier;
+ pub enum Offset12 { Identifier(u16), Other }
+ pub struct Timing;
+ impl Timing { pub fn is_hardware(&self)->bool {true} pub fn name(&self)->&'static str {"mock"} }
+ pub fn power_source() {}
+ pub fn power_cycle()->bool {true}
+ pub fn cs_timing()->Timing {Timing}
+ pub fn status()->Result<Status,()> {
+  super::MOCK.with(|m| { let mut m=m.borrow_mut(); m.reads+=1;
+   if m.reads==1 {return Ok(Status{state:0,ack:PATCH_ACCEPTED,silent:false})}
+   assert!(m.registered, "post-registration read preceded registration");
+   m.next.ok_or(())
+  })
+ }
+ impl Status {
+  pub fn is_silent(&self)->bool {self.silent}
+  pub fn offset12(&self)->Offset12 {Offset12::Identifier(1)}
+  pub fn identifier_to_register(&self)->Option<Identifier> {Some(Identifier)}
+  pub fn patch_ack(&self)->u8 {self.ack}
+ }
+}
+struct Driver { profile: Profile, sensor_power_ns: AtomicU64 }
+impl Driver {
+ fn new()->Self { Driver { profile: Profile { nonce_session: false }, sensor_power_ns: AtomicU64::new(0) } }
+ fn sensor_ms(&self)->u64 {0}
+ fn register_sensor(&self,_:&sensor::Identifier)->bool {
+  MOCK.with(|m| {let mut m=m.borrow_mut();assert_eq!(m.reads,1);m.registered=true;}); true
+ }
+ fn apply_sensor_patch(&self,ack:u8)->Option<PatchLoaded> {
+  MOCK.with(|m| {let mut m=m.borrow_mut();assert_eq!(m.reads,2);m.patch=Some(ack);});
+  Some(PatchLoaded(()))
+ }
+'''
+        program += function + '\n}\n' + r'''
+fn main() {
+ for (next,ready,patch) in [
+  (Some(sensor::Status{state:9,ack:0x29,silent:false}),true,Some(0x29)),
+  (None,false,None),
+  (Some(sensor::Status{state:0,ack:0x29,silent:true}),false,None),
+  (Some(sensor::Status{state:0,ack:0x29,silent:false}),true,None),
+  (Some(sensor::Status{state:0,ack:0,silent:false}),true,Some(0)),
+ ] {
+  MOCK.with(|m| *m.borrow_mut()=Mock{next,..Mock::default()});
+  assert_eq!(Driver::new().wake_sensor().is_some(),ready);
+  MOCK.with(|m| {let m=m.borrow();assert_eq!(m.reads,2);assert!(m.registered);assert_eq!(m.patch,patch);});
+ }
+}
+'''
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'test.rs').write_text(program)
+            subprocess.run(['rustc', '--edition=2021', str(root / 'test.rs'), '-o', str(root / 'test')], check=True)
+            subprocess.run([str(root / 'test')], check=True)
+
+
+if __name__ == '__main__':
+    unittest.main()
