@@ -284,6 +284,8 @@ struct typec_mux {
 	int srcu_index;
 	unsigned int prepared;
 	bool applied;
+	/* The last request timed out in a provider with transient timeouts. */
+	bool timeout_transient;
 };
 
 static struct typec_mux_context *typec_mux_context_get(struct fwnode_handle *fwnode)
@@ -333,6 +335,28 @@ bool typec_mux_safe_after_role(struct typec_mux *mux)
 	return false;
 }
 EXPORT_SYMBOL_GPL(typec_mux_safe_after_role);
+
+/**
+ * typec_mux_timeout_transient - Check whether a mux request timed out for now
+ * @mux: Mux handle
+ *
+ * For use after a request on @mux, by typec_mux_set() or by typec_mux_begin()
+ * and the calls that follow it, failed with -ETIMEDOUT. A handle can hold more
+ * than one provider, and only the one that timed out is asked: whether it
+ * declared its timeouts transient (&typec_mux_desc.transient_timeouts). Its
+ * hardware then only held the change up, and the same state can be applied
+ * again later. A timeout of any other provider can be permanent.
+ *
+ * The answer is about the last request on @mux: no other request on the same
+ * handle may run in between.
+ *
+ * Return: true if the provider that timed out declared its timeouts transient.
+ */
+bool typec_mux_timeout_transient(struct typec_mux *mux)
+{
+	return !IS_ERR_OR_NULL(mux) && mux->timeout_transient;
+}
+EXPORT_SYMBOL_GPL(typec_mux_timeout_transient);
 
 static int mux_fwnode_match(struct device *dev, const void *fwnode)
 {
@@ -523,6 +547,7 @@ int typec_mux_begin(struct typec_mux *mux, struct typec_mux_state *state)
 	mux->srcu_index = index;
 	mux->owner = current;
 	mux->transaction = *state;
+	mux->timeout_transient = false;
 	for (i = 0; i < mux->num_mux_devs; i++) {
 		struct typec_mux_dev *dev = mux->mux_devs[i];
 
@@ -564,6 +589,9 @@ int typec_mux_apply(struct typec_mux *mux)
 
 		ret = dev->set(dev, &mux->transaction);
 		if (ret && ret != -EOPNOTSUPP) {
+			/* Only the provider that failed knows what its timeout means. */
+			mux->timeout_transient = ret == -ETIMEDOUT &&
+						 dev->transient_timeouts;
 			typec_mux_abort(mux);
 			return ret;
 		}
@@ -669,6 +697,7 @@ typec_mux_register(struct device *parent, const struct typec_mux_desc *desc)
 	mux_dev->commit = desc->commit;
 	mux_dev->abort = desc->abort;
 	mux_dev->safe_after_role = desc->safe_after_role;
+	mux_dev->transient_timeouts = desc->transient_timeouts;
 
 	device_initialize(&mux_dev->dev);
 	mux_dev->dev.parent = parent;

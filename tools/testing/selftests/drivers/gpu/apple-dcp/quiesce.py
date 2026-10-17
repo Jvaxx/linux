@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Copyright 2026 Ryan Murray
 """Actual mux prepare/set and TPS removal ordering; firmware/PHY leaves are mocks."""
-from common import block
+from common import block, atc_function
 
 def make_unit(source, parent=False, reference=None):
  reference=source if reference is None else reference
@@ -41,7 +41,7 @@ enum typec_data_role {TYPEC_HOST,TYPEC_DEVICE};
 #define TPS_STATUS_TO_TYPEC_VCONN(s) (s)
 #define TPS_STATUS_TO_TYPEC_DATAROLE(s) (s)
 struct typec_mux_state { void *alt; unsigned long mode; void *data; };
-struct typec_mux_dev { bool removed, safe_after_role; void (*commit)(struct typec_mux_dev *,struct typec_mux_state *); void (*abort)(struct typec_mux_dev *,struct typec_mux_state *); int (*finish)(struct typec_mux_dev *,struct typec_mux_state *); void *data; int (*set)(struct typec_mux_dev *,struct typec_mux_state *); int (*prepare)(struct typec_mux_dev *,struct typec_mux_state *); };
+struct typec_mux_dev { bool removed, safe_after_role; void (*commit)(struct typec_mux_dev *,struct typec_mux_state *); void (*abort)(struct typec_mux_dev *,struct typec_mux_state *); int (*finish)(struct typec_mux_dev *,struct typec_mux_state *); void *data; int (*set)(struct typec_mux_dev *,struct typec_mux_state *); int (*prepare)(struct typec_mux_dev *,struct typec_mux_state *); bool transient_timeouts; };
 struct task_struct { int unused; };
 static _Thread_local struct task_struct this_task;
 #define current (&this_task)
@@ -53,7 +53,7 @@ static int srcu_read_lock(int *s) { (void)s;return 0; }
 static void srcu_read_unlock(int *s,int i) { (void)s;(void)i; }
 static int mutex_trylock(struct mutex *m) { return pthread_mutex_trylock(&m->value)==0; }
 static void mutex_unlock(struct mutex *m) { assert(!pthread_mutex_unlock(&m->value)); }
-struct typec_mux { struct typec_mux_context *context; struct typec_mux_state transaction; struct task_struct *owner; int srcu_index; unsigned prepared; bool applied; unsigned num_mux_devs; struct typec_mux_dev *mux_devs[3]; };
+struct typec_mux { struct typec_mux_context *context; struct typec_mux_state transaction; struct task_struct *owner; int srcu_index; unsigned prepared; bool applied; unsigned num_mux_devs; struct typec_mux_dev *mux_devs[3]; bool timeout_transient; };
 struct connector { bool connected; };
 struct apple_dcp { int external_lock,external_error; bool external_cable,external_stopped; struct { bool connected; } dptxport[1]; void *hdmi_hpd; bool active; bool external,typec_cable_connected; void *dev; struct connector *typec_connector; };
 struct apple_dcp_typec_route;
@@ -118,12 +118,16 @@ static void gpiod_set_value_cansleep(void *p,int v) { (void)p;assert(v==1);gpio_
  if 'static bool tps6598x_safe_after_role(' in core:
   functions+=block(core,'static bool tps6598x_safe_after_role(')+'\n'
  if not parent:functions+=block(core,'static void tps6598x_drop_partner(')+'\n'+block(core,'static int tps6598x_set_data_role(')+'\n'
+ # The fixed-hub SuperSpeed handover moved the locked mux body to atcphy_mux_switch();
+ # atcphy_mux_set_locked() also reports whether a SuperSpeed port may come back up.
+ split=[atc_function(atc,name) for name in ('atcphy_usb3_port_ready','atcphy_mux_check','atcphy_mux_park','atcphy_mux_switch')]
  functions+=block(core,'static '+('void' if parent else 'int')+' tps6598x_disconnect(')+'\n'+block(core,'static '+('void' if parent else 'int')+' cd321x_remove(')+'\n'+block(core,'void tipd_remove(')+'\n'
  ordinary_phy=r'''
 /* Actual ordinary-port ATC power-off, mux recheck and USB2 init; MMIO leaves. */
 #undef WARN_ON_ONCE
 #define WARN_ON_ONCE(x) ({ bool hit=(x);phy_warns+=hit;hit; })
 #define fallthrough __attribute__((fallthrough))
+#define KUNIT_STATIC_STUB_REDIRECT(...) ((void)0)
 enum atcphy_mode { APPLE_ATCPHY_MODE_OFF, APPLE_ATCPHY_MODE_USB2,
  APPLE_ATCPHY_MODE_USB3, APPLE_ATCPHY_MODE_USB3_DP, APPLE_ATCPHY_MODE_DP,
  APPLE_ATCPHY_MODE_TBT, APPLE_ATCPHY_MODE_USB4 };
@@ -133,6 +137,7 @@ struct apple_atcphy {
  const struct { bool has_usb4,has_t8140_dp; } *hw;
  struct { void *usb2phy; } regs;
  bool fixed_usb2,host_active,mode_dirty,pipe_pending,usb_off_pending,ss_tunables,dp_tunables;
+ bool usb3_port_off,park_owed;
  enum atcphy_mode mode,typec_mode;
  enum atcphy_pipehandler_state pipe_state;
 };
@@ -149,7 +154,7 @@ static int atcphy_configure_pipehandler(struct apple_atcphy *p,bool on) { (void)
 static int atcphy_configure(struct apple_atcphy *p,enum atcphy_mode mode) { configure_calls++;lane_requests+=mode!=APPLE_ATCPHY_MODE_OFF;p->mode=mode;p->mode_dirty=false;return 0; }
 static void set32(void *p,unsigned v) { (void)p;(void)v;assert(false); }
 static void atcphy_usb2_power_on(struct apple_atcphy *p) { (void)p;assert(false); }
-''' + '\n'.join(block(atc, marker) for marker in (
+''' + ''.join(split) + '\n'.join(block(atc, marker) for marker in (
   'static int atcphy_usb3_power_off(', 'static int atcphy_mux_set_locked(',
   'static int atcphy_usb2_init(')) + r'''
 static int ordinary_power_off(void) { return atcphy_usb3_power_off(&usb_phy); }
@@ -170,6 +175,10 @@ static void ordinary_usb2_check(void) {
  assert(ordinary_phy.typec_mode==APPLE_ATCPHY_MODE_OFF&&lane_requests==before);
 }
 '''
+ if split[-1]:
+  # An ordinary port takes no SuperSpeed port down, so none may come up.
+  ordinary_phy=ordinary_phy.replace(' int ret=atcphy_mux_set_locked(&ordinary_phy,APPLE_ATCPHY_MODE_OFF);',
+   ' bool port_on;\n int ret=atcphy_mux_set_locked(&ordinary_phy,APPLE_ATCPHY_MODE_OFF,&port_on);\n assert(!port_on);',1)
  controls=r'''
 static struct typec_mux_dev phy_provider,display_provider;
 static struct typec_mux mux;

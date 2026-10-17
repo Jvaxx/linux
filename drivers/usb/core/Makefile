@@ -25,3 +25,4 @@ obj-$(CONFIG_USB_QUIRKS_KUNIT_TEST)	+= usb-quirks-test.o
 obj-$(CONFIG_USB_WAKEUP_KUNIT_TEST)	+= usb-wakeup-test.o
 
 obj-$(CONFIG_USB_LEDS_TRIGGER_USBPORT)	+= ledtrig-usbport.o
+obj-$(CONFIG_USB_PORT_POWER_KUNIT_TEST)	+= port-power-test.o
