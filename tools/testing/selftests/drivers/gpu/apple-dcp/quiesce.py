@@ -41,7 +41,7 @@ enum typec_data_role {TYPEC_HOST,TYPEC_DEVICE};
 #define TPS_STATUS_TO_TYPEC_VCONN(s) (s)
 #define TPS_STATUS_TO_TYPEC_DATAROLE(s) (s)
 struct typec_mux_state { void *alt; unsigned long mode; void *data; };
-struct typec_mux_dev { bool removed, safe_after_role; void (*commit)(struct typec_mux_dev *,struct typec_mux_state *); void (*abort)(struct typec_mux_dev *,struct typec_mux_state *); int (*finish)(struct typec_mux_dev *,struct typec_mux_state *); void *data; int (*set)(struct typec_mux_dev *,struct typec_mux_state *); int (*prepare)(struct typec_mux_dev *,struct typec_mux_state *); };
+struct typec_mux_dev { bool removed, safe_after_role; void (*commit)(struct typec_mux_dev *,struct typec_mux_state *); void (*abort)(struct typec_mux_dev *,struct typec_mux_state *); int (*finish)(struct typec_mux_dev *,struct typec_mux_state *); void *data; int (*set)(struct typec_mux_dev *,struct typec_mux_state *); int (*prepare)(struct typec_mux_dev *,struct typec_mux_state *); bool transient_timeouts; };
 struct task_struct { int unused; };
 static _Thread_local struct task_struct this_task;
 #define current (&this_task)
@@ -53,7 +53,7 @@ static int srcu_read_lock(int *s) { (void)s;return 0; }
 static void srcu_read_unlock(int *s,int i) { (void)s;(void)i; }
 static int mutex_trylock(struct mutex *m) { return pthread_mutex_trylock(&m->value)==0; }
 static void mutex_unlock(struct mutex *m) { assert(!pthread_mutex_unlock(&m->value)); }
-struct typec_mux { struct typec_mux_context *context; struct typec_mux_state transaction; struct task_struct *owner; int srcu_index; unsigned prepared; bool applied; unsigned num_mux_devs; struct typec_mux_dev *mux_devs[3]; };
+struct typec_mux { struct typec_mux_context *context; struct typec_mux_state transaction; struct task_struct *owner; int srcu_index; unsigned prepared; bool applied; unsigned num_mux_devs; struct typec_mux_dev *mux_devs[3]; bool timeout_transient; };
 struct connector { bool connected; };
 struct apple_dcp { int external_lock,external_error; bool external_cable,external_stopped; struct { bool connected; } dptxport[1]; void *hdmi_hpd; bool active; bool external,typec_cable_connected; void *dev; struct connector *typec_connector; };
 struct apple_dcp_typec_route;
