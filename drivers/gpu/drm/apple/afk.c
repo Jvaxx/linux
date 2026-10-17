@@ -1235,7 +1235,7 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 	 * the current dummy queue entry and we have to advance to the next one
 	 * which will contain the real data.
 	*/
-	if (rptr + size + sizeof(*hdr) > ep->rxbfr.bufsz) {
+	if (!afk_ring_payload_fits(rptr, size, ep->rxbfr.bufsz)) {
 		rptr = 0;
 		hdr = ep->rxbfr.buf + rptr;
 		magic = le32_to_cpu(hdr->magic);
@@ -1250,7 +1250,7 @@ static bool afk_recv(struct apple_dcp_afkep *ep)
 		}
 	}
 
-	if (rptr + size + sizeof(*hdr) > ep->rxbfr.bufsz) {
+	if (!afk_ring_payload_fits(rptr, size, ep->rxbfr.bufsz)) {
 		dev_warn(ep->dcp->dev,
 			 "AFK[ep:%02x]: queue entry out of bounds: 0x%lx > 0x%lx\n",
 			 ep->endpoint, rptr + size + sizeof(*hdr), ep->rxbfr.bufsz);
@@ -2082,4 +2082,8 @@ static void afk_remove_service_debugfs(struct apple_epic_service *srv)
 	}
 }
 
+#endif
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_PARSER_KUNIT_TEST)
+#include "afk-parser-test.c"
 #endif
