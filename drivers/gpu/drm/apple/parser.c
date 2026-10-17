@@ -358,7 +358,12 @@ static int parse_dimension(struct dcp_parse_ctx *handle, struct dimension *dim, 
 		else if (!strcmp(key, "SyncWidth"))
 			ret = parse_int_bound(it.handle, &dim->sync_width, 0, U16_MAX);
 		else if (!strcmp(key, "PreciseSyncRate"))
-			ret = parse_int_bound(it.handle, &dim->precise_sync_rate, 1, U32_MAX);
+			/*
+			 * fw14 DMT timings carry a horizontal rate of 0; only the
+			 * vertical one is used.
+			 */
+			ret = parse_int_bound(it.handle, &dim->precise_sync_rate,
+					      !dcp_parse_v14_7_rgb8(handle), U32_MAX);
 		else if (polarity && !strcmp(key, "SyncPolarity")) {
 			if (dim->sync_polarity >= 0)
 				ret = -EINVAL;
@@ -449,6 +454,22 @@ static unsigned int external_sdr_rank(const struct color_mode *color)
 	default:
 		return 0;
 	}
+}
+
+/*
+ * J514S DCPEXT (fw14): only an 8-bit SDR RGB colour, sRGB or default RGB,
+ * is driven over USB-C, and among those the highest score, then the lowest
+ * ID, wins.  A tie on score goes to the lower ID.
+ */
+static bool v14_7_rgb8_color(const struct color_mode *color,
+			     struct dcp_color_mode *best)
+{
+	if (color->depth != 8 || color->colorimetry == DCP_COLORIMETRY_BT709 ||
+	    !external_sdr_rank(color))
+		return false;
+	if (best->score >= 0 && best->score == color->score && color->id < best->id)
+		best->score = -1;
+	return true;
 }
 
 /* Firmware lists color element IDs which this timing cannot safely use. */
@@ -641,6 +662,11 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 				}
 				continue;
 			}
+			if (dcp_parse_v14_7_rgb8(handle)) {
+				if (!v14_7_rgb8_color(&cmode, &out->sdr_rgb))
+					continue;
+				rank = 1;
+			}
 			if (!rank || rank < best_sdr_rank)
 				continue;
 			if (rank > best_sdr_rank)
@@ -701,6 +727,7 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 	bool is_virtual = false;
 	bool preferred = false, interlaced = false;
 	bool have_preferred = false, have_interlaced = false;
+	bool split = false, single_pipe = true;
 	struct drm_display_mode *mode = &out->mode;
 
 	*out = (struct dcp_display_mode) {
@@ -773,6 +800,16 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 			else
 				ret = parse_bool(it.handle, &interlaced);
 			have_interlaced = true;
+		} else if (dcp_parse_v14_7_rgb8(handle) && !strcmp(key, "IsSplit")) {
+			ret = parse_bool(it.handle, &split);
+		} else if (dcp_parse_v14_7_rgb8(handle) &&
+			   (!strcmp(key, "HorizontalPipeCount") ||
+			    !strcmp(key, "VerticalPipeCount"))) {
+			s64 pipes = 0;
+
+			/* fw14 omits both counts: a single pipe. */
+			ret = parse_int_bound(it.handle, &pipes, 0, U32_MAX);
+			single_pipe &= pipes == 1;
 		} else if (!strcmp(key, "Score"))
 			ret = parse_int_bound(it.handle, score, 0, S64_MAX);
 		else
@@ -833,6 +870,12 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 	 * DCP reports these modes at all. Treat as a recoverable error.
 	 */
 	if (is_virtual)
+		return -EINVAL;
+
+	/* fw14 USB-C: progressive, unsplit, one pipe, no pixel repetition. */
+	if (dcp_parse_v14_7_rgb8(handle) &&
+	    (interlaced || split || !single_pipe ||
+	     horiz.pixel_repetition != 0 || vert.pixel_repetition != 0))
 		return -EINVAL;
 
 	/*

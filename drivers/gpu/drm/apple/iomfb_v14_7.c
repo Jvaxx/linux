@@ -28,6 +28,7 @@
 #include "iomfb_v14_7.h"
 #include "iomfb_h17p.h"
 #include "version_utils.h"
+#include "dcpext-t6030.h"
 
 /*
  * 14.7 method numbers (in/out bytes).  The J514S panel lifecycle sends only
@@ -145,6 +146,15 @@ static const struct dcp_callback_shape_v14_7 callback_shapes[IOMFB_MAX_CB] = {
 	 * A410 should the firmware send it.
 	 */
 	[599] = DCP_CB_V14_7(0, 0),
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_EXT)
+	/*
+	 * External role only: the panel has no handler for these, so it still
+	 * refuses them.
+	 */
+	[2] = DCP_CB_V14_7(0, 0),		/* will_power_off */
+	[574] = DCP_CB_V14_7(4, 4),		/* powerUpDART */
+	[591] = DCP_CB_V14_7(20, 0),		/* swap_complete_intent_gated */
+#endif
 };
 
 bool iomfb_check_callback_v14_7(int tag, u32 in_len, u32 out_len)
@@ -715,6 +725,10 @@ static const iomfb_cb_handler cb_handlers[IOMFB_MAX_CB] = {
 
 void DCP_FW_NAME(iomfb_start)(struct apple_dcp *dcp)
 {
+	if (iomfb_is_v14_7_external(dcp)) {
+		iomfb_v14_7_ext_ready(dcp);
+		return;
+	}
 	dcp->cb_handlers = cb_handlers;
 
 	dcp_start_signal(dcp, false, dcp_started, NULL);
@@ -758,6 +772,8 @@ void iomfb_v14_7_fail(struct apple_dcp *dcp, const char *what)
 		dev_err(dcp->dev, "DCP session failed: %s; a reboot is required to restore the display\n",
 			what);
 	complete(&dcp->start_done);
+	if (iomfb_is_v14_7_external(dcp))
+		dcp_ext_v14_7_failed(dcp);
 	if (READ_ONCE(dcp->crtc))
 		schedule_work(&dcp->vblank_wq);
 }
@@ -784,8 +800,500 @@ int iomfb_v14_7_session_init(struct apple_dcp *dcp)
 	/* Failures can latch before dcp_start() initialises this. */
 	init_completion(&dcp->start_done);
 	dcp->v14_7 = s;
+	return iomfb_is_v14_7_external(dcp) ? dcp_ext_v14_7_init(dcp) : 0;
+}
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_EXT)
+/*
+ * The external role of the 14.7 interface (J514S DCPEXT): the panel's
+ * callbacks with the external role's answers, the external-role check at
+ * READY, the client open after the first HPD reply, and A411/A472 for mode
+ * and power.
+ */
+
+/* D101: 7680 until a mode is set, then the mode's pitch. */
+static bool dcpep_cb_default_stride_v14_7_ext(struct apple_dcp *dcp, int tag,
+					      void *out, void *in)
+{
+	trace_iomfb_callback(dcp, tag, __func__);
+	put_unaligned_le32(dcp_ext_v14_7_stride(dcp), out);
+	return true;
+}
+
+/* D107: removing TimingElements withdraws the sink's modes. */
+static bool dcpep_cb_set_property_v14_7_ext(struct apple_dcp *dcp, int tag,
+					    void *out, void *in)
+{
+	if (!dcpep_cb_set_property_v14_7(dcp, tag, out, in))
+		return false;
+	if (tag == 107 && !strcmp(in, "TimingElements"))
+		dcp_ext_v14_7_catalog(dcp, NULL, 0);
+	return true;
+}
+
+/* D129: TimingElements and DisplayAttributes describe the connected sink. */
+static bool dcpep_cb_prop_end_v14_7_ext(struct apple_dcp *dcp, int tag,
+					void *out, void *in)
+{
+	struct dcp_v14_7_session *s = dcp->v14_7;
+	const char *key = in;
+	const void *blob;
+	u32 size;
+
+	trace_iomfb_callback(dcp, tag, __func__);
+	if (dcp_property_key_valid(key) || dcp_property_chunk_end(s->props, key))
+		return v14_7_reject(dcp, tag, "transfer incomplete");
+	blob = dcp_property_get_raw(s->props, 0, key, &size);
+	if (blob && !strcmp(key, "TimingElements"))
+		dcp_ext_v14_7_catalog(dcp, blob, size);
+	else if (blob && !strcmp(key, "DisplayAttributes"))
+		dcp_ext_v14_7_attributes(dcp, blob, size);
+	put_unaligned_le32(1, out);
+	return true;
+}
+
+/* D206: the external role's nested A131 answers 1, then D206 answers 1. */
+static void dcp_pmu_matched_v14_7_ext(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	struct dcp_channel *ch = &dcp->ch_cb;
+	u8 *succ = ch->output[ch->depth - 1];
+
+	if (!out || get_unaligned_le32(out) != 1) {
+		iomfb_v14_7_fail(dcp, "A131 pmu_service_matched failed");
+		return;
+	}
+	*succ = true;
+	dcp_ack(dcp, DCP_CONTEXT_CB);
+}
+
+static bool dcpep_cb_match_pmu_service_2_v14_7_ext(struct apple_dcp *dcp, int tag,
+						   void *out, void *in)
+{
+	trace_iomfb_callback(dcp, tag, __func__);
+	iomfb_a131_pmu_service_matched(dcp, false, dcp_pmu_matched_v14_7_ext, NULL);
+	return false;
+}
+
+/* D408: VORP index 0 is the controller's clock (DT, 935 MHz), index 1 none. */
+static bool dcpep_cb_get_frequency_v14_7_ext(struct apple_dcp *dcp, int tag,
+					     void *out, void *in)
+{
+	u32 index = get_unaligned_le32((u8 *)in + 4);
+	unsigned long rate = dcp->clk ? clk_get_rate(dcp->clk) : 0;
+
+	trace_iomfb_callback(dcp, tag, __func__);
+	if (memcmp(in, "VORP", 4) || index > 1 || !rate)
+		return v14_7_reject(dcp, tag, "unknown clock");
+	put_unaligned_le64(index ? 0 : rate, out);
+	return true;
+}
+
+/*
+ * D401: registry values only.  The panel's fixed SUMP Temperature is a
+ * mini-LED compatibility answer, not one for an external sink: logged if
+ * the external firmware ever asks, and answered as absent.
+ */
+static bool dcpep_cb_get_uint_prop_v14_7_ext(struct apple_dcp *dcp, int tag,
+					     void *out, void *in)
+{
+	if (!memcmp(in, "SUMP", 4) && !strncmp((const char *)in + 4, "Temperature", 64))
+		dev_info_once(dcp->dev, "external firmware asked for SUMP Temperature\n");
+	return dcpep_cb_get_uint_prop_v14_7(dcp, tag, out, in);
+}
+
+/* D574 powerUpDART: true; the host keeps owning the power (no DART restart). */
+static bool dcpep_cb_power_up_dart_v14_7(struct apple_dcp *dcp, int tag,
+					 void *out, void *in)
+{
+	trace_iomfb_callback(dcp, tag, __func__);
+	*(u8 *)out = 1;
+	return true;
+}
+
+/* D591: an intent-swap notification; it retires nothing. */
+static bool dcpep_cb_swap_intent_v14_7(struct apple_dcp *dcp, int tag,
+				       void *out, void *in)
+{
+	const u8 *req = in;
+
+	trace_iomfb_callback(dcp, tag, __func__);
+	dev_dbg(dcp->dev, "swap %u intent %u %ux%u\n", get_unaligned_le32(req), req[5],
+		get_unaligned_le32(req + 9), get_unaligned_le32(req + 13));
+	return true;
+}
+
+/* D599: answered after a nested is_main_display (A410), false on the external role. */
+static void dcp_main_display_v14_7_ext(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	if (!out || get_unaligned_le32(out)) {
+		iomfb_v14_7_fail(dcp, "A410 is_main_display not false");
+		return;
+	}
+	dcp_ack(dcp, DCP_CONTEXT_CB);
+}
+
+static bool dcpep_cb_main_display_v14_7_ext(struct apple_dcp *dcp, int tag,
+					    void *out, void *in)
+{
+	trace_iomfb_callback(dcp, tag, __func__);
+	dcp_is_main_display(dcp, false, dcp_main_display_v14_7_ext, NULL);
+	return false;
+}
+
+static const iomfb_cb_handler cb_handlers_ext[IOMFB_MAX_CB] = {
+	[0] = trampoline_true, /* did_boot_signal */
+	[1] = trampoline_true, /* did_power_on_signal */
+	[2] = trampoline_nop, /* will_power_off: a receipt, not a fence */
+	[3] = dcpep_cb_rt_bandwidth_v14_7, /* declined, status 1 at +56 */
+	[6] = dcpep_cb_frame_sync_props_v14_7,
+	[100] = iomfbep_cb_match_pmu_service, /* nested A374 */
+	[101] = dcpep_cb_default_stride_v14_7_ext,
+	[102] = dcpep_cb_set_property_v14_7, /* set_number_property */
+	[104] = dcpep_cb_set_property_v14_7, /* set_boolean_property */
+	[107] = dcpep_cb_set_property_v14_7_ext, /* remove_property */
+	[108] = trampoline_true, /* create_provider_service */
+	[109] = trampoline_true, /* create_product_service */
+	[110] = trampoline_true, /* create_pmu_service */
+	[111] = trampoline_true, /* create_iomfb_service */
+	[112] = trampoline_true, /* create_backlight_service */
+	[113] = trampoline_true, /* create_nvram_service */
+	[114] = dcpep_cb_analytics_v14_7, /* CoreAnalyticsSendEvent */
+	[115] = dcpep_cb_get_tiling_state_v14_7,
+	[116] = trampoline_false, /* set_tiling_state */
+	[121] = dcpep_cb_boot_1, /* start_hardware_boot, A444 answers 0 */
+	[122] = trampoline_false, /* is_dark_boot */
+	[123] = trampoline_false, /* is_waking_from_hibernate */
+	[125] = dcpep_cb_read_edt_data_v14_7,
+	[127] = dcpep_cb_prop_start_v14_7,
+	[128] = dcpep_cb_prop_chunk_v14_7,
+	[129] = dcpep_cb_prop_end_v14_7_ext,
+	[201] = dcpep_cb_map_piodma_v14_7,
+	[206] = dcpep_cb_match_pmu_service_2_v14_7_ext, /* nested A131, 1 */
+	[207] = iomfbep_cb_match_backlight_service, /* no panel: 1, no A132 */
+	[209] = trampoline_get_time,
+	[300] = dcpep_cb_pr_publish_v14_7,
+	[400] = dcpep_cb_get_property_v14_7,
+	[401] = dcpep_cb_get_uint_prop_v14_7_ext, /* registry only */
+	[406] = trampoline_set_fx_prop,
+	[408] = dcpep_cb_get_frequency_v14_7_ext,
+	[413] = dcpep_cb_set_property_v14_7, /* dictionary */
+	[414] = dcpep_cb_set_property_v14_7, /* number */
+	[415] = dcpep_cb_set_property_v14_7, /* Boolean */
+	[451] = dcpep_cb_allocate_buffer_v14_7,
+	[454] = dcpep_cb_release_mem_desc_v14_7,
+	[552] = dcpep_cb_set_property_v14_7, /* dictionary */
+	[561] = dcpep_cb_set_property_v14_7, /* dictionary */
+	[563] = dcpep_cb_set_property_v14_7, /* number */
+	[565] = dcpep_cb_set_property_v14_7, /* Boolean */
+	[567] = dcpep_cb_set_property_v14_7, /* string */
+	[574] = dcpep_cb_power_up_dart_v14_7,
+	[576] = dcpep_cb_hotplug_v14_7, /* echo; no connector transition */
+	[577] = trampoline_nop, /* powerstate_notify */
+	[582] = trampoline_false, /* create_default_fb_surface */
+	[588] = trampoline_nop, /* update_ap_hdcp_encryption_status */
+	[589] = trampoline_swap_complete,
+	[591] = dcpep_cb_swap_intent_v14_7,
+	[596] = trampoline_false, /* isDFBAllocated */
+	[598] = trampoline_nop, /* find_swap_function_gated */
+	[599] = dcpep_cb_main_display_v14_7_ext, /* nested A410, false */
+};
+
+/* D121's nested A444 (create_default_fb) answers 0 on the external role. */
+bool iomfb_v14_7_ext_a444(struct apple_dcp *dcp, void *out)
+{
+	if (!out || get_unaligned_le32(out)) {
+		dev_err(dcp->dev, "A444 create_default_fb answered %#x\n",
+			out ? get_unaligned_le32(out) : ~0U);
+		iomfb_v14_7_fail(dcp, "D121 continuation failed");
+		return false;
+	}
+	return true;
+}
+
+static void dcp_ready_v14_7_ext(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	if (!out || get_unaligned_le32(out)) {
+		dev_err(dcp->dev, "A410 is_main_display answered %#x on DCPEXT\n",
+			out ? get_unaligned_le32(out) : ~0U);
+		iomfb_v14_7_fail(dcp, "A410 is_main_display not false");
+		return;
+	}
+	dcp->main_display = false;
+	dcp->active = true;
+	dev_info(dcp->dev, "IOMFB external role confirmed (A410 = 0)\n");
+	complete(&dcp->start_done);
+}
+
+/* READY: the external-role query A410 comes first; the client opens later. */
+void iomfb_v14_7_ext_ready(struct apple_dcp *dcp)
+{
+	dcp->cb_handlers = cb_handlers_ext;
+	dcp_is_main_display(dcp, false, dcp_ready_v14_7_ext, NULL);
+}
+
+/* One 14.7 call from process context, through the IOMFB queue, with its reply. */
+struct iomfb_v14_7_ext_call {
+	struct kref refcount;
+	struct completion done;
+	u32 out_len;
+	bool replied;
+	u8 out[];
+};
+
+static void iomfb_v14_7_ext_call_release(struct kref *ref)
+{
+	kfree(container_of(ref, struct iomfb_v14_7_ext_call, refcount));
+}
+
+static void iomfb_v14_7_ext_call_done(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	struct iomfb_v14_7_ext_call *call = cookie;
+
+	if (out && call->out_len)
+		memcpy(call->out, out, call->out_len);
+	call->replied = !!out;
+	complete(&call->done);
+	kref_put(&call->refcount, iomfb_v14_7_ext_call_release);
+}
+
+static int iomfb_v14_7_ext_call_entry(struct apple_dcp *dcp,
+				      const struct dcp_method_entry *method,
+				      void *in, u32 in_len, void *out, u32 out_len,
+				      unsigned long timeout)
+{
+	struct iomfb_v14_7_ext_call *call;
+	int ret;
+
+	if (READ_ONCE(dcp->crashed))
+		return -EIO;
+	call = kzalloc(struct_size(call, out, out_len), GFP_KERNEL);
+	if (!call)
+		return -ENOMEM;
+	kref_init(&call->refcount);
+	/* The receiver's reference, dropped by the reply. */
+	kref_get(&call->refcount);
+	init_completion(&call->done);
+	call->out_len = out_len;
+	dcp_push(dcp, false, method, in_len, out_len, in,
+		 iomfb_v14_7_ext_call_done, call);
+	if (!wait_for_completion_timeout(&call->done, timeout))
+		ret = -ETIMEDOUT;
+	else
+		ret = call->replied ? 0 : -EIO;
+	if (!ret && out_len)
+		memcpy(out, call->out, out_len);
+	kref_put(&call->refcount, iomfb_v14_7_ext_call_release);
+	return ret;
+}
+
+static int iomfb_v14_7_ext_call(struct apple_dcp *dcp, enum dcpep_method method,
+				void *in, u32 in_len, void *out, u32 out_len,
+				unsigned long timeout)
+{
+	return iomfb_v14_7_ext_call_entry(dcp, &dcp_methods[method], in, in_len,
+					  out, out_len, timeout);
+}
+
+/*
+ * A437 get_block, block 0x6e: the display status word the firmware checks
+ * before it programs a swap.  Called only here, so it is not in the method
+ * table the other firmware versions share.
+ */
+static const struct dcp_method_entry iomfb_v14_7_get_block = {
+	"get_block", { 'A', '4', '3', '7' }
+};
+
+struct iomfb_v14_7_get_block_req {
+	__le64 token;
+	__le32 block;
+	__le32 sub_block;
+	__le64 args[8];
+	__le32 arg_count;
+	__le64 out_len;
+} __packed;
+static_assert(sizeof(struct iomfb_v14_7_get_block_req) == 0x5c);
+
+#define IOMFB_V14_7_GET_BLOCK_OUT	0x1004
+#define IOMFB_V14_7_DISPLAY_STATUS	0x6e
+/* Pipe, can program a swap, soft and controller power, link, timings enabled. */
+#define IOMFB_V14_7_DISPLAY_READY	(BIT(0) | BIT(2) | BIT(3) | BIT(4) | BIT(6) | BIT(7))
+#define IOMFB_V14_7_DISPLAY_RUN_MODE_PENDING	BIT(1)
+
+static int iomfb_v14_7_ext_display_status(struct apple_dcp *dcp, u32 *status)
+{
+	struct iomfb_v14_7_get_block_req req = {
+		.block = cpu_to_le32(IOMFB_V14_7_DISPLAY_STATUS),
+		.out_len = cpu_to_le64(4),
+	};
+	u8 *out;
+	int ret;
+
+	out = kzalloc(IOMFB_V14_7_GET_BLOCK_OUT, GFP_KERNEL);
+	if (!out)
+		return -ENOMEM;
+	ret = iomfb_v14_7_ext_call_entry(dcp, &iomfb_v14_7_get_block, &req, sizeof(req),
+					 out, IOMFB_V14_7_GET_BLOCK_OUT,
+					 msecs_to_jiffies(1000));
+	if (!ret && get_unaligned_le32(out + 0x1000)) {
+		dev_err(dcp->dev, "A437 get_block(%#x) answered %#x\n",
+			IOMFB_V14_7_DISPLAY_STATUS, get_unaligned_le32(out + 0x1000));
+		ret = -EIO;
+	}
+	if (!ret)
+		*status = get_unaligned_le32(out);
+	kfree(out);
+	return ret;
+}
+
+/*
+ * After A472(1) the firmware enables the timings asynchronously, and a swap
+ * submitted before that is dropped: wait for the display status to report
+ * them, polling while the callbacks keep running.  Bounded; a sink that went
+ * away ends the wait.
+ */
+static int iomfb_v14_7_ext_wait_ready(struct apple_dcp *dcp)
+{
+	unsigned long deadline = jiffies + msecs_to_jiffies(2000);
+	u32 status = 0;
+	int ret;
+
+	for (;;) {
+		ret = iomfb_v14_7_ext_display_status(dcp, &status);
+		if (ret)
+			return ret;
+		if ((status & IOMFB_V14_7_DISPLAY_READY) == IOMFB_V14_7_DISPLAY_READY &&
+		    !(status & IOMFB_V14_7_DISPLAY_RUN_MODE_PENDING))
+			return 0;
+		if (!READ_ONCE(dcp->v14_7->ext->hpd_delivered) || time_after(jiffies, deadline))
+			break;
+		usleep_range(1000, 2000);
+	}
+	dev_warn(dcp->dev, "display not ready after power-on: status %#x\n", status);
+	return -ETIMEDOUT;
+}
+
+/*
+ * The client open after the first HPD reply: A401 answers 1, then A455.
+ * Their nested callbacks run on the receive path meanwhile.  A session that
+ * does not open is latched.
+ */
+int iomfb_v14_7_ext_open(struct apple_dcp *dcp, unsigned long timeout)
+{
+	u32 started;
+	int ret;
+
+	if (dcp->v14_7->opened)
+		return 0;
+	ret = iomfb_v14_7_ext_call(dcp, dcpep_start_signal, NULL, 0, &started,
+				   sizeof(started), timeout);
+	if (!ret && get_unaligned_le32(&started) != 1) {
+		dev_err(dcp->dev, "A401 start_signal answered %#x\n",
+			get_unaligned_le32(&started));
+		ret = -EPROTO;
+	}
+	if (!ret)
+		ret = iomfb_v14_7_ext_call(dcp, dcpep_first_client_open, NULL, 0, NULL, 0,
+					   timeout);
+	if (ret) {
+		iomfb_v14_7_fail(dcp, "client open (A401/A455) failed");
+		return ret;
+	}
+	dcp->v14_7->opened = true;
+	dev_info(dcp->dev, "A401/A455 client open done (%u callbacks)\n",
+		 dcp->v14_7->callbacks);
 	return 0;
 }
+
+/* A472: 12 bytes, u64 state at +0; the status is the u32 at +4 of its reply. */
+int iomfb_v14_7_ext_power(struct apple_dcp *dcp, bool on)
+{
+	struct DCP_FW_NAME(dcp_set_power_state_req) req = { .unklong = on };
+	struct dcp_set_power_state_resp resp;
+	int ret;
+
+	ret = iomfb_v14_7_ext_call(dcp, dcpep_set_power_state, &req, sizeof(req),
+				   &resp, sizeof(resp), msecs_to_jiffies(5000));
+	if (!ret && resp.ret) {
+		dev_err(dcp->dev, "A472 set_power_state(%d) answered %#x\n", on, resp.ret);
+		ret = -EIO;
+	}
+	return ret;
+}
+
+/*
+ * Modeset of the external role: A411 with the catalog's colour and timing
+ * IDs, then A472 on.  A powered display changing IDs is turned off first, in
+ * the order macOS uses.
+ */
+int iomfb_v14_7_ext_modeset(struct apple_dcp *dcp, struct drm_crtc_state *crtc_state)
+{
+	struct dcp_ext_v14_7 *ext = dcp->v14_7->ext;
+	struct dcp_set_digital_out_mode_req req;
+	struct dcp_display_mode *mode;
+	u32 status;
+	int ret;
+
+	mode = lookup_mode(dcp, &crtc_state->mode);
+	if (!mode) {
+		dev_err(dcp->dev, "no match for " DRM_MODE_FMT "\n",
+			DRM_MODE_ARG(&crtc_state->mode));
+		return -EIO;
+	}
+	if (!READ_ONCE(ext->hpd_delivered))
+		return -ENODEV;
+	if (ext->display_on && (ext->color_id != mode->color_mode_id ||
+				ext->timing_id != mode->timing_mode_id)) {
+		ret = iomfb_v14_7_ext_power(dcp, false);
+		if (ret)
+			return ret;
+		ext->display_on = false;
+	}
+
+	/* Powering the unchanged mode back on (DPMS) is A472(1) alone. */
+	if (!ext->display_on && ext->color_id == mode->color_mode_id &&
+	    ext->timing_id == mode->timing_mode_id) {
+		ret = iomfb_v14_7_ext_power(dcp, true);
+		if (ret)
+			return ret;
+		WRITE_ONCE(ext->display_on, true);
+		/* Swaps dropped meanwhile end at once; this only avoids them. */
+		iomfb_v14_7_ext_wait_ready(dcp);
+		return 0;
+	}
+
+	req = (struct dcp_set_digital_out_mode_req) {
+		.color_mode_id = mode->color_mode_id,
+		.timing_mode_id = mode->timing_mode_id,
+	};
+	dev_info(dcp->dev, "set_digital_out_mode(color:%u timing:%u) " DRM_MODE_FMT "\n",
+		 req.color_mode_id, req.timing_mode_id, DRM_MODE_ARG(&crtc_state->mode));
+	/* The firmware bounds a modeset at ~8 s. */
+	ret = iomfb_v14_7_ext_call(dcp, dcpep_set_digital_out_mode, &req, sizeof(req),
+				   &status, sizeof(status), msecs_to_jiffies(8500));
+	if (!ret && status) {
+		dev_err(dcp->dev, "A411 set_digital_out_mode answered %#x\n", status);
+		ret = -EIO;
+	}
+	if (ret)
+		return ret;
+	ext->color_id = req.color_mode_id;
+	ext->timing_id = req.timing_mode_id;
+	WRITE_ONCE(ext->stride, crtc_state->mode.hdisplay * 4);
+
+	if (!ext->display_on) {
+		ret = iomfb_v14_7_ext_power(dcp, true);
+		if (ret)
+			return ret;
+		WRITE_ONCE(ext->display_on, true);
+		iomfb_v14_7_ext_wait_ready(dcp);
+	}
+	dcp->mode = req;
+	/* The J514S profile presents with zero timestamps and no VRR. */
+	dcp->use_timestamps = false;
+	dcp->vrr_enabled = false;
+	return 0;
+}
+#endif /* CONFIG_DRM_APPLE_DCP_T6030_EXT */
 
 #undef DCP_FW_VER
 #undef DCP_FW

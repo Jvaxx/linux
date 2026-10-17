@@ -419,6 +419,8 @@ static void afk_service_worker(struct work_struct *work)
 		afk_retry_service_init(ep);
 }
 
+static void afk_recv_handle_teardown(struct apple_dcp_afkep *ep, u32 channel);
+
 static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 				 u8 *payload, size_t payload_size)
 {
@@ -436,6 +438,14 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 	size_t props_size = payload_size - sizeof(name);
 
 	previous = afk_epic_find_service(ep, channel);
+	/*
+	 * fw14 DCPEXT: the AV service re-announced on its channel after a
+	 * replug is a new instance; the old one is gone.
+	 */
+	if (previous && iomfb_is_v14_7_external(ep->dcp) && ep == ep->dcp->dcpavservep) {
+		afk_recv_handle_teardown(ep, channel);
+		previous = afk_epic_find_service(ep, channel);
+	}
 	if (previous) {
 		spin_lock_irqsave(&previous->lock, flags);
 		retired = previous->torndown;
@@ -1169,7 +1179,13 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 	    subtype == EPIC_SUBTYPE_TEARDOWN)
 		return afk_recv_handle_teardown(ep, channel);
 
-	if (type == EPIC_TYPE_REPLY && eshdr->category == EPIC_CAT_REPLY)
+	/*
+	 * The fw14 DCPEXT firmware answers commands in records of kind 0
+	 * (notify); its reply category is what identifies them.
+	 */
+	if ((type == EPIC_TYPE_REPLY ||
+	     (iomfb_is_v14_7_external(ep->dcp) && type == EPIC_TYPE_NOTIFY)) &&
+	    eshdr->category == EPIC_CAT_REPLY)
 		return afk_recv_handle_reply(ep, channel,
 					     le16_to_cpu(eshdr->tag), payload,
 					     payload_size);
@@ -1585,6 +1601,9 @@ static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 		eshdr->type = cpu_to_le16(stype);
 		eshdr->timestamp = cpu_to_le64(0);
 		eshdr->tag = cpu_to_le16(tag);
+		/* fw14 DCPEXT callback replies carry 8 in byte 35. */
+		if (iomfb_is_v14_7_external(ep->dcp) && ecat == EPIC_CAT_REPLY)
+			eshdr->unk = cpu_to_le16(8 << 8);
 		if (ecat == EPIC_CAT_REPLY)
 			eshdr->inline_len = cpu_to_le32(payload_len - 4);
 		else

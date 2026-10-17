@@ -397,6 +397,9 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 		ret = dcp_dpxbar_tunnel_select_source(xbar, route->mux_index);
 		if (ret == -EOPNOTSUPP)
 			ret = 0;
+	} else if (iomfb_is_v14_7_external(dcp)) {
+		/* PHY DP hold first, then the crossbar at rate 0. */
+		ret = xbar == route->xbar ? dcp_ext_v14_7_route_select(route) : -EINVAL;
 	} else {
 		ret = xbar == route->xbar ?
 			mux_control_select(xbar, route->mux_index) : 0;
@@ -470,6 +473,12 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 	if (dcp_is_external_h17p(dcp) &&
 	    (dcp->external_error || (dcp->external_power_attempted && !dcp->external_stopped)))
 		return dcp->external_error ?: -EAGAIN;
+	/* 14.7 external: sink released and link stopped first; retryable. */
+	if (iomfb_is_v14_7_external(dcp)) {
+		ret = dcp_ext_v14_7_route_release(route);
+		if (ret)
+			return ret;
+	}
 
 	dcp_firmware_metadata_connection(dcp, READ_ONCE(dcp->typec_generation), false);
 
@@ -481,7 +490,9 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *route)
 		if (route->deactivate_error)
 			return route->deactivate_error;
 		if (!route->deactivate_xbar_done) {
-			if (!route->tunnel || route->xbar_up)
+			if (iomfb_is_v14_7_external(dcp))
+				ret = dcp_ext_v14_7_route_deselect(route);
+			else if (!route->tunnel || route->xbar_up)
 				ret = mux_control_deselect(route->active_xbar ?: route->xbar);
 			else
 				ret = dcp_dpxbar_preselect(route->active_xbar, MUX_IDLE_DISCONNECT);
@@ -1080,7 +1091,8 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 	 */
 	if (port->applied_valid && port->applied_alt == state->alt &&
 	    port->applied_mode == state->mode &&
-	    port->applied_status == dp_status && port->applied_conf == dp_conf)
+	    port->applied_status == dp_status && port->applied_conf == dp_conf &&
+	    !dcp_typec_route_irq_hpd(route, port->owner, dp_status))
 		return 0;
 
 	port->applied_alt = state->alt;
@@ -1202,7 +1214,10 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 	} else if (hpd && dp_data && (dp_data->status & DP_STATUS_IRQ_HPD)) {
 		struct apple_dcp *dcp = port->owner->dcp;
 
-		if (dcp->typec_connector)
+		/* 14.7 external: InterruptRequestOccurred, not a retrain. */
+		if (iomfb_is_v14_7_external(dcp))
+			dcp_ext_v14_7_irq_hpd(dcp);
+		else if (dcp->typec_connector)
 			dcp_retrain_oob(dcp->typec_connector);
 	}
 	port->hpd = hpd;
@@ -2303,7 +2318,8 @@ VISIBLE_IF_KUNIT void dcp_swap_watchdog(struct work_struct *work)
 
 void dcp_swap_watchdog_arm(struct apple_dcp *dcp)
 {
-	if (dcp_is_typec_output(dcp)) {
+	/* 14.7: a missing D589 times the IOMFB queue out instead. */
+	if (dcp_is_typec_output(dcp) && !iomfb_is_v14_7_external(dcp)) {
 		dcp->swap_watchdog_deadline = jiffies +
 			msecs_to_jiffies(DCP_SWAP_WATCHDOG_MS);
 		mod_delayed_work(system_wq, &dcp->swap_watchdog_wq,
@@ -2900,6 +2916,8 @@ static int dcp_external_start_locked(struct apple_dcp *dcp)
 
 static int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 {
+	if (iomfb_is_v14_7_external(dcp))
+		return dcp_ext_v14_7_connect(dcp);
 	if (!dcp_is_external_h17p(dcp))
 		return dcp_dptx_connect_raw(dcp, port, NULL);
 	guard(mutex)(&dcp->external_lock);
@@ -3240,6 +3258,8 @@ static void disconnected_hpd_event(struct apple_connector *con)
 
 static int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port)
 {
+	if (iomfb_is_v14_7_external(dcp))
+		return dcp_ext_v14_7_disconnect(dcp, false);
 	if (dcp_is_external_h17p(dcp))
 		return dcp_external_disconnect(dcp, false);
 
@@ -3260,6 +3280,8 @@ int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	int ret;
 
+	if (iomfb_is_v14_7_external(dcp))
+		return dcp_ext_v14_7_connect(dcp);
 	if (dcp_is_external_h17p(dcp)) {
 		bool new_cable;
 
@@ -3309,6 +3331,8 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
+	if (iomfb_is_v14_7_external(dcp))
+		return dcp_ext_v14_7_disconnect(dcp, true);
 	if (dcp_is_external_h17p(dcp))
 		return dcp_external_disconnect(dcp, true);
 
@@ -3419,6 +3443,10 @@ int dcp_start(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	int ret;
+
+	/* The external session starts lazily, at its first sink. */
+	if (iomfb_is_v14_7_external(dcp))
+		return dcp->rtk ? dcp_ext_v14_7_start(dcp) : -ENODEV;
 
 	/* Even if nothing starts, dcp_wait_ready() must find it initialised. */
 	init_completion(&dcp->start_done);
@@ -3634,6 +3662,9 @@ int dcp_wait_ready(struct platform_device *pdev, u64 timeout)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	int ret;
 
+	/* Nothing to wait for: the external session starts at its first sink. */
+	if (iomfb_is_v14_7_external(dcp))
+		return 0;
 	if (iomfb_is_v14_7(dcp))
 		return dcp_wait_ready_v14_7(dcp);
 
@@ -3695,6 +3726,9 @@ void dcp_poweron(struct platform_device *pdev)
 	unsigned long remaining;
 	int ret;
 
+	/* 14.7 external: the modeset that follows sets the mode and A472 on. */
+	if (iomfb_is_v14_7_external(dcp))
+		return;
 	if (dcp_is_external_h17p(dcp)) {
 		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
 		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
@@ -3800,6 +3834,10 @@ void dcp_poweroff(struct platform_device *pdev)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	int ret;
 
+	if (iomfb_is_v14_7_external(dcp)) {
+		dcp_ext_v14_7_poweroff(dcp);
+		return;
+	}
 	if (dcp_is_external_h17p(dcp)) {
 		cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
 		cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
@@ -4590,7 +4628,8 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 		}
 	}
 
-	if (!dcp->hw.adopt_live_session) {
+	/* The external coprocessor stays cold until its first sink. */
+	if (!dcp->hw.adopt_live_session && !iomfb_is_v14_7_external(dcp)) {
 		cpu_ctrl =
 			readl_relaxed(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
 		writel_relaxed(cpu_ctrl | APPLE_DCP_COPROC_CPU_CONTROL_RUN,
@@ -4602,7 +4641,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	 * running DCP is adopted; the acknowledgement also starts the display
 	 * memory-bandwidth floor.
 	 */
-	if (iomfb_is_v14_7(dcp)) {
+	if (iomfb_is_v14_7_panel(dcp)) {
 		ret = dcp_t6030_display_get(dev);
 		if (ret) {
 			dev_err(dev, "PMP DISP acknowledgement missing: %d\n", ret);
@@ -4638,7 +4677,7 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	if (dcp->hw.iomfb_method_profile ==
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		ret = apple_rtkit_wake_early_ap(dcp->rtk);
-	else
+	else if (!iomfb_is_v14_7_external(dcp))
 		ret = apple_rtkit_wake(dcp->rtk);
 	if (ret) {
 		ret = dev_err_probe(dev, ret, "Failed to boot RTKit: %d\n", ret);
@@ -4663,6 +4702,8 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 	if (!dcp)
 		return;
 
+	if (iomfb_is_v14_7_external(dcp))
+		dcp_ext_v14_7_unbind(dcp);
 	if (dcp->retain_dma) {
 		/* No firmware stop is acknowledged: detach host users, never DMA. */
 		scoped_guard(mutex, &dcp->iomfb.lock)
@@ -4909,10 +4950,10 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	if (fw_compat == DCP_FIRMWARE_UNKNOWN)
 		return -ENODEV;
 
-	/* The J514S panel is only taken over from a qualified handoff. */
-	if (IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030) &&
-	    fw_compat == DCP_FIRMWARE_V_14_7) {
-		ret = dcp_t6030_admit(pdev, &boot_stride);
+	/* J514S: the panel or a DCPEXT, each only from its qualified handoff. */
+	if (IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030) && fw_compat == DCP_FIRMWARE_V_14_7) {
+		ret = IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_EXT) && hw->v14_7_external ?
+		      dcp_t6030_ext_admit(pdev) : dcp_t6030_admit(pdev, &boot_stride);
 		if (ret)
 			return ret;
 	}
@@ -5159,9 +5200,9 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		WRITE_ONCE(dcp->external_prepared, true);
 	}
 
-	/* Last fallible step: the J514S DCP is powered through the PMP. */
+	/* Last fallible step: the J514S panel DCP is powered through the PMP. */
 	if (IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030) &&
-	    fw_compat == DCP_FIRMWARE_V_14_7) {
+	    fw_compat == DCP_FIRMWARE_V_14_7 && !iomfb_is_v14_7_external(dcp)) {
 		ret = dcp_t6030_display_prepare(dev);
 		if (ret)
 			return dev_err_probe(dev, ret, "PMP display supplier not ready\n");
@@ -5291,6 +5332,8 @@ static int dcp_platform_suspend(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
+	if (iomfb_is_v14_7_external(dcp))
+		return dcp_ext_v14_7_suspend(dcp);
 	if (dcp_is_external_h17p(dcp)) {
 		int ret;
 
@@ -5340,6 +5383,8 @@ static int dcp_platform_resume(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
+	if (iomfb_is_v14_7_external(dcp))
+		return dcp_ext_v14_7_resume(dcp);
 	dcp_release_after_sleep(dcp);
 	dcp_enable_typec_work(dcp);
 	if (dcp->hdmi_hpd_irq)
@@ -5420,6 +5465,22 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t6030 = {
 };
 #endif
 
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_EXT)
+/*
+ * MacBook Pro M3 Pro (J514S) external display controllers (DCPEXT0/1): the
+ * panel's 14.7.0 firmware image in its external role, started cold by
+ * Linux, with one DPTX port that the Type-C routes connect to a USB-C port.
+ */
+static const struct apple_dcp_hw_data apple_dcp_hw_t6030_dcpext = {
+	.num_dptx_ports = 1,
+	.firmware_compat = DCP_FIRMWARE_V_14_7,
+	.primary_only = true,
+	.optional_clock = true,
+	.no_rt_bandwidth = true,
+	.v14_7_external = true,
+};
+#endif
+
 static const struct apple_dcp_hw_data apple_dcp_hw_dcp = {
 	.num_dptx_ports = 0,
 };
@@ -5436,6 +5497,9 @@ static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t8142-dcp", .data = &apple_dcp_hw_t8142,  },
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030)
 	{ .compatible = "apple,t6030-dcp", .data = &apple_dcp_hw_t6030,  },
+#endif
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_EXT)
+	{ .compatible = "apple,t6030-dcpext", .data = &apple_dcp_hw_t6030_dcpext, },
 #endif
 	{ .compatible = "apple,dcp",       .data = &apple_dcp_hw_dcp,    },
 	{ .compatible = "apple,dcpext",    .data = &apple_dcp_hw_dcpext, },
@@ -5464,3 +5528,52 @@ void __exit dcp_unregister(void)
 {
 	platform_driver_unregister(&apple_platform_driver);
 }
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_EXT)
+/*
+ * J514S DCPEXT start: its DMA domain, buffers and this module are pinned
+ * until reboot before the firmware can see a buffer.
+ * A cold coprocessor then gets RUN alone, the reset vector state preserved.
+ * One the boot loader left running (RUN set, e.g. with a sink attached at
+ * power-on) keeps running untouched: only its RTKit communication restarts,
+ * with the INIT power request of the RTKit wake. Anything else is refused.
+ */
+int dcp_ext_v14_7_run(struct apple_dcp *dcp)
+{
+	struct dcp_session_ref *session;
+	bool inherited;
+	u32 ctrl;
+
+	ctrl = readl_relaxed(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+	if (ctrl && ctrl != APPLE_DCP_COPROC_CPU_CONTROL_RUN) {
+		dev_err(dcp->dev, "DCPEXT in an unknown state (CPU control %#x); not starting\n",
+			ctrl);
+		return -EBUSY;
+	}
+	inherited = ctrl == APPLE_DCP_COPROC_CPU_CONTROL_RUN;
+	if (!dcp->retain_dma) {
+		session = kzalloc_obj(*session);
+		if (!session)
+			return -ENOMEM;
+		session->dev = get_device(dcp->dev);
+		session->group = iommu_group_get(dcp->dev);
+		__module_get(THIS_MODULE);
+		WRITE_ONCE(dcp->retain_dma, true);
+		mutex_lock(&dcp_retained_sessions_lock);
+		list_add_tail(&session->link, &dcp_retained_sessions);
+		mutex_unlock(&dcp_retained_sessions_lock);
+	}
+	if (inherited) {
+		dev_info(dcp->dev, "DCPEXT left running by the boot loader; restarting its RTKit session, DMA retained until reboot\n");
+		return 0;
+	}
+	writel(APPLE_DCP_COPROC_CPU_CONTROL_RUN, dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+	ctrl = readl(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+	if (ctrl != APPLE_DCP_COPROC_CPU_CONTROL_RUN) {
+		dev_err(dcp->dev, "DCPEXT RUN not taken (CPU control %#x)\n", ctrl);
+		return -EIO;
+	}
+	dev_info(dcp->dev, "DCPEXT cold RUN; DMA retained until reboot\n");
+	return 0;
+}
+#endif

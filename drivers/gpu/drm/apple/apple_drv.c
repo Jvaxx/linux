@@ -706,6 +706,9 @@ static const struct of_device_id apple_dcp_id_tbl[] = {
 	/* The J514S boot loader names its DCP and display subsystem by SoC only. */
 	{ .compatible = "apple,t6030-dcp" },
 #endif
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_EXT)
+	{ .compatible = "apple,t6030-dcpext" },
+#endif
 	{},
 };
 
@@ -714,7 +717,10 @@ static bool apple_dcp_usable(struct device_node *np)
 {
 	return of_device_is_available(np) &&
 	       (!of_device_is_compatible(np, "apple,t8140-dcpext") ||
-		dcp_h17p_external_supported(np));
+		dcp_h17p_external_supported(np)) &&
+	       (!IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_EXT) ||
+		!of_device_is_compatible(np, "apple,t6030-dcpext") ||
+		dcp_t6030_ext_supported(np));
 }
 
 static int apple_drm_init_dcp(struct device *dev)
@@ -802,7 +808,7 @@ static int apple_drm_init_dcp(struct device *dev)
 		 * The J514S panel is only taken over from a started session:
 		 * without it the boot framebuffer (simpledrm) stays.
 		 */
-		if (ret && iomfb_is_v14_7(platform_get_drvdata(dcp[i])))
+		if (ret && iomfb_is_v14_7_panel(platform_get_drvdata(dcp[i])))
 			return ret;
 	}
 	/* HACK: Wait for dcp* to settle before a modeset */

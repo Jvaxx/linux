@@ -1313,7 +1313,9 @@ static void boot_3(struct apple_dcp *dcp, void *out, void *cookie)
 static void boot_2(struct apple_dcp *dcp, void *out, void *cookie)
 {
 #if DCP_FW_IS_V14_7
-	if (!dcp_v14_7_boot_step(dcp, out, "A444 create_default_fb"))
+	/* The external role has no default framebuffer: A444 answers 0 there. */
+	if (iomfb_is_v14_7_external(dcp) ? !iomfb_v14_7_ext_a444(dcp, out) :
+	    !dcp_v14_7_boot_step(dcp, out, "A444 create_default_fb"))
 		return;
 #endif
 	dcp_setup_video_limits(dcp, false, boot_3, NULL);
@@ -2278,6 +2280,24 @@ static void dcp_swapped(struct apple_dcp *dcp, void *data, void *cookie)
 	u32 swap_id = DCP_FW_SWAP(dcp).swap.swap_id;
 	u32 status = resp ? resp->ret : ~0U;
 
+#if DCP_FW_VER == DCP_FW_VERSION(14, 7, 0)
+	/*
+	 * The external firmware drops a swap it gets while its timings are
+	 * off (after a power-on) and says so in the output Boolean: the swap
+	 * ends here, never presented and never completed by D589.
+	 */
+	if (iomfb_is_v14_7_external(dcp) && resp && !status && resp->unkoutbool) {
+		dev_info_ratelimited(dcp->dev, "swap %u dropped: timings not enabled\n",
+				     swap_id);
+		dcp_present_submit(dcp, swap_id, false);
+		dcp_present_failed(dcp);
+		if (dcp_present_retires(dcp)) {
+			dcp_unarm_retained_framebuffers(dcp, swap_id);
+			dcp_drm_crtc_vblank(dcp->crtc);
+		}
+		return;
+	}
+#endif
 	ret = dcp_present_submit(dcp, swap_id, !status);
 	if (ret)
 		status = ~0U;
@@ -3268,7 +3288,9 @@ void iomfb_swap_complete_v14_7(struct apple_dcp *dcp, u32 swap_id)
 			return;
 		}
 		dev_err(dcp->dev, "unexpected present completion %u\n", swap_id);
-		WRITE_ONCE(dcp->crashed, true);
+		/* On the external role a stray completion is only logged. */
+		if (!iomfb_is_v14_7_external(dcp))
+			WRITE_ONCE(dcp->crashed, true);
 		return;
 	}
 
@@ -3359,5 +3381,7 @@ DEFINE_SHOW_ATTRIBUTE(iomfb_v14_7_status);
 void iomfb_debugfs_init_v14_7(struct apple_dcp *dcp, struct dentry *root)
 {
 	debugfs_create_file("j514s", 0444, root, dcp, &iomfb_v14_7_status_fops);
+	if (iomfb_is_v14_7_external(dcp))
+		dcp_ext_v14_7_debugfs_init(dcp, root);
 }
 #endif /* DCP_FW_VER == DCP_FW_VERSION(14, 7, 0) */

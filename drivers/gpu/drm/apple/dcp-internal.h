@@ -14,6 +14,7 @@
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
 #include <linux/scatterlist.h>
+#include <linux/usb/typec_dp.h>
 #include <linux/usb/typec_mux.h>
 
 #include "dptxep.h"
@@ -262,6 +263,11 @@ struct apple_dcp_hw_data {
 	u32 panel_mini_led : 1;
 	u32 panel_max_nits : 12;
 	u32 panel_default_nits : 12;
+	/*
+	 * A J514S external display controller (DCPEXT): the 14.7 firmware in
+	 * its external role, started cold and routed to the USB-C ports.
+	 */
+	u32 v14_7_external : 1;
 };
 static_assert(sizeof(struct apple_dcp_hw_data) ==
 	      ALIGN(offsetofend(struct apple_dcp_hw_data, firmware_request),
@@ -610,6 +616,27 @@ static inline bool iomfb_is_v14_7(const struct apple_dcp *dcp)
 	       dcp->fw_compat == DCP_FIRMWARE_V_14_7;
 }
 
+/*
+ * The J514S external role of the 14.7 interface (DCPEXT, USB-C DisplayPort).
+ * It exists only with DRM_APPLE_DCP_T6030_EXT, so its branches compile out
+ * of every other configuration.
+ */
+static inline bool iomfb_is_v14_7_external(const struct apple_dcp *dcp)
+{
+	return IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_EXT) && iomfb_is_v14_7(dcp) &&
+	       dcp->hw.v14_7_external;
+}
+
+/*
+ * The J514S internal panel role of the 14.7 interface: everything adopted
+ * from the boot loader (admission, PMP DISP, backlight, preferred mode only).
+ * Without DRM_APPLE_DCP_T6030_EXT this is iomfb_is_v14_7().
+ */
+static inline bool iomfb_is_v14_7_panel(const struct apple_dcp *dcp)
+{
+	return iomfb_is_v14_7(dcp) && !iomfb_is_v14_7_external(dcp);
+}
+
 /* Presents carry nits; one serialized IOMFB owner (H17P panel and DCPEXT, 14.7). */
 static inline bool dcp_presents_nits(const struct apple_dcp *dcp)
 {
@@ -712,5 +739,71 @@ void iomfb_debugfs_init_v14_7(struct apple_dcp *dcp, struct dentry *root);
 extern bool iomfb_v14_7_ctm;
 
 #define DCP_AUDIO_MAX_CHANS 15
+
+/*
+ * J514S external controllers (dcpext-t6030.c): the boot loader handoff,
+ * whether a published controller takes part in the DRM device, and its
+ * admission at probe.
+ */
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_EXT)
+bool dcp_t6030_ext_supported(struct device_node *np);
+int dcp_t6030_ext_admit(struct platform_device *pdev);
+#else
+static inline bool dcp_t6030_ext_supported(struct device_node *np)
+{
+	return false;
+}
+
+static inline int dcp_t6030_ext_admit(struct platform_device *pdev)
+{
+	return -ENODEV;
+}
+#endif
+
+/*
+ * The 14.7 external role (dcpext-t6030.c).  Every caller tests
+ * iomfb_is_v14_7_external() first, so without DRM_APPLE_DCP_T6030_EXT these
+ * calls compile out and need no definition.
+ */
+int dcp_ext_v14_7_init(struct apple_dcp *dcp);
+int dcp_ext_v14_7_start(struct apple_dcp *dcp);
+void dcp_ext_v14_7_unbind(struct apple_dcp *dcp);
+int dcp_ext_v14_7_connect(struct apple_dcp *dcp);
+int dcp_ext_v14_7_disconnect(struct apple_dcp *dcp, bool physical);
+void dcp_ext_v14_7_irq_hpd(struct apple_dcp *dcp);
+int dcp_ext_v14_7_route_select(struct apple_dcp_typec_route *route);
+int dcp_ext_v14_7_route_release(struct apple_dcp_typec_route *route);
+int dcp_ext_v14_7_route_deselect(struct apple_dcp_typec_route *route);
+void dcp_ext_v14_7_poweroff(struct apple_dcp *dcp);
+int dcp_ext_v14_7_suspend(struct apple_dcp *dcp);
+int dcp_ext_v14_7_resume(struct apple_dcp *dcp);
+bool dcp_ext_v14_7_presentable(struct apple_dcp *dcp);
+void dcp_ext_v14_7_failed(struct apple_dcp *dcp);
+void dcp_ext_v14_7_av_published(struct apple_dcp *dcp);
+void dcp_ext_v14_7_catalog(struct apple_dcp *dcp, const void *blob, u32 size);
+void dcp_ext_v14_7_attributes(struct apple_dcp *dcp, const void *blob, u32 size);
+u32 dcp_ext_v14_7_stride(struct apple_dcp *dcp);
+int dcp_ext_v14_7_dptx_call(struct apple_epic_service *service, u16 group, u32 command,
+			    const void *data, size_t size, void *reply, size_t room);
+struct drm_edid;
+const struct drm_edid *dcp_ext_v14_7_read_edid(struct apple_epic_service *service);
+struct dentry;
+void dcp_ext_v14_7_debugfs_init(struct apple_dcp *dcp, struct dentry *root);
+/* dcp.c: cold start of the coprocessor, its DMA pinned first. */
+int dcp_ext_v14_7_run(struct apple_dcp *dcp);
+
+/*
+ * A fresh IRQ_HPD for the port's current owner bypasses the Type-C route's
+ * duplicate-state filter on the 14.7 external profile: identical status
+ * images can describe distinct sink interrupts.  Only the owning
+ * route forwards it, once per notification.
+ */
+static inline bool dcp_typec_route_irq_hpd(const struct apple_dcp_typec_route *route,
+					   const struct apple_dcp_typec_route *owner,
+					   u32 status)
+{
+	return route == owner && owner && iomfb_is_v14_7_external(owner->dcp) &&
+	       (status & DP_STATUS_HPD_STATE) && (status & DP_STATUS_IRQ_HPD);
+}
 
 #endif /* __APPLE_DCP_INTERNAL_H__ */

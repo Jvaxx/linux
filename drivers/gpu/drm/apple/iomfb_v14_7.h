@@ -124,6 +124,10 @@ struct dcp_v14_7_session {
 
 	/* D576: flags of the last hotplug notification. */
 	u64 hotplug_flags;
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_EXT)
+	/* The external role's state (dcpext-t6030.c); NULL for the panel. */
+	struct dcp_ext_v14_7 *ext;
+#endif
 };
 
 int iomfb_v14_7_session_init(struct apple_dcp *dcp);
@@ -132,5 +136,17 @@ void iomfb_v14_7_fail(struct apple_dcp *dcp, const char *what);
 /* Callbacks whose reply needs a nested AP call (a context-0 continuation). */
 bool iomfb_v14_7_needs_continuation(int tag);
 void iomfb_v14_7_try_activate(struct apple_dcp *dcp);
+
+/*
+ * The external role (DRM_APPLE_DCP_T6030_EXT): the client opens after the
+ * first HPD reply, modes come from the sink's TimingElements, and mode and
+ * power are A411 and A472 (iomfb_v14_7.c, external block).
+ */
+struct drm_crtc_state;
+void iomfb_v14_7_ext_ready(struct apple_dcp *dcp);
+bool iomfb_v14_7_ext_a444(struct apple_dcp *dcp, void *out);
+int iomfb_v14_7_ext_open(struct apple_dcp *dcp, unsigned long timeout);
+int iomfb_v14_7_ext_modeset(struct apple_dcp *dcp, struct drm_crtc_state *crtc_state);
+int iomfb_v14_7_ext_power(struct apple_dcp *dcp, bool on);
 
 #endif /* __APPLE_IOMFB_V14_7_H__ */

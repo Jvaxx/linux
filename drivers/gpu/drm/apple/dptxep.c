@@ -886,6 +886,10 @@ static int dptxport_group_call(struct apple_epic_service *service, u16 group,
 {
 	struct dptx_port *dptx = service->cookie;
 
+	/* The J514S DCPEXT profile: its own replies, no invented ACK. */
+	if (iomfb_is_v14_7_external(service->ep->dcp))
+		return dcp_ext_v14_7_dptx_call(service, group, command, data, size,
+					       reply, room);
 	/* Keep native AFK-v2 training and its refusal policy distinct. */
 	if (service->ep->wire_v2)
 		return dptxport_v2_group_call(service, group, command, data,

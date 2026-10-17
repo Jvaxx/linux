@@ -19,7 +19,25 @@ struct dcp_parse_ctx {
 	/* External H17P candidates require separate publication/lookup proof. */
 	bool automatic_1080p180_rgb8;
 	bool ambiguous_180hz;
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_EXT)
+	/*
+	 * J514S DCPEXT (DCP firmware 14.7, USB-C): external SDR timings with an
+	 * 8-bit RGB colour only, progressive, unsplit, single pipe, no pixel
+	 * repetition.  In the tail padding.
+	 */
+	bool v14_7_rgb8;
+#endif
 };
+
+/* The J514S DCPEXT external SDR profile (DRM_APPLE_DCP_T6030_EXT only). */
+static inline bool dcp_parse_v14_7_rgb8(const struct dcp_parse_ctx *ctx)
+{
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_EXT)
+	return ctx->v14_7_rgb8;
+#else
+	return false;
+#endif
+}
 
 enum dcp_color_eotf {
 	DCP_EOTF_SDR_GAMMA = 0, // "SDR gamma"

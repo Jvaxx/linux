@@ -1601,7 +1601,7 @@ int dcp_get_modes(struct drm_connector *connector)
 	/* Internal H17P still has no supported EDID command transport. */
 	if (nr_modes && !apple_connector->drm_edid &&
 	    ((dcp->fw_compat != DCP_FIRMWARE_H17P &&
-	      !iomfb_is_v14_7(dcp)) ||
+	      !iomfb_is_v14_7_panel(dcp)) ||
 	     (dcp->dcpavservep && dcp->dcpavservep->wire_v2))) {
 		const struct drm_edid *edid;
 		/* Let physical disconnect advance the generation during the request. */
@@ -1780,7 +1780,7 @@ static bool dcp_mode_settable(struct apple_dcp *dcp,
 		return false;
 
 	if ((dcp->fw_compat == DCP_FIRMWARE_H17P ||
-	     iomfb_is_v14_7(dcp)) &&
+	     iomfb_is_v14_7_panel(dcp)) &&
 	    dcp->hw.iomfb_method_profile !=
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		return dcp_mode->mode.type & DRM_MODE_TYPE_PREFERRED;
@@ -1856,7 +1856,8 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 		ret = iomfb_modeset_h17p(dcp, crtc_state);
 		break;
 	case DCP_FIRMWARE_V_14_7:
-		ret = iomfb_modeset_v14_7(dcp, crtc_state);
+		ret = iomfb_is_v14_7_external(dcp) ? iomfb_v14_7_ext_modeset(dcp, crtc_state) :
+		      iomfb_modeset_v14_7(dcp, crtc_state);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n",
@@ -2200,6 +2201,11 @@ static void iomfb_atomic_start(struct apple_dcp *dcp,
 	}
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030)
 	if (iomfb_is_v14_7(dcp)) {
+		/* 14.7 external: no new present while the display is off or inactive. */
+		if (iomfb_is_v14_7_external(dcp) && !dcp_ext_v14_7_presentable(dcp)) {
+			schedule_work(&dcp->vblank_wq);
+			return;
+		}
 		atomic->scanout_v14_7 = iomfb_present_atomic_v14_7(dcp, atomic->crtc,
 								    atomic->state);
 		return;

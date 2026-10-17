@@ -142,6 +142,9 @@ static void dcpavserv_init(struct apple_epic_service *service, const char *name,
 		/* Also report announcements arriving after the discovery window. */
 		dev_dbg(dcp->dev, "DCPAVSERV: legacy EDID service published\n");
 	}
+	/* fw14 external: opened on publication, never gating DPTX. */
+	if (iomfb_is_v14_7_external(dcp))
+		dcp_ext_v14_7_av_published(dcp);
 }
 
 /* Defer DRM cleanup: AFK callbacks must not take mode_config.mutex. */
@@ -416,8 +419,11 @@ const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *dcp, u64 generation
 	if (!service)
 		return ERR_PTR(-ENODEV);
 
-	edid = service->ep->wire_v2 ? dcpavserv_read_edid_inline(service) :
-		dcpavserv_read_edid_legacy(service);
+	if (iomfb_is_v14_7_external(dcp))
+		edid = dcp_ext_v14_7_read_edid(service);
+	else
+		edid = service->ep->wire_v2 ? dcpavserv_read_edid_inline(service) :
+			dcpavserv_read_edid_legacy(service);
 	mutex_lock(&dcp->dcpavserv.lock);
 	if (dcp->dcpavserv.service != service ||
 	    !dcpavserv_edid_service_current(dcp, *epoch)) {
@@ -488,7 +494,7 @@ int dpavservep_init(struct apple_dcp *dcp)
 	}
 
 	/* Admission may arrive after startup; exact guards and late notify own it. */
-	if (ep->wire_v2)
+	if (ep->wire_v2 || iomfb_is_v14_7_external(dcp))
 		return 0;
 
 	/*
