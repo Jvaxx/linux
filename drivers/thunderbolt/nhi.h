@@ -11,6 +11,8 @@
 
 #include <linux/thunderbolt.h>
 
+struct tb_port;
+
 enum nhi_fw_mode {
 	NHI_FW_SAFE_MODE,
 	NHI_FW_AUTH_MODE,
@@ -79,6 +81,19 @@ struct tb_nhi_ring_layout {
  * @ring_configure: NHI specific hook to program the ring options registers
  *		    and enable the ring with the given flags. If not set
  *		    the standard USB4 NHI registers are used.
+ * @pci_tunnel_pre_activate: NHI specific hook run after a host PCIe tunnel has
+ *			   been allocated but before its paths and adapters are enabled
+ * @pci_tunnel_post_activate: NHI specific hook run after a host PCIe tunnel's
+ *			    paths and adapters have been enabled, including
+ *			    adoption of an enabled tunnel at domain startup
+ * @pci_tunnel_deactivate: Release native host state acquired by the
+ *			  PCIe post-activation hook
+ * @dp_tunnel_pre_activate: NHI specific hook run after DP hops are programmed
+ *			    and before VE/AE. USB4 DPTX Discovery belongs here.
+ * @dp_tunnel_post_activate: NHI specific hook run after a DP tunnel's
+ *			     adapters have VE/AE enabled
+ * @dp_tunnel_deactivate: Releases state from an attempted post-activation hook,
+ *			 before adapters are disabled or the host router is removed
  * @is_present: Whether the device is currently present on the parent bus
  * @init_interrupts: NHI specific interrupt initialization hook
  * @reset_interface: Resets the host interface
@@ -97,7 +112,17 @@ struct tb_nhi_ops {
 	void (*ring_interrupt_active)(struct tb_ring *ring, bool active);
 	void (*ring_interrupt_mask)(struct tb_ring *ring, bool mask);
 	void (*ring_configure)(struct tb_ring *ring, u32 flags, u32 e2e_flags);
+	int (*pci_tunnel_pre_activate)(struct tb_nhi *nhi);
+	int (*pci_tunnel_post_activate)(struct tb_nhi *nhi);
+	int (*pci_tunnel_deactivate)(struct tb_nhi *nhi);
+	int (*dp_tunnel_pre_activate)(struct tb_nhi *nhi, struct tb_port *in,
+				      struct tb_port *out);
+	int (*dp_tunnel_post_activate)(struct tb_nhi *nhi, struct tb_port *in,
+				       struct tb_port *out);
+	void (*dp_tunnel_deactivate)(struct tb_nhi *nhi, struct tb_port *in,
+				     struct tb_port *out);
 	bool (*is_present)(struct tb_nhi *nhi);
+	void (*dp_tunnel_changed)(struct tb_nhi *nhi, u8 in_port, bool active);
 	int (*init_interrupts)(struct tb_nhi *nhi);
 	void (*reset_interface)(struct tb_nhi *nhi);
 };
@@ -170,6 +195,18 @@ struct tb_nhi_ops {
 #define QUIRK_RESET_DMA_ON_TEARDOWN			BIT(2)
 #define QUIRK_NO_DMA_PORT				BIT(3)
 #define QUIRK_NO_USB3_BW_ALLOC				BIT(4)
+#define QUIRK_HOST_DP_NFC_CREDITS			BIT(5)
+/*
+ * The host router stays powered and its links stay up across system sleep,
+ * so routers must not be asked to enter sleep: a TBT3 device router that
+ * was told to sleep drops its link on its own some tens of seconds later.
+ */
+#define QUIRK_NO_SYSTEM_SLEEP				BIT(6)
+/*
+ * Set for one system sleep when the routers stayed awake and the tunneled
+ * PCIe host kept its link up: the tunnels are still active on resume.
+ */
+#define QUIRK_KEEP_TUNNELS				BIT(7)
 
 /*
  * Minimal number of vectors when we use MSI-X. Two for control channel
