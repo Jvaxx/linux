@@ -1671,6 +1671,7 @@ static int vfio_dma_do_unmap(struct vfio_iommu *iommu,
 		goto unlock;
 	}
 
+	WARN_ON(!IS_ENABLED(CONFIG_MM_SUBPAGE) && ((pgsize - 1) & PAGE_MASK));
 again:
 	/*
 	 * vfio-iommu-type1 (v1) - User mappings were coalesced together to
@@ -1986,6 +1987,8 @@ static int vfio_dma_do_map(struct vfio_iommu *iommu,
 	mutex_lock(&iommu->lock);
 
 	pgsize = (size_t)1 << __ffs(iommu->pgsize_bitmap);
+
+	WARN_ON(!IS_ENABLED(CONFIG_MM_SUBPAGE) && ((pgsize - 1) & PAGE_MASK));
 
 	if ((size | iova | vaddr) & (pgsize - 1)) {
 		ret = -EINVAL;
