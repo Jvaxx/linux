@@ -602,6 +602,45 @@ static void brcmf_msgbuf_rxreorder(struct brcmf_if *ifp, struct sk_buff *skb)
 {
 }
 
+/* Free the host state of a flowring. The ring's commonring lock, which the tx
+ * flow worker holds while it uses the ring, also orders this with the tx
+ * status lookup in brcmf_msgbuf_flowring_ifidx(). A commonring that was never
+ * configured has no initialized lock; no frame was ever posted on it, so no tx
+ * status can refer to it.
+ */
+static void
+brcmf_msgbuf_flowring_delete(struct brcmf_msgbuf *msgbuf, u16 flowid)
+{
+	struct brcmf_commonring *commonring = msgbuf->flowrings[flowid];
+
+	if (!commonring->inited) {
+		brcmf_flowring_delete(msgbuf->flow, flowid);
+		return;
+	}
+
+	brcmf_commonring_lock(commonring);
+	brcmf_flowring_delete(msgbuf->flow, flowid);
+	brcmf_commonring_unlock(commonring);
+}
+
+/* The interface index the host gave a flowring, or 0 once the ring is gone. */
+static u8
+brcmf_msgbuf_flowring_ifidx(struct brcmf_msgbuf *msgbuf, u16 flowid)
+{
+	struct brcmf_commonring *commonring = msgbuf->flowrings[flowid];
+	u8 ifidx = 0;
+
+	if (!commonring->inited)
+		return 0;
+
+	brcmf_commonring_lock(commonring);
+	if (msgbuf->flow->rings[flowid])
+		ifidx = brcmf_flowring_ifidx_get(msgbuf->flow, flowid);
+	brcmf_commonring_unlock(commonring);
+
+	return ifidx;
+}
+
 static void
 brcmf_msgbuf_remove_flowring(struct brcmf_msgbuf *msgbuf, u16 flowid)
 {
@@ -615,7 +654,7 @@ brcmf_msgbuf_remove_flowring(struct brcmf_msgbuf *msgbuf, u16 flowid)
 	dma_free_coherent(msgbuf->drvr->bus_if->dev, dma_sz, dma_buf,
 			  msgbuf->flowring_dma_handle[flowid]);
 
-	brcmf_flowring_delete(msgbuf->flow, flowid);
+	brcmf_msgbuf_flowring_delete(msgbuf, flowid);
 }
 
 static bool brcmf_msgbuf_get_flowid(struct brcmf_msgbuf *msgbuf,
@@ -680,7 +719,7 @@ brcmf_msgbuf_flowring_create_worker(struct brcmf_msgbuf *msgbuf,
 				     GFP_KERNEL);
 	if (!dma_buf) {
 		bphy_err(drvr, "dma_alloc_coherent failed\n");
-		brcmf_flowring_delete(msgbuf->flow, flowid);
+		brcmf_msgbuf_flowring_delete(msgbuf, flowid);
 		return BRCMF_FLOWRING_INVALID_ID;
 	}
 
@@ -1004,18 +1043,20 @@ brcmf_msgbuf_process_txstatus(struct brcmf_msgbuf *msgbuf, void *buf)
 	 * (0x0006 EXPIRED) after the ring was freed -- awdl0's VO multicast
 	 * never completes while the ring is open (observed as a NULL deref
 	 * here on `awdl-if destroy`). The skb and its pktid are unaffected.
+	 * Only the trace looks the ring up, under the ring's lock, so that a
+	 * ring removed from another context is not read while it is freed.
 	 */
-	ring_ifidx = msgbuf->flow->rings[flowid] ?
-		     brcmf_flowring_ifidx_get(msgbuf->flow, flowid) : 0;
-	if (ring_ifidx && READ_ONCE(brcmf_awdl_trace) &&
-	    __ratelimit(&brcmf_awdl_txs_rs))
-		pr_info("brcmfmac: awdl txstatus ring_ifidx=%u msg_ifidx=%u awdl=%d flow=%u status=%d tx_status=0x%04x meta=%u dst=%pM\n",
-			ring_ifidx, tx_status->msg.ifidx,
-			ifp ? ifp->is_awdl : -1, flowid,
-			(int)(s16)le16_to_cpu(tx_status->compl_hdr.status),
-			le16_to_cpu(tx_status->tx_status),
-			le16_to_cpu(tx_status->metadata_len),
-			skb->len >= ETH_ALEN ? skb->data : (u8 *)"\0\0\0\0\0\0");
+	if (READ_ONCE(brcmf_awdl_trace)) {
+		ring_ifidx = brcmf_msgbuf_flowring_ifidx(msgbuf, flowid);
+		if (ring_ifidx && __ratelimit(&brcmf_awdl_txs_rs))
+			pr_info("brcmfmac: awdl txstatus ring_ifidx=%u msg_ifidx=%u awdl=%d flow=%u status=%d tx_status=0x%04x meta=%u dst=%pM\n",
+				ring_ifidx, tx_status->msg.ifidx,
+				ifp ? ifp->is_awdl : -1, flowid,
+				(int)(s16)le16_to_cpu(tx_status->compl_hdr.status),
+				le16_to_cpu(tx_status->tx_status),
+				le16_to_cpu(tx_status->metadata_len),
+				skb->len >= ETH_ALEN ? skb->data : (u8 *)"\0\0\0\0\0\0");
+	}
 
 	brcmf_txfinalize(ifp, skb, true);
 }
@@ -1402,7 +1443,7 @@ brcmf_msgbuf_process_flow_ring_delete_response(struct brcmf_msgbuf *msgbuf,
 
 	if (status) {
 		bphy_err(drvr, "Flowring deletion failed, code %d\n", status);
-		brcmf_flowring_delete(msgbuf->flow, flowid);
+		brcmf_msgbuf_flowring_delete(msgbuf, flowid);
 		return;
 	}
 	brcmf_dbg(MSGBUF, "Flowring %d Delete response status %d\n", flowid,
