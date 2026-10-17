@@ -244,6 +244,17 @@ static int brcmf_cfg80211_request_if(struct brcmf_if *ifp,
 	iface_create_ver = 0;
 	err = brcmf_fil_bsscfg_int_query(ifp, "interface_create",
 					 &iface_create_ver);
+	/* Only the version 3 request can describe an AWDL interface. Refuse it
+	 * on older firmware, including firmware too old to report a version,
+	 * rather than send a request that does not say what is asked for.
+	 */
+	if (if_type == BRCMF_INTERFACE_TYPE_AWDL &&
+	    (err || iface_create_ver != BRCMF_INTERFACE_CREATE_VER_3)) {
+		bphy_err(ifp->drvr,
+			 "AWDL needs interface_create version 3 (firmware: %d)\n",
+			 err ? -1 : (int)iface_create_ver);
+		return -EOPNOTSUPP;
+	}
 	if (!err) {
 		err = brcmf_cfg80211_request_if_internal(ifp, iface_create_ver,
 							 if_type, macaddr);
