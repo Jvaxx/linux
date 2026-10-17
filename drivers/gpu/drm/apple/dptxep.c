@@ -971,13 +971,12 @@ static int dptxport_v2_group_call(struct apple_epic_service *service, u16 group,
 
 /*
  * Group 1 calls 3 and 4 come around link (re)configuration, audio prepare
- * included. They carry a lane count at +0x10 in (1, 3) and at +0x00 in
- * (1, 4); the J700 code reads (1, 3) as drive settings with levels per
- * lane from +0x20, and its group 0 GET (0, 4) has the count at +0x00.
- * macOS 13 acks both with the request, (1, 3) with +0x00..0x03
- * cleared and (1, 4) with +0x10..0x13 and +0x20 to the end cleared, so
- * what DCP left there does not go back (42 of 42 traced pairs on t6020,
- * 13.5 firmware: TV through a USB-C to HDMI adapter, Dell over TB).
+ * included. Handled as group 0's SET and GET_DRIVE_SETTINGS, which have
+ * the same numbers, they stored addresses from their payload as drive
+ * settings, and DCP then refused to start audio to a TV behind a USB-C to
+ * HDMI adapter (M2 Pro, 13.5 firmware). Answer each with its request, with
+ * +0x00..0x03 cleared for (1, 3), and +0x10..0x13 and everything from +0x20
+ * cleared for (1, 4).
  */
 static int dptxport_call_group1(u32 command, const void *data,
 				size_t data_size, void *reply, size_t reply_size)
@@ -1005,6 +1004,14 @@ static int dptxport_group_call(struct apple_epic_service *service, u16 group,
 	if (service->ep->wire_v2)
 		return dptxport_v2_group_call(service, group, command, data,
 					     size, reply, room);
+
+	/* Legacy dispatch is by command, except the tested 13.5 group-1 calls. */
+	if (service->ep->dcp->fw_compat == DCP_FIRMWARE_V_13_5 &&
+	    group == 1 && (command == 3 || command == 4))
+		return dptxport_call_group1(command, data, size, reply, room);
+	if (service->ep->dcp->fw_compat == DCP_FIRMWARE_V_12_3 ||
+	    service->ep->dcp->fw_compat == DCP_FIRMWARE_V_13_5)
+		return dptxport_call(service, command, data, size, reply, room);
 
 	if (!group)
 		return dptxport_call(service, command, data, size, reply, room);
