@@ -371,7 +371,7 @@ struct xhci_s2idle_test {
 	/* The PORTSC read just before which the device below signals resume, from 1 */
 	unsigned int resume_at_read;
 	unsigned int reads;
-	/* The generic xHCI root hub methods, as the USB core calls them */
+	/* The generic xHCI root hub and interrupt methods, as the USB core calls them */
 	struct hc_driver driver;
 	struct device *dev;
 	char name[32];
@@ -649,7 +649,7 @@ static irqreturn_t xhci_s2idle_test_irq(struct xhci_s2idle_test *t)
 	irqreturn_t ret;
 
 	local_irq_disable();
-	ret = xhci_irq(t->hcd);
+	ret = t->driver.irq(t->hcd);
 	local_irq_enable();
 	return ret;
 }
