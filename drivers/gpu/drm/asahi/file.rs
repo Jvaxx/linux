@@ -247,7 +247,7 @@ impl drm::file::DriverFile for File {
 
         let gpu = &device.gpu;
         let id = gpu.ids().file.next();
-        let user_range = gpu.uat_geometry().user_usable_range();
+        let user_range = gpu.user_range();
 
         mod_dev_dbg!(device, "[File {}]: DRM device opened\n", id);
         Ok(KBox::pin_init(File::new(id, user_range), GFP_KERNEL)?)
@@ -375,7 +375,7 @@ impl File {
             params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES as u64;
         }
 
-        if *module_parameters::fault_control.value() == 0xb {
+        if gpu.soft_faults() && *module_parameters::fault_control.value() == 0xb {
             params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS as u64;
         }
 
@@ -603,6 +603,9 @@ impl File {
         };
 
         let gem = gem::new_object(device, data.size.try_into()?, data.flags, resv_obj, reclaim_cpu)?;
+        if device.gpu.prepare_new_objects() {
+            gem::prepare_new_object(&gem)?;
+        }
 
         let handle = gem.create_handle(file)?;
         data.handle = handle;
@@ -676,7 +679,19 @@ impl File {
             return Err(EINVAL);
         }
 
-        if device.gpu.as_any().is::<crate::g17::Gpu>() {
+        if let Some(limit) = device.gpu.bind_batch_limit() {
+            if data.num_binds == 0
+                || data.num_binds > limit
+                || data.userptr == 0
+                || data.stride % 8 != 0
+                || data.stride as usize > kernel::page::PAGE_SIZE
+            {
+                cls_pr_debug!(Errors, "vm_bind: Batch outside the GPU's limits\n");
+                return Err(EINVAL);
+            }
+        }
+
+        if device.gpu.as_any().is::<crate::g17::Gpu>() || device.gpu.tracked_submission() {
             return Self::vm_bind_g17(data, file);
         }
 
@@ -1240,7 +1255,7 @@ impl File {
             .reader()
             .read_all(bytes, GFP_KERNEL)
         };
-        let guarded = gpu.as_any().is::<crate::g17::Gpu>();
+        let guarded = gpu.as_any().is::<crate::g17::Gpu>() || gpu.tracked_submission();
         // Once G17 output syncobjs are resolved, its queue must install a fence
         // on every failure. Take the fallible userspace snapshot before that point.
         if guarded {
