@@ -12,6 +12,7 @@
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
+#include <linux/pm_runtime.h>
 #include <linux/regmap.h>
 #include <linux/mfd/syscon.h>
 #include <linux/reset-controller.h>
@@ -345,14 +346,71 @@ static int apple_pmgr_reset_xlate(struct reset_controller_dev *rcdev,
 	return 0;
 }
 
+#define APPLE_PMGR_PS_MAX_FOREIGN 2
+
+/* Release the parents apple_pmgr_ps_take_foreign() took; joining them holds them now. */
+static void apple_pmgr_ps_release_foreign(struct device **taken, int n)
+{
+	while (n-- > 0) {
+		pm_runtime_put(taken[n]);
+		dev_pm_domain_detach(taken[n], false);
+	}
+}
+
+/*
+ * genpd adds a domain that is on only below parents that are on. The PMGR
+ * parents of a domain found on are on, but a parent from another provider
+ * need not be: the T6030 PMP device-state request a DISPEXT chain hangs from
+ * is off until it is taken, even when the boot loader left the chain on. Take
+ * such parents through genpd before joining them. Returns the number taken.
+ */
+static int apple_pmgr_ps_take_foreign(struct device *dev, struct device **taken)
+{
+	struct of_phandle_iterator it;
+	unsigned int index = 0;
+	int n = 0, ret;
+
+	/* A single parent is already held: the bus attached the device to it. */
+	if (dev->pm_domain)
+		return 0;
+
+	of_for_each_phandle(&it, ret, dev->of_node, "power-domains", "#power-domain-cells", -1) {
+		struct device *virt;
+
+		if (of_match_node(dev->driver->of_match_table, it.node)) {
+			index++;
+			continue;
+		}
+		virt = n < APPLE_PMGR_PS_MAX_FOREIGN ? dev_pm_domain_attach_by_id(dev, index) :
+						       ERR_PTR(-E2BIG);
+		index++;
+		if (IS_ERR_OR_NULL(virt)) {
+			ret = virt ? PTR_ERR(virt) : -ENODEV;
+			goto err;
+		}
+		ret = pm_runtime_resume_and_get(virt);
+		if (ret) {
+			dev_pm_domain_detach(virt, false);
+			goto err;
+		}
+		taken[n++] = virt;
+	}
+	return n;
+err:
+	of_node_put(it.node);
+	apple_pmgr_ps_release_foreign(taken, n);
+	return ret;
+}
+
 static int apple_pmgr_ps_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct device_node *node = dev->of_node;
 	struct apple_pmgr_ps *ps;
 	struct regmap *regmap;
+	struct device *foreign[APPLE_PMGR_PS_MAX_FOREIGN];
 	struct of_phandle_iterator it;
-	int ret;
+	int ret, nforeign = 0;
 	const char *name;
 	bool active, t8132, strict_state = false;
 	struct device_node *tvm;
@@ -479,6 +537,15 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	if (active) {
+		nforeign = apple_pmgr_ps_take_foreign(dev, foreign);
+		if (nforeign < 0) {
+			ret = nforeign;
+			nforeign = 0;
+			goto err_remove;
+		}
+	}
+
 	of_for_each_phandle(&it, ret, node, "power-domains", "#power-domain-cells", -1) {
 		struct of_phandle_args parent, child;
 
@@ -499,6 +566,9 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 		}
 	}
 
+	apple_pmgr_ps_release_foreign(foreign, nforeign);
+	nforeign = 0;
+
 	/*
 	 * Do not participate in regular PM; parent power domains are handled via the
 	 * genpd hierarchy.
@@ -518,6 +588,7 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 
 	return 0;
 err_remove:
+	apple_pmgr_ps_release_foreign(foreign, nforeign);
 	of_genpd_del_provider(node);
 	pm_genpd_remove(&ps->genpd);
 	return ret;
