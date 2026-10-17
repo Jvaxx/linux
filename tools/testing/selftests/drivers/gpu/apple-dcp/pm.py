@@ -39,7 +39,7 @@ static bool pipe_change_window(void);
  int (*prepare)(struct typec_mux_dev *, struct typec_mux_state *);
  int (*finish)(struct typec_mux_dev *, struct typec_mux_state *);
  void (*commit)(struct typec_mux_dev *, struct typec_mux_state *);
- void (*abort)(struct typec_mux_dev *, struct typec_mux_state *);bool removed; };
+ void (*abort)(struct typec_mux_dev *, struct typec_mux_state *);bool removed, transient_timeouts; };
  struct typec_mux_context { struct { bool held; } lock; };
  struct task_struct { int unused; };static struct task_struct test_task;
  #define current (&test_task)
@@ -48,7 +48,7 @@ static bool pipe_change_window(void);
  static void srcu_read_unlock(int *s,int i) { (void)s;(void)i; }
  #define mutex_trylock(m) ((m)->held ? 0 : ((m)->held=true))
  #define mutex_unlock(m) ((m)->held=false)
- struct typec_mux { unsigned int num_mux_devs; struct typec_mux_dev **mux_devs; struct typec_mux_context *context; struct typec_mux_state transaction; struct task_struct *owner; int srcu_index; unsigned prepared; bool applied; };
+ struct typec_mux { unsigned int num_mux_devs; struct typec_mux_dev **mux_devs; struct typec_mux_context *context; struct typec_mux_state transaction; struct task_struct *owner; int srcu_index; unsigned prepared; bool applied, timeout_transient; };
  #define IS_ERR_OR_NULL(p) (!(p))''')
     prefix=prefix.replace('#define WARN_ON_ONCE(v) assert(!(v))', 'static bool checked_warn(bool v) { assert(!v);return v; }\n#define WARN_ON_ONCE(v) checked_warn(v)')
     prefix=prefix.replace('#define guard(kind) (void)',r'''
