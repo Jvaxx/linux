@@ -1292,6 +1292,33 @@ static void posixtimer_exec(struct task_struct *me)
 #endif
 }
 
+#if defined(CONFIG_MM_SUBPAGE) || defined(CONFIG_ARCH_HAS_USER_PAGE_SIZE)
+/*
+ * The user page-size preference is set by an unprivileged prctl. Like the
+ * personality bits in PER_CLEAR_ON_SETID, it must not reach an image that
+ * gains privilege through set-user-ID, set-group-ID, file capabilities or
+ * an LSM secure-exec transition.
+ */
+static bool bprm_drops_page_size_policy(const struct linux_binprm *bprm)
+{
+	return (bprm->per_clear & PER_CLEAR_ON_SETID) || bprm->secureexec;
+}
+#endif
+
+#ifdef CONFIG_MM_SUBPAGE
+/*
+ * Stage an image that gains privilege at the granule it gets without the
+ * caller's preference. Credentials must already be computed, and this
+ * must run before the point of no return.
+ */
+int bprm_secure_page_size(struct linux_binprm *bprm)
+{
+	if (!bprm_drops_page_size_policy(bprm))
+		return 0;
+	return bprm_set_page_shift(bprm, bprm->secure_page_shift ?: PAGE_SHIFT);
+}
+#endif
+
 /*
  * Calling this is the point of no return. None of the failures will be
  * seen by userspace since either the process is already taking a fatal
@@ -1311,6 +1338,13 @@ int begin_new_exec(struct linux_binprm * bprm)
 	retval = bprm_creds_from_file(bprm);
 	if (retval)
 		return retval;
+
+#ifdef CONFIG_MM_SUBPAGE
+	/* Still before the point of no return: a failure fails the exec. */
+	retval = bprm_secure_page_size(bprm);
+	if (retval)
+		return retval;
+#endif
 
 	/*
 	 * This tracepoint marks the point before flushing the old exec where
@@ -1404,6 +1438,13 @@ int begin_new_exec(struct linux_binprm * bprm)
 					PF_NOFREEZE | PF_NO_SETAFFINITY);
 	flush_thread();
 	me->personality &= ~bprm->per_clear;
+#ifdef CONFIG_ARCH_HAS_USER_PAGE_SIZE
+	/* A privileged image and its children start without a preference. */
+	if (bprm_drops_page_size_policy(bprm)) {
+		me->exec_page_shift = 0;
+		me->default_exec_page_shift = 0;
+	}
+#endif
 
 	clear_syscall_work_syscall_user_dispatch(me);
 

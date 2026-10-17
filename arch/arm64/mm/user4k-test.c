@@ -33,6 +33,7 @@
 #include <linux/memcontrol.h>
 #include <linux/pagemap.h>
 #include <linux/pagewalk.h>
+#include <linux/personality.h>
 #include <linux/perf_event.h>
 #include <linux/preempt.h>
 #include <linux/rmap.h>
@@ -5374,6 +5375,119 @@ static void user4k_exec_arguments_test(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, bprm->p, initial + copied);
 		KUNIT_EXPECT_EQ(test, bprm->argc, 0);
 		KUNIT_EXPECT_EQ(test, bprm->vma_pages, 0UL);
+	}
+}
+
+/* Stage two strings at the top of a fresh exec stack in @mm. */
+static unsigned long test_stage_exec_strings(struct kunit *test,
+		struct linux_binprm *bprm, struct mm_struct *mm)
+{
+	unsigned long initial;
+
+	bprm->mm = mm;
+	KUNIT_ASSERT_EQ(test, create_init_stack_vma(mm, &bprm->vma, &bprm->p), 0);
+	initial = bprm->p;
+	bprm->argmin = initial - SZ_2M;
+	bprm->rlim_stack.rlim_cur = SZ_8M;
+	bprm->rlim_stack.rlim_max = RLIM_INFINITY;
+	KUNIT_ASSERT_EQ(test, copy_string_kernel("arg", bprm), 0);
+	KUNIT_ASSERT_EQ(test, copy_string_kernel("setid-image", bprm), 0);
+	return initial - bprm->p;
+}
+
+static void test_expect_exec_strings(struct kunit *test,
+		struct linux_binprm *bprm, unsigned long copied)
+{
+	char buf[16] = {};
+
+	KUNIT_ASSERT_EQ(test, copied, sizeof("setid-image") + sizeof("arg"));
+	KUNIT_ASSERT_EQ(test, access_remote_vm(bprm->mm, bprm->p, buf, copied, 0),
+			(int)copied);
+	KUNIT_EXPECT_STREQ(test, buf, "setid-image");
+	KUNIT_EXPECT_STREQ(test, buf + sizeof("setid-image"), "arg");
+}
+
+/*
+ * A set-user-ID, set-group-ID or secure-exec image must not run with the
+ * caller's unprivileged granule preference: it is restaged at the granule
+ * it gets without one, with the staged arguments intact.
+ */
+static void user4k_exec_privileged_test(struct kunit *test)
+{
+	unsigned int privileged;
+
+	if (!user4k_test_enabled && !IS_ENABLED(CONFIG_KASAN)) {
+		kunit_skip(test, "borrowed-mm stack setup requires hardware opt-in");
+		return;
+	}
+	for (privileged = 0; privileged < 3; privileged++) {
+		struct linux_binprm *bprm = kunit_kzalloc(test, sizeof(*bprm), GFP_KERNEL);
+		struct mm_struct *mm = test_vma_mm(test);
+		unsigned long copied;
+
+		KUNIT_ASSERT_NOT_NULL(test, bprm);
+		KUNIT_ASSERT_NOT_NULL(test, mm);
+		copied = test_stage_exec_strings(test, bprm, mm);
+		bprm->secure_page_shift = PAGE_SHIFT;
+		if (privileged == 1)
+			bprm->per_clear = PER_CLEAR_ON_SETID;
+		else if (privileged == 2)
+			bprm->secureexec = 1;
+		/* A replacement drops the staging mm's reference. */
+		mmget(mm);
+		KUNIT_ASSERT_EQ(test, bprm_secure_page_size(bprm), 0);
+		if (bprm->mm != mm)
+			KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test,
+					user4k_vma_mm_free, bprm->mm), 0);
+		else
+			mmput(mm);
+		KUNIT_EXPECT_EQ(test, mm_page_shift(bprm->mm),
+				privileged ? PAGE_SHIFT : 12U);
+		KUNIT_EXPECT_PTR_EQ(test, bprm->vma->vm_mm, bprm->mm);
+		test_expect_exec_strings(test, bprm, copied);
+	}
+}
+
+/* The arch selection records the preference-free granule for begin_new_exec(). */
+static void user4k_exec_secure_granule_test(struct kunit *test)
+{
+	unsigned int saved = current->exec_page_shift;
+	unsigned int compat;
+
+	if (!user4k_test_enabled && !IS_ENABLED(CONFIG_KASAN)) {
+		kunit_skip(test, "borrowed-mm stack setup requires hardware opt-in");
+		return;
+	}
+	if (!cpus_have_final_cap(ARM64_HAS_USER4K_GRANULE)) {
+		kunit_skip(test, "no 4K translation granule");
+		return;
+	}
+	for (compat = 0; compat < 2; compat++) {
+		struct linux_binprm *bprm = kunit_kzalloc(test, sizeof(*bprm), GFP_KERNEL);
+		struct mm_struct *mm = mm_alloc_exec_page_shift(PAGE_SHIFT);
+		unsigned long copied;
+		int ret;
+
+		KUNIT_ASSERT_NOT_NULL(test, bprm);
+		KUNIT_ASSERT_NOT_NULL(test, mm);
+		copied = test_stage_exec_strings(test, bprm, mm);
+		current->exec_page_shift = 12;
+		ret = arm64_bprm_prepare_mm(bprm, compat);
+		current->exec_page_shift = saved;
+		KUNIT_ASSERT_EQ(test, ret, 0);
+		KUNIT_EXPECT_EQ(test, mm_page_shift(bprm->mm), 12U);
+		/* AArch32 always uses 4K when available; AArch64 defaults to native. */
+		KUNIT_EXPECT_EQ(test, bprm->secure_page_shift, compat ? 12U : PAGE_SHIFT);
+		bprm->per_clear = PER_CLEAR_ON_SETID;
+		mm = bprm->mm;
+		/* Keep the staging mm alive across a possible replacement. */
+		mmget(mm);
+		KUNIT_ASSERT_EQ(test, bprm_secure_page_size(bprm), 0);
+		mmput(mm);
+		KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, user4k_vma_mm_free,
+				bprm->mm), 0);
+		KUNIT_EXPECT_EQ(test, mm_page_shift(bprm->mm), compat ? 12U : PAGE_SHIFT);
+		test_expect_exec_strings(test, bprm, copied);
 	}
 }
 
@@ -14326,6 +14440,8 @@ static struct kunit_case user4k_test_cases[] = {
 	KUNIT_CASE(user4k_mremap_resize_test),
 	KUNIT_CASE(user4k_stack_relocate_test),
 	KUNIT_CASE(user4k_exec_arguments_test),
+	KUNIT_CASE(user4k_exec_privileged_test),
+	KUNIT_CASE(user4k_exec_secure_granule_test),
 	KUNIT_CASE(user4k_special_mapping_test),
 	KUNIT_CASE(native_callback_mapping_test),
 	KUNIT_CASE(user4k_callback_mapping_test),

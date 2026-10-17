@@ -891,10 +891,13 @@ int arm64_bprm_prepare_mm(struct linux_binprm *bprm, bool compat)
 {
 	unsigned int requested = current->exec_page_shift ?:
 				 current->default_exec_page_shift;
-	unsigned int shift = arm64_exec_page_shift(compat,
-			cpus_have_final_cap(ARM64_HAS_USER4K_GRANULE), PAGE_SHIFT,
-			requested);
+	bool has_4k = cpus_have_final_cap(ARM64_HAS_USER4K_GRANULE);
+	unsigned int shift = arm64_exec_page_shift(compat, has_4k, PAGE_SHIFT,
+						   requested);
 
+	/* begin_new_exec() falls back to this if the exec gains privilege. */
+	bprm->secure_page_shift = arm64_exec_page_shift(compat, has_4k,
+							PAGE_SHIFT, 0);
 	return bprm_set_page_shift(bprm, shift);
 }
 

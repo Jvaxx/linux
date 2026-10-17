@@ -82,6 +82,13 @@ struct linux_binprm {
 	unsigned long exec;
 
 	struct rlimit rlim_stack; /* Saved RLIMIT_STACK used during exec. */
+#ifdef CONFIG_MM_SUBPAGE
+	/*
+	 * User page shift the image gets without the caller's page-size
+	 * preference, used when the exec gains privilege. Zero: native.
+	 */
+	unsigned int secure_page_shift;
+#endif
 
 	char buf[BINPRM_BUF_SIZE];
 } __randomize_layout;
@@ -162,6 +169,7 @@ extern void unregister_binfmt(struct linux_binfmt *);
 
 #ifdef CONFIG_MM_SUBPAGE
 int bprm_set_page_shift(struct linux_binprm *bprm, unsigned int page_shift);
+int bprm_secure_page_size(struct linux_binprm *bprm);
 #endif
 
 extern int __must_check remove_arg_zero(struct linux_binprm *);
