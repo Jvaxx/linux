@@ -3305,11 +3305,11 @@ int dcp_start(struct platform_device *pdev)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	int ret;
 
-	/* A failed component bind leaves no RTKit instance to start. */
+	/* Even if nothing starts, dcp_wait_ready() must find it initialised. */
+	init_completion(&dcp->start_done);
+
 	if (IS_ERR_OR_NULL(dcp->rtk))
 		return -ENODEV;
-
-	init_completion(&dcp->start_done);
 
 	/* Make the H17P allocator available before external service discovery. */
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL) {
