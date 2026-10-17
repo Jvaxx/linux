@@ -468,6 +468,7 @@ err_free:
 
 static const struct of_device_id apple_pmp_report_entry_of_match[] = {
 	{ .compatible = "apple,t6000-pmp-v2-report-entry" },
+	{ .compatible = "apple,t8140-pmp-v2-report-entry" },
 	{}
 };
 
