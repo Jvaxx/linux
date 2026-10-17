@@ -56,6 +56,92 @@ pub(crate) enum EntropyEnd {
     Abandoned,
 }
 
+impl EntropyEnd {
+    /// How a request ended that the mailbox refused with `e`. ETIMEDOUT is
+    /// its wait for room running out.
+    pub(crate) fn not_sent(e: Error) -> Self {
+        EntropyEnd::NotSent {
+            full: e == ETIMEDOUT,
+        }
+    }
+}
+
+/// How a hwrng read ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadEnd {
+    /// It took this many bytes.
+    Bytes(usize),
+    /// None, as requests are being held back: nothing failed, and the core
+    /// tries again later.
+    Held(Error),
+    /// None, as the request failed.
+    Failed(Error),
+}
+
+/// How a hwrng read ends that took `written` bytes and then stopped for
+/// `failure`, if anything stopped it.
+pub(crate) fn read_end(written: usize, failure: Option<Error>) -> ReadEnd {
+    if written > 0 {
+        return ReadEnd::Bytes(written);
+    }
+    // must return a negative errno, not 0: a blocking reader would spin on 0
+    match failure.unwrap_or(EIO) {
+        e if e == EAGAIN => ReadEnd::Held(e),
+        e => ReadEnd::Failed(e),
+    }
+}
+
+/// What came of an attempt at the ready-phase hwrng survey.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Survey {
+    Registered,
+    /// Requests were held back, so the enclave was not asked: try again,
+    /// without counting the attempt.
+    Held,
+    /// It failed, and attempts are left.
+    Retry(Error),
+    /// It failed, and that was the last attempt.
+    GiveUp(Error),
+}
+
+/// Runs `survey` once if fewer than `max` attempts have been `used`.
+/// Returns the attempts used after it, and what came of it.
+pub(crate) fn survey_step(
+    used: u32,
+    max: u32,
+    survey: impl FnOnce() -> Result<()>,
+) -> Option<(u32, Survey)> {
+    let attempt = used + 1;
+    if attempt > max {
+        return None;
+    }
+    Some(match survey() {
+        Ok(()) => (attempt, Survey::Registered),
+        Err(e) if e == EAGAIN => (used, Survey::Held),
+        Err(e) if attempt < max => (attempt, Survey::Retry(e)),
+        Err(e) => (attempt, Survey::GiveUp(e)),
+    })
+}
+
+/// Waits for `busy()` to clear, sleeping `step_ms` at a time through
+/// `sleep()`, for at most `limit_ms`. Returns whether it cleared.
+pub(crate) fn wait_idle(
+    limit_ms: u32,
+    step_ms: u32,
+    mut busy: impl FnMut() -> bool,
+    mut sleep: impl FnMut(u32),
+) -> bool {
+    let mut waited: u32 = 0;
+    while busy() {
+        if waited >= limit_ms {
+            return false;
+        }
+        sleep(step_ms);
+        waited = waited.saturating_add(step_ms);
+    }
+    true
+}
+
 pub(crate) enum Delivery {
     Entropy,
     /// The answer to an entropy request that had timed out. `recovered` if
@@ -280,6 +366,7 @@ impl ControlState {
 #[kernel::macros::kunit_tests(apple_sep_control)]
 mod tests {
     use super::*;
+    use core::cell::Cell;
 
     fn entropy(value: u32) -> proto::ControlReply {
         proto::ControlReply {
@@ -445,5 +532,112 @@ mod tests {
         let mut state = ControlState::new();
         assert!(matches!(state.deliver(entropy(1)), Delivery::Unmatched));
         assert_eq!(draw(&mut state, 0, 2), Some(2));
+    }
+
+    #[test]
+    fn a_full_mailbox_is_told_from_other_send_failures() {
+        assert_eq!(
+            EntropyEnd::not_sent(ETIMEDOUT),
+            EntropyEnd::NotSent { full: true }
+        );
+        for e in [ENODEV, EINTR, EIO] {
+            assert_eq!(EntropyEnd::not_sent(e), EntropyEnd::NotSent { full: false });
+        }
+        // Only a full mailbox holds the next request back.
+        let mut state = ControlState::new();
+        assert!(state.entropy_begin(0).is_ok());
+        state.entropy_end(EntropyEnd::not_sent(ENODEV), 0);
+        assert_eq!(draw(&mut state, 0, 1), Some(1));
+        assert!(state.entropy_begin(0).is_ok());
+        state.entropy_end(EntropyEnd::not_sent(ETIMEDOUT), 0);
+        assert_eq!(state.entropy_begin(0), Err(EAGAIN));
+    }
+
+    #[test]
+    fn a_read_returns_what_it_took_or_why_not() {
+        assert_eq!(read_end(4, Some(ETIMEDOUT)), ReadEnd::Bytes(4));
+        assert_eq!(read_end(64, None), ReadEnd::Bytes(64));
+        assert_eq!(read_end(0, Some(ETIMEDOUT)), ReadEnd::Failed(ETIMEDOUT));
+        // Never 0, which a blocking reader would spin on.
+        assert_eq!(read_end(0, None), ReadEnd::Failed(EIO));
+    }
+
+    #[test]
+    fn a_held_read_is_not_a_failure() {
+        assert_eq!(read_end(0, Some(EAGAIN)), ReadEnd::Held(EAGAIN));
+        assert_eq!(read_end(8, Some(EAGAIN)), ReadEnd::Bytes(8));
+    }
+
+    #[test]
+    fn a_held_survey_attempt_is_not_counted() {
+        let max = 5;
+        assert_eq!(survey_step(0, max, || Err(EAGAIN)), Some((0, Survey::Held)));
+        assert_eq!(survey_step(3, max, || Err(EAGAIN)), Some((3, Survey::Held)));
+        // Not even when it would have been the last.
+        assert_eq!(
+            survey_step(max - 1, max, || Err(EAGAIN)),
+            Some((max - 1, Survey::Held))
+        );
+    }
+
+    #[test]
+    fn the_survey_gives_up_after_its_attempts() {
+        let max = 5;
+        let mut used = 0;
+        for _ in 1..max {
+            assert_eq!(
+                survey_step(used, max, || Err(EIO)),
+                Some((used + 1, Survey::Retry(EIO)))
+            );
+            used += 1;
+        }
+        assert_eq!(
+            survey_step(used, max, || Err(EIO)),
+            Some((max, Survey::GiveUp(EIO)))
+        );
+        let ran = Cell::new(false);
+        let run = || {
+            ran.set(true);
+            Ok(())
+        };
+        assert_eq!(survey_step(max, max, run), None);
+        assert!(!ran.get());
+        assert_eq!(
+            survey_step(2, max, || Ok(())),
+            Some((3, Survey::Registered))
+        );
+    }
+
+    #[test]
+    fn the_drain_waits_for_the_request_in_flight() {
+        let slept = Cell::new(0u32);
+        let polls = Cell::new(0u32);
+        let busy = || {
+            polls.set(polls.get() + 1);
+            polls.get() <= 3
+        };
+        assert!(wait_idle(3000, 10, busy, |ms| slept.set(slept.get() + ms)));
+        assert_eq!(slept.get(), 30);
+        // Nothing in flight: no wait at all.
+        slept.set(0);
+        assert!(wait_idle(
+            3000,
+            10,
+            || false,
+            |ms| slept.set(slept.get() + ms)
+        ));
+        assert_eq!(slept.get(), 0);
+    }
+
+    #[test]
+    fn the_drain_gives_up_at_its_limit() {
+        let slept = Cell::new(0u32);
+        assert!(!wait_idle(
+            3000,
+            10,
+            || true,
+            |ms| slept.set(slept.get() + ms)
+        ));
+        assert_eq!(slept.get(), 3000);
     }
 }
