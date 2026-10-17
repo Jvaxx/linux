@@ -1578,6 +1578,12 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 	u32 entries = 0;
 	int ret = 0;
 
+	/* A stale transfer is refused before it is parsed, as it is published. */
+	scoped_guard(mutex, &dcp->modes_lock) {
+		if (generation != dcp->modes_generation)
+			return -ESTALE;
+	}
+
 	if (h17p_external && dcp->chunks.payload_complete &&
 	    dcp->chunks.mode_ticket.associated) {
 		ctx->automatic_1080p180_rgb8 = true;
@@ -1722,22 +1728,22 @@ int dcp_attributes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *handle,
 		}
 	}
 
+	/* Malformed attributes keep the display's previous description. */
+	if (ret)
+		return ret;
+
 	/*
 	 * Written once, so the hotplug work never sees a working display
-	 * without its backlight; a display whose attributes do not parse
-	 * gets none. The attributes can arrive after the hotplug work has
-	 * run, so sync the backlight when the answer changes. 14.7 swaps
-	 * carry no external backlight level.
+	 * without its backlight. The attributes can arrive after the
+	 * hotplug work has run, so sync the backlight when the answer
+	 * changes. 14.7 swaps carry no external backlight level.
 	 */
-	ext = !ret && backlight_control && !dcp_has_panel(dcp) &&
-	      !dcp_fw_is_14_7(dcp);
+	ext = backlight_control && !dcp_has_panel(dcp) && !dcp_fw_is_14_7(dcp);
 	if (ext != READ_ONCE(dcp->ext_backlight)) {
 		WRITE_ONCE(dcp->ext_backlight, ext);
 		if (dcp->connector)
 			schedule_work(&dcp->connector->bl_sync_wq);
 	}
-	if (ret)
-		return ret;
 
 	/*
 	 * This callback runs on the ordered RTKit RX worker. A mode probe
