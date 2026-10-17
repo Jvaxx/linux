@@ -25,6 +25,7 @@ typedef uint8_t u8; typedef uint16_t u16; typedef int gfp_t;
 #define WLAN_REASON_UNSPECIFIED 1
 #define NL80211_TIMEOUT_UNSPECIFIED 0
 #define GFP_ATOMIC 0
+#define GFP_KERNEL 0
 #define ETH_ALEN 6
 #define WLAN_PMKID_LEN 16
 #define WLAN_EID_TIM 5
@@ -41,6 +42,7 @@ typedef uint8_t u8; typedef uint16_t u16; typedef int gfp_t;
 #define mutex_lock(l) ((void)(l))
 #define mutex_unlock(l) ((void)(l))
 #define dev_info(...) ((void)0)
+#define dev_dbg(...) ((void)0)
 #define dev_err(...) ((void)0)
 #define for_each_valid_link(cr,l) for((l)=0;(l)<1;(l)++)
 struct sk_buff { unsigned values[32]; bool seen[32]; };
@@ -50,10 +52,10 @@ struct cfg80211_bss_ies { unsigned len; const u8 *data; };
 struct cfg80211_bss { const u8 *bssid; const struct cfg80211_bss_ies *beacon_ies; };
 struct net_device { int ifindex; };
 struct cfg80211_registered_device { int wiphy_idx,wiphy; };
-struct cfg80211_connect_resp_params {int status,timeout_reason;const u8 *req_ie,*resp_ie,*ap_mld_addr;size_t req_ie_len,resp_ie_len;unsigned valid_links;
+struct cfg80211_connect_resp_params {int status,timeout_reason;const u8 *req_ie,*resp_ie,*ap_mld_addr;size_t req_ie_len,resp_ie_len;unsigned valid_links;bool assoc_encrypted;
  struct {const u8 *kek,*pmk,*pmkid;size_t kek_len,pmk_len;bool update_erp_next_seq_num;u16 erp_next_seq_num;} fils;
  struct {const u8 *addr,*bssid;struct cfg80211_bss *bss;u16 status;} links[1];};
-enum {NL80211_ATTR_WIPHY,NL80211_ATTR_IFINDEX,NL80211_ATTR_MAC,NL80211_ATTR_STATUS_CODE,NL80211_ATTR_TIMED_OUT,NL80211_ATTR_TIMEOUT_REASON,NL80211_ATTR_REQ_IE,NL80211_ATTR_RESP_IE,NL80211_ATTR_FILS_ERP_NEXT_SEQ_NUM,NL80211_ATTR_FILS_KEK,NL80211_ATTR_PMK,NL80211_ATTR_PMKID,NL80211_ATTR_MLO_LINKS,NL80211_ATTR_MLO_LINK_ID,NL80211_ATTR_BSSID};
+enum {NL80211_ATTR_WIPHY,NL80211_ATTR_IFINDEX,NL80211_ATTR_MAC,NL80211_ATTR_STATUS_CODE,NL80211_ATTR_TIMED_OUT,NL80211_ATTR_TIMEOUT_REASON,NL80211_ATTR_REQ_IE,NL80211_ATTR_RESP_IE,NL80211_ATTR_FILS_ERP_NEXT_SEQ_NUM,NL80211_ATTR_FILS_KEK,NL80211_ATTR_PMK,NL80211_ATTR_PMKID,NL80211_ATTR_MLO_LINKS,NL80211_ATTR_MLO_LINK_ID,NL80211_ATTR_BSSID,NL80211_ATTR_ASSOC_ENCRYPTED};
 #define NL80211_CMD_CONNECT 1
 #define NL80211_MCGRP_MLME 1
 static int nl80211_fam;
@@ -73,7 +75,7 @@ static void genlmsg_end(struct sk_buff*m,void*h){}
 static int wiphy_net(int*w){return 0;}
 static void genlmsg_multicast_netns(int*f,int n,struct sk_buff*m,int p,int g,gfp_t t){}
 ENCODER
-struct mt7932 {bool stopping,connect_open,assoc_request_seen,connecting,connected,disconnecting,connect_cancelled,rf_ready;
+struct mt7932 {bool stopping,connect_open,assoc_request_seen,connecting,connected,disconnecting,connect_cancelled,connect_publishing,connect_lost,rf_ready;
  int connect_error,response_lock,command_mutex,data_lock,wiphy,power_work;u16 disconnect_reason;struct net_device *netdev;struct cfg80211_bss *connect_bss;u8 connect_bssid[6],connect_pmk[32],assoc_request_ies[512];unsigned assoc_request_ie_len;
  struct {struct {bool ht_supported;}ht_cap;}band2;bool power_tim,data_ready,station_signal_valid,station_rx_rate_valid,station_tx_rate_valid;unsigned long station_tx_bytes,station_rx_bytes,station_tx_packets,station_rx_packets,station_connected;};
 static unsigned long jiffies=1;
@@ -81,6 +83,7 @@ static unsigned notifications,disconnections,retirements,releases,authorizations
 static struct cfg80211_connect_resp_params saved;
 static bool mt_rf_allowed(struct mt7932*m){return m->rf_ready;}
 static void mt_transport_snapshot(struct mt7932*m){}
+static void mt_cqm_reset(struct mt7932*m){}
 static void memzero_explicit(void*p,size_t n){memset(p,0,n);}
 static int mt_retire_connection(struct mt7932*m){retirements++;return 0;}
 static void mt_peer_release(struct mt7932*m){releases++;}
@@ -94,7 +97,7 @@ static void netif_carrier_on(struct net_device*n){carrier++;}
 static void netif_wake_queue(struct net_device*n){}
 static void cfg80211_port_authorized(struct net_device*n,const u8*b,const u8*p,size_t l,gfp_t f){authorizations++;}
 static void report_worker(struct mt7932 *m,int ret){
- struct cfg80211_connect_resp_params response={};unsigned long flags;bool submitted=true,peer_owned=true;
+ struct cfg80211_connect_resp_params response={};unsigned long flags;bool submitted=true,peer_owned=true,cancelled;u16 reason;
 REPORT
 int main(void){struct net_device n={1};struct cfg80211_bss b={};
  int errors[]={0,-ETIMEDOUT,-ECONNREFUSED,-EPROTO,-ECANCELED,-ECONNRESET,-EIO};

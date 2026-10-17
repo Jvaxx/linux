@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-2.0-only
 """Compile retained Bluetooth resume callbacks against controlled core/PCI services."""
 import argparse, hashlib, json, os, re, resource, subprocess
 from pathlib import Path
@@ -50,7 +51,7 @@ c=subprocess.run(['cc','-std=gnu11','-pthread','-Wall','-Wextra','-Wno-unused-fu
 (o/'compile.log').write_text(c.stdout+c.stderr);assert not c.returncode,c.stderr
 def no_core():resource.setrlimit(resource.RLIMIT_CORE,(0,0))
 results=[]
-for n in ([mutations[a.mutation][3]] if a.mutation else [0,1,2,28] if a.old_ref else range(42)):
+for n in ([mutations[a.mutation][3]] if a.mutation else [0,1,2,28] if a.old_ref else range(44)):
  c=subprocess.run([str(o/'controls'),str(n)],capture_output=True,text=True,preexec_fn=no_core,env=dict(env,ASAN_OPTIONS='detect_leaks=1'))
  results.append({'case':n,'exit':c.returncode,'stdout':c.stdout,'stderr':c.stderr})
 expected=-6 if a.old_ref or a.mutation else 0

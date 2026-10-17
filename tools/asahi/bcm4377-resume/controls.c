@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 static bool timeout_during_resume;
 static int hci_resume_sync(struct hci_dev *h) { if(timeout_during_resume)hci_cmd_timeout(&h->cmd_timer.work);return resume_error; }
 static int hci_dev_close_sync(struct hci_dev *h) {assert(req_locked);h->flags&=~HCI_UP;return bcm4377_hci_close(h);}
@@ -55,6 +56,17 @@ int main(int argc,char **argv) {
  case 39: resume_cycle(&dev);assert(!reset_count&&!request.fn&&!cal_count&&!ptb_count);break;
  case 40: resume_cycle(&dev);bcm4377_hci_timeout(&h);deliver_work(&b);active_callback_pause=active_running=true;pthread_barrier_init(&active_started,NULL,2);pthread_barrier_init(&active_release,NULL,2);pthread_create(&active_thread,NULL,active_callback,&h);pthread_barrier_wait(&active_started);assert(!request.fn);assert(!bcm4377_suspend(&dev));assert(reset_count==1&&quiesces==2&&!active_running&&!req_locked);break;
  case 41: resume_cycle(&dev);bcm4377_hci_timeout(&h);deliver_work(&b);active_callback_pause=active_running=true;pthread_barrier_init(&active_started,NULL,2);pthread_barrier_init(&active_release,NULL,2);pthread_create(&active_thread,NULL,active_callback,&h);pthread_barrier_wait(&active_started);bcm4377_hci_unregister_dev(&h);assert(reset_count==1&&unregistered==1&&!active_running&&!req_locked);break;
+	case 42:
+		fixture_wakeup = true;
+		resume_cycle(&dev);
+		assert(!quiesces && !b.wake_armed && !b.quiesced);
+		recover(&b);
+		assert(reset_count == 1);
+		break;
+	case 43:
+		resume_cycle(&dev);
+		assert(quiesces == 1 && !b.quiesced && !b.wake_armed);
+		break;
  default:abort();
  }
  assert(!request.fn);printf("case %s passed\n",argv[1]);return 0;

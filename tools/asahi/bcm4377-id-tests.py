@@ -104,7 +104,7 @@ def main():
     assert defs == '\n'.join(re.findall(r'^#define BCM\d+_DEVICE_ID [^\n]+', old, re.M))
     ids = (root / 'include/linux/pci_ids.h').read_text()
     pci_defs = '\n'.join(re.findall(r'^#define (?:PCI_VENDOR_ID_BROADCOM|PCI_CLASS_NETWORK_OTHER)\s+[^\n]+', ids, re.M))
-    any_id = take((root / 'include/linux/mod_devicetable.h').read_text(), r'^#define PCI_ANY_ID[^\n]+')
+    any_id = take((root / 'include/linux/device-id/pci.h').read_text(), r'^#define PCI_ANY_ID[^\n]+')
     source_prefix = PREFIX + defs + '\n' + pci_defs + '\n' + any_id + '\n' + '\n'.join(pieces[n] for n in ('enum', 'hw_struct', 'variants', 'pci_macro_table'))
     suffix = SUFFIX.replace('@SELECTION@', pieces['selection']).replace('@REGISTRATION@', pieces['registration'])
     gates = {'positive': pieces['gate'], 'published-original': old_pieces['gate']}
