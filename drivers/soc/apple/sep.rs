@@ -182,7 +182,9 @@ const PROTECTED_DATA_AVAILABLE: bool = true;
 const RNG_MAX_WORDS_PER_READ: usize = 16;
 
 // How long going to sleep waits for an entropy request in flight: the
-// mailbox's 500 ms wait for room, then the wait for the reply.
+// mailbox's 500 ms wait for room, then the wait for the reply. Only a request
+// already being written can still go out once the sleep has begun; see
+// `send_entropy_request()`.
 const RNG_SLEEP_DRAIN_MS: u32 = proto::CONTROL_TIMEOUT_MS + 1000;
 
 extern "C" {
@@ -1192,7 +1194,7 @@ impl SepData {
         self.control.lock().entropy_begin(boottime_ms())?;
 
         let msg = proto::encode_control(&op, proto::TAG_ENTROPY);
-        if let Err(e) = self.send(msg) {
+        if let Err(e) = self.send_entropy_request(msg) {
             self.control
                 .lock()
                 .entropy_end(control::EntropyEnd::not_sent(e), boottime_ms());
@@ -1222,6 +1224,24 @@ impl SepData {
         };
         guard.entropy_end(end, boottime_ms());
         result
+    }
+
+    /// Sends an entropy request claimed by `entropy_begin()`, or EAGAIN if
+    /// the system has begun going to sleep since. The check is made with the
+    /// mailbox lock held. A sender can wait for that lock behind others, such
+    /// as a Touch ID capture still running, for longer than the drain on the
+    /// way to sleep waits for it. It must not then write its request into
+    /// the suspend. Lock order: mailbox, then control.
+    fn send_entropy_request(&self, msg: Message) -> Result<()> {
+        if self.shutting_down.load(Relaxed) {
+            return Err(ENODEV);
+        }
+        let mbox = self.mbox.lock();
+        let mbox = mbox.as_ref().ok_or(ENODEV)?;
+        if !self.control.lock().entropy_may_send() {
+            return Err(EAGAIN);
+        }
+        Self::ring(mbox, msg)
     }
 
     /// The system is about to suspend: send no entropy request until it has
