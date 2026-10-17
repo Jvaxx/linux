@@ -173,6 +173,10 @@ const PROTECTED_DATA_AVAILABLE: bool = true;
 
 const RNG_MAX_WORDS_PER_READ: usize = 16;
 
+// How long going to sleep waits for an entropy request in flight: the
+// mailbox's 500 ms wait for room, then the wait for the reply.
+const RNG_SLEEP_DRAIN_MS: u32 = proto::CONTROL_TIMEOUT_MS + 1000;
+
 extern "C" {
     fn sep_cancel_work_sync(work: *mut c_void);
     fn sep_cancel_delayed_work_sync(work: *mut c_void);
@@ -1200,6 +1204,35 @@ impl SepData {
         result
     }
 
+    /// The system is about to suspend: send no entropy request until it has
+    /// resumed, and let one already sent be answered while the enclave can
+    /// still answer it. On a T6000 a request sent while devices were
+    /// suspended was never answered, and the enclave did not read its mailbox
+    /// again after the resume.
+    pub(crate) fn rng_sleep_prepare(&self) {
+        if !self.control.lock().entropy_sleep() {
+            return;
+        }
+        let mut waited: u32 = 0;
+        while self.control.lock().entropy_busy() {
+            if waited >= RNG_SLEEP_DRAIN_MS {
+                dev_warn!(
+                    self.dev,
+                    "hwrng: a request was still in flight after {} ms; suspending anyway\n",
+                    RNG_SLEEP_DRAIN_MS
+                );
+                return;
+            }
+            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(10));
+            waited += 10;
+        }
+    }
+
+    /// The system has resumed, or the suspend was aborted.
+    pub(crate) fn rng_sleep_finished(&self) {
+        self.control.lock().entropy_wake();
+    }
+
     fn control_survey(&self) {
         for param in [0x00u8, 0x01, 0xff] {
             let _ = self.control_request(&proto::op_nop(param));
@@ -1235,8 +1268,8 @@ impl SepData {
         this.rng_survey_attempts.store(attempt, Relaxed);
         match this.survey_hwrng() {
             Ok(()) => dev_info!(this.dev, "hwrng: registered after ready-phase survey (attempt {})\n", attempt),
-            // Holding back after a request that went unanswered: this
-            // attempt did not ask the enclave anything.
+            // Asleep, or holding back after a request that went unanswered:
+            // this attempt did not ask the enclave anything.
             Err(e) if e == EAGAIN => {
                 this.rng_survey_attempts.store(attempt - 1, Relaxed);
                 Self::arm_settle(this);
@@ -1847,8 +1880,8 @@ impl SepData {
 
         // must return a negative errno, not 0: a blocking reader would spin on 0
         let e = failure.unwrap_or(EIO);
-        // Holding back after a request that went unanswered. Nothing failed
-        // in this read; the core tries again later.
+        // Asleep, or holding back after a request that went unanswered.
+        // Nothing failed in this read; the core tries again later.
         if e == EAGAIN {
             return e.to_errno();
         }

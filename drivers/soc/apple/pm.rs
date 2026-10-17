@@ -4,8 +4,10 @@
 //! talking to the sensor over SPI, so one left running into a suspend is still
 //! active while devices go down. A J313 that suspended with the lock screen's
 //! capture in flight did not wake. Before the system suspends, end any capture
-//! in progress and hold new ones until it has resumed. The notifier itself
-//! is in `pm_shim.c`; the capture handling is on [`SepData`].
+//! in progress and hold new ones until it has resumed. The hwrng fill thread
+//! is not frozen either, so entropy requests are held over the same window.
+//! The notifier itself is in `pm_shim.c`; the capture and entropy handling is
+//! on [`SepData`].
 
 use core::sync::atomic::{AtomicPtr, Ordering};
 
@@ -51,13 +53,16 @@ unsafe extern "C" fn pm_event(entering: bool) -> c_int {
     // notifier call, so it is live for this borrow.
     let sep = unsafe { <Arc<SepData> as ForeignOwnable>::borrow(ptr) };
     if entering {
+        sep.rng_sleep_prepare();
         if let Err(error) = sep.sleep_prepare() {
             // A failing notifier is not included in the PM chain's rollback.
             sep.sleep_finished();
+            sep.rng_sleep_finished();
             return error.to_errno();
         }
     } else {
         sep.sleep_finished();
+        sep.rng_sleep_finished();
     }
     0
 }
