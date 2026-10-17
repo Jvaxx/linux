@@ -1193,10 +1193,9 @@ impl SepData {
 
         let msg = proto::encode_control(&op, proto::TAG_ENTROPY);
         if let Err(e) = self.send(msg) {
-            let full = e == ETIMEDOUT;
             self.control
                 .lock()
-                .entropy_end(control::EntropyEnd::NotSent { full }, boottime_ms());
+                .entropy_end(control::EntropyEnd::not_sent(e), boottime_ms());
             return Err(e);
         }
 
@@ -1234,18 +1233,18 @@ impl SepData {
         if !self.control.lock().entropy_sleep() {
             return;
         }
-        let mut waited: u32 = 0;
-        while self.control.lock().entropy_busy() {
-            if waited >= RNG_SLEEP_DRAIN_MS {
-                dev_warn!(
-                    self.dev,
-                    "hwrng: a request was still in flight after {} ms; suspending anyway\n",
-                    RNG_SLEEP_DRAIN_MS
-                );
-                return;
-            }
-            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(10));
-            waited += 10;
+        let idle = control::wait_idle(
+            RNG_SLEEP_DRAIN_MS,
+            10,
+            || self.control.lock().entropy_busy(),
+            |ms| kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(ms))),
+        );
+        if !idle {
+            dev_warn!(
+                self.dev,
+                "hwrng: a request was still in flight after {} ms; suspending anyway\n",
+                RNG_SLEEP_DRAIN_MS
+            );
         }
     }
 
@@ -1282,24 +1281,32 @@ impl SepData {
         if this.rng.lock().is_some() {
             return;
         }
-        let attempt = this.rng_survey_attempts.load(Relaxed) + 1;
-        if attempt > RNG_SURVEY_ATTEMPTS {
+        let used = this.rng_survey_attempts.load(Relaxed);
+        let Some((attempt, next)) =
+            control::survey_step(used, RNG_SURVEY_ATTEMPTS, || this.survey_hwrng())
+        else {
             return;
-        }
+        };
         this.rng_survey_attempts.store(attempt, Relaxed);
-        match this.survey_hwrng() {
-            Ok(()) => dev_info!(this.dev, "hwrng: registered after ready-phase survey (attempt {})\n", attempt),
+        match next {
+            control::Survey::Registered => dev_info!(
+                this.dev,
+                "hwrng: registered after ready-phase survey (attempt {})\n",
+                attempt
+            ),
             // Asleep, or holding back after a request that went unanswered:
             // this attempt did not ask the enclave anything.
-            Err(e) if e == EAGAIN => {
-                this.rng_survey_attempts.store(attempt - 1, Relaxed);
-                Self::arm_settle(this);
-            }
-            Err(e) if attempt < RNG_SURVEY_ATTEMPTS => {
+            control::Survey::Held => Self::arm_settle(this),
+            control::Survey::Retry(e) => {
                 dev_warn!(this.dev, "hwrng: survey attempt {} failed ({:?}); retrying\n", attempt, e);
                 Self::arm_settle(this);
             }
-            Err(e) => dev_err!(this.dev, "hwrng: survey failed after {} attempts ({:?})\n", attempt, e),
+            control::Survey::GiveUp(e) => dev_err!(
+                this.dev,
+                "hwrng: survey failed after {} attempts ({:?})\n",
+                attempt,
+                e
+            ),
         }
     }
 
@@ -1929,17 +1936,12 @@ impl SepData {
             }
         }
 
-        if written > 0 {
-            return written as c_int;
-        }
-
-        // must return a negative errno, not 0: a blocking reader would spin on 0
-        let e = failure.unwrap_or(EIO);
-        // Asleep, or holding back after a request that went unanswered.
-        // Nothing failed in this read; the core tries again later.
-        if e == EAGAIN {
-            return e.to_errno();
-        }
+        let e = match control::read_end(written, failure) {
+            control::ReadEnd::Bytes(n) => return n as c_int,
+            // Asleep, or holding back after a request that went unanswered.
+            control::ReadEnd::Held(e) => return e.to_errno(),
+            control::ReadEnd::Failed(e) => e,
+        };
         let n = self.rng_failures.load(Relaxed).wrapping_add(1);
         self.rng_failures.store(n, Relaxed);
         if n == 1 {
