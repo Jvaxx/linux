@@ -108,10 +108,10 @@ struct io_pgtable_cfg { struct { int n_levels; } apple_dart_cfg; };
 struct io_pgtable { struct io_pgtable_ops ops; struct io_pgtable_cfg cfg; };
 #define io_pgtable_ops_to_pgtable(ops) ((struct io_pgtable *)(ops))
 #define DART_TCR(dart, sid) ((dart)->hw->tcr + ((sid) << 2))
-/* This T8112 SEP domain has no firmware handoff; firmware-only calls are errors. */
+/* This T8112 SEP domain has no firmware mirror or handoff; firmware-only calls
+ * are errors. */
 #define spin_lock_irqsave(lock, flags) abort()
 #define spin_unlock_irqrestore(lock, flags) abort()
-#define apple_dart_fw_mapping_matches(...) (abort(), false)
 #define READ_ONCE(x) (x)
 static unsigned int ilog2(unsigned int value)
 { return 31 - __builtin_clz(value); }
@@ -126,6 +126,14 @@ static bool apple_dart_fw_slot_owned(const struct apple_dart_fw_root *fw,
 { abort(); }
 static bool apple_dart_fw_leaf_decode(u64 pte, dma_addr_t iova,
                                      phys_addr_t *phys, int *prot)
+{ abort(); }
+static bool apple_dart_fw_mapping_matches(phys_addr_t phys, int prot,
+                                          phys_addr_t expected, int required)
+{ abort(); }
+static bool apple_dart_fw_handoff_page_busy(struct apple_dart *dart,
+                                            struct apple_dart_domain *domain, int i,
+                                            struct apple_dart_atomic_stream_map *map,
+                                            u64 addr)
 { abort(); }
 enum { APPLE_DART, APPLE_DART2 };
 struct dart_io_pgtable { struct { int fmt; } iop; };
