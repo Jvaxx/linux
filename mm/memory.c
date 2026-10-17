@@ -3788,10 +3788,14 @@ static int remap_pfn_range_track(struct vm_area_struct *vma, unsigned long addr,
 	int err;
 
 	size = mm_page_align(vma->vm_mm, size);
+#ifdef CONFIG_MM_SUBPAGE
 	if (check_add_overflow(size, (unsigned long)offset, &track_size) ||
 	    track_size > ULONG_MAX - (PAGE_SIZE - 1))
 		return -EINVAL;
 	track_size = PAGE_ALIGN(track_size);
+#else
+	track_size = size;
+#endif
 
 	/*
 	 * If we cover the full VMA, we'll perform actual tracking, and
@@ -3941,6 +3945,7 @@ int remap_pfn_range_complete(struct vm_area_struct *vma,
 	return do_remap_pfn_range(vma, start, pfn, mmap_action_remap_offset(action), size, prot);
 }
 
+#ifdef CONFIG_MM_SUBPAGE
 static int __simple_ioremap_prep(struct mm_struct *mm, unsigned long vm_len,
 				 struct vm_page_offset pos,
 				 phys_addr_t start_phys, unsigned long size,
@@ -3977,18 +3982,52 @@ static int __simple_ioremap_prep(struct mm_struct *mm, unsigned long vm_len,
 		return -EINVAL;
 	return 0;
 }
+#else
+static int __simple_ioremap_prep(unsigned long vm_len, pgoff_t vm_pgoff,
+				 phys_addr_t start_phys, unsigned long size,
+				 unsigned long *pfnp)
+{
+	unsigned long pfn, pages;
+
+	/* Check that the physical memory area passed in looks valid */
+	if (start_phys + size < start_phys)
+		return -EINVAL;
+	/*
+	 * You *really* shouldn't map things that aren't page-aligned,
+	 * but we've historically allowed it because IO memory might
+	 * just have smaller alignment.
+	 */
+	size += start_phys & ~PAGE_MASK;
+	pfn = start_phys >> PAGE_SHIFT;
+	pages = (size + ~PAGE_MASK) >> PAGE_SHIFT;
+	if (pfn + pages < pfn)
+		return -EINVAL;
+
+	/* We start the mapping 'vm_pgoff' pages into the area */
+	if (vm_pgoff > pages)
+		return -EINVAL;
+	pfn += vm_pgoff;
+	pages -= vm_pgoff;
+
+	/* Can we fit all of the mapping? */
+	if ((vm_len >> PAGE_SHIFT) > pages)
+		return -EINVAL;
+
+	*pfnp = pfn;
+	return 0;
+}
+#endif
 
 int simple_ioremap_prepare(struct vm_area_desc *desc)
 {
 	struct mmap_action *action = &desc->action;
 	const phys_addr_t start = action->simple_ioremap.start_phys_addr;
 	const unsigned long size = action->simple_ioremap.size;
+#ifdef CONFIG_MM_SUBPAGE
 	struct vm_page_offset physical, pos = { .index = desc->pgoff };
 	int err;
 
-#ifdef CONFIG_MM_SUBPAGE
 	pos.offset = desc->subpage_offset;
-#endif
 	err = __simple_ioremap_prep(desc->mm, vma_desc_size(desc), pos,
 				    start, size, &physical);
 	if (err)
@@ -3996,8 +4035,18 @@ int simple_ioremap_prepare(struct vm_area_desc *desc)
 
 	/* The I/O remap logic does the heavy lifting. */
 	mmap_action_ioremap_full(desc, physical.index);
-#ifdef CONFIG_MM_SUBPAGE
 	action->remap.offset = physical.offset;
+#else
+	unsigned long pfn;
+	int err;
+
+	err = __simple_ioremap_prep(vma_desc_size(desc), desc->pgoff,
+				    start, size, &pfn);
+	if (err)
+		return err;
+
+	/* The I/O remap logic does the heavy lifting. */
+	mmap_action_ioremap_full(desc, pfn);
 #endif
 	return io_remap_pfn_range_prepare(desc);
 }
@@ -4022,6 +4071,7 @@ int vm_iomap_memory(struct vm_area_struct *vma, phys_addr_t start, unsigned long
 	const unsigned long vm_start = vma->vm_start;
 	const unsigned long vm_end = vma->vm_end;
 	const unsigned long vm_len = vm_end - vm_start;
+#ifdef CONFIG_MM_SUBPAGE
 	struct vm_page_offset physical;
 	int err;
 
@@ -4033,6 +4083,17 @@ int vm_iomap_memory(struct vm_area_struct *vma, phys_addr_t start, unsigned long
 	/* Ok, let it rip */
 	return io_remap_pfn_range_offset(vma, vm_start, physical.index, physical.offset,
 					vm_len, vma->vm_page_prot);
+#else
+	unsigned long pfn;
+	int err;
+
+	err = __simple_ioremap_prep(vm_len, vma->vm_pgoff, start, len, &pfn);
+	if (err)
+		return err;
+
+	/* Ok, let it rip */
+	return io_remap_pfn_range(vma, vma->vm_start, pfn, vm_len, vma->vm_page_prot);
+#endif
 }
 EXPORT_SYMBOL(vm_iomap_memory);
 
