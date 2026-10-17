@@ -1158,7 +1158,9 @@ copy_present_page(struct vm_area_struct *dst_vma, struct vm_area_struct *src_vma
 	}
 
 	*prealloc = NULL;
-	folio_ref_add(new_folio, mm_pte_native_pages(dst_vma->vm_mm) - 1);
+	/* Only a larger user granule maps more than one native page. */
+	if (mm_pte_native_pages(dst_vma->vm_mm) > 1)
+		folio_ref_add(new_folio, mm_pte_native_pages(dst_vma->vm_mm) - 1);
 	__folio_mark_uptodate(new_folio);
 	folio_add_new_anon_rmap(new_folio, dst_vma, addr, RMAP_EXCLUSIVE);
 	folio_add_lru_vma(new_folio, dst_vma);
@@ -4743,7 +4745,8 @@ static vm_fault_t wp_page_copy(struct vm_fault *vmf)
 		 * some TLBs while the old PTE remains in others.
 		 */
 		ptep_clear_flush(vma, vmf->address, vmf->pte);
-		folio_ref_add(new_folio, mm_pte_native_pages(mm) - 1);
+		if (mm_pte_native_pages(mm) > 1)
+			folio_ref_add(new_folio, mm_pte_native_pages(mm) - 1);
 		folio_add_new_anon_rmap(new_folio, vma, vmf->address, RMAP_EXCLUSIVE);
 		folio_add_lru_vma(new_folio, vma);
 		BUG_ON(unshare && pte_write(entry));
