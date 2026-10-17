@@ -57,10 +57,25 @@ struct bcm4377_data {
  struct hci_dev *hdev; struct pci_dev *pdev; struct bcm4377_hw *hw;
 	bool wake_armed, quiesced, needs_reset, cal_needed, cal_loaded;
 	bool setup_retry_used, setup_retry_pending, setup_retry_blocked;
- struct delayed_work setup_retry_work; bdaddr_t bdaddr; char *bar0; pthread_mutex_t resume_lock; uint64_t resume_epoch,resume_pending; bool resume_armed,resume_blocked,resume_powered; struct work_struct resume_work;
+	struct delayed_work setup_retry_work;
+	bdaddr_t bdaddr;
+	char *bar0;
+	pthread_mutex_t resume_lock;
+	uint64_t resume_epoch, resume_pending;
+	bool resume_armed, resume_blocked, resume_powered;
+	bool resume_guarded, resume_recovering;
+	struct work_struct resume_work;
  struct ring acl_d2h_ring,acl_h2d_ring,sco_d2h_ring,sco_h2d_ring,hci_d2h_ring,hci_h2d_ring,sco_event_ring,sco_ack_ring,hci_acl_event_ring,hci_acl_ack_ring;
 };
 static int cal_count,ptb_count,reset_count,open_count,queued_count,addr_count,cal_failures,ptb_error,addr_error,reset_error,rings_error,close_error;
+static int rebind_count;
+
+/* Controlled boundary for the existing driver's asynchronous rebind work. */
+static void bcm4377_hci_reset(struct hci_dev *hdev)
+{
+	rebind_count++;
+}
+
 static bool missing_blob;
 static bool active_callback_pause,active_running;
 static pthread_barrier_t active_started,active_release;

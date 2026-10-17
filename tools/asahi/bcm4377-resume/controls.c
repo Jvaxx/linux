@@ -20,7 +20,10 @@ int main(int argc,char **argv) {
  case 3: resume_cycle(&dev);reset_error=-EIO;recover(&b);recover(&b);assert(reset_count==1&&!(h.flags&HCI_UP)&&b.needs_reset);break;
  case 4: resume_cycle(&dev);cal_failures=1;recover(&b);recover(&b);assert(reset_count==1&&cal_count==1&&b.cal_needed&&!(h.flags&HCI_UP));break;
  case 5: resume_cycle(&dev);addr_error=-EIO;recover(&b);assert(reset_count==1&&b.cal_loaded&&b.cal_needed&&!(h.flags&HCI_UP));break;
- case 6: recover(&b);assert(!reset_count&&!request.fn);break;
+	case 6:
+		recover(&b);
+		assert(!reset_count && !request.fn && rebind_count == 1);
+		break;
  case 7: h.flags=HCI_RUNNING;resume_cycle(&dev);recover(&b);assert(!reset_count);break;
  case 8: h.flags|=HCI_AUTO_OFF;resume_cycle(&dev);recover(&b);assert(!reset_count);break;
  case 9: h.flags|=HCI_SETUP;resume_cycle(&dev);recover(&b);assert(!reset_count);break;
@@ -67,7 +70,34 @@ int main(int argc,char **argv) {
 		resume_cycle(&dev);
 		assert(quiesces == 1 && !b.quiesced && !b.wake_armed);
 		break;
+	case 44:
+		resume_cycle(&dev);
+		recover(&b);
+		recover(&b);
+		assert(reset_count == 1 && !rebind_count && b.resume_guarded);
+		h.flags &= ~HCI_UP;
+		bcm4377_hci_close(&h);
+		h.flags |= HCI_UP;
+		recover(&b);
+		assert(reset_count == 1 && rebind_count == 1);
+		break;
+	case 45:
+		resume_cycle(&dev);
+		bcm4377_hci_timeout(&h);
+		deliver_work(&b);
+		h.flags &= ~HCI_UP;
+		bcm4377_hci_close(&h);
+		h.flags |= HCI_UP;
+		run_request(&h);
+		assert(!reset_count && !b.resume_guarded);
+		recover(&b);
+		assert(rebind_count == 1);
+		break;
  default:abort();
  }
+	if (atoi(argv[1]) == 6 || atoi(argv[1]) == 44 || atoi(argv[1]) == 45)
+		assert(rebind_count == 1);
+	else
+		assert(!rebind_count);
  assert(!request.fn);printf("case %s passed\n",argv[1]);return 0;
 }

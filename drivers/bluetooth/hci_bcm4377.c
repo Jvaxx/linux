@@ -599,6 +599,8 @@ struct bcm4377_data {
 	bool resume_armed;
 	bool resume_blocked;
 	bool resume_powered;
+	bool resume_guarded;
+	bool resume_recovering;
 	struct work_struct resume_work;
 	bdaddr_t bdaddr;
 
@@ -1540,6 +1542,9 @@ static void bcm4377_resume_recovery_invalidate(struct bcm4377_data *bcm4377)
 	bcm4377->resume_epoch++;
 	bcm4377->resume_armed = false;
 	bcm4377->resume_pending = 0;
+	/* A normal power cycle starts a new runtime-recovery context. */
+	if (!bcm4377->resume_recovering)
+		bcm4377->resume_guarded = false;
 	spin_unlock_irqrestore(&bcm4377->resume_lock, flags);
 }
 
@@ -1549,20 +1554,27 @@ static int bcm4377_resume_recovery_sync(struct hci_dev *hdev, void *data)
 	u64 epoch = *(u64 *)data;
 	unsigned long flags;
 	bool allowed;
+	int ret;
 
 	/* The core runs this callback under req_lock, after earlier power changes. */
 	spin_lock_irqsave(&bcm4377->resume_lock, flags);
 	allowed = epoch == bcm4377->resume_epoch && !bcm4377->resume_blocked &&
 		  bcm4377_resume_recovery_allowed(hdev);
-	if (allowed)
+	if (allowed) {
 		bcm4377->needs_reset = true;
+		bcm4377->resume_recovering = true;
+	}
 	spin_unlock_irqrestore(&bcm4377->resume_lock, flags);
 	if (!allowed)
 		return 0;
 
 	dev_warn(&bcm4377->pdev->dev,
 		 "recovering transport once after resume command timeout\n");
-	return hci_reset_dev_sync(hdev);
+	ret = hci_reset_dev_sync(hdev);
+	spin_lock_irqsave(&bcm4377->resume_lock, flags);
+	bcm4377->resume_recovering = false;
+	spin_unlock_irqrestore(&bcm4377->resume_lock, flags);
+	return ret;
 }
 
 static void bcm4377_resume_recovery_destroy(struct hci_dev *hdev, void *data,
@@ -1602,19 +1614,33 @@ static void bcm4377_resume_recovery_work(struct work_struct *work)
 		bcm4377_resume_recovery_destroy(bcm4377->hdev, epoch, ret);
 }
 
+static void bcm4377_hci_reset(struct hci_dev *hdev);
+
 static void bcm4377_hci_timeout(struct hci_dev *hdev)
 {
 	struct bcm4377_data *bcm4377 = hci_get_drvdata(hdev);
 	unsigned long flags;
+	bool rebind = false;
+
+	if (!bcm4377_resume_recovery_supported(bcm4377))
+		return;
 
 	spin_lock_irqsave(&bcm4377->resume_lock, flags);
-	if (bcm4377->resume_armed && !bcm4377->resume_blocked &&
-	    bcm4377_resume_recovery_allowed(hdev)) {
-		bcm4377->resume_armed = false;
-		bcm4377->resume_pending = bcm4377->resume_epoch;
-		queue_work(system_freezable_wq, &bcm4377->resume_work);
+	if (!bcm4377->resume_blocked && bcm4377_resume_recovery_allowed(hdev)) {
+		if (bcm4377->resume_guarded) {
+			if (bcm4377->resume_armed) {
+				bcm4377->resume_armed = false;
+				bcm4377->resume_pending = bcm4377->resume_epoch;
+				queue_work(system_freezable_wq, &bcm4377->resume_work);
+			}
+		} else {
+			/* Retain ordinary runtime recovery outside a resume epoch. */
+			rebind = true;
+		}
 	}
 	spin_unlock_irqrestore(&bcm4377->resume_lock, flags);
+	if (rebind)
+		bcm4377_hci_reset(hdev);
 }
 
 static void bcm4377_resume_recovery_stop(struct bcm4377_data *bcm4377)
@@ -2963,6 +2989,7 @@ static int bcm4377_resume(struct device *dev)
 		bcm4377->resume_blocked = false;
 		bcm4377->resume_armed = bcm4377->resume_powered &&
 			bcm4377_resume_recovery_allowed(bcm4377->hdev);
+		bcm4377->resume_guarded = bcm4377->resume_armed;
 		spin_unlock_irqrestore(&bcm4377->resume_lock, flags);
 	}
 	bcm4377->resume_powered = false;
