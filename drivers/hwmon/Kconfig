@@ -1211,6 +1211,16 @@ config SENSORS_MACSMC_HWMON
 	  This driver can also be built as a module. If so, the module will
 	  be called macsmc-hwmon.
 
+config SENSORS_MACSMC_HWMON_KUNIT_TEST
+	bool "KUnit tests for the Apple SMC hwmon driver" if !KUNIT_ALL_TESTS
+	depends on SENSORS_MACSMC_HWMON && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Unit tests for the channel numbering of the Apple SMC hwmon driver.
+	  Thermal zones refer to temperature channels by index, so a sensor
+	  that cannot be set up must keep its channel; the tests check that.
+	  No SMC is needed. Only useful for kernel developers.
+
 config SENSORS_MAX1111
 	tristate "Maxim MAX1111 Serial 8-bit ADC chip and compatibles"
 	depends on SPI_MASTER

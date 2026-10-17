@@ -1186,4 +1186,14 @@ config MACSMC_POWER
 
 	  Say Y or M here if you have an Apple Silicon based Mac.
 
+config MACSMC_POWER_KUNIT_TEST
+	bool "KUnit tests for Apple SMC battery replies" if !KUNIT_ALL_TESTS
+	depends on MACSMC_POWER && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Build tests for malformed fixed-width battery replies. The tests
+	  exercise zero-length and short CHTE replies and check that the
+	  charge-behaviour reader rejects them. Static stubs replace SMC
+	  reads, so the tests need no Apple hardware.
+
 endif # POWER_SUPPLY
