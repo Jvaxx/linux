@@ -569,4 +569,5 @@ static struct kunit_suite cd321x_pm_suite = {
 };
 
 kunit_test_suite(cd321x_pm_suite);
+MODULE_DESCRIPTION("KUnit tests for CD321x system sleep and cable-state revalidation");
 MODULE_LICENSE("GPL");

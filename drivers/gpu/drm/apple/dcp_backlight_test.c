@@ -528,4 +528,5 @@ static struct kunit_suite backlight_suite = {
 
 kunit_test_suite(backlight_suite);
 
+MODULE_DESCRIPTION("KUnit tests for the Apple DCP backlight");
 MODULE_LICENSE("Dual MIT/GPL");
