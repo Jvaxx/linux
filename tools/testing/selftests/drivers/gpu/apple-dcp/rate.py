@@ -353,9 +353,12 @@ def policy(root):
     block = namespace['block']
     dptx = (base/'dptxep.c').read_text()
     callback_types = '\n'.join(block(dptx, marker)+' __packed;' for marker in ('struct dptxport_apcall_link_rate {', 'struct dptxport_apcall_set_active_lane_count {'))
-    callback = block(dptx, 'static int dptxport_call_qualified_config(')
+    callback = block(dptx, 'static int dptxport_call_link_config(')
     dcp = (base/'dcp.c').read_text()
-    connection = block(dcp, 'void dcp_firmware_metadata_connection(') + '\n' + block(dcp, 'void dcp_firmware_metadata_hotplug(')
+    connection = '\n'.join(block(dcp, marker) for marker in (
+        'void dcp_firmware_metadata_connection(', 'static void dcp_firmware_metadata_present_locked(',
+        'static void dcp_announce_kick(', 'void dcp_firmware_metadata_announced(',
+        'void dcp_firmware_metadata_hotplug('))
     state=r'''
 #define U64_MAX UINT64_MAX
 #define READ_ONCE(v) (v)
@@ -381,7 +384,8 @@ struct apple_epic_service { struct apple_epic *ep; void *cookie; bool enabled; }
 struct dptx_port { u32 lane_count, link_rate; bool enabled, closed, connected; void *atcphy; struct apple_epic_service *service; };
 struct apple_dcp {
     struct { int iomfb_method_profile; } hw;
-    struct { bool lock, attributes_valid, timing_valid, hpd_seen; struct dcp_metadata_epoch epoch; } metadata;
+    struct { bool lock, attributes_valid, timing_valid, hpd_seen; struct dcp_metadata_epoch epoch; struct dcp_metadata_ticket catalog_ticket;
+        u64 catalog_connection_sequence; } metadata;
     struct { bool lock, enabled; void *service; u64 epoch; } dcpavserv;
     struct dcp_180hz_proof rate_proof;
     struct dptx_port dptxport[1];
@@ -389,10 +393,19 @@ struct apple_dcp {
     void *dev, *phy, *active_typec_route;
     bool dptx_tunnel, usb4, typec_cable_connected, quiescing, hpd_mutex;
     u64 typec_generation; unsigned int nr_modes;
+    struct dcp_display_mode *modes;
+    struct { bool holding, stopped; } announce;
 };
+struct rate_guard { bool *lock; };
+static struct rate_guard rate_lock(bool *p) { assert(!*p);*p=true;return (struct rate_guard){p}; }
+static void rate_unlock(struct rate_guard *g) { assert(*g->lock);*g->lock=false; }
+#define guard(kind) struct rate_guard __attribute__((cleanup(rate_unlock))) _guard = rate_lock
 static bool dcp_is_usb4_output(struct apple_dcp *d) { return d->usb4; }
 static void schedule_work(struct work_struct *w) { w->scheduled++; }
 static const struct edid *drm_edid_raw(const struct drm_edid *e) { return (const void *)e->data; }
+static bool dcpavserv_edid_current(struct apple_dcp *d, u64 generation) {
+    assert(d->hpd_mutex);return d->typec_cable_connected&&generation==d->typec_generation&&!d->quiescing;
+}
 static bool dcpavserv_edid_service_current(struct apple_dcp *d, u64 e) {
     assert(d->dcpavserv.lock); return e==d->dcpavserv.epoch && d->dcpavserv.enabled && d->dcpavserv.service;
 }
@@ -423,8 +436,8 @@ static void checksum(u8 *p) { unsigned sum=0; for(unsigned i=0;i<127;i++) sum+=p
 static void qualify(struct apple_dcp *d, struct apple_epic_service *s) {
     struct dptxport_apcall_link_rate rate={.link_rate=0x1e}, rate_reply={};
     struct dptxport_apcall_set_active_lane_count lanes={.lane_count=2}, lanes_reply={};
-    assert(!dptxport_call_qualified_config(s,false,&rate,sizeof(rate),&rate_reply,sizeof(rate_reply)));
-    assert(!dptxport_call_qualified_config(s,true,&lanes,sizeof(lanes),&lanes_reply,sizeof(lanes_reply)));
+    assert(!dptxport_call_link_config(s,false,&rate,sizeof(rate),&rate_reply,sizeof(rate_reply)));
+    assert(!dptxport_call_link_config(s,true,&lanes,sizeof(lanes),&lanes_reply,sizeof(lanes_reply)));
     (void)d;
 }
 static bool current(struct apple_dcp *d,const struct dcp_display_mode *m) {
@@ -496,9 +509,9 @@ int main(int argc,char **argv) {
     DENY(m.sdr_rgb.depth,10);DENY(m.sdr_rgb.colorimetry,1);DENY(m.sdr_rgb.range,1);DENY(m.mode.clock,414091);
     struct dptxport_apcall_link_rate rate={.link_rate=0x1e}, response={};
     configure_error=-EIO;
-    assert(dptxport_call_qualified_config(&s,false,&rate,sizeof(rate),&response,sizeof(response))==-EIO);
+    assert(dptxport_call_link_config(&s,false,&rate,sizeof(rate),&response,sizeof(response))==-EIO);
     assert(!current(&d,&m));configure_error=0;qualify(&d,&s);
-    assert(dptxport_call_qualified_config(&s,false,&rate,sizeof(rate)-1,&response,sizeof(response))==-EINVAL);
+    assert(dptxport_call_link_config(&s,false,&rate,sizeof(rate)-1,&response,sizeof(response))==-EINVAL);
     assert(!current(&d,&m));qualify(&d,&s);
     dcp_firmware_metadata_connection(&d,7,false);dcp_firmware_metadata_connection(&d,7,true);
     assert(!current(&d,&m));qualify(&d,&s);assert(!current(&d,&m));
@@ -543,7 +556,6 @@ struct apple_connector {''')
 };''')
     state = state.replace('struct { bool lock, enabled; void *service; u64 epoch; } dcpavserv;', 'struct { bool lock, enabled; void *service; u64 epoch; int enable_completion; } dcpavserv;')
     state = state.replace('u64 typec_generation; unsigned int nr_modes;', '''u64 typec_generation; unsigned int nr_modes;
-    struct dcp_display_mode *modes;
     struct apple_epic *dcpavservep;
     int fw_compat,width_mm,height_mm,fixed_connector_type; unsigned notch_height;
     struct { size_t length,received; void *data; bool contiguous,payload_complete;
@@ -551,7 +563,7 @@ struct apple_connector {''')
         struct dcp_metadata_ticket metadata_ticket,mode_ticket;
     } chunks;''')
 
-    start = state.index('static bool dcpavserv_edid_service_current(')
+    start = state.index('static bool dcpavserv_edid_current(')
     state = state[:start]
 
     stubs = r'''
@@ -604,7 +616,6 @@ static int drm_edid_connector_update(struct drm_connector *c,const struct drm_ed
 }
 static const struct drm_edid *dcp_firmware_edid(struct apple_dcp *d,u64 *generation) { (void)d; (void)generation; return ERR_PTR(-ENODATA); }
 static bool dcp_firmware_metadata_current(struct apple_dcp *d,u64 generation) { (void)d; (void)generation; return false; }
-static bool dcp_has_panel(struct apple_dcp *d) { return d->fixed_connector_type==DRM_CONNECTOR_eDP; }
 static struct drm_display_mode *drm_mode_duplicate(struct drm_device *dev,const struct drm_display_mode *m) {
     assert(dev->mode_config.mutex);struct drm_display_mode *copy=malloc(sizeof(*copy));assert(copy);*copy=*m;
     if(invalidate_during_duplicate) { invalidate_during_duplicate=false;dcp_180hz_invalidate(probing); }
@@ -691,9 +702,9 @@ static void finish_receipt(void) {
 static void timings(void) { start_receipt();finish_receipt(); }
 static void callbacks(bool lanes) {
     if(lanes) { struct dptxport_apcall_set_active_lane_count a={.lane_count=2},b={};
-        assert(!dptxport_call_qualified_config(&s,true,&a,sizeof(a),&b,sizeof(b))); }
+        assert(!dptxport_call_link_config(&s,true,&a,sizeof(a),&b,sizeof(b))); }
     else { struct dptxport_apcall_link_rate a={.link_rate=0x1e},b={};
-        assert(!dptxport_call_qualified_config(&s,false,&a,sizeof(a),&b,sizeof(b))); }
+        assert(!dptxport_call_link_config(&s,false,&a,sizeof(a),&b,sizeof(b))); }
 }
 static void probe(bool expected) {
     drm.mode_config.mutex=true;unsigned before=published;
@@ -753,7 +764,7 @@ static void permutations(void) {
     reset();callbacks(false);callbacks(true);timings();admit(0);fail_update=true;probe(false);assert(!con.drm_edid);cleanup();
     reset();callbacks(false);callbacks(true);timings();admit(0);transport_edid.data[10]^=1;checksum(transport_edid.data);probe(false);cleanup();transport_edid=raw;
     reset();callbacks(false);callbacks(true);timings();admit(0);configure_error=-EIO;
-    struct dptxport_apcall_link_rate req={.link_rate=0x1e},resp={};assert(dptxport_call_qualified_config(&s,false,&req,sizeof(req),&resp,sizeof(resp))==-EIO);
+    struct dptxport_apcall_link_rate req={.link_rate=0x1e},resp={};assert(dptxport_call_link_config(&s,false,&req,sizeof(req),&resp,sizeof(resp))==-EIO);
     configure_error=0;probe(false);cleanup();
     puts("PASS: 24 callback/timing/AV arrival permutations and real get_modes/lookup publication; early configuration needs no second callback; CLOSE, physical reconnect, receipt epochs and publication races deny stale proof");
 }

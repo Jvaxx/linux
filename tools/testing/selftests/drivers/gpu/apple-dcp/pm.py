@@ -10,7 +10,8 @@ def ownership(root, usb_unreachable=False):
     ns=phy.parking(root)
     s=ns['atc'];has_pm='static int atcphy_usb3_pm_get(' in s
     prod=ns['production'].replace('struct apple_atcphy {','struct apple_atcphy {\n    struct device_node *np;',1)
-    if has_pm: prod=prod.replace('static int atcphy_mux_set(', 'static int atcphy_mux_set_locked(',1)
+    if has_pm:
+        prod = prod.replace(block(prod, 'static int atcphy_mux_set('), '')
     # Non-mux fixture entry points continue to exercise actual source. Only the new
     # wrapper owns PM; the fixture's original helpers call it through this declaration.
     prefix=ns['prefix']+'\nstruct device_node;\nstatic int atcphy_mux_set(struct typec_mux_dev *, struct typec_mux_state *);\n'
@@ -35,8 +36,9 @@ def ownership(root, usb_unreachable=False):
     prefix=prefix.replace('#define guard(kind) (void)',r'''
 struct lock_guard { int *lock; };
 static struct lock_guard lock_take(int *lock) { assert(!*lock); *lock=1; return (struct lock_guard){lock}; }
-static void lock_release(struct lock_guard *g) { assert(*g->lock==1); *g->lock=0; }
+static void lock_release(struct lock_guard *g) { if(g->lock) { assert(*g->lock==1); *g->lock=0; } }
 #define guard(kind) struct lock_guard __attribute__((cleanup(lock_release))) _guard = lock_take
+#define scoped_guard(kind, ptr) for (struct lock_guard __attribute__((cleanup(lock_release))) _scope = lock_take(ptr); _scope.lock; lock_release(&_scope), _scope.lock=NULL)
 ''')
     # Basic USB/device APIs are modeled, but get/put/wrapper and all parking/
     # restoration bodies are extracted verbatim from the chosen public source.
@@ -240,13 +242,21 @@ int main(void)
    assert(select_mode(&p,APPLE_ATCPHY_MODE_USB3_DP)==-ETIMEDOUT&&p.mode_dirty&&p.pipe_pending);balanced(&p);
    bist_status_stuck=false;recover();assert(select_mode(&p,APPLE_ATCPHY_MODE_USB3_DP)==0);balanced(&p);
  }
- /* Scope and clean same-mode preserve MMIO guards; fixed no-op briefly owns PM. */
+ /* Clean same-mode updates bypass PM; dirty lanes or PIPE retry still need it. */
  struct typec_altmode alt={.svid=USB_TYPEC_DP_SID};
  struct typec_mux_dev mux={&p};struct typec_mux_state same={.mode=TYPEC_DP_STATE_D,.alt=&alt};
  prepare(&p,false,true,false);before=writes;assert(atcphy_mux_set(&mux,&same)==0&&resumes==0&&writes==before);balanced(&p);
  prepare(&p,true,false,false);before=writes;assert(atcphy_mux_set(&mux,&same)==0&&resumes==0&&writes==before);balanced(&p);
  prepare(&p,true,true,false);before=writes;
- assert(atcphy_mux_set(&mux,&same)==0&&writes==before&&resumes==1);balanced(&p);
+ root_missing=true;resume_error=-EIO;
+ assert(atcphy_mux_set(&mux,&same)==0&&writes==before&&resumes==0);balanced(&p);
+ for(unsigned int retry=0;retry<3;retry++){
+  prepare(&p,true,true,false);before=writes;root_missing=true;
+  if(retry==0)p.mode_dirty=true;
+  if(retry==1)p.pipe_pending=true;
+  if(retry==2)p.pipe_state=ATCPHY_PIPEHANDLER_STATE_DUMMY;
+  assert(atcphy_mux_set(&mux,&same)==-EAGAIN&&writes==before&&resumes==0);balanced(&p);
+ }
  /* Binding/identity failure must not reach USB PM or PHY programming. */
  for(unsigned int missing=0;missing<3;missing++){
   prepare(&p,true,true,false);before=writes;
@@ -302,7 +312,8 @@ int main(void)
       helpers+=ns['function'](s,'atcphy_usb3_link_get')+'\n'+ns['function'](s,'atcphy_usb3_link_put')+'\n'
      helpers+=ns['function'](s,'atcphy_usb3_pm_find')+'\n#endif\n'
      helpers+=ns['function'](s,'atcphy_usb3_pm_get')+'\n'+ns['function'](s,'atcphy_usb3_pm_put')+'\n'
-     # The fixture extractor adapts the locked body; extract the wrapper directly.
+     helpers+=ns['function'](s,'atcphy_mux_is_noop')+'\n'+ns['function'](s,'atcphy_mux_update')+'\n'
+     # Lane fixtures provide the target mapping and locked body; use the real callback here.
      marker=re.search(r'^static int atcphy_mux_set\(',s,re.M).group()
      helpers+=ns['block'](s,marker)+'\n'
     else:
@@ -346,6 +357,8 @@ def probe(root):
 #include <string.h>
 #define EPROBE_DEFER 517
 #define IS_ERR(p) ((intptr_t)(p)<0)
+#define ERR_PTR(e) ((void *)(intptr_t)(e))
+#define dev_info(...) ((void)0)
 #define PTR_ERR(p) ((int)(intptr_t)(p))
 #define IS_ERR_OR_NULL(p) (!(p)||IS_ERR(p))
 #define container_of(p,t,m) ((t *)((char *)(p)-offsetof(t,m)))
@@ -356,7 +369,8 @@ def probe(root):
 struct work { bool pending; };
 struct fwnode_handle { int refs; };
 struct typec_mux_state { void *alt,*data; unsigned long mode; };
-struct tps6598x { int lock; void *port; };
+struct device;
+struct tps6598x { int lock; void *port; struct device *dev; };
 struct notifier_block { int (*notifier_call)(struct notifier_block *,unsigned long,void *); };
 '''
     pm = source('drivers/usb/typec/tipd/cd321x-pm.h').replace('#include <linux/types.h>', '')
@@ -375,7 +389,9 @@ struct cd321x {
 static struct fwnode_handle connector;
 static int mux_error, notifier_error, switch_error;
 static int ports,altmodes,muxes,switches,notifiers,stop_calls;
-static bool displayport=true;
+struct typec_thunderbolt_switch;
+static bool keep_waiting=true;
+static bool cd321x_tbt_switch_keep_waiting(struct device *d) { (void)d;return keep_waiting; }
 static int tps6598x_register_port(struct tps6598x *t,struct fwnode_handle *f) {
  (void)f;t->port=t;ports++;return 0;
 }
@@ -383,7 +399,6 @@ static int cd321x_register_port_altmodes(struct cd321x *c) {
  c->port_altmode_dp=c;c->port_altmode_tbt=c;altmodes+=2;return 0;
 }
 static void *fwnode_typec_mux_get(struct fwnode_handle *f) { (void)f;muxes++;return &muxes; }
-static bool fwnode_property_present(struct fwnode_handle *f,const char *s) { (void)f;(void)s;return displayport; }
 static struct fwnode_handle *fwnode_find_reference(struct fwnode_handle *f,const char *s,int n) {
  (void)f;(void)s;(void)n;connector.refs++;return &connector;
 }
@@ -396,23 +411,25 @@ static void *fwnode_typec_thunderbolt_switch_get(struct fwnode_handle *f) {
 static int typec_set_mode(void *p,unsigned long m) { (void)p;assert(m==TYPEC_STATE_SAFE);return mux_error; }
 static int cd321x_tbt_notify(struct notifier_block *n,unsigned long e,void *d) { (void)n;(void)e;(void)d;return 0; }
 static int typec_thunderbolt_switch_register_notifier(void *s,struct notifier_block *n) {
- (void)s;(void)n;if(notifier_error)return notifier_error;notifiers++;return 0;
+ (void)n;if(!s)return 0;if(notifier_error)return notifier_error;notifiers++;return 0;
 }
-static void typec_thunderbolt_switch_put(void *s) { assert(s&&switches>0);switches--; }
+static void typec_thunderbolt_switch_put(void *s) { if(s){assert(switches>0);switches--;} }
 static void typec_mux_put(void *m) { assert(m&&muxes>0);muxes--; }
 static void typec_unregister_altmode(void *a) { if(a){assert(altmodes>0);altmodes--;} }
 static void typec_unregister_port(void *p) { assert(p&&ports>0);ports--; }
 static void cd321x_stop_work(struct cd321x *c) {
- stop_calls++;if(c->tbt_notifier_registered){notifiers--;c->tbt_notifier_registered=false;}
+ stop_calls++;if(c->tbt_notifier_registered){if(c->tbt_switch)notifiers--;c->tbt_notifier_registered=false;}
  cd321x_pm_remove(&c->pm);c->resume_work.pending=c->update_work.pending=false;
 }
 '''
     core = source('drivers/usb/typec/tipd/core.c')
-    production = function(core, 'cd321x_register_port') + '\n' + function(core, 'cd321x_unregister_port')
+    switch_get = block(core, 'VISIBLE_IF_KUNIT struct typec_thunderbolt_switch *\ncd321x_tbt_switch_get(')
+    production = switch_get.replace('VISIBLE_IF_KUNIT', 'static', 1) + '\n'
+    production += function(core, 'cd321x_register_port') + '\n' + function(core, 'cd321x_unregister_port')
     controls = r'''
 static void reset(struct cd321x *c) {
  memset(c,0,sizeof(*c));connector.refs=0;
- mux_error=notifier_error=switch_error=0;stop_calls=0;
+ mux_error=notifier_error=switch_error=0;stop_calls=0;keep_waiting=true;
  assert(!ports&&!altmodes&&!muxes&&!switches&&!notifiers);
 }
 static void balanced(void) {
@@ -422,6 +439,7 @@ int main(void) {
  struct cd321x c;
  struct cd321x_pm_state budget;
  cd321x_pm_init(&budget);assert(cd321x_pm_ready(&budget));
+ assert(cd321x_display_taken(-ENOSPC)&&!cd321x_display_taken(-EBUSY)&&!cd321x_display_taken(0));
  for(unsigned int i=0;i<CD321X_RESUME_ATTEMPTS;i++){
   assert(cd321x_pm_begin_read(&budget));cd321x_pm_snapshot_ready(&budget);
   assert(cd321x_pm_retry(&budget,false)==(i+1<CD321X_RESUME_ATTEMPTS));
@@ -458,8 +476,11 @@ int main(void) {
  reset(&c);mux_error=-EIO;
  assert(cd321x_register_port(&c.tps,&connector)==0&&!c.state_valid);
  cd321x_unregister_port(&c.tps);balanced();
- reset(&c);displayport=false;
- assert(cd321x_register_port(&c.tps,&connector)==0&&c.state_valid);
+ /* Missing router defers while suppliers may still bind, then is optional. */
+ reset(&c);switch_error=-EPROBE_DEFER;
+ assert(cd321x_register_port(&c.tps,&connector)==-EPROBE_DEFER);balanced();
+ reset(&c);switch_error=-EPROBE_DEFER;keep_waiting=false;
+ assert(cd321x_register_port(&c.tps,&connector)==0&&c.state_valid&&!c.tbt_switch);
  cd321x_unregister_port(&c.tps);balanced();
  puts("PASS actual cd321x port: mux defer/reprobe, rollback, fwnode balance and ordinary scope");
 }

@@ -75,8 +75,18 @@ or admit a hardware trial. Token/sequence semantics remain a separate protocol
 fact to establish; the tests do not manufacture a firmware echo guarantee.
 
 The boot group executes the actual OSLOG dispatcher with synthetic fixed-width
-words. Known opaque event types remain visible, unknown types retain warnings,
+words. Opaque event types 2-5 use debug logging, unknown types retain warnings,
 and only the existing buffer-request path can allocate/ACK buffers. The EDID
 service-rebind group also distinguishes intentional optional EOPNOTSUPP from
 required admission failures and genuine optional-service errors, and proves
 refused services never OPEN or publish. No captured firmware values are used.
+
+The ATC lane/PIPE and DWC3 teardown fixtures use a shared host adapter around
+both the extracted Type-C target-mode mapper and the extracted locked mux body.
+They omit USB PM at that boundary. The PM fixtures replace the adapter with the
+actual mux update and callback, including the scoped no-op check: a clean
+same-mode request needs neither root-hub lookup nor PM, while dirty lanes,
+pending PIPE work and a mismatched PIPE still require ownership. KUnit static
+redirects are disabled in host fixtures so the production bodies execute.
+CD321x probe uses the actual optional-router lookup with a modeled deferred
+probe decision; both supplier waiting and optional-router fallback are checked.
