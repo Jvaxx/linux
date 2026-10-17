@@ -39,6 +39,7 @@
 #endif
 
 #include "acpi.c"
+#include "arm_arch_timer.c"
 #include "atomic.c"
 #include "atomic_ext.c"
 #include "auxiliary.c"
@@ -85,6 +86,7 @@
 #include "poll.c"
 #include "processor.c"
 #include "property.c"
+#include "pm_domain.c"
 #include "pwm.c"
 #include "rbtree.c"
 #include "rcu.c"
