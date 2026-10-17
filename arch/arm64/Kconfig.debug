@@ -47,6 +47,7 @@ config ARM64_USER4K_KUNIT_TEST
 	bool "Test mixed userspace granules with larger kernel pages"
 	depends on KUNIT=y && ARM64_USER4K_EXPERIMENTAL
 	depends on ARM64_PA_BITS_48
+	depends on TMPFS
 	select ARM64_USER4K_DATA_KUNIT_TEST
 	select IOMMUFD
 	select IOMMUFD_DRIVER
