@@ -108,8 +108,12 @@ properties:
   "#mbox-cells":
     const: 0
 
-  power-domains:
+  resets:
     maxItems: 1
+
+  power-domains:
+    minItems: 1
+    maxItems: 2
 
 allOf:
   - if:
