@@ -34,6 +34,9 @@ struct DCP_FW_NAME(dcp_swap) {
 	 * two small u32 counters (at +0x50 and +0x78) that are not modelled.
 	 */
 	u8 h17p_pre_swap_id[0x48];
+#elif DCP_FW_VER == DCP_FW_VERSION(14, 7, 0)
+	/* 14.7 has the same 0x48-byte gap: the swap ID is at +0x98. */
+	u8 v14_7_pre_swap_id[0x48];
 #endif
 
 	u32 swap_id;
@@ -47,6 +50,21 @@ struct DCP_FW_NAME(dcp_swap) {
 	u32 swap_completed;
 
 	u32 bg_color;
+#if DCP_FW_VER == DCP_FW_VERSION(14, 7, 0)
+	/*
+	 * 14.7: opaque prefix state through +0x353 (no validated relocation of
+	 * the 13.x unk_110..bl_power fields, so the DAC writer has no fields to
+	 * write), the panel level in nits (a present byte at +0x354 and an
+	 * unaligned binary64 at +0x35c), then opaque state to +0x507.  Every
+	 * opaque byte stays zero in the qualified single-surface profile.
+	 */
+	u8 unk_158[0x1fc];
+	u8 bl_nits_present;
+	u8 unk_355[7];
+	u64 bl_nits;
+	u8 unk_364[0x20];
+	u8 unk_384[0x184];
+#else
 	u8 unk_110[0x1b8];
 	u32 unk_2c8;
 	u8 unk_2cc[0x14];
@@ -64,6 +82,7 @@ struct DCP_FW_NAME(dcp_swap) {
 	u8 unk_320[0x13f];
 	u64 unk_1;
 #endif
+#endif /* DCP_FW_VER == DCP_FW_VERSION(14, 7, 0) */
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
 	/*
 	 * The H17P A408 request is 0xe9c bytes; with a 0x22c-byte surface,
@@ -95,7 +114,11 @@ struct DCP_FW_NAME(dcp_swap_submit_req) {
 	 * H17P carries no surf2 block: its trailing u8 null-flag run is 8 bytes
 	 * (swap_null + surf_null[4] + three tail bools).
 	 */
-#if DCP_FW_VER < DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_VER == DCP_FW_VERSION(14, 7, 0)
+	/* 14.7 has six surf2 entries. */
+	struct DCP_FW_NAME(dcp_surface) surf2[6];
+	u64 surf2_iova[6];
+#elif DCP_FW_VER < DCP_FW_VERSION(26, 0, 0)
 	struct DCP_FW_NAME(dcp_surface) surf2[5];
 	u64 surf2_iova[5];
 #endif
@@ -113,7 +136,9 @@ struct DCP_FW_NAME(dcp_swap_submit_req) {
 	u8 swap_null;
 	u8 surf_null[SWAP_SURFACES];
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-#if DCP_FW_VER < DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_VER == DCP_FW_VERSION(14, 7, 0)
+	u8 surf2_null[6];
+#elif DCP_FW_VER < DCP_FW_VERSION(26, 0, 0)
 	u8 surf2_null[5];
 #endif
 #endif
@@ -122,7 +147,9 @@ struct DCP_FW_NAME(dcp_swap_submit_req) {
 	u8 unknown_pointer_null;
 	u8 unknown_output_null;
 #endif
-#if DCP_FW_VER < DCP_FW_VERSION(26, 0, 0)
+/* The 14.7 record ends with unknown_output_null at +0x1b57. */
+#if DCP_FW_VER < DCP_FW_VERSION(26, 0, 0) && \
+	DCP_FW_VER != DCP_FW_VERSION(14, 7, 0)
 	u8 padding[1];
 #endif
 } __packed;
@@ -165,6 +192,29 @@ struct DCP_FW_NAME(dcp_set_power_state_req) {
 static_assert(sizeof(struct DCP_FW_NAME(dcp_swap_start_req)) == 0x10);
 static_assert(sizeof(struct DCP_FW_NAME(dcp_swap_start_resp)) == 0x8);
 static_assert(sizeof(struct DCP_FW_NAME(dcp_set_power_state_req)) == 0x10);
+#elif DCP_FW_VER == DCP_FW_VERSION(14, 7, 0)
+/*
+ * 14.7: A406 swap_start is 0x10/0x8 with a scalar u64 client handle and a
+ * swap-ID null byte; A472 set_power_state is 12 bytes: u64 state, three
+ * booleans and the null byte of its optional u32 output.
+ */
+struct DCP_FW_NAME(dcp_swap_start_req) {
+	u32 swap_id;
+	u64 client;
+	u8 swap_id_null;
+	u8 padding[3];
+} __packed;
+
+struct DCP_FW_NAME(dcp_swap_start_resp) {
+	u32 swap_id;
+	u32 ret;
+} __packed;
+
+struct DCP_FW_NAME(dcp_set_power_state_req) {
+	u64 unklong;
+	u8 unkbool[3];
+	u8 unkint_null;
+} __packed;
 #else
 struct DCP_FW_NAME(dcp_swap_start_req) {
 	u32 swap_id;
@@ -233,6 +283,17 @@ struct DCP_FW_NAME(dc_swap_complete_resp) {
 	u8 completion_flag;		/* +0x72b */
 	u8 swap_data_null;		/* +0x72c, 0 => data at +0x005 valid */
 	u8 padding[3];			/* +0x72d, to sizeof == 0x730 */
+#elif DCP_FW_VER == DCP_FW_VERSION(14, 7, 0)
+	/*
+	 * 14.7 D589 is 0x6f0 bytes: a 0x22-byte SwapCompleteData, eight
+	 * 0xd8-byte SwapInfoBlobs and their count.  Only the swap ID is used.
+	 */
+	u8 swap_complete_data[0x22];	/* +0x005 */
+	u8 swap_info[8][0xd8];		/* +0x027 */
+	u32 swap_info_count;		/* +0x6e7, max 8 */
+	u8 completion_flag;		/* +0x6eb */
+	u8 swap_data_null;		/* +0x6ec */
+	u8 padding[3];			/* +0x6ed, to sizeof == 0x6f0 */
 #else
 	u64 swap_data;
 #if DCP_FW_VER < DCP_FW_VERSION(13, 2, 0)

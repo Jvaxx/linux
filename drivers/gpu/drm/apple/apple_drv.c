@@ -249,6 +249,18 @@ static int apple_crtc_verify_crc_source(struct drm_crtc *crtc,
 
 static const char * const apple_crtc_crc_sources[] = {"auto"};
 
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030)
+/* The J514S panel's status file, crtc-N/j514s. */
+static int apple_crtc_late_register(struct drm_crtc *crtc)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(to_apple_crtc(crtc)->dcp);
+
+	if (iomfb_is_v14_7(dcp) && !IS_ERR_OR_NULL(crtc->debugfs_entry))
+		iomfb_debugfs_init_v14_7(dcp, crtc->debugfs_entry);
+	return 0;
+}
+#endif
+
 static const char *const * apple_crtc_get_crc_sources(struct drm_crtc *crtc,
 						      size_t *count)
 {
@@ -266,6 +278,9 @@ static const struct drm_crtc_funcs apple_crtc_funcs = {
 	.set_crc_source		= apple_crtc_set_crc_source,
 	.verify_crc_source	= apple_crtc_verify_crc_source,
 	.get_crc_sources	= apple_crtc_get_crc_sources,
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030)
+	.late_register		= apple_crtc_late_register,
+#endif
 
 };
 
@@ -445,10 +460,20 @@ static int apple_probe_per_dcp(struct device *dev,
 
 	for_each_set_bit(surf, iomfb_surfaces, DCP_MAX_PLANES) {
 		plane_type = (zpos == 0) ? DRM_PLANE_TYPE_PRIMARY : DRM_PLANE_TYPE_OVERLAY;
-		planes[zpos] = apple_plane_init(drm, 1U << num, surf,
-						supports_l10r,
-						supports_xrgb2101010,
-						plane_type);
+		if (iomfb_is_v14_7(dcp_data)) {
+			/* J514S: surface 0 is the only plane. */
+			if (zpos)
+				break;
+			if (surf)
+				return dev_err_probe(dev, -EINVAL,
+						     "J514S panel needs surface 0\n");
+			planes[zpos] = apple_plane_init_v14_7(drm, 1U << num, surf);
+		} else {
+			planes[zpos] = apple_plane_init(drm, 1U << num, surf,
+							supports_l10r,
+							supports_xrgb2101010,
+							plane_type);
+		}
 		if (IS_ERR(planes[zpos]))
 			return PTR_ERR(planes[zpos]);
 
@@ -474,7 +499,9 @@ static int apple_probe_per_dcp(struct device *dev,
 		return ret;
 
 	drm_crtc_helper_add(&crtc->base, &apple_crtc_helper_funcs);
-	drm_crtc_enable_color_mgmt(&crtc->base, 0, true, 0);
+	/* J514S: no CTM, so no set_matrix, unless j514s_ctm is set. */
+	if (!iomfb_is_v14_7(dcp_data) || iomfb_v14_7_ctm)
+		drm_crtc_enable_color_mgmt(&crtc->base, 0, true, 0);
 
 	crtc->dcp = dcp;
 	*crtc_mask = drm_crtc_mask(&crtc->base);
@@ -638,9 +665,47 @@ err:
 	return ret;
 }
 
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030)
+/*
+ * The J514S loader describes the boot framebuffer only as a simple-framebuffer
+ * node; its display subsystem has no "framebuffer" memory region.  Take the
+ * aperture from the single available simple-framebuffer.
+ */
+static bool apple_boot_fb_only(struct device *dev)
+{
+	return of_device_is_compatible(dev->of_node, "apple,t6030-display-diagnostics") &&
+	       of_property_match_string(dev->of_node, "memory-region-names",
+					"framebuffer") < 0;
+}
+
+static int apple_get_boot_fb_resource(struct device *dev, struct resource *fb_r)
+{
+	struct device_node *np;
+	int found = 0, ret = -ENODEV;
+
+	for_each_compatible_node(np, NULL, "simple-framebuffer") {
+		if (!of_device_is_available(np))
+			continue;
+		if (++found > 1) {
+			of_node_put(np);
+			dev_err(dev, "more than one boot framebuffer\n");
+			return -EINVAL;
+		}
+		ret = of_address_to_resource(np, 0, fb_r);
+	}
+	if (ret)
+		dev_err(dev, "no boot framebuffer aperture: %d\n", ret);
+	return ret;
+}
+#endif
+
 static const struct of_device_id apple_dcp_id_tbl[] = {
 	{ .compatible = "apple,dcp" },
 	{ .compatible = "apple,dcpext" },
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030)
+	/* The J514S boot loader names its DCP and display subsystem by SoC only. */
+	{ .compatible = "apple,t6030-dcp" },
+#endif
 	{},
 };
 
@@ -733,6 +798,12 @@ static int apple_drm_init_dcp(struct device *dev)
 		 */
 		if (ret)
 			dev_warn(dev, "DCP[%d] not ready: %d\n", i, ret);
+		/*
+		 * The J514S panel is only taken over from a started session:
+		 * without it the boot framebuffer (simpledrm) stays.
+		 */
+		if (ret && iomfb_is_v14_7(platform_get_drvdata(dcp[i])))
+			return ret;
 	}
 	/* HACK: Wait for dcp* to settle before a modeset */
 	msleep(100);
@@ -751,7 +822,12 @@ static int apple_drm_init(struct device *dev)
 	if (ret)
 		return ret;
 
-	ret = apple_get_fb_resource(dev, "framebuffer", &fb_r);
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030)
+	if (apple_boot_fb_only(dev))
+		ret = apple_get_boot_fb_resource(dev, &fb_r);
+	else
+#endif
+		ret = apple_get_fb_resource(dev, "framebuffer", &fb_r);
 	if (ret)
 		return ret;
 
@@ -913,6 +989,9 @@ static void apple_platform_remove(struct platform_device *pdev)
 
 static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,display-subsystem" },
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030)
+	{ .compatible = "apple,t6030-display-diagnostics" },
+#endif
 	{}
 };
 MODULE_DEVICE_TABLE(of, of_match);

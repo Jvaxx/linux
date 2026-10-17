@@ -108,6 +108,16 @@ static enum dcp_context_id dcp_call_context(struct apple_dcp *dcp, bool oob)
 {
 	u8 depth = oob ? dcp->ch_oobcmd.depth : dcp->ch_cmd.depth;
 
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030)
+	/*
+	 * 14.7: a call made while a context-0 callback runs continues that
+	 * conversation (context 0, bit 9 clear); any other call opens a new
+	 * stream on context 2.
+	 */
+	if (iomfb_is_v14_7(dcp))
+		return dcp->ch_cb.depth ? DCP_CONTEXT_CB : DCP_CONTEXT_CMD;
+#endif
+
 	if (depth)
 		return oob ? DCP_CONTEXT_OOBCB : DCP_CONTEXT_CB;
 	else
@@ -161,11 +171,15 @@ static u8 dcp_pop_depth(u8 *depth)
 	return --(*depth);
 }
 
-/* Older firmware and the H17G method profile retain their existing transport. */
+/*
+ * Older firmware and the H17G method profile retain their existing transport.
+ * The J514S 14.7 panel has one serialized owner, as H17P.
+ */
 static bool iomfb_uses_queue(struct apple_dcp *dcp)
 {
-	return dcp->fw_compat == DCP_FIRMWARE_H17P &&
-	       dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G;
+	return (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+		dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) ||
+	       iomfb_is_v14_7(dcp);
 }
 
 static bool iomfb_channels_idle(struct apple_dcp *dcp)
@@ -642,7 +656,7 @@ void dcp_push(struct apple_dcp *dcp, bool oob, const struct dcp_method_entry *ca
 		return;
 	}
 
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P && READ_ONCE(dcp->crashed))
+	if (dcp_fail_stop(dcp) && READ_ONCE(dcp->crashed))
 		return;
 
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G &&
@@ -667,7 +681,19 @@ void dcp_push(struct apple_dcp *dcp, bool oob, const struct dcp_method_entry *ca
 	u8 depth;
 	u16 offset;
 
-	if (iomfb_uses_queue(dcp) &&
+	/*
+	 * 14.7 sends no out-of-band call, and a second top-level call while
+	 * one is outstanding outside a callback has no owner.
+	 */
+	if (iomfb_is_v14_7(dcp) &&
+	    (oob || (context == DCP_CONTEXT_CMD && dcp->ch_cmd.depth))) {
+		dev_err(dcp->dev, "IOMFB %c%c%c%c has no 14.7 call context\n",
+			call->tag[0], call->tag[1], call->tag[2], call->tag[3]);
+		iomfb_v14_7_fail(dcp, "invalid call context");
+		return;
+	}
+
+	if ((iomfb_uses_queue(dcp) || iomfb_is_v14_7(dcp)) &&
 	    (!ch || ch->depth >= DCP_MAX_CALL_DEPTH ||
 	     (u64)sizeof(header) + in_len + out_len > 0x8000 ||
 	     dcp_packet_start(ch, ch->depth) >
@@ -675,6 +701,8 @@ void dcp_push(struct apple_dcp *dcp, bool oob, const struct dcp_method_entry *ca
 			       DCP_PACKET_ALIGNMENT))) {
 		dev_err(dcp->dev, "invalid IOMFB command envelope\n");
 		WRITE_ONCE(dcp->crashed, true);
+		if (iomfb_is_v14_7(dcp))
+			iomfb_v14_7_fail(dcp, "invalid command envelope");
 		return;
 	}
 	depth = dcp_push_depth(&ch->depth);
@@ -691,6 +719,9 @@ void dcp_push(struct apple_dcp *dcp, bool oob, const struct dcp_method_entry *ca
 	/* An unwritten status must not look like a successful response. */
 	if (out_len)
 		memset(out_data + in_len, 0xff, out_len);
+	/* 14.7 calls go out with zeroed output storage. */
+	if (out_len && iomfb_is_v14_7(dcp))
+		memset(out_data + in_len, 0, out_len);
 
 	trace_iomfb_push(dcp, call, context, offset, depth);
 
@@ -1186,6 +1217,98 @@ static bool dcp_external_zero_reply(struct apple_dcp *dcp, int tag,
 	       of_device_is_compatible(dcp->dev->of_node, "apple,t8140-dcpext");
 }
 
+/*
+ * A 14.7 callback can arrive on either route of the first two streams, with
+ * or without the new-stream flag (bit 9).  Its record is in the callback area
+ * of its route and stream, and its ACK keeps its own context nibble; the
+ * bookkeeping uses the callback channel of that route and stream.
+ */
+static struct dcp_channel *dcp_v14_7_cb_channel(struct apple_dcp *dcp,
+						 enum dcp_context_id context)
+{
+	switch ((unsigned int)context) {
+	case 0: case 2:
+		return &dcp->ch_cb;
+	case 1: case 3:
+		return &dcp->ch_async;
+	case 4: case 6:
+		return &dcp->ch_oobcb;
+	case 5: case 7:
+		return &dcp->ch_oobasync;
+	default:
+		return NULL;
+	}
+}
+
+static int dcp_v14_7_cb_offset(enum dcp_context_id context)
+{
+	if ((unsigned int)context > 7)
+		return -EINVAL;
+	return ((context & 1) ? 0x40000 : 0x60000) + ((context & 4) ? 0x8000 : 0);
+}
+
+/*
+ * 14.7 callbacks: the exact shape of every callback the J514S session
+ * handles is known, so any other number or shape, a missing handler or a
+ * continuation callback off context 0 is a protocol failure.  The session
+ * latches and the callback is never acknowledged with an invented reply.
+ */
+static void dcpep_handle_cb_v14_7(struct apple_dcp *dcp,
+				  enum dcp_context_id context, void *data,
+				  u32 length, u16 offset)
+{
+	struct dcp_channel *ch = dcp_v14_7_cb_channel(dcp, context);
+	struct dcp_packet_header *hdr = data;
+	void *in, *out;
+	int tag;
+	u8 depth;
+
+	if (length < sizeof(*hdr) || !ch || ch->depth >= DCP_MAX_CALL_DEPTH ||
+	    offset % DCP_PACKET_ALIGNMENT || offset >= 0x8000 ||
+	    length > 0x8000 - offset) {
+		dev_err(dcp->dev, "invalid IOMFB callback envelope context=%u offset=%#x length=%#x\n",
+			context, offset, length);
+		iomfb_v14_7_fail(dcp, "invalid callback envelope");
+		return;
+	}
+
+	tag = dcp_parse_tag(hdr->tag);
+	if (tag < 0 || (u64)sizeof(*hdr) + hdr->in_len + hdr->out_len != length ||
+	    !iomfb_check_callback_v14_7(tag, hdr->in_len, hdr->out_len) ||
+	    !dcp->cb_handlers || !dcp->cb_handlers[tag]) {
+		dev_err(dcp->dev, "unsupported IOMFB callback %c%c%c%c (%u, %u) context=%u\n",
+			hdr->tag[3], hdr->tag[2], hdr->tag[1], hdr->tag[0],
+			hdr->in_len, hdr->out_len, context);
+		iomfb_v14_7_fail(dcp, "unsupported callback");
+		return;
+	}
+	if (context != DCP_CONTEXT_CB && iomfb_v14_7_needs_continuation(tag)) {
+		dev_err(dcp->dev, "callback D%03d needs a continuation but arrived on context %u\n",
+			tag, context);
+		iomfb_v14_7_fail(dcp, "continuation callback off context 0");
+		return;
+	}
+
+	in = data + sizeof(*hdr);
+	out = in + hdr->in_len;
+	if (hdr->out_len)
+		memset(out, 0, hdr->out_len);
+
+	depth = dcp_push_depth(&ch->depth);
+	ch->output[depth] = out;
+	ch->end[depth] = offset + ALIGN(length, DCP_PACKET_ALIGNMENT);
+	if (dcp->v14_7)
+		dcp->v14_7->callbacks++;
+
+	/* A deferred reply ACKs from its continuation; a failure never does. */
+	if (!dcp->cb_handlers[tag](dcp, tag, out, in) || READ_ONCE(dcp->crashed))
+		return;
+
+	dma_wmb();
+	dcp_pop_depth(&ch->depth);
+	dcp_send_message(dcp, IOMFB_ENDPOINT, dcpep_ack(context));
+}
+
 static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 			    void *data, u32 length, u16 offset)
 {
@@ -1196,6 +1319,11 @@ static void dcpep_handle_cb(struct apple_dcp *dcp, enum dcp_context_id context,
 	struct dcp_channel *ch = dcp_get_channel(dcp, context);
 	u8 depth;
 	bool handled, zero_reply;
+
+	if (iomfb_is_v14_7(dcp)) {
+		dcpep_handle_cb_v14_7(dcp, context, data, length, offset);
+		return;
+	}
 
 	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
 	    (length < sizeof(*hdr) || !ch || ch->depth >= DCP_MAX_CALL_DEPTH ||
@@ -1280,11 +1408,15 @@ static void dcpep_handle_ack(struct apple_dcp *dcp, enum dcp_context_id context)
 
 	if (!ch) {
 		dev_warn(dcp->dev, "ignoring ack on context %X\n", context);
+		if (iomfb_is_v14_7(dcp))
+			iomfb_v14_7_fail(dcp, "reply on an unknown context");
 		return;
 	}
 
 	if (!ch->depth) {
 		dev_warn(dcp->dev, "ignoring ack on idle context %X\n", context);
+		if (iomfb_is_v14_7(dcp))
+			iomfb_v14_7_fail(dcp, "reply without a pending call");
 		return;
 	}
 
@@ -1347,9 +1479,13 @@ static void dcpep_got_msg(struct apple_dcp *dcp, u64 message)
 	length = FIELD_GET(IOMFB_MSG_LENGTH, message);
 
 	channel_offset = dcp_channel_offset(ctx_id);
+	if (iomfb_is_v14_7(dcp) && !FIELD_GET(IOMFB_MSG_ACK, message))
+		channel_offset = dcp_v14_7_cb_offset(ctx_id);
 
 	if (channel_offset < 0) {
 		dev_warn(dcp->dev, "invalid context received %u\n", ctx_id);
+		if (iomfb_is_v14_7(dcp))
+			iomfb_v14_7_fail(dcp, "message on an unknown context");
 		return;
 	}
 
@@ -1464,7 +1600,8 @@ int dcp_get_modes(struct drm_connector *connector)
 
 	/* Internal H17P still has no supported EDID command transport. */
 	if (nr_modes && !apple_connector->drm_edid &&
-	    (dcp->fw_compat != DCP_FIRMWARE_H17P ||
+	    ((dcp->fw_compat != DCP_FIRMWARE_H17P &&
+	      !iomfb_is_v14_7(dcp)) ||
 	     (dcp->dcpavservep && dcp->dcpavservep->wire_v2))) {
 		const struct drm_edid *edid;
 		/* Let physical disconnect advance the generation during the request. */
@@ -1642,7 +1779,8 @@ static bool dcp_mode_settable(struct apple_dcp *dcp,
 	if (!dcp_mode)
 		return false;
 
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	if ((dcp->fw_compat == DCP_FIRMWARE_H17P ||
+	     iomfb_is_v14_7(dcp)) &&
 	    dcp->hw.iomfb_method_profile !=
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		return dcp_mode->mode.type & DRM_MODE_TYPE_PREFERRED;
@@ -1716,6 +1854,9 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 		break;
 	case DCP_FIRMWARE_H17P:
 		ret = iomfb_modeset_h17p(dcp, crtc_state);
+		break;
+	case DCP_FIRMWARE_V_14_7:
+		ret = iomfb_modeset_v14_7(dcp, crtc_state);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n",
@@ -1989,6 +2130,10 @@ static void iomfb_backlight_start(struct apple_dcp *dcp,
 	bool have_surface = false;
 	unsigned int i;
 
+	if (iomfb_is_v14_7(dcp)) {
+		iomfb_present_backlight_v14_7(dcp);
+		return;
+	}
 	if (!dcp_backlight_pending(dcp) || !READ_ONCE(dcp->mode_state.valid) || !scanout ||
 	    !dcp->connector || !dcp->connector->connected)
 		return;
@@ -2037,6 +2182,10 @@ struct iomfb_atomic_transaction {
 	struct drm_crtc *crtc;
 	struct apple_dcp *dcp;
 	struct iomfb_scanout_h17p *scanout;
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030)
+	/* The 14.7 snapshot this present becomes once it completes. */
+	struct iomfb_scanout_v14_7 *scanout_v14_7;
+#endif
 };
 
 static void iomfb_atomic_start(struct apple_dcp *dcp,
@@ -2049,6 +2198,13 @@ static void iomfb_atomic_start(struct apple_dcp *dcp,
 		schedule_work(&dcp->vblank_wq);
 		return;
 	}
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030)
+	if (iomfb_is_v14_7(dcp)) {
+		atomic->scanout_v14_7 = iomfb_present_atomic_v14_7(dcp, atomic->crtc,
+								    atomic->state);
+		return;
+	}
+#endif
 	atomic->scanout = iomfb_scanout_prepare_h17p(dcp, atomic->crtc, atomic->state);
 	if (!atomic->scanout) {
 		WRITE_ONCE(dcp->crashed, true);
@@ -2065,6 +2221,9 @@ static void iomfb_atomic_release(struct iomfb_transaction *transaction)
 					 struct iomfb_atomic_transaction, transaction);
 
 	iomfb_scanout_put_h17p(atomic->dcp, atomic->scanout);
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030)
+	iomfb_present_release_v14_7(atomic->dcp, atomic->scanout_v14_7);
+#endif
 	drm_atomic_state_put(atomic->state);
 	kfree(atomic);
 }
@@ -2151,6 +2310,9 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
 	case DCP_FIRMWARE_H17P:
 		iomfb_flush_h17p(dcp, crtc, state);
 		break;
+	case DCP_FIRMWARE_V_14_7:
+		iomfb_flush_v14_7(dcp, crtc, state);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
@@ -2169,6 +2331,9 @@ static void iomfb_start(struct apple_dcp *dcp)
 	case DCP_FIRMWARE_H17P:
 		iomfb_start_h17p(dcp);
 		break;
+	case DCP_FIRMWARE_V_14_7:
+		iomfb_start_v14_7(dcp);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
@@ -2182,11 +2347,43 @@ bool dcp_is_initialized(struct platform_device *pdev)
 	return dcp->active;
 }
 
+/*
+ * The 14.7 READY word: type 1, the packet alignment (64) in bits 47:16 and no
+ * firmware hash; bit 8 is routing.  It arrives once, and IOMFB traffic only
+ * after it.
+ */
+static bool iomfb_v14_7_check_message(struct apple_dcp *dcp, u64 message)
+{
+	enum dcpep_type type = FIELD_GET(IOMFB_MESSAGE_TYPE, message);
+	struct dcp_v14_7_session *s = dcp->v14_7;
+
+	if (type == IOMFB_MESSAGE_TYPE_INITIALIZED) {
+		if (s->ready_word || (message & 0xfeff) != 1 ||
+		    (message >> 16) != DCP_PACKET_ALIGNMENT) {
+			dev_err(dcp->dev, "unexpected IOMFB READY %#llx\n", message);
+			iomfb_v14_7_fail(dcp, "unexpected READY");
+			return false;
+		}
+		s->ready_word = message;
+		dev_info(dcp->dev, "IOMFB READY %#018llx; client open A401 -> A455\n",
+			 message);
+	} else if (type == IOMFB_MESSAGE_TYPE_MSG && !s->ready_word) {
+		dev_err(dcp->dev, "IOMFB message %#llx before READY\n", message);
+		iomfb_v14_7_fail(dcp, "message before READY");
+		return false;
+	}
+	return true;
+}
+
 static void iomfb_recv_message(struct apple_dcp *dcp, u64 message)
 {
 	enum dcpep_type type = FIELD_GET(IOMFB_MESSAGE_TYPE, message);
 
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P && READ_ONCE(dcp->crashed))
+	if (dcp_fail_stop(dcp) && READ_ONCE(dcp->crashed))
+		return;
+
+	if (iomfb_is_v14_7(dcp) &&
+	    !iomfb_v14_7_check_message(dcp, message))
 		return;
 
 	if (type == IOMFB_MESSAGE_TYPE_INITIALIZED) {
@@ -2259,6 +2456,24 @@ int iomfb_start_rtkit(struct apple_dcp *dcp)
 	if (!dcp->shmem)
 		return -ENOMEM;
 
+	/*
+	 * The 14.7 INIT descriptor: bytes 0-11 zero and the packet alignment
+	 * at +12, in the DCP's DMA window.  The arena is never freed.
+	 */
+	if (iomfb_is_v14_7(dcp)) {
+		if (shmem_iova < DCP_V14_7_DVA_BASE ||
+		    shmem_iova - DCP_V14_7_DVA_BASE > DCP_V14_7_DVA_SIZE - DCP_SHMEM_SIZE) {
+			dev_err(dcp->dev, "IOMFB arena %pad outside the DCP window\n",
+				&shmem_iova);
+			iomfb_v14_7_fail(dcp, "IOMFB arena outside the DMA window");
+			return -ERANGE;
+		}
+		put_unaligned_le32(DCP_PACKET_ALIGNMENT, dcp->shmem + 12);
+		dma_wmb();
+		dev_info(dcp->dev, "IOMFB INIT %#llx (arena %pad, %#x bytes)\n",
+			 dcpep_set_shmem(shmem_iova), &shmem_iova, DCP_SHMEM_SIZE);
+	}
+
 	dcp_send_message(dcp, IOMFB_ENDPOINT, dcpep_set_shmem(shmem_iova));
 
 	return 0;
@@ -2279,6 +2494,9 @@ void iomfb_shutdown(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_H17P:
 		iomfb_shutdown_h17p(dcp);
+		break;
+	case DCP_FIRMWARE_V_14_7:
+		iomfb_shutdown_v14_7(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);

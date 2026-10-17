@@ -559,3 +559,92 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 
 	return &plane->base;
 }
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030)
+#include <drm/drm_print.h>
+
+#include "iomfb_v14_7_present.h"
+
+/*
+ * J514S (DCP firmware 14.7) internal panel.  Its only plane is a primary in
+ * surface slot 0 that scans one linear XRGB8888 or ARGB8888 framebuffer over
+ * the whole panel, unscaled: any second DCP surface sends the frame through
+ * the firmware's blending and colour processing, which casts this panel warm.
+ */
+static const u32 dcp_primary_formats_v14_7[] = {
+	DRM_FORMAT_XRGB8888,
+	DRM_FORMAT_ARGB8888,
+};
+
+static int apple_plane_atomic_check_v14_7(struct drm_plane *plane,
+					  struct drm_atomic_state *state)
+{
+	struct drm_plane_state *new_plane_state;
+	struct drm_crtc_state *crtc_state;
+	struct iomfb_v14_7_frame frame;
+	int ret;
+
+	new_plane_state = drm_atomic_get_new_plane_state(state, plane);
+	if (!new_plane_state->crtc)
+		return 0;
+
+	crtc_state = drm_atomic_get_crtc_state(state, new_plane_state->crtc);
+	if (IS_ERR(crtc_state))
+		return PTR_ERR(crtc_state);
+
+	ret = drm_atomic_helper_check_plane_state(new_plane_state, crtc_state,
+						  DRM_PLANE_NO_SCALING,
+						  DRM_PLANE_NO_SCALING,
+						  false, true);
+	if (ret || !new_plane_state->visible)
+		return ret;
+
+	ret = iomfb_v14_7_plane_frame(new_plane_state, crtc_state->mode.hdisplay,
+				      crtc_state->mode.vdisplay, &frame);
+	if (ret)
+		drm_dbg_atomic(plane->dev,
+			       "J514S plane refuses fb %ux%u %p4cc mod %#llx pitch %u offset %u src %ux%u+%u+%u crtc %ux%u+%d+%d\n",
+			       new_plane_state->fb->width,
+			       new_plane_state->fb->height,
+			       &new_plane_state->fb->format->format,
+			       new_plane_state->fb->modifier,
+			       new_plane_state->fb->pitches[0],
+			       new_plane_state->fb->offsets[0],
+			       new_plane_state->src_w >> 16,
+			       new_plane_state->src_h >> 16,
+			       new_plane_state->src_x >> 16,
+			       new_plane_state->src_y >> 16,
+			       new_plane_state->crtc_w, new_plane_state->crtc_h,
+			       new_plane_state->crtc_x, new_plane_state->crtc_y);
+	return ret;
+}
+
+static const struct drm_plane_helper_funcs apple_primary_plane_helper_funcs_v14_7 = {
+	.prepare_fb	= apple_plane_prepare_fb,
+	.cleanup_fb	= apple_plane_cleanup_fb,
+	.atomic_check	= apple_plane_atomic_check_v14_7,
+	.atomic_update	= apple_plane_atomic_update,
+	.get_scanout_buffer = drm_fb_dma_get_scanout_buffer,
+};
+
+struct drm_plane *apple_plane_init_v14_7(struct drm_device *dev,
+					 unsigned long possible_crtcs,
+					 u32 iomfb_surf)
+{
+	struct apple_plane *plane;
+
+	plane = drmm_universal_plane_alloc(dev, struct apple_plane, base,
+					   possible_crtcs, &apple_plane_funcs,
+					   dcp_primary_formats_v14_7,
+					   ARRAY_SIZE(dcp_primary_formats_v14_7),
+					   apple_format_modifiers,
+					   DRM_PLANE_TYPE_PRIMARY, NULL);
+	if (IS_ERR(plane))
+		return ERR_CAST(plane);
+
+	drm_plane_helper_add(&plane->base, &apple_primary_plane_helper_funcs_v14_7);
+	plane->iomfb_surf = iomfb_surf;
+
+	return &plane->base;
+}
+#endif

@@ -24,8 +24,11 @@
 #include <linux/of_device.h>
 #include <linux/of_graph.h>
 #include <linux/of_platform.h>
+#include <linux/of_reserved_mem.h>
 #include <linux/property.h>
+#include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/soc/apple/pmp-display.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/string.h>
 #include <linux/usb/typec_altmode.h>
@@ -48,6 +51,7 @@
 #include "dcp-internal.h"
 #include "dcp-external-bw.h"
 #include "dptx-service.h"
+#include "dcp-property-store.h"
 #include "iomfb.h"
 #include "parser.h"
 #include "trace.h"
@@ -90,7 +94,7 @@ static int dcp_pin_live_session(struct apple_dcp *dcp)
 	if ((!dcp->hw.adopt_live_session &&
 	     dcp->hw.iomfb_method_profile !=
 	     DCP_IOMFB_METHODS_H17P_EXTERNAL) ||
-	    dcp->fw_compat != DCP_FIRMWARE_H17P ||
+	    !dcp_fail_stop(dcp) ||
 	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G || dcp->retain_dma)
 		return 0;
 	session = kzalloc_obj(*session);
@@ -2344,7 +2348,7 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 	 * remote allocator endpoint, for one).  Log their messages rather than
 	 * dereferencing a NULL afkep or warning about an unknown endpoint.
 	 */
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P && endpoint != IOMFB_ENDPOINT &&
+	if (dcp_fail_stop(dcp) && endpoint != IOMFB_ENDPOINT &&
 	    !dcp_afkep(dcp, endpoint)) {
 		dev_dbg_ratelimited(dcp->dev, "ep %#04x: %#llx\n", endpoint,
 				    message);
@@ -2375,7 +2379,7 @@ static void dcp_rtk_crashed(void *cookie, const void *crashlog, size_t crashlog_
 
 	dcp->crashed = true;
 	dev_err(dcp->dev, "DCP has crashed\n");
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	if (dcp_fail_stop(dcp) &&
 	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
 		/* No in-place restart exists; the last scanout stays retained. */
 		dev_err(dcp->dev, "a reboot is required to restore the display\n");
@@ -2417,10 +2421,121 @@ static int dcp_check_iova_contiguous(struct iommu_domain *domain,
 	return 0;
 }
 
+static bool dcp_v14_7_in(u64 base, u64 length, u64 addr, u64 size)
+{
+	return length && size && addr >= base && addr - base < length &&
+	       size <= length - (addr - base);
+}
+
+/*
+ * Only the DCP's own no-map "apple,asc-mem" reservations may back a buffer
+ * the firmware names; @oslog selects the "apple,dcp-os-log" carveout.
+ */
+static bool dcp_v14_7_reserved(struct apple_dcp *dcp, u64 pa, size_t size,
+			       bool oslog)
+{
+	struct device_node *node;
+	struct resource res;
+	bool found = false;
+	int i;
+
+	for (i = 0; (node = of_parse_phandle(dcp->dev->of_node, "memory-region", i)); i++) {
+		struct reserved_mem *rmem = of_reserved_mem_lookup(node);
+
+		if (of_device_is_compatible(node, "apple,asc-mem") &&
+		    of_property_read_bool(node, "no-map") &&
+		    oslog == of_property_read_bool(node, "apple,dcp-os-log") &&
+		    !of_address_to_resource(node, 0, &res) && rmem &&
+		    rmem->base == res.start && rmem->size == resource_size(&res) &&
+		    dcp_v14_7_in(res.start, resource_size(&res), pa, size))
+			found = true;
+		of_node_put(node);
+		if (found)
+			break;
+	}
+	return found;
+}
+
+/*
+ * RTKit system buffers of the adopted 14.7 session.  A buffer the firmware
+ * names by DVA must translate contiguously into one of the DCP's reserved
+ * regions; the OS log names its carveout by physical address instead.  New
+ * buffers come from the DCP's DMA window.  Nothing is ever returned: the
+ * session keeps them until reboot.
+ */
+static int dcp_rtk_shmem_setup_v14_7(struct apple_dcp *dcp,
+				     struct apple_rtkit_shmem *bfr)
+{
+	struct iommu_domain *domain = iommu_get_domain_for_dev(dcp->dev);
+	struct dcp_v14_7_session *s = dcp->v14_7;
+	phys_addr_t pa;
+	size_t off;
+
+	if (!domain || !bfr->size || bfr->size > SZ_16M ||
+	    s->rtkit_bytes > SZ_64M - bfr->size)
+		goto fail;
+
+	if (!bfr->iova) {
+		bfr->buffer = dma_alloc_coherent(dcp->dev, bfr->size, &bfr->iova,
+						 GFP_KERNEL);
+		if (!bfr->buffer)
+			goto fail;
+		s->rtkit_bytes += bfr->size;
+		if (!dcp_v14_7_in(DCP_V14_7_DVA_BASE, DCP_V14_7_DVA_SIZE,
+				  bfr->iova, bfr->size))
+			goto fail;
+		bfr->is_mapped = false;
+		dev_info(dcp->dev, "RTKit allocated %zu bytes at %pad\n",
+			 bfr->size, &bfr->iova);
+		return 0;
+	}
+
+	if (dcp_v14_7_reserved(dcp, bfr->iova, bfr->size, true)) {
+		/* A physical address can also fall in the DVA window: refuse that. */
+		for (off = 0; off < bfr->size;) {
+			if (iommu_iova_to_phys(domain, bfr->iova + off))
+				goto fail;
+			off += SZ_16K - ((bfr->iova + off) & (SZ_16K - 1));
+		}
+		pa = bfr->iova;
+	} else {
+		if (!dcp_v14_7_in(DCP_V14_7_DVA_BASE, DCP_V14_7_DVA_SIZE,
+				  bfr->iova, bfr->size))
+			goto fail;
+		pa = iommu_iova_to_phys(domain, bfr->iova);
+		if (!pa || !dcp_v14_7_reserved(dcp, pa, bfr->size, false))
+			goto fail;
+		/* The initial unaligned span and every crossed 16 KiB page. */
+		for (off = SZ_16K - (bfr->iova & (SZ_16K - 1)); off < bfr->size;
+		     off += SZ_16K)
+			if (iommu_iova_to_phys(domain, bfr->iova + off) != pa + off)
+				goto fail;
+	}
+
+	/* Firmware writes without CPU cache maintenance. */
+	bfr->buffer = memremap(pa, bfr->size, MEMREMAP_WC);
+	if (!bfr->buffer)
+		goto fail;
+	bfr->is_mapped = true;
+	s->rtkit_bytes += bfr->size;
+	dev_info(dcp->dev, "RTKit borrowed %zu bytes at %pad -> %pa\n",
+		 bfr->size, &bfr->iova, &pa);
+	return 0;
+
+fail:
+	dev_err(dcp->dev, "RTKit buffer request for %zu bytes at %pad refused\n",
+		bfr->size, &bfr->iova);
+	iomfb_v14_7_fail(dcp, "RTKit buffer request refused");
+	return -EINVAL;
+}
+
 static int dcp_rtk_shmem_setup(void *cookie, struct apple_rtkit_shmem *bfr)
 {
 	struct apple_dcp *dcp = cookie;
 	int ret;
+
+	if (iomfb_is_v14_7(dcp))
+		return dcp_rtk_shmem_setup_v14_7(dcp, bfr);
 
 	if (bfr->iova) {
 		struct iommu_domain *domain =
@@ -3311,6 +3426,17 @@ int dcp_start(struct platform_device *pdev)
 	if (IS_ERR_OR_NULL(dcp->rtk))
 		return -ENODEV;
 
+	/*
+	 * The adopted 14.7 panel session runs IOMFB only: it starts no AFK
+	 * service endpoint (system, DPAV, iBoot, DPTX, AV).
+	 */
+	if (iomfb_is_v14_7(dcp)) {
+		ret = iomfb_start_rtkit(dcp);
+		if (ret)
+			dev_err(dcp->dev, "Failed to start IOMFB endpoint: %d\n", ret);
+		return ret;
+	}
+
 	/* Make the H17P allocator available before external service discovery. */
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL) {
 		ret = apple_rtkit_start_ep(dcp->rtk, REMOTE_ALLOC_ENDPOINT);
@@ -3403,6 +3529,9 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 	case DCP_FIRMWARE_H17P:
 		iomfb_poweroff_h17p(dcp);
 		break;
+	case DCP_FIRMWARE_V_14_7:
+		iomfb_poweroff_v14_7(dcp);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
@@ -3431,10 +3560,82 @@ static int dcp_enable_dp2hdmi_hpd(struct apple_dcp *dcp)
 	return 0;
 }
 
+/* Startup budget of the 14.7 session: READY, A401 and A455 with callbacks. */
+#define DCP_V14_7_START_TIMEOUT	msecs_to_jiffies(10000)
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030)
+static int dcp_t6030_display_prepare(struct device *dev)
+{
+	return apple_pmp_j514s_display_prepare(dev);
+}
+
+static int dcp_t6030_display_get(struct device *dev)
+{
+	return apple_pmp_j514s_display_get(dev);
+}
+
+static int dcp_t6030_display_check(struct device *dev)
+{
+	return apple_pmp_j514s_display_check(dev);
+}
+#else
+static int dcp_t6030_display_prepare(struct device *dev) { return -ENODEV; }
+static int dcp_t6030_display_get(struct device *dev) { return -ENODEV; }
+static int dcp_t6030_display_check(struct device *dev) { return -ENODEV; }
+#endif
+
+/* KMS scans out through the display subsystem's own DART stream (SID0). */
+static bool dcp_t6030_scanout_domain(void)
+{
+	struct device_node *np = of_find_node_by_path("disp0");
+	struct platform_device *pdev = np ? of_find_device_by_node(np) : NULL;
+	bool ok = pdev && iommu_get_domain_for_dev(&pdev->dev);
+
+	of_node_put(np);
+	if (pdev)
+		put_device(&pdev->dev);
+	return ok;
+}
+
+/*
+ * The 14.7 session is usable once A455 has replied and the preferred mode is
+ * known; the PMP must still hold the display (DISP requested and
+ * acknowledged) and the scanout device must have its DMA domain before KMS
+ * takes the panel over.  Anything else is a failed session.
+ */
+static int dcp_wait_ready_v14_7(struct apple_dcp *dcp)
+{
+	int ret;
+
+	if (!READ_ONCE(dcp->crashed) && !dcp->active)
+		wait_for_completion_timeout(&dcp->start_done,
+					    DCP_V14_7_START_TIMEOUT);
+	if (READ_ONCE(dcp->crashed))
+		return -ENODEV;
+	if (!dcp->active) {
+		iomfb_v14_7_fail(dcp, "IOMFB startup did not complete");
+		return -ETIMEDOUT;
+	}
+	if (!dcp_t6030_scanout_domain()) {
+		iomfb_v14_7_fail(dcp, "scanout DMA domain missing");
+		return -ENODEV;
+	}
+	ret = dcp_t6030_display_check(dcp->dev);
+	if (ret) {
+		dev_err(dcp->dev, "PMP display power check failed: %d\n", ret);
+		iomfb_v14_7_fail(dcp, "PMP display power lost before KMS");
+		return ret;
+	}
+	return 0;
+}
+
 int dcp_wait_ready(struct platform_device *pdev, u64 timeout)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 	int ret;
+
+	if (iomfb_is_v14_7(dcp))
+		return dcp_wait_ready_v14_7(dcp);
 
 	if (dcp->crashed)
 		return -ENODEV;
@@ -3467,6 +3668,9 @@ static void __maybe_unused dcp_sleep(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_H17P:
 		iomfb_sleep_h17p(dcp);
+		break;
+	case DCP_FIRMWARE_V_14_7:
+		iomfb_sleep_v14_7(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
@@ -3570,6 +3774,9 @@ void dcp_poweron(struct platform_device *pdev)
 		break;
 	case DCP_FIRMWARE_H17P:
 		iomfb_poweron_h17p(dcp);
+		break;
+	case DCP_FIRMWARE_V_14_7:
+		iomfb_poweron_v14_7(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
@@ -4025,6 +4232,12 @@ static int dcp_get_disp_regs(struct apple_dcp *dcp)
 		return 0;
 	}
 
+	/* Without bandwidth registers D003 is declined, as on the J514S. */
+	if (dcp->hw.no_rt_bandwidth) {
+		dcp->nr_disp_registers = count;
+		return 0;
+	}
+
 	/* load pmgr bandwidth scratch resource and offset */
 	ret = dcp_get_bw_scratch_reg(dcp, count);
 	if (ret < 0)
@@ -4267,7 +4480,8 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 		dev_info(dev, "DCP index:%u dptx target phy: %u dptx die: %u\n",
 			 dcp->index, dcp->dptx_phy, dcp->dptx_die);
 
-	if (!show_notch)
+	/* The 14.7 panel profile scans out the full panel, notch included. */
+	if (!show_notch && !iomfb_is_v14_7(dcp))
 		ret = of_property_read_u32(dev->of_node, "apple,notch-height",
 					   &dcp->notch_height);
 
@@ -4302,6 +4516,20 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 		of_node_put(panel_np);
 		dcp->fixed_connector_type = DRM_MODE_CONNECTOR_eDP;
 		dcp->connector_type = DRM_MODE_CONNECTOR_eDP;
+	} else if (dcp->hw.panel_max_nits) {
+		/*
+		 * The J514S boot loader describes the panel on the DCP node
+		 * only: its size there, its brightness range and backlight
+		 * type from the hardware data.
+		 */
+		dcp->panel.has_mini_led = dcp->hw.panel_mini_led;
+		dcp->brightness.maximum = dcp->hw.panel_max_nits;
+		of_property_read_u32(dev->of_node, "apple,panel-width-mm",
+				     &dcp->panel.width_mm);
+		of_property_read_u32(dev->of_node, "apple,panel-height-mm",
+				     &dcp->panel.height_mm);
+		dcp->fixed_connector_type = DRM_MODE_CONNECTOR_eDP;
+		dcp->connector_type = DRM_MODE_CONNECTOR_eDP;
 	}
 
 	ret = dcp_create_piodma_iommu_dev(dcp);
@@ -4320,7 +4548,10 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 		goto err_piodma;
 	}
 
-	dcp->clk = devm_clk_get(dev, NULL);
+	if (dcp->hw.optional_clock)
+		dcp->clk = devm_clk_get_optional(dev, NULL);
+	else
+		dcp->clk = devm_clk_get(dev, NULL);
 	if (IS_ERR(dcp->clk)) {
 		ret = dev_err_probe(dev, PTR_ERR(dcp->clk),
 				    "Unable to find clock\n");
@@ -4364,6 +4595,20 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 			readl_relaxed(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
 		writel_relaxed(cpu_ctrl | APPLE_DCP_COPROC_CPU_CONTROL_RUN,
 			       dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
+	}
+
+	/*
+	 * The J514S PMP must have acknowledged the DISP request before the
+	 * running DCP is adopted; the acknowledgement also starts the display
+	 * memory-bandwidth floor.
+	 */
+	if (iomfb_is_v14_7(dcp)) {
+		ret = dcp_t6030_display_get(dev);
+		if (ret) {
+			dev_err(dev, "PMP DISP acknowledgement missing: %d\n", ret);
+			goto err_piodma;
+		}
+		dev_info(dev, "PMP DISP acknowledged; starting warm RTKit adoption (no reset)\n");
 	}
 
 	/* Registering the mailbox can already expose RTKit buffer requests. */
@@ -4522,12 +4767,130 @@ static const struct component_ops dcp_comp_ops = {
 	.unbind	= dcp_comp_unbind,
 };
 
+/* The J514S (T6030) handoff this driver adopts. */
+#define J514S_DCP_UUID		"DDF38191-93B3-324A-BC8F-643006F5AC82"
+#define J514S_DCP_COPROC	0x28ec00000ULL
+#define J514S_NOTCH_HEIGHT	74
+#define J514S_BOOT_STRIDE	12096
+#define J514S_INHERITED		"apple,j514s-inherited-mappings"
+
+/*
+ * The boot loader leaves one simple framebuffer on the panel: the full panel
+ * or the panel below the notch, at the stride D101 reports.
+ */
+static int dcp_t6030_boot_framebuffer(struct device *dev, u32 *stride)
+{
+	struct device_node *np;
+	u32 width, height, pitch;
+	int found = 0;
+
+	for_each_compatible_node(np, NULL, "simple-framebuffer") {
+		if (!of_device_is_available(np))
+			continue;
+		if (found++ ||
+		    of_property_read_u32(np, "width", &width) ||
+		    of_property_read_u32(np, "height", &height) ||
+		    of_property_read_u32(np, "stride", &pitch) ||
+		    width != J514S_PANEL_WIDTH || pitch != J514S_BOOT_STRIDE ||
+		    (height != J514S_PANEL_HEIGHT &&
+		     height != J514S_PANEL_HEIGHT - J514S_NOTCH_HEIGHT)) {
+			of_node_put(np);
+			dev_err(dev, "unexpected boot framebuffer %pOF\n", np);
+			return -EINVAL;
+		}
+	}
+	if (!found) {
+		dev_err(dev, "no boot framebuffer\n");
+		return -ENODEV;
+	}
+	*stride = J514S_BOOT_STRIDE;
+	return 0;
+}
+
+/* An enabled handoff node at @path that carries the inherited-mapping marker. */
+static bool dcp_t6030_handoff_node(struct device_node *np, const char *path,
+				   const char *compatible)
+{
+	struct device_node *alias = of_find_node_by_path(path);
+	bool ok = np && alias == np && of_device_is_available(np) &&
+		  of_property_read_bool(np, J514S_INHERITED) &&
+		  (!compatible || of_device_is_compatible(np, compatible));
+
+	of_node_put(alias);
+	return ok;
+}
+
+/*
+ * J514S admission: board and firmware identity, the DCP's coprocessor
+ * window and DMA domain, the boot loader's display handoff (scanout and
+ * PIODMA markers, inherited mappings, the chosen handoff note) and the boot
+ * framebuffer.  The DCP is only adopted from this exact handoff.
+ */
+static int dcp_t6030_admit(struct platform_device *pdev, u32 *stride)
+{
+	struct device *dev = &pdev->dev;
+	struct device_node *np = dev->of_node;
+	struct device_node *piodma, *disp, *chosen;
+	struct resource *res;
+	const char *uuid;
+	u32 compat[3];
+	bool handoff;
+	int ret;
+
+	if (!of_machine_is_compatible("apple,j514s") ||
+	    !of_machine_is_compatible("apple,t6030")) {
+		dev_info(dev, "not a J514S; not binding\n");
+		return -ENODEV;
+	}
+	if (of_property_count_u32_elems(np, "apple,firmware-compat") != 3 ||
+	    of_property_read_u32_array(np, "apple,firmware-compat", compat, 3) ||
+	    compat[0] != 14 || compat[1] != 7 || compat[2] != 0 ||
+	    of_property_read_string(np, "apple,firmware-uuid", &uuid) ||
+	    strcmp(uuid, J514S_DCP_UUID)) {
+		dev_info(dev, "DCP firmware is not the qualified 14.7.0 image; not binding\n");
+		return -ENODEV;
+	}
+	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "coproc");
+	if (!res || res->start != J514S_DCP_COPROC || resource_size(res) != SZ_16K) {
+		dev_info(dev, "unexpected coprocessor window; not binding\n");
+		return -ENODEV;
+	}
+	if (!iommu_get_domain_for_dev(dev))
+		return dev_err_probe(dev, -EPROBE_DEFER, "DCP DMA domain not ready\n");
+
+	piodma = of_get_child_by_name(np, "piodma");
+	disp = of_find_node_by_path("disp0");
+	chosen = of_find_node_by_path("/chosen");
+	handoff = of_property_read_bool(np, "apple,j514s-native-scanout") &&
+		  of_property_read_bool(np, "apple,j514s-native-piodma") &&
+		  dcp_t6030_handoff_node(piodma, "disp0_piodma", NULL) &&
+		  dcp_t6030_handoff_node(disp, "disp0",
+					 "apple,t6030-display-diagnostics") &&
+		  chosen &&
+		  of_property_present(chosen, "aurora,j514s-display-handoff");
+	of_node_put(chosen);
+	of_node_put(disp);
+	of_node_put(piodma);
+	if (!handoff) {
+		dev_info(dev, "no qualified boot loader display handoff; not binding\n");
+		return -ENODEV;
+	}
+
+	ret = dcp_t6030_boot_framebuffer(dev, stride);
+	if (ret)
+		return ret;
+
+	dev_info(dev, "J514S DCP firmware 14.7.0 handoff admitted\n");
+	return 0;
+}
+
 static int dcp_platform_probe(struct platform_device *pdev)
 {
 	const struct apple_dcp_hw_data *hw = of_device_get_match_data(&pdev->dev);
 	enum dcp_firmware_version fw_compat;
 	struct device *dev = &pdev->dev;
 	struct apple_dcp *dcp;
+	u32 boot_stride = 0;
 	int ret, surf, num_surfs;
 	u32 surf_en;
 	u32 mux_index;
@@ -4546,12 +4909,20 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	if (fw_compat == DCP_FIRMWARE_UNKNOWN)
 		return -ENODEV;
 
+	/* The J514S panel is only taken over from a qualified handoff. */
+	if (IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030) &&
+	    fw_compat == DCP_FIRMWARE_V_14_7) {
+		ret = dcp_t6030_admit(pdev, &boot_stride);
+		if (ret)
+			return ret;
+	}
+
 	/* Check for "apple,bw-scratch" to avoid probing appledrm with outdated
 	 * device trees. This prevents replacing simpledrm and ending up without
 	 * display.
 	 */
 	if (!of_property_present(dev->of_node, "apple,bw-scratch") &&
-	    !hw->firmware_clock)
+	    !hw->firmware_clock && !hw->no_rt_bandwidth)
 		return dev_err_probe(dev, -ENODEV, "Incompatible devicetree! "
 			"Use devicetree matching this kernel.\n");
 
@@ -4595,6 +4966,14 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		iomfb_pause_presentation(dcp, true);
 	}
 
+
+	if (IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030) &&
+	    fw_compat == DCP_FIRMWARE_V_14_7) {
+		ret = iomfb_v14_7_session_init(dcp);
+		if (ret)
+			return ret;
+		dcp->v14_7->boot_stride = boot_stride;
+	}
 
 	/* The domain use must survive driver-core DMA cleanup for a live session. */
 	ret = iommu_device_use_default_domain(dev);
@@ -4645,7 +5024,10 @@ static int dcp_platform_probe(struct platform_device *pdev)
 						    "apple,iomfb-surfaces",
 						    sizeof(u32));
 
-	if (num_surfs == 0 || num_surfs == -ENODATA) {
+	if (dcp->hw.primary_only && (num_surfs == 0 || num_surfs == -ENODATA)) {
+		/* One primary plane: a second surface changes the panel's colour. */
+		set_bit(0, dcp->iomfb_surfaces);
+	} else if (num_surfs == 0 || num_surfs == -ENODATA) {
 		set_bit(0, dcp->iomfb_surfaces);
 		set_bit(1, dcp->iomfb_surfaces);
 	} else if (num_surfs < 0) {
@@ -4777,6 +5159,14 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		WRITE_ONCE(dcp->external_prepared, true);
 	}
 
+	/* Last fallible step: the J514S DCP is powered through the PMP. */
+	if (IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030) &&
+	    fw_compat == DCP_FIRMWARE_V_14_7) {
+		ret = dcp_t6030_display_prepare(dev);
+		if (ret)
+			return dev_err_probe(dev, ret, "PMP display supplier not ready\n");
+	}
+
 	ret = component_add(&pdev->dev, &dcp_comp_ops);
 	if (ret && dcp->external_prepared) {
 		dcp_disable_typec_work(dcp, true);
@@ -4799,8 +5189,7 @@ VISIBLE_IF_KUNIT void dcp_platform_shutdown(struct platform_device *pdev)
 		return;
 	}
 
-	if (dcp && dcp->hw.adopt_live_session &&
-	    dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	if (dcp && dcp->hw.adopt_live_session && dcp_fail_stop(dcp) &&
 	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
 		/*
 		 * This firmware keeps scanning across soft DPMS and has no
@@ -4829,8 +5218,7 @@ static void dcp_drain_for_sleep(struct apple_dcp *dcp)
 {
 	int pass;
 
-	if (!dcp->hw.adopt_live_session || dcp->fw_compat != DCP_FIRMWARE_H17P ||
-	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G)
+	if (!dcp->hw.adopt_live_session || !dcp_presents_nits(dcp))
 		return;
 
 	/*
@@ -4877,8 +5265,7 @@ static void dcp_hold_for_sleep(struct apple_dcp *dcp)
 {
 	/* A failed component bind leaves no coprocessor session to hold. */
 	if (IS_ERR_OR_NULL(dcp->rtk) ||
-	    !dcp_uses_soft_dpms(dcp) || dcp->fw_compat != DCP_FIRMWARE_H17P ||
-	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G ||
+	    !dcp_uses_soft_dpms(dcp) || !dcp_presents_nits(dcp) ||
 	    READ_ONCE(dcp->crashed))
 		return;
 
@@ -5014,6 +5401,25 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8142 = {
 	.firmware_compat = DCP_FIRMWARE_H17P,
 };
 
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030)
+/*
+ * MacBook Pro M3 Pro (J514S, T6030) internal panel.  The boot loader leaves
+ * the DCP running DCP firmware 14.7.0 with the panel lit; Linux adopts that
+ * session with an RTKit wake and never stops or restarts the ASC.
+ */
+static const struct apple_dcp_hw_data apple_dcp_hw_t6030 = {
+	.num_dptx_ports = 0,
+	.adopt_live_session = true,
+	.firmware_compat = DCP_FIRMWARE_V_14_7,
+	.primary_only = true,
+	.optional_clock = true,
+	.no_rt_bandwidth = true,
+	.panel_mini_led = true,
+	.panel_max_nits = 500,
+	.panel_default_nits = 140,
+};
+#endif
+
 static const struct apple_dcp_hw_data apple_dcp_hw_dcp = {
 	.num_dptx_ports = 0,
 };
@@ -5028,6 +5434,9 @@ static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t8140-dcp", .data = &apple_dcp_hw_t8140,  },
 	{ .compatible = "apple,t8140-dcpext", .data = &apple_dcp_hw_t8140_external, },
 	{ .compatible = "apple,t8142-dcp", .data = &apple_dcp_hw_t8142,  },
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030)
+	{ .compatible = "apple,t6030-dcp", .data = &apple_dcp_hw_t6030,  },
+#endif
 	{ .compatible = "apple,dcp",       .data = &apple_dcp_hw_dcp,    },
 	{ .compatible = "apple,dcpext",    .data = &apple_dcp_hw_dcpext, },
 	{}

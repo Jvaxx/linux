@@ -34,6 +34,35 @@
 #include "trace.h"
 #include "version_utils.h"
 
+/*
+ * The queued swap request of this firmware variant.  14.7 keeps its own
+ * request outside the apple_dcp swap union (see dcp-internal.h).
+ */
+#if DCP_FW_VER == DCP_FW_VERSION(14, 7, 0)
+#define DCP_FW_SWAP(dcp) ((dcp)->swap_v14_7)
+#else
+#define DCP_FW_SWAP(dcp) DCP_FW_UNION((dcp)->swap)
+#endif
+
+/* Blocks specific to the 14.7 (J514S) instantiation. */
+#define DCP_FW_IS_V14_7 (DCP_FW_VER == DCP_FW_VERSION(14, 7, 0))
+
+/*
+ * Lifecycle, not wire, behaviour of the adopted sessions (H17P and the
+ * J514S 14.7 panel): the present state machine, the inherited mode, no
+ * pipe-off or sleep sequence.  Wire facts stay keyed on the version.
+ */
+#define DCP_FW_ADOPTED_PRESENT \
+	(DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0) || \
+	 DCP_FW_VER == DCP_FW_VERSION(14, 7, 0))
+
+#if DCP_FW_VER == DCP_FW_VERSION(14, 7, 0)
+#include <linux/debugfs.h>
+#include <linux/seq_file.h>
+
+#include "iomfb_v14_7_present.h"
+#endif
+
 /* Register defines used in bandwidth setup structure */
 #define REG_DOORBELL_BIT(idx) (2 + (idx))
 
@@ -60,7 +89,9 @@ DCP_THUNK_OUT(iomfb_a132_backlight_service_matched, iomfbep_a132_backlight_servi
 DCP_THUNK_OUT(iomfb_a358_vi_set_temperature_hint, iomfbep_a358_vi_set_temperature_hint, u32);
 
 IOMFB_THUNK_INOUT(set_matrix);
+#if !DCP_FW_IS_V14_7
 IOMFB_THUNK_INOUT(get_color_remap_mode);
+#endif
 IOMFB_THUNK_INOUT(last_client_close);
 IOMFB_THUNK_INOUT(abort_swaps_dcp);
 
@@ -83,6 +114,21 @@ static void dcp_swap_submit(struct apple_dcp *dcp, bool oob,
 
 	dcp_push(dcp, oob, &dcp_methods[dcpep_swap_submit], sizeof(*request),
 		 sizeof(struct dcp_swap_submit_resp_h17p), (void *)data, cb, cookie);
+}
+#elif DCP_FW_VER == DCP_FW_VERSION(14, 7, 0)
+/* The 14.7 request is its wire record; the present carries the panel level. */
+static void dcp_swap_submit(struct apple_dcp *dcp, bool oob,
+			    struct dcp_swap_submit_req_v14_7 *request,
+			    dcp_callback_t cb, void *cookie)
+{
+	if (!iomfb_swap_prepare_v14_7(dcp, request)) {
+		if (cb)
+			cb(dcp, NULL, cookie);
+		return;
+	}
+
+	dcp_push(dcp, oob, &dcp_methods[dcpep_swap_submit], sizeof(*request),
+		 sizeof(struct dcp_swap_submit_resp_v14_7), request, cb, cookie);
 }
 #else
 DCP_THUNK_INOUT(dcp_swap_submit, dcpep_swap_submit,
@@ -115,7 +161,7 @@ DCP_THUNK_INOUT(dcp_set_power_state, dcpep_set_power_state,
  * is no vblank and no swap completion.  Keep the mode the bootloader
  * programmed, which is the panel's native mode, instead of requesting one.
  */
-#if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#if DCP_FW_ADOPTED_PRESENT
 #define DCP_INHERIT_BOOT_MODE	true
 #else
 #define DCP_INHERIT_BOOT_MODE	false
@@ -129,6 +175,9 @@ DCP_THUNK_INOUT(dcp_set_power_state, dcpep_set_power_state,
  * still sends its clear swap first.
  */
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
+#define DCP_HAS_CLIENT_TEARDOWN	false
+#elif DCP_FW_VER == DCP_FW_VERSION(14, 7, 0)
+/* The adopted 14.7 session keeps its client open until reboot. */
 #define DCP_HAS_CLIENT_TEARDOWN	false
 #else
 #define DCP_HAS_CLIENT_TEARDOWN	true
@@ -151,7 +200,9 @@ DCP_THUNK_IN(dcp_flush_supports_power, dcpep_flush_supports_power, u32);
 DCP_THUNK_OUT(dcp_create_default_fb, dcpep_create_default_fb, u32);
 DCP_THUNK_OUT(dcp_start_signal, dcpep_start_signal, u32);
 DCP_THUNK_VOID(dcp_setup_video_limits, dcpep_setup_video_limits);
+#if !DCP_FW_IS_V14_7
 DCP_THUNK_VOID(dcp_set_create_dfb, dcpep_set_create_dfb);
+#endif
 
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
 /*
@@ -219,8 +270,10 @@ DCP_THUNK_VOID(dcp_first_client_open, dcpep_first_client_open);
 DCP_THUNK_INOUT(dcp_set_parameter_dcp, dcpep_set_parameter_dcp,
 		struct dcp_set_parameter_dcp, u32);
 
+#if !DCP_FW_IS_V14_7
 DCP_THUNK_INOUT(dcp_enable_disable_video_power_savings,
 		dcpep_enable_disable_video_power_savings, u32, int);
+#endif
 
 DCP_THUNK_OUT(dcp_is_main_display, dcpep_is_main_display, u32);
 
@@ -248,6 +301,10 @@ static u32 dcpep_cb_zero(struct apple_dcp *dcp)
 static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 				   struct DCP_FW_NAME(dc_swap_complete_resp) *resp)
 {
+#if DCP_FW_VER == DCP_FW_VERSION(14, 7, 0)
+	/* Retires only with its accepted A407 reply (iomfb_swap_complete_v14_7). */
+	iomfb_swap_complete_v14_7(dcp, resp->swap_id);
+#else
 	ktime_t now = ktime_get();
 	bool retire = true;
 
@@ -302,11 +359,19 @@ static void dcpep_cb_swap_complete(struct apple_dcp *dcp,
 		u32 crc32 = 0;
 		drm_crtc_add_crc_entry(&dcp->crtc->base, true, resp->swap_id, &crc32);
 	}
+#endif
 }
 
 /* special */
 static void complete_vi_set_temperature_hint(struct apple_dcp *dcp, void *out, void *cookie)
 {
+#if DCP_FW_IS_V14_7
+	/* Any result is accepted, but there must be a reply record. */
+	if (!out) {
+		iomfb_v14_7_fail(dcp, "no D100 continuation reply");
+		return;
+	}
+#endif
 	// ack D100 cb_match_pmu_service
 	dcp_ack(dcp, DCP_CONTEXT_CB);
 }
@@ -417,11 +482,27 @@ static bool iomfbep_cb_create_dfb_surface(struct apple_dcp *dcp, int tag,
 }
 #endif
 
+#if DCP_FW_IS_V14_7
+/* The 14.7 service-match continuations (A131/A132) answer status 0. */
+static bool dcp_v14_7_matched(struct apple_dcp *dcp, void *out, const char *what)
+{
+	if (!out || get_unaligned_le32(out)) {
+		iomfb_v14_7_fail(dcp, what);
+		return false;
+	}
+	return true;
+}
+#endif
+
 static void complete_pmu_service_matched(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	struct dcp_channel *ch = &dcp->ch_cb;
 	u8 *succ = ch->output[ch->depth - 1];
 
+#if DCP_FW_IS_V14_7
+	if (!dcp_v14_7_matched(dcp, out, "A131 pmu_service_matched failed"))
+		return;
+#endif
 	*succ = true;
 
 	// ack D206 cb_match_pmu_service_2
@@ -444,6 +525,10 @@ static void complete_backlight_service_matched(struct apple_dcp *dcp, void *out,
 	struct dcp_channel *ch = &dcp->ch_cb;
 	u8 *succ = ch->output[ch->depth - 1];
 
+#if DCP_FW_IS_V14_7
+	if (!dcp_v14_7_matched(dcp, out, "A132 backlight_service_matched failed"))
+		return;
+#endif
 	*succ = true;
 
 	// ack D206 cb_match_backlight_service
@@ -1141,11 +1226,34 @@ static u8 dcpep_cb_prop_end(struct apple_dcp *dcp,
 	return resp;
 }
 
+/*
+ * 14.7 D121 continuation results: create_default_fb (A444), late_init_signal
+ * (A000) and set_display_refresh_properties (A463) each answer 1.  Anything
+ * else fails the session, and D121 is not answered.
+ */
+#if DCP_FW_IS_V14_7
+static bool dcp_v14_7_boot_step(struct apple_dcp *dcp, void *out, const char *what)
+{
+	if (!out || get_unaligned_le32(out) != 1) {
+		dev_err(dcp->dev, "%s answered %#x\n", what,
+			out ? get_unaligned_le32(out) : ~0U);
+		iomfb_v14_7_fail(dcp, "D121 continuation failed");
+		return false;
+	}
+	return true;
+}
+#endif
+
 /* Boot sequence */
 static void boot_done(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	struct dcp_channel *ch = &dcp->ch_cb;
 	u8 *succ = ch->output[ch->depth - 1];
+
+#if DCP_FW_IS_V14_7
+	if (!dcp_v14_7_boot_step(dcp, out, "A463 set_display_refresh_properties"))
+		return;
+#endif
 	dev_dbg(dcp->dev, "boot done\n");
 
 	*succ = true;
@@ -1159,6 +1267,10 @@ static void boot_5b(struct apple_dcp *dcp, void *out, void *cookie)
 
 static void boot_5(struct apple_dcp *dcp, void *out, void *cookie)
 {
+#if DCP_FW_IS_V14_7
+	if (!dcp_v14_7_boot_step(dcp, out, "A000 late_init_signal"))
+		return;
+#endif
 #if DCP_FW_VER >= DCP_FW_VERSION(26, 0, 0)
 	/* H17P expects A380 right before set_display_refresh_properties */
 	dcp_dfb_ready_query(dcp, false, boot_5b, NULL);
@@ -1200,6 +1312,10 @@ static void boot_3(struct apple_dcp *dcp, void *out, void *cookie)
 
 static void boot_2(struct apple_dcp *dcp, void *out, void *cookie)
 {
+#if DCP_FW_IS_V14_7
+	if (!dcp_v14_7_boot_step(dcp, out, "A444 create_default_fb"))
+		return;
+#endif
 	dcp_setup_video_limits(dcp, false, boot_3, NULL);
 }
 
@@ -1304,7 +1420,15 @@ static bool dcpep_cb_d000_h17p(struct apple_dcp *dcp, int tag, void *out, void *
 static bool dcpep_cb_boot_1(struct apple_dcp *dcp, int tag, void *out, void *in)
 {
 	trace_iomfb_callback(dcp, tag, __func__);
+#if DCP_FW_IS_V14_7
+	/*
+	 * The adopted J514S session omits the optional set_create_dfb (A377)
+	 * and starts with A444.
+	 */
+	boot_1_5(dcp, NULL, NULL);
+#else
 	dcp_set_create_dfb(dcp, false, boot_1_5, NULL);
+#endif
 	return false;
 }
 
@@ -1431,7 +1555,7 @@ static void release_swap_cookie(struct kref *ref)
  */
 static void dcp_h17p_prepare_swap(struct apple_dcp *dcp)
 {
-	struct DCP_FW_NAME(dcp_swap_submit_req) *req = &DCP_FW_UNION(dcp->swap);
+	struct DCP_FW_NAME(dcp_swap_submit_req) *req = &DCP_FW_SWAP(dcp);
 	unsigned int i;
 
 	/*
@@ -1487,7 +1611,7 @@ static void dcp_h17p_prepare_swap(struct apple_dcp *dcp) { }
 
 static bool dcp_present_retires(struct apple_dcp *dcp)
 {
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+#if DCP_FW_ADOPTED_PRESENT
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
 		return !iomfb_present_brightness_only_h17p(dcp);
 #endif
@@ -1496,7 +1620,7 @@ static bool dcp_present_retires(struct apple_dcp *dcp)
 
 static void dcp_present_failed(struct apple_dcp *dcp)
 {
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+#if DCP_FW_ADOPTED_PRESENT
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
 		iomfb_present_failed_h17p(dcp);
 #endif
@@ -1504,7 +1628,7 @@ static void dcp_present_failed(struct apple_dcp *dcp)
 
 static bool dcp_present_begin(struct apple_dcp *dcp, u32 swap_id)
 {
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+#if DCP_FW_ADOPTED_PRESENT
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
 	    !dcp_present_begin_h17p(&dcp->present_state_h17p, swap_id)) {
 		dev_err(dcp->dev, "overlapping present %u\n", swap_id);
@@ -1522,7 +1646,7 @@ static bool dcp_present_begin(struct apple_dcp *dcp, u32 swap_id)
  */
 static int dcp_present_submit(struct apple_dcp *dcp, u32 swap_id, bool accepted)
 {
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+#if DCP_FW_ADOPTED_PRESENT
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
 	    !dcp_present_submit_h17p(&dcp->present_state_h17p, swap_id, accepted)) {
 		dev_err(dcp->dev, "unexpected present submission %u\n", swap_id);
@@ -1542,7 +1666,7 @@ static int dcp_present_submit(struct apple_dcp *dcp, u32 swap_id, bool accepted)
 
 static void dcp_prepare_clear_swap(struct apple_dcp *dcp, void *request)
 {
-	typeof(DCP_FW_UNION(dcp->swap)) *swap = request;
+	typeof(DCP_FW_SWAP(dcp)) *swap = request;
 
 	/* Clear surfaces. */
 	memset(swap, 0, sizeof(*swap));
@@ -1559,9 +1683,15 @@ static void dcp_prepare_clear_swap(struct apple_dcp *dcp, void *request)
 	 * brightness.
 	 */
 	if (dcp_has_panel(dcp)) {
+#if DCP_FW_VER == DCP_FW_VERSION(14, 7, 0)
+		/* 14.7 takes the level as nits; binary64 zero is all-zero. */
+		swap->swap.bl_nits_present = 1;
+		swap->swap.bl_nits = 0;
+#else
 		swap->swap.bl_unk = 1;
 		swap->swap.bl_value = 0;
 		swap->swap.bl_power = 0;
+#endif
 	}
 
 	/* Null all surfaces */
@@ -1569,7 +1699,7 @@ static void dcp_prepare_clear_swap(struct apple_dcp *dcp, void *request)
 		swap->surf_null[l] = true;
 #if DCP_FW_VERSION(13, 2, 0) <= DCP_FW_VER
 #if DCP_FW_VERSION(26, 0, 0) > DCP_FW_VER
-	for (int l = 0; l < 5; l++)
+	for (int l = 0; l < ARRAY_SIZE(swap->surf2_null); l++)
 		swap->surf2_null[l] = true;
 #endif
 	swap->unknown_pointer_null = true;
@@ -1581,7 +1711,7 @@ static void dcp_swap_cleared(struct apple_dcp *dcp, void *data, void *cookie)
 {
 	struct DCP_FW_NAME(dcp_swap_submit_resp) *resp = data;
 	struct dcp_swap_cookie *info = cookie;
-	u32 swap_id = DCP_FW_UNION(dcp->swap).swap.swap_id;
+	u32 swap_id = DCP_FW_SWAP(dcp).swap.swap_id;
 	u32 status = resp ? resp->ret : ~0U;
 	int ret;
 
@@ -1632,9 +1762,9 @@ static void dcp_swap_clear_started(struct apple_dcp *dcp, void *data,
 	}
 #if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
-		dcp_prepare_clear_swap(dcp, &DCP_FW_UNION(dcp->swap));
+		dcp_prepare_clear_swap(dcp, &DCP_FW_SWAP(dcp));
 #endif
-	DCP_FW_UNION(dcp->swap).swap.swap_id = resp->swap_id;
+	DCP_FW_SWAP(dcp).swap.swap_id = resp->swap_id;
 	if (dcp_present_retires(dcp))
 		dcp_arm_retained_framebuffers(dcp, resp->swap_id);
 
@@ -1642,7 +1772,7 @@ static void dcp_swap_clear_started(struct apple_dcp *dcp, void *data,
 		info->swap_id = resp->swap_id;
 
 	dcp_h17p_prepare_swap(dcp);
-	dcp_swap_submit(dcp, false, &DCP_FW_UNION(dcp->swap), dcp_swap_cleared, cookie);
+	dcp_swap_submit(dcp, false, &DCP_FW_SWAP(dcp), dcp_swap_cleared, cookie);
 }
 
 static void dcp_on_final(struct apple_dcp *dcp, void *out, void *cookie)
@@ -1690,6 +1820,15 @@ void DCP_FW_NAME(iomfb_poweron)(struct apple_dcp *dcp)
 	struct dcp_wait_cookie *cookie;
 	int ret;
 	u32 handle;
+#if DCP_FW_VER == DCP_FW_VERSION(14, 7, 0)
+	/*
+	 * The adopted J514S session takes no power or display-device call.
+	 * The first enable only sets up the backlight policy, whose requested
+	 * level the first present carries; DPMS is soft from then on.
+	 */
+	iomfb_configure_backlight_v14_7(dcp);
+	return;
+#endif
 	dev_info(dcp->dev, "dcp_poweron() starting\n");
 
 #if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
@@ -1798,9 +1937,9 @@ void DCP_FW_NAME(iomfb_poweroff)(struct apple_dcp *dcp)
 	struct dcp_swap_cookie *cookie;
 	struct dcp_wait_cookie *poff_cookie;
 	struct DCP_FW_NAME(dcp_swap_start_req) swap_req = { 0 };
-	typeof(DCP_FW_UNION(dcp->swap)) *swap = &DCP_FW_UNION(dcp->swap);
+	typeof(DCP_FW_SWAP(dcp)) *swap = &DCP_FW_SWAP(dcp);
 
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+#if DCP_FW_ADOPTED_PRESENT
 	/* H17P has no known safe pipe-off or surface-free transition. */
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
 		return;
@@ -1904,7 +2043,7 @@ void DCP_FW_NAME(iomfb_sleep)(struct apple_dcp *dcp)
 
 	struct dcp_wait_cookie *cookie;
 
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+#if DCP_FW_ADOPTED_PRESENT
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G)
 		return;
 #endif
@@ -2136,7 +2275,7 @@ static void dcp_swapped(struct apple_dcp *dcp, void *data, void *cookie)
 {
 	int ret;
 	struct DCP_FW_NAME(dcp_swap_submit_resp) *resp = data;
-	u32 swap_id = DCP_FW_UNION(dcp->swap).swap.swap_id;
+	u32 swap_id = DCP_FW_SWAP(dcp).swap.swap_id;
 	u32 status = resp ? resp->ret : ~0U;
 
 	ret = dcp_present_submit(dcp, swap_id, !status);
@@ -2157,12 +2296,23 @@ static void dcp_swapped(struct apple_dcp *dcp, void *data, void *cookie)
 	dcp->swap_start = ktime_get();
 	dcp->swap_submit_timestamp = arch_timer_read_counter();
 	dcp_swap_watchdog_arm(dcp);
+#if DCP_FW_VER == DCP_FW_VERSION(14, 7, 0)
+	iomfb_swap_accepted_v14_7(dcp, swap_id);
+#endif
 }
 
 static void dcp_swap_started(struct apple_dcp *dcp, void *data, void *cookie)
 {
 	struct DCP_FW_NAME(dcp_swap_start_resp) *resp = data;
 
+#if DCP_FW_VER == DCP_FW_VERSION(14, 7, 0)
+	/* A406 must name the swap (nonzero ID) it accepted. */
+	if (resp && !resp->ret && !resp->swap_id) {
+		dev_err(dcp->dev, "swap_start returned no swap ID\n");
+		WRITE_ONCE(dcp->crashed, true);
+		resp = NULL;
+	}
+#endif
 	if (!resp || resp->ret) {
 		dev_err(dcp->dev, "swap_start was rejected\n");
 		if (dcp_present_retires(dcp))
@@ -2174,13 +2324,13 @@ static void dcp_swap_started(struct apple_dcp *dcp, void *data, void *cookie)
 			dcp_drm_crtc_vblank(dcp->crtc);
 		return;
 	}
-	DCP_FW_UNION(dcp->swap).swap.swap_id = resp->swap_id;
+	DCP_FW_SWAP(dcp).swap.swap_id = resp->swap_id;
 	if (dcp_present_retires(dcp))
 		dcp_arm_retained_framebuffers(dcp, resp->swap_id);
 
 	trace_iomfb_swap_submit(dcp, resp->swap_id);
 	dcp_h17p_prepare_swap(dcp);
-	dcp_swap_submit(dcp, false, &DCP_FW_UNION(dcp->swap), dcp_swapped, NULL);
+	dcp_swap_submit(dcp, false, &DCP_FW_SWAP(dcp), dcp_swapped, NULL);
 }
 
 /* Helpers to modeset and swap, used to flush */
@@ -2305,6 +2455,10 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 
 	/* Built-in ProMotion panels require timestamps even in fixed-120 mode. */
 	dcp->use_timestamps = mode->vrr && dcp->main_display;
+#if DCP_FW_VER == DCP_FW_VERSION(14, 7, 0)
+	/* The J514S profile presents with zero timestamps. */
+	dcp->use_timestamps = false;
+#endif
 
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
 	if (!cookie) {
@@ -2377,6 +2531,9 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	}
 	kref_put(&cookie->refcount, release_wait_cookie);
 	dcp->vrr_enabled = mode->vrr && crtc_state->vrr_enabled;
+#if DCP_FW_VER == DCP_FW_VERSION(14, 7, 0)
+	dcp->vrr_enabled = false;
+#endif
 
 	return 0;
 }
@@ -2386,11 +2543,17 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	struct drm_plane *plane;
 	struct drm_plane_state *new_state, *old_state;
 	struct drm_crtc_state *crtc_state;
-	struct DCP_FW_NAME(dcp_swap_submit_req) *req = &DCP_FW_UNION(dcp->swap);
+	struct DCP_FW_NAME(dcp_swap_submit_req) *req = &DCP_FW_SWAP(dcp);
 	int plane_idx, l;
 	int has_surface = 0;
 	bool update_brightness;
 
+#if DCP_FW_VER == DCP_FW_VERSION(14, 7, 0)
+	/* 14.7 presents only as queue transactions (iomfb_present_atomic_v14_7). */
+	dev_WARN_ONCE(dcp->dev, 1, "14.7 present outside the IOMFB queue\n");
+	schedule_work(&dcp->vblank_wq);
+	return;
+#endif
 	crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
 
 	/* Reset all surfaces to defaults */
@@ -2399,7 +2562,7 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		req->surf_null[l] = true;
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
 #if DCP_FW_VER < DCP_FW_VERSION(26, 0, 0)
-	for (l = 0; l < 5; l++)
+	for (l = 0; l < ARRAY_SIZE(req->surf2_null); l++)
 		req->surf2_null[l] = true;
 #endif
 	req->unknown_pointer_null = true;
@@ -2508,10 +2671,16 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 	update_brightness = update_brightness &&
 			    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G;
 #endif
+#if DCP_FW_VER == DCP_FW_VERSION(14, 7, 0)
+	/* 14.7 has no DAC words; nits ride in the present. */
+	update_brightness = false;
+#endif
 	if (update_brightness) {
+#if DCP_FW_VER != DCP_FW_VERSION(14, 7, 0)
 		req->swap.bl_unk = 1;
 		req->swap.bl_value = dcp->brightness.dac;
 		req->swap.bl_power = 0x40;
+#endif
 		dcp->brightness.update = false;
 	}
 
@@ -2536,6 +2705,37 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		do_swap(dcp, NULL, NULL);
 }
 
+#if DCP_FW_IS_V14_7
+/*
+ * The adopted J514S session opens its client with A401 -> A455 only, the
+ * method sequence the panel's boot-loader session expects: no colour-remap
+ * query, no video power-savings call and no top-level is_main_display.  The
+ * internal panel is the main display by hardware data; the session becomes
+ * active once A455 has replied and the preferred timing has been published.
+ */
+static void dcp_client_opened_v14_7(struct apple_dcp *dcp, void *out, void *cookie)
+{
+	if (READ_ONCE(dcp->crashed))
+		return;
+	dcp->v14_7->opened = true;
+	dev_info(dcp->dev, "A455 first_client_open done\n");
+	iomfb_v14_7_try_activate(dcp);
+}
+
+static void dcp_started(struct apple_dcp *dcp, void *data, void *cookie)
+{
+	/* A401 answers 1 once its callback continuations have completed. */
+	if (!data || get_unaligned_le32(data) != 1) {
+		dev_err(dcp->dev, "A401 start_signal answered %#x\n",
+			data ? get_unaligned_le32(data) : ~0U);
+		iomfb_v14_7_fail(dcp, "A401 start_signal failed");
+		return;
+	}
+
+	dev_info(dcp->dev, "DCP booted (A401)\n");
+	dcp_first_client_open(dcp, false, dcp_client_opened_v14_7, NULL);
+}
+#else
 static void res_is_main_display(struct apple_dcp *dcp, void *out, void *cookie)
 {
 	struct apple_connector *connector;
@@ -2731,6 +2931,8 @@ static void dcp_started(struct apple_dcp *dcp, void *data, void *cookie)
 	iomfb_get_color_remap_mode(dcp, false, &color_remap, init_1, cookie);
 }
 
+#endif /* DCP_FW_IS_V14_7 */
+
 void DCP_FW_NAME(iomfb_shutdown)(struct apple_dcp *dcp)
 {
 	struct DCP_FW_NAME(dcp_set_power_state_req) req = {
@@ -2739,7 +2941,7 @@ void DCP_FW_NAME(iomfb_shutdown)(struct apple_dcp *dcp)
 	struct dcp_wait_cookie *cookie;
 	int ret;
 
-#if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
+#if DCP_FW_ADOPTED_PRESENT
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
 		iomfb_queue_stop(dcp);
 		return;
@@ -2761,3 +2963,401 @@ void DCP_FW_NAME(iomfb_shutdown)(struct apple_dcp *dcp)
 		dev_warn(dcp->dev, "shutdown scanout stop was not confirmed\n");
 	kref_put(&cookie->refcount, release_wait_cookie);
 }
+
+#if DCP_FW_VER == DCP_FW_VERSION(14, 7, 0)
+/*
+ * DCP firmware 14.7, J514S internal panel: presentation.
+ *
+ * Every present is one transaction of the serialized IOMFB queue: A406 with
+ * an all-zero request (nonzero swap ID), A407 with the complete surface-0 or
+ * blank request of iomfb_v14_7_present.h, and the matching D589.  Only the
+ * accepted A407 reply together with that D589 retires the displaced
+ * framebuffers and completes the DRM event.  The panel level rides in the
+ * present that changes it.  Brightness has no RPC of its own: a
+ * brightness-only present repeats the last completed present with a fresh
+ * swap ID, and soft DPMS off is the blank present at 0 nits.  Nothing else
+ * is sent: no power, display-device, mode, matrix or client-teardown call.
+ */
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030)
+bool iomfb_v14_7_ctm;
+module_param_named(j514s_ctm, iomfb_v14_7_ctm, bool, 0444);
+MODULE_PARM_DESC(j514s_ctm,
+		 "J514S panel: expose CTM and send it as set_matrix (A421), for qualification only");
+#endif
+
+static bool iomfb_v14_7_ctm_enabled(void)
+{
+	return IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030) && iomfb_v14_7_ctm;
+}
+
+static void iomfb_scanout_release_v14_7(struct iomfb_scanout_v14_7 *scanout)
+{
+	if (!scanout)
+		return;
+	if (scanout->fb)
+		drm_framebuffer_put(scanout->fb);
+	kfree(scanout);
+}
+
+/* A completed request becomes the snapshot: without its swap ID and level. */
+static void iomfb_scanout_record_v14_7(struct iomfb_scanout_v14_7 *scanout,
+				       const struct dcp_swap_submit_req_v14_7 *request)
+{
+	scanout->request = *request;
+	scanout->request.swap.swap_id = 0;
+	iomfb_v14_7_encode_nits(&scanout->request, false, 0);
+}
+
+/*
+ * The panel's backlight policy, set up once: 500 nits at most, 140 nits
+ * presented by the first present, no fades.
+ */
+void iomfb_configure_backlight_v14_7(struct apple_dcp *dcp)
+{
+	u32 maximum = IOMFB_V14_7_NITS_MAX;
+	int ret;
+
+	if (dcp_backlight_active(dcp) || !dcp_has_panel(dcp))
+		return;
+	/* A described panel maximum may only lower the wire bound. */
+	if (dcp->brightness.maximum)
+		maximum = min_t(u32, maximum, dcp->brightness.maximum);
+	ret = iomfb_configure_backlight_h17p(dcp, maximum, false, 0, true,
+					     min_t(u32, maximum,
+						   IOMFB_V14_7_NITS_DEFAULT));
+	if (ret && ret != -EBUSY)
+		dev_err(dcp->dev, "J514S backlight unavailable: %d\n", ret);
+}
+
+static void iomfb_present_start_v14_7(struct apple_dcp *dcp)
+{
+	dcp->iomfb_v14_7.blank = false;
+	dcp->iomfb_v14_7.early_complete = false;
+	dcp->iomfb_v14_7.start = ktime_get();
+}
+
+/*
+ * One atomic present: the primary plane's new state becomes the complete
+ * surface-0 request, or the blank background when it shows nothing.
+ * Returns the snapshot the transaction owns until the present completes, or
+ * NULL when nothing was presented.
+ */
+struct iomfb_scanout_v14_7 *iomfb_present_atomic_v14_7(struct apple_dcp *dcp,
+							struct drm_crtc *crtc,
+							struct drm_atomic_state *state)
+{
+	struct dcp_swap_submit_req_v14_7 *req = &DCP_FW_SWAP(dcp);
+	struct drm_crtc_state *crtc_state = drm_atomic_get_new_crtc_state(state, crtc);
+	struct drm_plane_state *old_state, *new_state;
+	struct iomfb_scanout_v14_7 *scanout;
+	struct drm_framebuffer *fb = NULL;
+	struct iomfb_v14_7_frame frame;
+	struct drm_plane *plane;
+	bool primary = false;
+	int i;
+
+	lockdep_assert_held(&dcp->iomfb.lock);
+	/* The first enable set it up, unless that enable took the soft-DPMS path. */
+	iomfb_configure_backlight_v14_7(dcp);
+
+	for_each_oldnew_plane_in_state(state, plane, old_state, new_state, i) {
+		if (old_state->crtc != crtc && new_state->crtc != crtc)
+			continue;
+		/* The panel is qualified with surface 0 only. */
+		if (WARN_ON_ONCE(to_apple_plane(plane)->iomfb_surf))
+			goto refused;
+		primary = true;
+		if (new_state->crtc != crtc || !new_state->visible || !new_state->fb)
+			continue;
+		/* The plane check admitted exactly this frame. */
+		if (WARN_ON_ONCE(!crtc_state ||
+				 iomfb_v14_7_plane_frame(new_state,
+							 crtc_state->mode.hdisplay,
+							 crtc_state->mode.vdisplay,
+							 &frame)))
+			goto refused;
+		fb = new_state->fb;
+	}
+	if (!primary) {
+		/* A commit without the plane has no new pixels: no present. */
+		schedule_work(&dcp->vblank_wq);
+		return NULL;
+	}
+
+	scanout = kzalloc_obj(*scanout);
+	if (!scanout) {
+		WRITE_ONCE(dcp->crashed, true);
+		schedule_work(&dcp->vblank_wq);
+		return NULL;
+	}
+	if (fb) {
+		drm_framebuffer_get(fb);
+		scanout->fb = fb;
+	}
+	dcp->iomfb_v14_7.next_scanout = scanout;
+	iomfb_v14_7_encode_present(req, fb ? &frame : NULL);
+	iomfb_present_start_v14_7(dcp);
+
+	if (crtc_state && crtc_state->color_mgmt_changed && iomfb_v14_7_ctm_enabled()) {
+		struct iomfb_set_matrix_req mat = {
+			.location = 9,
+		};
+
+		if (crtc_state->ctm) {
+			struct drm_color_ctm *ctm = crtc_state->ctm->data;
+
+			memcpy(mat.matrix, ctm->matrix, sizeof(mat.matrix));
+		} else {
+			mat.matrix[0] = mat.matrix[4] = mat.matrix[8] = 1ULL << 32;
+		}
+		iomfb_set_matrix(dcp, false, &mat, do_swap, NULL);
+	} else {
+		do_swap(dcp, NULL, NULL);
+	}
+	return scanout;
+
+refused:
+	dcp->iomfb_v14_7.refused++;
+	schedule_work(&dcp->vblank_wq);
+	return NULL;
+}
+
+/* A queue transaction ends; it keeps nothing the panel may still scan. */
+void iomfb_present_release_v14_7(struct apple_dcp *dcp,
+				 struct iomfb_scanout_v14_7 *scanout)
+{
+	if (!scanout || dcp->iomfb_v14_7.scanout == scanout)
+		return;
+	if (dcp->iomfb_v14_7.next_scanout == scanout)
+		dcp->iomfb_v14_7.next_scanout = NULL;
+	iomfb_scanout_release_v14_7(scanout);
+}
+
+/*
+ * A brightness-only present repeats what the panel scans with a fresh swap
+ * ID; iomfb_swap_prepare_v14_7() adds the level, or turns it into the blank
+ * for soft DPMS off.  Blanked or nothing scanned yet: the next atomic present
+ * carries the level instead.
+ */
+void iomfb_present_backlight_v14_7(struct apple_dcp *dcp)
+{
+	struct iomfb_scanout_v14_7 *scanout = dcp->iomfb_v14_7.scanout;
+
+	lockdep_assert_held(&dcp->iomfb.lock);
+	if (!dcp_backlight_pending(dcp) || !READ_ONCE(dcp->mode_state.valid) ||
+	    !dcp->connector || !dcp->connector->connected ||
+	    !scanout || !scanout->fb)
+		return;
+
+	DCP_FW_SWAP(dcp) = scanout->request;
+	iomfb_present_start_v14_7(dcp);
+	do_swap(dcp, NULL, NULL);
+}
+
+/*
+ * Complete a request just before A407: the single-surface invariant and the
+ * level the backlight policy has to present.  False fails the present
+ * without sending it.
+ */
+bool iomfb_swap_prepare_v14_7(struct apple_dcp *dcp,
+			      struct dcp_swap_submit_req_v14_7 *req)
+{
+	struct iomfb_transaction *transaction = dcp->iomfb.active;
+	struct dcp_backlight_present present;
+	unsigned long flags;
+	bool dpms_off;
+	u32 swap_id;
+	int ret;
+
+	lockdep_assert_held(&dcp->iomfb.lock);
+	iomfb_v14_7_encode_nits(req, false, 0);
+	if (WARN_ON_ONCE(!iomfb_v14_7_single_surface(req))) {
+		dcp->iomfb_v14_7.refused++;
+		return false;
+	}
+	if (!dcp_backlight_active(dcp))
+		return true;
+	if (!transaction)
+		return false;
+
+	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	ret = dcp_bl_prepare(&dcp->backlight.state, true, &present);
+	dpms_off = dcp->backlight.state.dpms_off;
+	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+	/* An unchanged level is not sent again. */
+	if (ret == -EALREADY)
+		return true;
+	if (ret)
+		return false;
+	transaction->backlight = present;
+	transaction->backlight_reserved = true;
+
+	if (transaction->brightness_only && dpms_off) {
+		/* Soft DPMS off: the blank background at 0 nits. */
+		swap_id = req->swap.swap_id;
+		iomfb_v14_7_encode_present(req, NULL);
+		req->swap.swap_id = swap_id;
+		dcp->iomfb_v14_7.blank = true;
+	}
+	if (iomfb_v14_7_encode_nits(req, true, present.nits))
+		return false;
+	dcp->iomfb_v14_7.nits_sent = present.nits;
+	return true;
+}
+
+/* The present's D589 and A407 reply have both arrived. */
+static bool iomfb_present_complete_v14_7(struct apple_dcp *dcp, ktime_t now)
+{
+	struct iomfb_transaction *transaction = dcp->iomfb.active;
+	struct iomfb_v14_7_state *v = &dcp->iomfb_v14_7;
+	struct iomfb_scanout_v14_7 *previous = v->scanout;
+	u64 ns = ktime_to_ns(ktime_sub(now, v->start));
+
+	lockdep_assert_held(&dcp->iomfb.lock);
+	v->swap_ns_last = ns;
+	v->swap_ns_max = max(v->swap_ns_max, ns);
+	if (transaction) {
+		transaction->completed = true;
+		if (transaction->backlight_reserved) {
+			dcp_backlight_complete(dcp, transaction->backlight.sequence, true);
+			transaction->backlight_reserved = false;
+			v->nits_presents++;
+		}
+		if (transaction->brightness_only) {
+			if (v->blank && previous) {
+				/* The blank replaced the frame: it is the snapshot now. */
+				if (previous->fb)
+					drm_framebuffer_put(previous->fb);
+				previous->fb = NULL;
+				iomfb_scanout_record_v14_7(previous, &DCP_FW_SWAP(dcp));
+				v->blank_presents++;
+			} else {
+				v->brightness_presents++;
+			}
+			v->blank = false;
+			/* Nothing displaced, and no DRM event to complete. */
+			return false;
+		}
+	}
+	v->presents++;
+	if (v->next_scanout) {
+		iomfb_scanout_record_v14_7(v->next_scanout, &DCP_FW_SWAP(dcp));
+		v->scanout = v->next_scanout;
+		v->next_scanout = NULL;
+		iomfb_scanout_release_v14_7(previous);
+	}
+	return true;
+}
+
+/*
+ * D589.  The accepted A407 reply and the matching D589 are independent
+ * receipts, and the present retires only with both: a D589 that overtakes
+ * the reply completes the present when the reply arrives.
+ */
+void iomfb_swap_complete_v14_7(struct apple_dcp *dcp, u32 swap_id)
+{
+	struct dcp_present_state_h17p *state = &dcp->present_state_h17p;
+	ktime_t now = ktime_get();
+	bool retire;
+
+	if (!dcp_present_complete_h17p(state, swap_id)) {
+		if (state->pending && !state->accepted && state->swap_id == swap_id &&
+		    !dcp->iomfb_v14_7.early_complete) {
+			dcp->iomfb_v14_7.early_complete = true;
+			return;
+		}
+		dev_err(dcp->dev, "unexpected present completion %u\n", swap_id);
+		WRITE_ONCE(dcp->crashed, true);
+		return;
+	}
+
+	retire = iomfb_present_complete_v14_7(dcp, now);
+	trace_iomfb_swap_complete(dcp, swap_id);
+	dcp->last_swap_id = swap_id;
+	dcp_swap_watchdog_complete(dcp);
+	if (retire) {
+		dcp_release_retained_framebuffers(dcp, swap_id);
+		dcp_drm_crtc_page_flip(dcp, now);
+	}
+	if (READ_ONCE(dcp->crc_enabled)) {
+		u32 crc32 = 0;
+
+		drm_crtc_add_crc_entry(&dcp->crtc->base, true, swap_id, &crc32);
+	}
+}
+
+/* The A407 reply accepted the present; its D589 may already be here. */
+void iomfb_swap_accepted_v14_7(struct apple_dcp *dcp, u32 swap_id)
+{
+	if (!dcp->iomfb_v14_7.early_complete)
+		return;
+	dcp->iomfb_v14_7.early_complete = false;
+	iomfb_swap_complete_v14_7(dcp, swap_id);
+}
+
+/* Session, present and backlight status: crtc-N/j514s in the DRM debugfs. */
+static int iomfb_v14_7_status_show(struct seq_file *m, void *unused)
+{
+	struct apple_dcp *dcp = m->private;
+	struct iomfb_v14_7_state *v = &dcp->iomfb_v14_7;
+	const struct dcp_swap_submit_req_v14_7 *req;
+	struct dcp_backlight_state bl;
+	unsigned long flags;
+
+	spin_lock_irqsave(&dcp->backlight.lock, flags);
+	bl = dcp->backlight.state;
+	spin_unlock_irqrestore(&dcp->backlight.lock, flags);
+
+	mutex_lock(&dcp->iomfb.lock);
+	seq_printf(m, "crashed=%d stopped=%d paused=%d queued=%u active=%d pending=%d accepted=%d\n",
+		   READ_ONCE(dcp->crashed), dcp->iomfb.stopped,
+		   dcp->iomfb.presentation_paused, dcp->iomfb.queued,
+		   !!dcp->iomfb.active, dcp->present_state_h17p.pending,
+		   dcp->present_state_h17p.accepted);
+	seq_printf(m, "presents=%llu brightness_presents=%llu blank_presents=%llu nits_presents=%llu refused=%llu\n",
+		   v->presents, v->brightness_presents, v->blank_presents,
+		   v->nits_presents, v->refused);
+	seq_printf(m, "last_swap_id=%u swap_ns_last=%llu swap_ns_max=%llu\n",
+		   dcp->last_swap_id, v->swap_ns_last, v->swap_ns_max);
+	if (v->scanout) {
+		req = &v->scanout->request;
+		seq_printf(m, "scanout=%s dva=%#llx %ux%u stride=%u surf_null=%*phN surf2_null=%*phN mask=%#x/%#x bg=%#x\n",
+			   v->scanout->fb ? "frame" : "blank", req->surf_iova[0],
+			   req->surf[0].base.width, req->surf[0].base.height,
+			   req->surf[0].base.stride,
+			   (int)sizeof(req->surf_null), req->surf_null,
+			   (int)sizeof(req->surf2_null), req->surf2_null,
+			   req->swap.swap_enabled, req->swap.swap_completed,
+			   req->swap.bg_color);
+		/* Colour profile of the single surface. */
+		seq_printf(m, "surface0 format=%#x transfer=%u primaries=%u premultiplied=%u layer_word=%#x surf_id=%u surface_id=%u tile_size=%u\n",
+			   req->surf[0].base.format, req->surf[0].base.xfer_func,
+			   req->surf[0].base.colorspace,
+			   req->surf[0].base.is_premultiplied, req->swap.surf_flags[0],
+			   req->swap.surf_ids[0], req->surf[0].base.surface_id,
+			   req->surf[0].base.planes[0].tile_size);
+	} else {
+		seq_puts(m, "scanout=none\n");
+	}
+	if (dcp->v14_7)
+		seq_printf(m, "session ready=%#llx callbacks=%u buffers=%u buffer_bytes=%llu rtkit_bytes=%zu pr_nits=%u.%04u hotplug=%#llx\n",
+			   dcp->v14_7->ready_word, dcp->v14_7->callbacks,
+			   dcp->v14_7->objects, dcp->v14_7->object_bytes,
+			   dcp->v14_7->rtkit_bytes, dcp->v14_7->pr_nits >> 16,
+			   (u32)(((u64)(dcp->v14_7->pr_nits & 0xffff) * 10000) >> 16),
+			   dcp->v14_7->hotplug_flags);
+	seq_printf(m, "nits_target=%u nits_level=%u nits_actual=%u nits_sent=%u max=%u ready=%d dirty=%d in_flight=%d dpms_off=%d core_blank=%d suspended=%d level_known=%d\n",
+		   bl.target, bl.level, bl.actual, v->nits_sent, bl.maximum,
+		   bl.ready, bl.dirty, bl.in_flight, bl.dpms_off, bl.core_blank,
+		   bl.suspended, bl.level_known);
+	mutex_unlock(&dcp->iomfb.lock);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(iomfb_v14_7_status);
+
+void iomfb_debugfs_init_v14_7(struct apple_dcp *dcp, struct dentry *root)
+{
+	debugfs_create_file("j514s", 0444, root, dcp, &iomfb_v14_7_status_fops);
+}
+#endif /* DCP_FW_VER == DCP_FW_VERSION(14, 7, 0) */

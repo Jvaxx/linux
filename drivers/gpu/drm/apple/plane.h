@@ -39,4 +39,9 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 				   bool supports_xrgb2101010,
 				   enum drm_plane_type type);
 
+/* The J514S (DCP firmware 14.7) panel's only plane; DRM_APPLE_DCP_T6030. */
+struct drm_plane *apple_plane_init_v14_7(struct drm_device *dev,
+					 unsigned long possible_crtcs,
+					 u32 iomfb_surf);
+
 #endif /* __APPLE_PLANE_H__ */

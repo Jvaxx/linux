@@ -27,6 +27,7 @@
 #include "iomfb-state.h"
 #include "iomfb_v12_3.h"
 #include "iomfb_v13_3.h"
+#include "iomfb_v14_7.h"
 #include "epic/dpavservep.h"
 
 #define DCP_MAX_PLANES 4
@@ -42,6 +43,36 @@ struct iomfb_scanout_h17p {
 	struct drm_framebuffer *fb[SWAP_SURFACES];
 	/* On iomfb.dropped while the firmware may still read a dropped present. */
 	struct list_head link;
+};
+
+/* Snapshot of a completed J514S (14.7) present; see iomfb_scanout_h17p. */
+struct iomfb_scanout_v14_7 {
+	struct dcp_swap_submit_req_v14_7 request;
+	/* The framebuffer it scans, or NULL for the blank background. */
+	struct drm_framebuffer *fb;
+};
+
+/* J514S (14.7) presentation state, under iomfb.lock. */
+struct iomfb_v14_7_state {
+	/* The last completed present, which brightness-only presents repeat. */
+	struct iomfb_scanout_v14_7 *scanout;
+	/* The atomic present in flight, adopted when it completes. */
+	struct iomfb_scanout_v14_7 *next_scanout;
+	/* The present in flight is the soft-DPMS blank. */
+	bool blank;
+	/* Its D589 arrived before the A407 reply; both are required. */
+	bool early_complete;
+	/* When the present in flight started (A406). */
+	ktime_t start;
+	/* Reported by the j514s debugfs file. */
+	u64 presents;
+	u64 brightness_presents;
+	u64 blank_presents;
+	u64 nits_presents;
+	u64 refused;
+	u64 swap_ns_last;
+	u64 swap_ns_max;
+	u32 nits_sent;
 };
 
 /* One operation, including all of its nested replies and present completion. */
@@ -93,6 +124,8 @@ enum dcp_firmware_version {
 	DCP_FIRMWARE_V_12_3,
 	DCP_FIRMWARE_V_13_5,
 	DCP_FIRMWARE_H17P,
+	/* J514S (T6030) internal DCP, adopted running from the boot loader */
+	DCP_FIRMWARE_V_14_7,
 };
 
 enum {
@@ -213,7 +246,26 @@ struct apple_dcp_hw_data {
 	u32 firmware_display_windows;
 	u32 firmware_scratch;
 	u32 firmware_request;
+	/*
+	 * Internal-panel facts the T6030 (J514S) boot loader's devicetree does
+	 * not carry; zero for every other SoC.  They occupy the tail padding of
+	 * this structure, so struct apple_dcp, which embeds a copy, keeps its
+	 * layout.
+	 */
+	/* One PRIMARY plane on surface 0, no OVERLAY or CURSOR plane. */
+	u32 primary_only : 1;
+	/* The DCP node has no clock; D408 is answered without one. */
+	u32 optional_clock : 1;
+	/* No real-time bandwidth registers: D003 is declined. */
+	u32 no_rt_bandwidth : 1;
+	/* Panel facts used when the DCP node has no panel child. */
+	u32 panel_mini_led : 1;
+	u32 panel_max_nits : 12;
+	u32 panel_default_nits : 12;
 };
+static_assert(sizeof(struct apple_dcp_hw_data) ==
+	      ALIGN(offsetofend(struct apple_dcp_hw_data, firmware_request),
+		    __alignof__(struct apple_dcp_hw_data)));
 
 enum dcp_test_point {
 	DCP_TEST_ANNOUNCE_TIMER_DONE,		/* past hpd_mutex in the timeout work */
@@ -532,7 +584,45 @@ struct apple_dcp {
 		 */
 		struct list_head dropped;
 	} iomfb;
+
+	/*
+	 * Queued 14.7 swap, outside the union above: appending it leaves the
+	 * layout of every other member, and so the code of the other
+	 * firmware variants, unchanged.
+	 */
+	struct dcp_swap_submit_req_v14_7 swap_v14_7;
+	/* 14.7 presentation state, appended for the same reason. */
+	struct iomfb_v14_7_state iomfb_v14_7;
+
+	/* 14.7 session state (registry, buffers, startup), NULL otherwise. */
+	struct dcp_v14_7_session *v14_7;
 };
+
+/*
+ * J514S (DCP firmware 14.7) presentation.  Only the T6030 hardware data
+ * selects the 14.7 variant, and it exists only with DRM_APPLE_DCP_T6030, so
+ * shared code tests the variant through this predicate and the 14.7
+ * branches compile out without that option.
+ */
+static inline bool iomfb_is_v14_7(const struct apple_dcp *dcp)
+{
+	return IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030) &&
+	       dcp->fw_compat == DCP_FIRMWARE_V_14_7;
+}
+
+/* Presents carry nits; one serialized IOMFB owner (H17P panel and DCPEXT, 14.7). */
+static inline bool dcp_presents_nits(const struct apple_dcp *dcp)
+{
+	return (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+		dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) ||
+	       iomfb_is_v14_7(dcp);
+}
+
+/* An adopted firmware session that fails stop and is never torn down. */
+static inline bool dcp_fail_stop(const struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_H17P || iomfb_is_v14_7(dcp);
+}
 
 void dcp_firmware_metadata_connection(struct apple_dcp *dcp, u64 generation, bool connected);
 void dcp_firmware_metadata_hotplug(struct apple_dcp *dcp, bool connected);
@@ -603,6 +693,23 @@ void dcp_backlight_finish_fade(struct apple_dcp *dcp);
 int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);
+
+/* J514S (DCP firmware 14.7) presentation (iomfb_template.c, 14.7 block). */
+
+struct iomfb_scanout_v14_7 *iomfb_present_atomic_v14_7(struct apple_dcp *dcp,
+							struct drm_crtc *crtc,
+							struct drm_atomic_state *state);
+void iomfb_present_backlight_v14_7(struct apple_dcp *dcp);
+void iomfb_present_release_v14_7(struct apple_dcp *dcp,
+				 struct iomfb_scanout_v14_7 *scanout);
+bool iomfb_swap_prepare_v14_7(struct apple_dcp *dcp,
+			      struct dcp_swap_submit_req_v14_7 *request);
+void iomfb_swap_accepted_v14_7(struct apple_dcp *dcp, u32 swap_id);
+void iomfb_swap_complete_v14_7(struct apple_dcp *dcp, u32 swap_id);
+void iomfb_configure_backlight_v14_7(struct apple_dcp *dcp);
+void iomfb_debugfs_init_v14_7(struct apple_dcp *dcp, struct dentry *root);
+/* Debug: expose the CTM and send it as set_matrix (A421) on 14.7. */
+extern bool iomfb_v14_7_ctm;
 
 #define DCP_AUDIO_MAX_CHANS 15
 

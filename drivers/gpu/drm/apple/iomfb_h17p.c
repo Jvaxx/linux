@@ -8,7 +8,7 @@
 #include "iomfb_h17p.h"
 #include "iomfb_v12_3.h"
 #include "iomfb_v13_3.h"
-#include "version_utils.h"
+#include "iomfb_v14_7.h"
 
 struct dcp_callback_size {
 	u32 in_len;

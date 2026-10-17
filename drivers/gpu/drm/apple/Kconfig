@@ -24,6 +24,24 @@ config DRM_APPLE_AUDIO
 	select SND_PCM
 	select SND_DMAENGINE_PCM
 
+config DRM_APPLE_DCP_T6030
+	bool "MacBook Pro M3 Pro (J514S) internal panel"
+	depends on DRM_APPLE
+	depends on APPLE_PMP=y || APPLE_PMP=DRM_APPLE
+	help
+	  Lets the common Apple display driver match the J514S (T6030)
+	  internal display coprocessor, which the boot loader hands over
+	  running with DCP firmware 14.7.0, and its display subsystem. The
+	  14.7 firmware interface (iomfb_v14_7) is always built; this option
+	  adds the T6030 device-tree matches and the J514S session and
+	  presentation paths.
+
+	  The panel is adopted from a qualified boot loader handoff (no
+	  reset, no modeset) and keeps its firmware session until reboot:
+	  appledrm cannot be unloaded once it has bound it. The GPU starts
+	  after the display, so userspace should load appledrm explicitly
+	  and blacklist its alias autoload.
+
 config DRM_APPLE_DEBUG
 	bool "Enable additional driver debugging"
 	depends on DRM_APPLE
@@ -44,6 +62,8 @@ config DRM_APPLE_KUNIT_TEST
 	  Also test the Type-C modeset, hotplug and service ownership state,
 	  the system resume of a CRTC whose mode is no longer admissible, and
 	  when an external display is ready to be reported to userspace.
+	  The J514S (DCP firmware 14.7) present encoding is checked byte for
+	  byte against reference requests.
 
 config DRM_APPLE_PARSER_KUNIT_TEST
 	bool "KUnit tests for Apple firmware message parsers" if !KUNIT_ALL_TESTS
