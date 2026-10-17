@@ -903,6 +903,7 @@ force_jump_domain:
  *
  * Returns true on success, false otherwise.
  */
+#ifdef CONFIG_MM_SUBPAGE
 bool tomoyo_dump_page(struct linux_binprm *bprm, unsigned long pos,
 		      struct tomoyo_page_dump *dump)
 {
@@ -940,3 +941,50 @@ bool tomoyo_dump_page(struct linux_binprm *bprm, unsigned long pos,
 	dump->pos = pos;
 	return true;
 }
+#else
+bool tomoyo_dump_page(struct linux_binprm *bprm, unsigned long pos,
+		      struct tomoyo_page_dump *dump)
+{
+	struct page *page;
+#ifdef CONFIG_MMU
+	int ret;
+#endif
+
+	/* dump->data is released by tomoyo_find_next_domain(). */
+	if (!dump->data) {
+		dump->data = kzalloc(PAGE_SIZE, GFP_NOFS);
+		if (!dump->data)
+			return false;
+	}
+	/* Same with get_arg_page(bprm, pos, 0) in fs/exec.c */
+#ifdef CONFIG_MMU
+	/*
+	 * This is called at execve() time in order to dig around
+	 * in the argv/environment of the new process
+	 * (represented by bprm).
+	 */
+	mmap_read_lock(bprm->mm);
+	ret = get_user_pages_remote(bprm->mm, pos, 1,
+				    FOLL_FORCE, &page, NULL);
+	mmap_read_unlock(bprm->mm);
+	if (ret <= 0)
+		return false;
+#else
+	page = bprm->page[pos / PAGE_SIZE];
+#endif
+	if (page != dump->page) {
+		const unsigned int offset = pos % PAGE_SIZE;
+		char *kaddr = kmap_local_page(page);
+
+		dump->page = page;
+		memcpy(dump->data + offset, kaddr + offset,
+		       PAGE_SIZE - offset);
+		kunmap_local(kaddr);
+	}
+	/* Same with put_arg_page(page) in fs/exec.c */
+#ifdef CONFIG_MMU
+	put_page(page);
+#endif
+	return true;
+}
+#endif
