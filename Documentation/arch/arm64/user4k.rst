@@ -19,7 +19,7 @@ Configuration and supported combinations
 ========================================
 
 Enable ``CONFIG_ARM64_USER4K_EXPERIMENTAL`` with 48-bit VA and PA and a native
-16K or 64K page size. The option defaults off and selects the generic
+16K or 64K page size. The option is on by default and selects the generic
 ``MM_SUBPAGE`` backing and ``ARCH_HAS_USER_PAGE_SIZE`` exec policy support.
 LPA2 and ``NO_PAGE_MAPCOUNT`` configurations are excluded by Kconfig.
 
