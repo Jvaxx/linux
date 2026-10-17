@@ -1116,8 +1116,13 @@ static int atcphy_pipehandler_lock(struct apple_atcphy *atcphy)
 {
 	int ret;
 	u32 reg;
-	u32 requested = readl(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ);
+	u32 requested;
 
+	/* The tests stand in for the controller that acknowledges the lock */
+	if (IS_ENABLED(CONFIG_PHY_APPLE_ATC_KUNIT_TEST))
+		KUNIT_STATIC_STUB_REDIRECT(atcphy_pipehandler_lock, atcphy);
+
+	requested = readl(atcphy->regs.pipehandler + PIPEHANDLER_LOCK_REQ);
 	dev_dbg(atcphy->dev, "PIPE request: req=%#x mode=%u pipe=%u host=%u dirty=%u\n",
 		requested, atcphy->mode, atcphy->pipe_state,
 		atcphy->host_active, atcphy->mode_dirty);
@@ -1188,6 +1193,9 @@ static int atcphy_configure_pipehandler_usb3_host_t8122(struct apple_atcphy *atc
 {
 	int ret, error = 0;
 	u32 reg;
+
+	if (IS_ENABLED(CONFIG_PHY_APPLE_ATC_KUNIT_TEST))
+		KUNIT_STATIC_STUB_REDIRECT(atcphy_configure_pipehandler_usb3_host_t8122, atcphy);
 
 	core_set32(atcphy, ACIOPHY_BIST_CFG1, ACIOPHY_BIST_CFG1_CLOCK_EN);
 	/* This should be a mask, but unsure what bits should be cleared */
@@ -4084,6 +4092,33 @@ static void atcphy_typec_mux_unregister(void *data)
 	typec_mux_unregister(data);
 }
 
+/*
+ * A controller behind a fixed hub keeps running across mode changes, so the PHY
+ * parks its PIPE with the controller's SuperSpeed port taken down. The PIPE
+ * lock is still only acknowledged once the controller lets go of the PIPE, and
+ * on a J700 that need not happen within the lock timeout while the partner
+ * renegotiates. A Mac on the port did so through a burst of power elections
+ * lasting several seconds, and the safe state of its data role swap then found
+ * the PIPE held:
+ *
+ *   phy-apple-atc 40b000000.phy: Pipehandler lock not acked.
+ *   phy-apple-atc 40b000000.phy: Failed to switch PIPE to dummy: -110
+ *   sn201202x 1-0c: failed to place Type-C mux in safe mode: -110
+ *
+ * The failed change leaves the lanes dirty and the SuperSpeed port down, and
+ * the next mux update that gets through puts both right. Such a timeout says
+ * nothing about the state asked for, so tell the Type-C driver to keep applying
+ * its whole state, the safe state and then the USB one, until it goes through.
+ * Only a timeout of this PHY counts, not one of the display route that shares
+ * the connector. The PHY's other timeouts, of its power and PLL polls, are
+ * faults that retrying does not clear, but the Type-C driver stops retrying
+ * after about two minutes, which bounds those as well.
+ */
+static bool atcphy_mux_transient_timeouts(const struct apple_atcphy *atcphy)
+{
+	return atcphy->fixed_usb2 && atcphy->hw->has_t8140_dp;
+}
+
 static int atcphy_probe_mux(struct apple_atcphy *atcphy)
 {
 	struct typec_mux_dev *mux;
@@ -4092,6 +4127,7 @@ static int atcphy_probe_mux(struct apple_atcphy *atcphy)
 		.fwnode = atcphy->dev->fwnode,
 		.set = atcphy_mux_set,
 		.safe_after_role = !atcphy->fixed_usb2,
+		.transient_timeouts = atcphy_mux_transient_timeouts(atcphy),
 	};
 
 	mux = typec_mux_register(atcphy->dev, &mux_desc);
