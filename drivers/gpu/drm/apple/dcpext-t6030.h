@@ -210,6 +210,9 @@ struct dcp_ext_v14_7 {
 	u64 edid_generation, edid_epoch;
 	/* The firmware withdrew the sink's modes: the next modeset is a full one. */
 	bool mode_lost;
+	/* The DP/HDMI audio endpoint (EP 0x29): started once (audio_work only). */
+	struct work_struct audio_work;
+	bool audio_started;
 
 	/* Startup, connection and failure waits. */
 	wait_queue_head_t wq;

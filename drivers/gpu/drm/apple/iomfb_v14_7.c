@@ -1285,6 +1285,7 @@ int iomfb_v14_7_ext_modeset(struct apple_dcp *dcp, struct drm_crtc_state *crtc_s
 		WRITE_ONCE(ext->display_on, true);
 		/* Swaps dropped meanwhile end at once; this only avoids them. */
 		iomfb_v14_7_ext_wait_ready(dcp);
+		dcp_ext_v14_7_display_on(dcp);
 		return 0;
 	}
 
@@ -1313,6 +1314,7 @@ int iomfb_v14_7_ext_modeset(struct apple_dcp *dcp, struct drm_crtc_state *crtc_s
 			return ret;
 		WRITE_ONCE(ext->display_on, true);
 		iomfb_v14_7_ext_wait_ready(dcp);
+		dcp_ext_v14_7_display_on(dcp);
 	}
 	dcp->mode = req;
 	/* The J514S profile presents with zero timestamps and no VRR. */

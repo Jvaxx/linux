@@ -33,6 +33,11 @@ struct dcp_parse_ctx {
 	 * still preferred.
 	 */
 	bool v14_7_dsc;
+	/*
+	 * J514S DCPEXT audio elements (DCP firmware 14.7): an element's
+	 * ElementData, the link data the audio service takes, is 32 bytes.
+	 */
+	bool v14_7_audio;
 #endif
 };
 
@@ -51,6 +56,16 @@ static inline bool dcp_parse_v14_7_dsc(const struct dcp_parse_ctx *ctx)
 {
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_EXT)
 	return ctx->v14_7_dsc;
+#else
+	return false;
+#endif
+}
+
+/* The J514S DCPEXT audio elements (DRM_APPLE_DCP_T6030_EXT only). */
+static inline bool dcp_parse_v14_7_audio(const struct dcp_parse_ctx *ctx)
+{
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_EXT)
+	return ctx->v14_7_audio;
 #else
 	return false;
 #endif
@@ -183,8 +198,20 @@ struct dcp_sound_format_mask {
 	unsigned int nchans;
 };
 
+/*
+ * An audio element's ElementData, the link data of the audio service's link
+ * methods: 24 bytes up to DCP firmware 13.5, 32 on the 14.7 external role.
+ */
+#define DCP_SOUND_COOKIE_SIZE		24
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_EXT)
+#define DCP_SOUND_COOKIE_SIZE_V14_7	32
+#define DCP_SOUND_COOKIE_MAX		DCP_SOUND_COOKIE_SIZE_V14_7
+#else
+#define DCP_SOUND_COOKIE_MAX		DCP_SOUND_COOKIE_SIZE
+#endif
+
 struct dcp_sound_cookie {
-	u8 data[24];
+	u8 data[DCP_SOUND_COOKIE_MAX];
 };
 
 struct snd_pcm_chmap_elem;

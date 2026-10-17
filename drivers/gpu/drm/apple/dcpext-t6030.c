@@ -64,6 +64,7 @@
 #include <drm/drm_edid.h>
 
 #include "afk.h"
+#include "av.h"
 #include "dcp.h"
 #include "dcp-internal.h"
 #include "dcpext-t6030.h"
@@ -1119,9 +1120,12 @@ static int dcp_ext_release_locked(struct dcp_ext_v14_7 *ext)
 	int ret;
 
 	lockdep_assert_held(&dcp->external_lock);
+	/* The sink's audio goes first, as on a DPTX disconnect of the other DCPs. */
+	if (dcp->avep)
+		av_service_disconnect(dcp);
 	/*
-	 * The AV client goes first: the firmware completes the HPD low only once
-	 * the sink's AV device has no client left.
+	 * Then the AV client: the firmware completes the HPD low only once the
+	 * sink's AV device has no client left.
 	 */
 	dcp_ext_av_close(ext);
 	dcp_ext_service_disarm(ext);
@@ -1758,6 +1762,26 @@ void dcp_ext_v14_7_av_report(struct apple_epic_service *service, u32 type,
 	queue_work(system_freezable_wq, &ext->av_close_work);
 }
 
+/*
+ * DP/HDMI audio (EP 0x29) on the opt-in, as the other DCPs start it, once per
+ * session and after the sink's first EDID (see dcp_ext_v14_7_read_edid());
+ * only a controller whose port@0 links an audio device gets it.
+ */
+static void dcp_ext_audio_work(struct work_struct *work)
+{
+	struct dcp_ext_v14_7 *ext = container_of(work, struct dcp_ext_v14_7, audio_work);
+	struct apple_dcp *dcp = ext->dcp;
+	int ret;
+
+	if (!IS_ENABLED(CONFIG_DRM_APPLE_AUDIO) || !hdmi_audio || ext->audio_started ||
+	    READ_ONCE(dcp->crashed))
+		return;
+	ext->audio_started = true;
+	ret = avep_init(dcp);
+	if (ret)
+		dev_warn(dcp->dev, "AV audio endpoint not started: %d\n", ret);
+}
+
 /* The AV service was published (or re-published after a replug): open it. */
 void dcp_ext_v14_7_av_published(struct apple_dcp *dcp)
 {
@@ -1768,9 +1792,12 @@ static const struct drm_edid *dcp_ext_copy_edid(struct apple_epic_service *servi
 
 /*
  * The sink's EDID through the opened AV service, read once per HPD generation
- * and service instance: a re-plug inside the firmware keeps it, and later
- * reconnections take the cached one. A CopyEDID has the firmware report the
- * sink's physical address again (it sets it, repeats included).
+ * and service instance: a re-plug inside the firmware keeps it. A CopyEDID
+ * has the firmware report the sink's physical address again (it sets it,
+ * repeats included), and with the audio endpoint's interfaces published, a
+ * re-read on every reconnection was followed by their rebuild and another
+ * software re-plug of the sink, each time. The audio endpoint therefore
+ * starts after the first EDID, and later reconnections take the cached one.
  */
 const struct drm_edid *dcp_ext_v14_7_read_edid(struct apple_epic_service *service)
 {
@@ -1797,6 +1824,7 @@ const struct drm_edid *dcp_ext_v14_7_read_edid(struct apple_epic_service *servic
 	ext->edid = drm_edid_dup(edid);
 	ext->edid_generation = generation;
 	ext->edid_epoch = epoch;
+	queue_work(system_freezable_wq, &ext->audio_work);
 	return edid;
 }
 
@@ -1856,6 +1884,7 @@ int dcp_ext_v14_7_init(struct apple_dcp *dcp)
 	INIT_WORK(&ext->irq_work, dcp_ext_irq_work);
 	INIT_WORK(&ext->av_work, dcp_ext_av_work);
 	INIT_WORK(&ext->av_close_work, dcp_ext_av_close_work);
+	INIT_WORK(&ext->audio_work, dcp_ext_audio_work);
 	INIT_DELAYED_WORK(&ext->hpd_work, dcp_ext_hdmi_hpd_work);
 	INIT_DELAYED_WORK(&ext->service_work, dcp_ext_service_work);
 	dcp->v14_7->ext = ext;
@@ -1901,6 +1930,7 @@ void dcp_ext_v14_7_unbind(struct apple_dcp *dcp)
 	disable_work_sync(&ext->irq_work);
 	disable_work_sync(&ext->av_work);
 	disable_work_sync(&ext->av_close_work);
+	disable_work_sync(&ext->audio_work);
 	dcp_ext_service_disarm(ext);
 	scoped_guard(mutex, &ext->edid_lock) {
 		drm_edid_free(ext->edid);
@@ -1929,10 +1959,21 @@ void dcp_ext_v14_7_poweroff(struct apple_dcp *dcp)
 		if (ext->link.inactive)
 			return;
 	}
+	/* Audio stops with the display, as the other DCPs' poweroff has it. */
+	if (dcp->avep)
+		av_service_disconnect(dcp);
 	ret = iomfb_v14_7_ext_power(dcp, false);
 	if (ret)
 		dev_err(dcp->dev, "A472 off failed: %d\n", ret);
 	ext->display_on = false;
+}
+
+/* A472 on (modeset path, external_lock held): the sink's audio again. */
+void dcp_ext_v14_7_display_on(struct apple_dcp *dcp)
+{
+	lockdep_assert_held(&dcp->external_lock);
+	if (dcp->avep)
+		av_service_connect(dcp);
 }
 
 /* The HDMI port after sleep: its service if the sink is held, its HPD again. */
@@ -1968,6 +2009,7 @@ int dcp_ext_v14_7_suspend(struct apple_dcp *dcp)
 	disable_work_sync(&ext->connect_work);
 	disable_work_sync(&ext->irq_work);
 	disable_work_sync(&ext->av_work);
+	disable_work_sync(&ext->audio_work);
 	device_set_wakeup_path(dcp->dev);
 	if (!ext->started || READ_ONCE(dcp->crashed))
 		return 0;
@@ -1979,6 +2021,7 @@ int dcp_ext_v14_7_suspend(struct apple_dcp *dcp)
 		enable_work(&ext->connect_work);
 		enable_work(&ext->irq_work);
 		enable_work(&ext->av_work);
+		enable_work(&ext->audio_work);
 		dcp_ext_hdmi_resume(ext);
 		return ret;
 	}
@@ -2000,6 +2043,7 @@ int dcp_ext_v14_7_resume(struct apple_dcp *dcp)
 	enable_work(&ext->connect_work);
 	enable_work(&ext->irq_work);
 	enable_work(&ext->av_work);
+	enable_work(&ext->audio_work);
 	/* A sink that came or went meanwhile is reported by the Type-C driver. */
 	dcp_ext_generation(ext, &high);
 	if (high)

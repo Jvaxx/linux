@@ -777,6 +777,7 @@ int dcp_ext_v14_7_route_release(struct apple_dcp_typec_route *route);
 int dcp_ext_v14_7_route_deselect(struct apple_dcp_typec_route *route);
 irqreturn_t dcp_ext_v14_7_hpd_irq(int irq, void *data);
 void dcp_ext_v14_7_poweroff(struct apple_dcp *dcp);
+void dcp_ext_v14_7_display_on(struct apple_dcp *dcp);
 int dcp_ext_v14_7_suspend(struct apple_dcp *dcp);
 int dcp_ext_v14_7_resume(struct apple_dcp *dcp);
 bool dcp_ext_v14_7_presentable(struct apple_dcp *dcp);
