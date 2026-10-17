@@ -7,6 +7,7 @@
 #include <linux/cpu.h>
 #include <linux/kernel.h>
 #include <linux/mm.h>
+#include <linux/mm_subpage.h>
 #include <linux/prctl.h>
 #include <linux/ptrace.h>
 #include <linux/sched.h>
@@ -70,21 +71,23 @@ void mte_sync_tags(pte_t pte, unsigned int nr_pages)
 	smp_wmb();
 }
 
-int memcmp_pages(struct page *page1, struct page *page2)
+int memcmp_pages_range(struct page *page1, unsigned int offset1,
+		       struct page *page2, unsigned int offset2, size_t len)
 {
 	char *addr1, *addr2;
 	int ret;
 
-	addr1 = page_address(page1);
-	addr2 = page_address(page2);
-	ret = memcmp(addr1, addr2, PAGE_SIZE);
+	addr1 = page_address(page1) + offset1;
+	addr2 = page_address(page2) + offset2;
+	ret = memcmp(addr1, addr2, len);
 
-	if (!system_supports_mte() || ret)
+	if (!len || !system_supports_mte() || ret)
 		return ret;
 
 	/*
-	 * If the page content is identical but at least one of the pages is
-	 * tagged, return non-zero to avoid KSM merging. If only one of the
+	 * If the byte ranges are identical but at least one page is tagged,
+	 * only the same physical range is interchangeable. Avoid merging or
+	 * replacing independently tagged ranges. If only one of the
 	 * pages is tagged, __set_ptes() may zero or change the tags of the
 	 * other page via mte_sync_tags().
 	 */
@@ -92,6 +95,11 @@ int memcmp_pages(struct page *page1, struct page *page2)
 		return addr1 != addr2;
 
 	return ret;
+}
+
+int memcmp_pages(struct page *page1, struct page *page2)
+{
+	return memcmp_pages_range(page1, 0, page2, 0, PAGE_SIZE);
 }
 
 static inline void __mte_enable_kernel(const char *mode, unsigned long tcf)
@@ -457,11 +465,24 @@ static int __access_remote_tags(struct mm_struct *mm, unsigned long addr,
 
 	while (len) {
 		struct vm_area_struct *vma;
-		unsigned long tags, offset;
+		unsigned long tags = 0, offset;
 		void *maddr;
-		struct page *page = get_user_page_vma_remote(mm, addr,
-							     gup_flags, &vma);
+		struct page *page;
 		struct folio *folio;
+#ifdef CONFIG_MM_SUBPAGE
+		struct user_page_fragment fragment = {};
+
+		if (mm_page_size(mm) != PAGE_SIZE) {
+			unsigned long bytes = min(len, PAGE_SIZE / MTE_GRANULE_SIZE) *
+					      MTE_GRANULE_SIZE;
+			int got = get_user_fragment_vma_remote(mm, addr, bytes,
+							     gup_flags, &fragment, &vma);
+
+			page = got > 0 ? folio_page(fragment.folio,
+					fragment.offset >> PAGE_SHIFT) : ERR_PTR(got ?: -EFAULT);
+		} else
+#endif
+			page = get_user_page_vma_remote(mm, addr, gup_flags, &vma);
 
 		if (IS_ERR(page)) {
 			err = PTR_ERR(page);
@@ -477,8 +498,7 @@ static int __access_remote_tags(struct mm_struct *mm, unsigned long addr,
 		 */
 		if (!(vma->vm_flags & VM_MTE)) {
 			err = -EIO;
-			put_page(page);
-			break;
+			goto release;
 		}
 
 		folio = page_folio(page);
@@ -491,18 +511,33 @@ static int __access_remote_tags(struct mm_struct *mm, unsigned long addr,
 		/* limit access to the end of the page */
 		offset = offset_in_page(addr);
 		tags = min(len, (PAGE_SIZE - offset) / MTE_GRANULE_SIZE);
+#ifdef CONFIG_MM_SUBPAGE
+		if (fragment.folio) {
+			offset = offset_in_page(fragment.offset);
+			tags = fragment.length / MTE_GRANULE_SIZE;
+		}
+#endif
 
 		maddr = page_address(page);
 		if (write) {
 			tags = mte_copy_tags_from_user(maddr + offset, buf, tags);
-			set_page_dirty_lock(page);
+#ifdef CONFIG_MM_SUBPAGE
+			if (!fragment.folio)
+#endif
+				set_page_dirty_lock(page);
 		} else {
 			tags = mte_copy_tags_to_user(buf, maddr + offset, tags);
 		}
-		put_page(page);
+release:
+#ifdef CONFIG_MM_SUBPAGE
+		if (fragment.folio)
+			release_user_fragments(&fragment, 1, write && !err);
+		else
+#endif
+			put_page(page);
 
 		/* error accessing the tracer's buffer */
-		if (!tags)
+		if (err || !tags)
 			break;
 
 		len -= tags;

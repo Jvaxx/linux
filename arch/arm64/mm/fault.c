@@ -153,7 +153,7 @@ static void show_pte(unsigned long addr)
 	}
 
 	pr_alert("%s pgtable: %luk pages, %llu-bit VAs, pgdp=%016lx\n",
-		 mm == &init_mm ? "swapper" : "user", PAGE_SIZE / SZ_1K,
+		 mm == &init_mm ? "swapper" : "user", mm_page_size(mm) / SZ_1K,
 		 vabits_actual, mm_to_pgd_phys(mm));
 
 	guard(irqsave)();
@@ -171,25 +171,29 @@ static void show_pte(unsigned long addr)
 		if (pgd_none(pgd) || pgd_bad(pgd))
 			break;
 
-		p4dp = p4d_offset_lockless(pgdp, pgd, addr);
+		p4dp = arm64_mm_alt_granule(mm) ? p4d_offset_mm(mm, pgdp, addr) :
+						  p4d_offset_lockless(pgdp, pgd, addr);
 		p4d = READ_ONCE(*p4dp);
 		pr_cont(", p4d=%016llx", p4d_val(p4d));
-		if (p4d_none(p4d) || p4d_bad(p4d))
+		if (p4d_none_mm(mm, p4d) || p4d_bad_mm(mm, p4d))
 			break;
 
-		pudp = pud_offset_lockless(p4dp, p4d, addr);
+		pudp = arm64_mm_alt_granule(mm) ? pud_offset_mm(mm, p4dp, addr) :
+						  pud_offset_lockless(p4dp, p4d, addr);
 		pud = READ_ONCE(*pudp);
 		pr_cont(", pud=%016llx", pud_val(pud));
 		if (pud_none(pud) || pud_bad(pud))
 			break;
 
-		pmdp = pmd_offset_lockless(pudp, pud, addr);
+		pmdp = arm64_mm_alt_granule(mm) ? pmd_offset_mm(mm, pudp, addr) :
+						  pmd_offset_lockless(pudp, pud, addr);
 		pmd = READ_ONCE(*pmdp);
 		pr_cont(", pmd=%016llx", pmd_val(pmd));
 		if (pmd_none(pmd) || pmd_bad(pmd))
 			break;
 
-		ptep = pte_offset_map(&pmd, addr);
+		ptep = arm64_mm_alt_granule(mm) ? pte_offset_map_mm(mm, pmdp, addr) :
+						  pte_offset_map(&pmd, addr);
 		if (!ptep)
 			break;
 
@@ -247,19 +251,15 @@ int __ptep_set_access_flags_anysz(struct vm_area_struct *vma,
 	 * flush_tlb_fix_spurious_fault().
 	 */
 	if (dirty) {
-		switch (pgsize) {
-		case PAGE_SIZE:
+		if (pgsize == mm_page_size(vma->vm_mm)) {
 			level = 3;
-			break;
-		case PMD_SIZE:
+		} else if (pgsize == pmd_size_mm(vma->vm_mm)) {
 			level = 2;
-			break;
 #ifndef __PAGETABLE_PMD_FOLDED
-		case PUD_SIZE:
+		} else if (pgsize == pud_size_mm(vma->vm_mm)) {
 			level = 1;
-			break;
 #endif
-		default:
+		} else {
 			level = TLBI_TTL_UNKNOWN;
 			WARN_ON(1);
 		}
@@ -1011,8 +1011,8 @@ NOKPROBE_SYMBOL(do_sp_pc_abort);
 /*
  * Used during anonymous page fault handling.
  */
-struct folio *vma_alloc_zeroed_movable_folio(struct vm_area_struct *vma,
-						unsigned long vaddr)
+struct folio *vma_alloc_zeroed_movable_folio_order(struct vm_area_struct *vma,
+					 unsigned long vaddr, unsigned int order)
 {
 	gfp_t flags = GFP_HIGHUSER_MOVABLE | __GFP_ZERO;
 
@@ -1024,7 +1024,7 @@ struct folio *vma_alloc_zeroed_movable_folio(struct vm_area_struct *vma,
 	if (vma->vm_flags & VM_MTE)
 		flags |= __GFP_ZEROTAGS;
 
-	return vma_alloc_folio(flags, 0, vma, vaddr);
+	return vma_alloc_folio(flags, order, vma, vaddr);
 }
 
 bool tag_clear_highpages(struct page *page, int numpages, bool clear_pages)
