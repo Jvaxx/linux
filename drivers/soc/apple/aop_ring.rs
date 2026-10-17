@@ -321,6 +321,18 @@ mod tests {
     }
 
     #[test]
+    fn a_wrapped_entry_is_refused_below_the_read_pointer() -> Result {
+        let ring = Ring::new(BUF, BLOCK)?;
+        // wptr < rptr: [0, wptr) holds unread entries, so an entry must
+        // not wrap even when it would end before the read pointer.
+        assert!(ring.write_entry(0xfc0, 0xf80, 0x80).is_err());
+        assert!(ring
+            .write_entry(0xf80, 0xf00, 0x100 - QEH_SIZE + 1)
+            .is_err());
+        Ok(())
+    }
+
+    #[test]
     fn an_entry_never_reaches_the_read_pointer() -> Result {
         let ring = Ring::new(BUF, BLOCK)?;
         // ending on rptr would make a full ring read as empty
