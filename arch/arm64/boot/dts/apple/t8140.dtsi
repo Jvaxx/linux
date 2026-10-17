@@ -491,8 +491,7 @@
 
 			/* PMP soc-device 9, which the PMP acknowledges */
 			pmp_report_gfx: report@9 {
-				compatible = "apple,t8140-pmp-v2-report-entry",
-					     "apple,t6000-pmp-v2-report-entry";
+				compatible = "apple,t8140-pmp-v2-report-entry";
 				reg = <0x9>;
 				label = "pmp-gfx";
 				#power-domain-cells = <0>;
