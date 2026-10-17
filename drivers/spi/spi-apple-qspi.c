@@ -859,7 +859,8 @@ static int apple_qspi_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	qspi = spi_controller_get_devdata(ctlr);
-	qspi->nvram_policy = !of_device_is_compatible(dev->of_node, "apple,t8140-qspi");
+	qspi->nvram_policy = of_device_is_compatible(dev->of_node, "apple,t8122-qspi") ||
+			     of_device_is_compatible(dev->of_node, "apple,t8132-qspi");
 	qspi->nvram_write_candidate = of_device_is_compatible(dev->of_node, "apple,t8122-qspi");
 	if (qspi->nvram_write_candidate && !of_machine_is_compatible("apple,j613"))
 		return -ENODEV;
