@@ -124,4 +124,5 @@ static struct kunit_suite dcp_mode_suite = {
 };
 
 kunit_test_suite(dcp_mode_suite);
+MODULE_DESCRIPTION("KUnit tests for the Apple DCP mode and connection state");
 MODULE_LICENSE("Dual MIT/GPL");
