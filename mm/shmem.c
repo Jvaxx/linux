@@ -2061,10 +2061,12 @@ try_split:
 		swap_cache_del_folio(folio);
 		goto redirty;
 	}
+#if defined(CONFIG_SHMEM) && defined(CONFIG_MM_SUBPAGE) && defined(CONFIG_USERFAULTFD)
 	/* Allocation failed: no swap entry owns the reserved inode metadata. */
 	xa_lock_irq(&mapping->i_pages);
 	shmem_uffd_forget(mapping, folio->index, folio_nr_pages(folio));
 	xa_unlock_irq(&mapping->i_pages);
+#endif
 	if (nr_pages > 1)
 		goto try_split;
 redirty:
