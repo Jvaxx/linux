@@ -3101,7 +3101,7 @@ impl SepData {
     /// The system is about to suspend. End any capture in progress, hold new
     /// ones, and wait for the enrol or verify work to stop touching the sensor
     /// before devices go down.
-    pub(crate) fn sleep_prepare(&self) -> Result<()> {
+    pub(crate) fn sleep_prepare(&self) {
         let woke = {
             let mut session = self.bio_session.lock();
             self.suspending.store(true, Relaxed);
@@ -3118,17 +3118,20 @@ impl SepData {
         let mut waited: u32 = 0;
         while self.captures_running.load(Relaxed) != 0 {
             if waited >= SLEEP_DRAIN_MS {
+                // Suspend anyway, as before: failing here would leave a
+                // laptop awake with its lid shut. The work item has been told
+                // to stop, and the next capture power-cycles and registers
+                // the sensor again.
                 dev_warn!(
                     self.dev,
-                    "Touch ID: capture did not drain within {} ms; aborting suspend\n",
+                    "Touch ID: a capture was still running {} ms after the system started to sleep; continuing\n",
                     SLEEP_DRAIN_MS
                 );
-                return Err(EBUSY);
+                return;
             }
             kernel::time::delay::fsleep(kernel::time::Delta::from_millis(10));
             waited += 10;
         }
-        Ok(())
     }
 
     /// The system has resumed, or the suspend was aborted.
