@@ -611,11 +611,14 @@ static int apple_qspi_resume(struct device *dev)
 	struct apple_qspi *qspi = spi_controller_get_devdata(ctlr);
 	int ret;
 
+	/*
+	 * Reopen the controller even if the reset failed. Left suspended, it
+	 * would fail every transfer until reboot; a transfer that times out
+	 * resets it again instead.
+	 */
 	ret = apple_qspi_hw_reset(qspi);
-	if (ret) {
+	if (ret)
 		dev_err(dev, "controller reset failed on resume: %d\n", ret);
-		return ret;
-	}
 
 	return spi_controller_resume(ctlr);
 }
