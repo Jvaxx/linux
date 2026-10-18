@@ -26,6 +26,7 @@ enum {
 	APPLE_RTKIT_EP_SYSLOG = 2,
 	APPLE_RTKIT_EP_DEBUG = 3,
 	APPLE_RTKIT_EP_IOREPORT = 4,
+	APPLE_RTKIT_EP_COREANALYTICS = 7,
 	APPLE_RTKIT_EP_OSLOG = 8,
 	APPLE_RTKIT_EP_TRACEKIT = 0xa,
 };
@@ -101,6 +102,17 @@ enum {
 /* The firmware gives the entry count; cap what it can make the kernel pin. */
 #define APPLE_RTKIT_KDEBUG_BUF0_MAX   SZ_4M
 
+#define APPLE_RTKIT_CA_TYPE GENMASK_ULL(55, 54)
+#define APPLE_RTKIT_CA_UNIT_1M BIT_ULL(53)
+#define APPLE_RTKIT_CA_UNIT_4K BIT_ULL(52)
+#define APPLE_RTKIT_CA_COUNT GENMASK_ULL(51, 44)
+#define APPLE_RTKIT_CA_IOVA GENMASK_ULL(43, 0)
+#define APPLE_RTKIT_CA_EVENT_ID GENMASK_ULL(47, 32)
+#define APPLE_RTKIT_CA_BUFFER_REQUEST 0
+#define APPLE_RTKIT_CA_BUFFER_REPLY 1
+#define APPLE_RTKIT_CA_EVENT 2
+#define APPLE_RTKIT_CA_EVENT_ACK 3
+
 #define APPLE_RTKIT_MIN_SUPPORTED_VERSION 11
 #define APPLE_RTKIT_MAX_SUPPORTED_VERSION 12
 
@@ -134,6 +146,11 @@ static bool apple_rtkit_coproc_places_buffers(struct apple_rtkit *rtk)
 	return rtk->ops->flags & APPLE_RTKIT_COPROC_PLACES_BUFFERS;
 }
 
+static bool apple_rtkit_needs_coreanalytics(struct apple_rtkit *rtk)
+{
+	return rtk->ops->flags & APPLE_RTKIT_NEEDS_COREANALYTICS;
+}
+
 static int apple_rtkit_management_send(struct apple_rtkit *rtk, u8 type,
 					u64 msg)
 {
@@ -159,6 +176,8 @@ static void apple_rtkit_management_rx_hello(struct apple_rtkit *rtk, u64 msg)
 	int max_ver = FIELD_GET(APPLE_RTKIT_MGMT_HELLO_MAXVER, msg);
 	int want_ver = min(APPLE_RTKIT_MAX_SUPPORTED_VERSION, max_ver);
 
+	if (rtk->ops->protocol_version)
+		want_ver = rtk->ops->protocol_version;
 	dev_dbg(rtk->dev, "RTKit: Min ver %d, max ver %d\n", min_ver, max_ver);
 
 	if (min_ver > APPLE_RTKIT_MAX_SUPPORTED_VERSION) {
@@ -170,6 +189,11 @@ static void apple_rtkit_management_rx_hello(struct apple_rtkit *rtk, u64 msg)
 	if (max_ver < APPLE_RTKIT_MIN_SUPPORTED_VERSION) {
 		dev_err(rtk->dev, "RTKit: Firmware max version %d is too old\n",
 			max_ver);
+		goto abort_boot;
+	}
+	if (want_ver < min_ver || want_ver > max_ver) {
+		dev_err(rtk->dev, "RTKit: required protocol %d outside remote range %d..%d\n",
+			want_ver, min_ver, max_ver);
 		goto abort_boot;
 	}
 
@@ -235,6 +259,12 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 		/* the management endpoint is started by default */
 		case APPLE_RTKIT_EP_MGMT:
 			break;
+
+		/* Only clients with a qualified startup dependency opt into EP7. */
+		case APPLE_RTKIT_EP_COREANALYTICS:
+			if (!apple_rtkit_needs_coreanalytics(rtk))
+				break;
+			fallthrough;
 
 		/* without starting these RTKit refuses to boot */
 		case APPLE_RTKIT_EP_SYSLOG:
@@ -323,9 +353,11 @@ static void apple_rtkit_management_rx(struct apple_rtkit *rtk, u64 msg)
 	}
 }
 
-static int apple_rtkit_alloc_shmem(struct apple_rtkit *rtk,
+static int apple_rtkit_alloc_shmem(struct apple_rtkit *rtk, u8 ep,
 				   struct apple_rtkit_shmem *buffer)
 {
+	if (rtk->ops->shmem_setup_ep)
+		return rtk->ops->shmem_setup_ep(rtk->cookie, ep, buffer);
 	if (rtk->ops->shmem_setup)
 		return rtk->ops->shmem_setup(rtk->cookie, buffer);
 
@@ -377,12 +409,12 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
 	dev_dbg(rtk->dev, "RTKit: buffer request for 0x%zx bytes at %pad\n",
 		request.size, &request.iova);
 
-	if (request.iova && !rtk->ops->shmem_setup) {
+	if (request.iova && !rtk->ops->shmem_setup && !rtk->ops->shmem_setup_ep) {
 		err = -EINVAL;
 		goto error;
 	}
 
-	err = apple_rtkit_alloc_shmem(rtk, &request);
+	err = apple_rtkit_alloc_shmem(rtk, ep, &request);
 	if (err)
 		goto error;
 	*buffer = request;
@@ -454,7 +486,7 @@ static int apple_rtkit_kdebug_alloc_buffer(struct apple_rtkit *rtk,
 	buffer->iomem = NULL;
 	buffer->is_mapped = false;
 
-	err = apple_rtkit_alloc_shmem(rtk, buffer);
+	err = apple_rtkit_alloc_shmem(rtk, APPLE_RTKIT_EP_DEBUG, buffer);
 	if (err)
 		buffer->size = 0;
 	return err;
@@ -530,6 +562,117 @@ error:
 	dev_err_ratelimited(rtk->dev, "RTKit: kdebug buffer request failed: %d\n", err);
 }
 
+static size_t apple_rtkit_coreanalytics_size(u64 msg)
+{
+	size_t count = FIELD_GET(APPLE_RTKIT_CA_COUNT, msg);
+
+	if (msg & APPLE_RTKIT_CA_UNIT_4K)
+		return count * 0x1000;
+	if (msg & APPLE_RTKIT_CA_UNIT_1M)
+		return count * 0x100000;
+	return 0;
+}
+
+static int apple_rtkit_coreanalytics_reply(size_t size, dma_addr_t iova, u64 *reply)
+{
+	size_t unit = size < 0x100000 ? 0x1000 : 0x100000;
+	size_t count;
+
+	if (!size || !FIELD_FIT(APPLE_RTKIT_CA_IOVA, iova))
+		return -EINVAL;
+	count = (size - 1) / unit + 1;
+	if (!FIELD_FIT(APPLE_RTKIT_CA_COUNT, count))
+		return -EINVAL;
+
+	*reply = FIELD_PREP(APPLE_RTKIT_CA_TYPE, APPLE_RTKIT_CA_BUFFER_REPLY) |
+		 FIELD_PREP(APPLE_RTKIT_CA_COUNT, count) |
+		 FIELD_PREP(APPLE_RTKIT_CA_IOVA, iova) |
+		 (unit == 0x1000 ? APPLE_RTKIT_CA_UNIT_4K : APPLE_RTKIT_CA_UNIT_1M);
+	return 0;
+}
+
+static int apple_rtkit_coreanalytics_get_buffer(struct apple_rtkit *rtk, u64 msg)
+{
+	struct apple_rtkit_shmem *buffer = &rtk->coreanalytics_buffer;
+	size_t size = apple_rtkit_coreanalytics_size(msg);
+	dma_addr_t iova = FIELD_GET(APPLE_RTKIT_CA_IOVA, msg);
+	bool mapped = iova != 0;
+	u64 reply;
+	int ret;
+
+	/* Never overwrite a live allocation on a duplicate request. */
+	if (buffer->size)
+		return -EBUSY;
+	if (!size || (iova && !rtk->ops->shmem_setup && !rtk->ops->shmem_setup_ep))
+		return -EINVAL;
+
+	buffer->size = size;
+	buffer->iova = iova;
+	buffer->is_mapped = mapped;
+	ret = apple_rtkit_alloc_shmem(rtk, APPLE_RTKIT_EP_COREANALYTICS, buffer);
+	if (ret) {
+		/* A failed setup must unwind its own partial allocation. */
+		memset(buffer, 0, sizeof(*buffer));
+		return ret;
+	}
+
+	if (buffer->size < size || buffer->is_mapped != mapped) {
+		ret = -EINVAL;
+		goto free_buffer;
+	}
+	if (buffer->iomem) {
+		memset_io(buffer->iomem, 0, buffer->size);
+	} else if (buffer->buffer) {
+		memset(buffer->buffer, 0, buffer->size);
+	} else {
+		ret = -EINVAL;
+		goto free_buffer;
+	}
+
+	if (!buffer->is_mapped) {
+		ret = apple_rtkit_coreanalytics_reply(buffer->size, buffer->iova, &reply);
+		if (ret)
+			goto free_buffer;
+		ret = apple_rtkit_send_message(rtk, APPLE_RTKIT_EP_COREANALYTICS,
+					       reply, NULL, false);
+		/* Retain memory until teardown if delivery status is uncertain. */
+		if (ret)
+			return ret;
+	}
+
+	dev_dbg(rtk->dev, "RTKit: CoreAnalytics buffer ready (%zu bytes)\n", buffer->size);
+	complete_all(&rtk->coreanalytics_completion);
+	return 0;
+
+free_buffer:
+	apple_rtkit_free_buffer(rtk, buffer);
+	return ret;
+}
+
+static void apple_rtkit_coreanalytics_rx(struct apple_rtkit *rtk, u64 msg)
+{
+	u8 type = FIELD_GET(APPLE_RTKIT_CA_TYPE, msg);
+	u64 reply;
+	int ret;
+
+	switch (type) {
+	case APPLE_RTKIT_CA_BUFFER_REQUEST:
+		ret = apple_rtkit_coreanalytics_get_buffer(rtk, msg);
+		break;
+	case APPLE_RTKIT_CA_EVENT:
+		reply = FIELD_PREP(APPLE_RTKIT_CA_TYPE, APPLE_RTKIT_CA_EVENT_ACK) |
+			(msg & APPLE_RTKIT_CA_EVENT_ID);
+		ret = apple_rtkit_send_message(rtk, APPLE_RTKIT_EP_COREANALYTICS,
+					       reply, NULL, false);
+		break;
+	default:
+		dev_warn(rtk->dev, "RTKit: Unknown CoreAnalytics message: %llx\n", msg);
+		return;
+	}
+	if (ret)
+		dev_err(rtk->dev, "RTKit: CoreAnalytics message %llx failed: %d\n", msg, ret);
+}
+
 static void apple_rtkit_memcpy(struct apple_rtkit *rtk, void *dst,
 			       struct apple_rtkit_shmem *bfr, size_t offset,
 			       size_t len)
@@ -572,6 +715,8 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 		 */
 		if (!rtk->crashlog_inherited)
 			return;
+	}
+	if (rtk->crashlog_inherited) {
 		if (rtk->crashlog_buffer.size < sizeof(header))
 			goto unmapped;
 
@@ -832,6 +977,9 @@ static void apple_rtkit_rx_work(struct work_struct *work)
 			dev_warn(rtk->dev,
 				 "RTKit: message to unknown endpoint %02x: %llx\n",
 				 rtk_work->ep, rtk_work->msg);
+		break;
+	case APPLE_RTKIT_EP_COREANALYTICS:
+		apple_rtkit_coreanalytics_rx(rtk, rtk_work->msg);
 		break;
 	case APPLE_RTKIT_EP_OSLOG:
 		apple_rtkit_oslog_rx(rtk, rtk_work->msg);
@@ -1115,15 +1263,72 @@ static void apple_rtkit_release_rx(struct apple_rtkit *rtk)
 	spin_unlock_irqrestore(&rtk->mbox->rx_lock, flags);
 }
 
+static int apple_rtkit_inherit_buffers(
+	struct apple_rtkit *rtk,
+	const struct apple_rtkit_inherited_buffer *buffers, unsigned int count)
+{
+	struct apple_rtkit_shmem *dst;
+	unsigned int i;
+
+	if (count > 4 || (count && !buffers))
+		return -EINVAL;
+
+	for (i = 0; i < count; i++) {
+		const struct apple_rtkit_inherited_buffer *b = &buffers[i];
+
+		switch (b->endpoint) {
+		case APPLE_RTKIT_EP_CRASHLOG:
+			dst = &rtk->crashlog_buffer;
+			break;
+		case APPLE_RTKIT_EP_SYSLOG:
+			dst = &rtk->syslog_buffer;
+			break;
+		case APPLE_RTKIT_EP_IOREPORT:
+			dst = &rtk->ioreport_buffer;
+			break;
+		case APPLE_RTKIT_EP_OSLOG:
+			dst = &rtk->oslog_buffer;
+			break;
+		default:
+			return -EINVAL;
+		}
+
+		if (dst->size || !b->shmem.size ||
+		    (!b->shmem.buffer && !b->shmem.iomem) ||
+		    (b->shmem.buffer && b->shmem.iomem))
+			return -EINVAL;
+		if (b->endpoint == APPLE_RTKIT_EP_OSLOG) {
+			if (b->shmem.iova & 0xfff ||
+			    !FIELD_FIT(APPLE_RTKIT_OSLOG_IOVA, b->shmem.iova >> 12) ||
+			    !FIELD_FIT(APPLE_RTKIT_OSLOG_SIZE, b->shmem.size))
+				return -EINVAL;
+		} else if (b->shmem.size & 0xfff ||
+			   !FIELD_FIT(APPLE_RTKIT_BUFFER_REQUEST_IOVA, b->shmem.iova) ||
+			   !FIELD_FIT(APPLE_RTKIT_BUFFER_REQUEST_SIZE, b->shmem.size >> 12)) {
+			return -EINVAL;
+		}
+		*dst = b->shmem;
+	}
+	return 0;
+}
+
 static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 					      const char *mbox_name, int mbox_idx,
 					      const struct apple_rtkit_ops *ops,
-					      bool adopted)
+					      bool adopted,
+					      const struct apple_rtkit_inherited_buffer *buffers,
+					      unsigned int count)
 {
 	struct apple_rtkit *rtk;
 	int ret;
 
 	if (!ops)
+		return ERR_PTR(-EINVAL);
+	if (ops->protocol_version &&
+	    (ops->protocol_version < APPLE_RTKIT_MIN_SUPPORTED_VERSION ||
+	     ops->protocol_version > APPLE_RTKIT_MAX_SUPPORTED_VERSION))
+		return ERR_PTR(-EINVAL);
+	if (ops->shmem_setup && ops->shmem_setup_ep)
 		return ERR_PTR(-EINVAL);
 
 	rtk = kzalloc_obj(*rtk);
@@ -1138,7 +1343,12 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 	INIT_KFIFO(rtk->sync_ack_fifo);
 	INIT_WORK(&rtk->sync_ack_work, apple_rtkit_sync_ack_work);
 
+	ret = apple_rtkit_inherit_buffers(rtk, buffers, count);
+	if (ret)
+		goto free_rtk;
+
 	init_completion(&rtk->epmap_completion);
+	init_completion(&rtk->coreanalytics_completion);
 	init_completion(&rtk->iop_pwr_ack_completion);
 	init_completion(&rtk->ap_pwr_ack_completion);
 
@@ -1191,7 +1401,8 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 					    const char *mbox_name, int mbox_idx,
 					    const struct apple_rtkit_ops *ops)
 {
-	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, false);
+	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, false,
+				  NULL, 0);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_init);
 
@@ -1199,7 +1410,8 @@ struct apple_rtkit *apple_rtkit_init_adopted(struct device *dev, void *cookie,
 					     const char *mbox_name, int mbox_idx,
 					     const struct apple_rtkit_ops *ops)
 {
-	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, true);
+	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, true,
+				  NULL, 0);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_init_adopted);
 
@@ -1237,6 +1449,16 @@ static int apple_rtkit_wait(struct apple_rtkit *rtk, struct completion *c)
 	return try_wait_for_completion(c) ? 0 : -ETIME;
 }
 
+struct apple_rtkit *apple_rtkit_init_adopted_with_buffers(
+	struct device *dev, void *cookie, const char *mbox_name, int mbox_idx,
+	const struct apple_rtkit_ops *ops,
+	const struct apple_rtkit_inherited_buffer *buffers, unsigned int count)
+{
+	return __apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, true,
+				  buffers, count);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_init_adopted_with_buffers);
+
 static int apple_rtkit_wait_for_completion(struct completion *c)
 {
 	long t;
@@ -1260,6 +1482,7 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 	apple_rtkit_detach_rx(rtk);
 	flush_workqueue(rtk->wq);
 
+	apple_rtkit_free_buffer(rtk, &rtk->coreanalytics_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->ioreport_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->crashlog_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->oslog_buffer);
@@ -1280,6 +1503,7 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 	set_bit(APPLE_RTKIT_EP_MGMT, rtk->endpoints);
 
 	reinit_completion(&rtk->epmap_completion);
+	reinit_completion(&rtk->coreanalytics_completion);
 	reinit_completion(&rtk->iop_pwr_ack_completion);
 	reinit_completion(&rtk->ap_pwr_ack_completion);
 
@@ -1367,6 +1591,16 @@ static int apple_rtkit_boot_common(struct apple_rtkit *rtk, bool early_ap_power)
 	}
 	if (rtk->boot_result)
 		return rtk->boot_result;
+
+	/* PMP waits for CoreAnalytics setup before acknowledging IOP power. */
+	if (apple_rtkit_needs_coreanalytics(rtk) &&
+	    test_bit(APPLE_RTKIT_EP_COREANALYTICS, rtk->endpoints)) {
+		ret = apple_rtkit_wait_for_completion(&rtk->coreanalytics_completion);
+		if (ret) {
+			dev_err(rtk->dev, "RTKit: CoreAnalytics readiness failed: %d\n", ret);
+			return ret;
+		}
+	}
 
 	/* Some helpers need AP readiness before acknowledging IOP power. */
 	if (early_ap_power) {
@@ -1521,6 +1755,7 @@ void apple_rtkit_free(struct apple_rtkit *rtk)
 {
 	apple_rtkit_stop_rx(rtk);
 
+	apple_rtkit_free_buffer(rtk, &rtk->coreanalytics_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->ioreport_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->crashlog_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->oslog_buffer);
