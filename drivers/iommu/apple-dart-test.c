@@ -5,6 +5,72 @@
 #include <kunit/test.h>
 #include <linux/vmalloc.h>
 
+struct apple_dart_test_window {
+	const char *soc;
+	u32 ias;
+	u32 sid;
+	u64 base;
+	u64 size;
+};
+
+static void apple_dart_test_iommu_specifiers(struct kunit *test)
+{
+	static const struct apple_dart_test_window windows[] = {
+		{ "t6000", 32, 0, 0, 0xfc000000 },
+		{ "t6020", 42, 5, 0x10000000000, 0x1000000000 },
+		{ "t8112", 36, 5, 0x800000000, 0x7ffff0000 },
+	};
+	struct device *dev;
+	int i;
+
+	dev = kunit_device_register(test, "apple-dart-window-test");
+	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dev);
+
+	for (i = 0; i < ARRAY_SIZE(windows); i++) {
+		const struct apple_dart_test_window *window = &windows[i];
+		struct of_phandle_args args = { .args_count = 1 };
+		struct apple_dart *dart;
+		dma_addr_t dma_min;
+		dma_addr_t dma_max;
+		int ret;
+
+		dart = kunit_kzalloc(test, sizeof(*dart), GFP_KERNEL);
+		KUNIT_ASSERT_NOT_NULL(test, dart);
+		dart->ias = window->ias;
+		dart->pgsize = SZ_16K;
+		dart->dma_min = window->base;
+		dart->dma_max = window->base + window->size - 1;
+
+		args.args[0] = window->sid;
+		ret = apple_dart_parse_dma_window(dev, dart, &args,
+						  &dma_min, &dma_max);
+		KUNIT_ASSERT_EQ_MSG(test, ret, 0, "%s legacy specifier",
+				    window->soc);
+		KUNIT_EXPECT_EQ_MSG(test, dma_min, (dma_addr_t)window->base,
+				    "%s legacy window start", window->soc);
+		KUNIT_EXPECT_EQ_MSG(test, dma_max,
+				    (dma_addr_t)(window->base + window->size - 1),
+				    "%s legacy window end", window->soc);
+
+		dart->dma_min = 0;
+		dart->dma_max = DMA_BIT_MASK(dart->ias);
+		args.args_count = 5;
+		args.args[1] = upper_32_bits(window->base);
+		args.args[2] = lower_32_bits(window->base);
+		args.args[3] = upper_32_bits(window->size);
+		args.args[4] = lower_32_bits(window->size);
+		ret = apple_dart_parse_dma_window(dev, dart, &args,
+						  &dma_min, &dma_max);
+		KUNIT_ASSERT_EQ_MSG(test, ret, 0, "%s 5-cell specifier",
+				    window->soc);
+		KUNIT_EXPECT_EQ_MSG(test, dma_min, (dma_addr_t)window->base,
+				    "%s 5-cell window start", window->soc);
+		KUNIT_EXPECT_EQ_MSG(test, dma_max,
+				    (dma_addr_t)(window->base + window->size - 1),
+				    "%s 5-cell window end", window->soc);
+	}
+}
+
 static void apple_dart_test_before_attach(struct kunit *test)
 {
 	struct apple_dart_master_cfg master = {};
@@ -31,6 +97,7 @@ static void apple_dart_test_before_attach(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, dart->regs);
 	spin_lock_init(&dart->lock);
 	mutex_init(&domain->init_lock);
+	master.dma_max = DMA_BIT_MASK(dart->ias);
 	master.stream_maps[0].dart = dart;
 	__set_bit(0, master.stream_maps[0].sidmap);
 	writel(dart->hw->ttbr_valid, dart->regs + DART_TTBR(dart, 0, 0));
@@ -772,6 +839,7 @@ static void apple_dart_test_resume_reset_retry(struct kunit *test)
 }
 
 static struct kunit_case apple_dart_test_cases[] = {
+	KUNIT_CASE(apple_dart_test_iommu_specifiers),
 	KUNIT_CASE(apple_dart_test_before_attach),
 	KUNIT_CASE(apple_dart_test_locked_handoff),
 	KUNIT_CASE(apple_dart_test_sync_unknown_roots),
