@@ -15,7 +15,9 @@ use kernel::{
     },
     dma::{
         Coherent,
-        CoherentBox, //
+        CoherentBox,
+        Device as _,
+        DmaMask, //
     },
     io::{
         io_project,
@@ -323,7 +325,9 @@ impl PmpData {
                 }
                 size = len as u32;
             } else {
-                dev_info!(self.dev, "unknown property {:?}", name_str);
+                // Not every boot loader provides every tunable the firmware
+                // asks for, and the firmware starts without them.
+                dev_dbg!(self.dev, "unknown property {:?}", name_str);
             }
         }
         state.ioreg_entries.push(size, GFP_KERNEL)?;
@@ -395,24 +399,47 @@ impl rtkit::Operations for PmpData {
 #[allow(dead_code)]
 struct PmpDriver(Arc<PmpData>);
 
+/// Per-SoC configuration.
+struct PmpHwConfig {
+    /// DMA mask to set before the firmware allocates anything, or `None` to
+    /// keep the default.
+    dma_mask: Option<DmaMask>,
+}
+
+const HW_CFG_DEFAULT: PmpHwConfig = PmpHwConfig { dma_mask: None };
+
+/// T8140: the DART translates 42 bits and its DMA window starts at 1 TiB.
+const HW_CFG_T8140: PmpHwConfig = PmpHwConfig {
+    dma_mask: Some(DmaMask::new::<42>()),
+};
+
 kernel::of_device_table!(
     OF_TABLE,
     MODULE_OF_TABLE,
-    (),
-    [(of::DeviceId::new(c"apple,t6000-pmp-v2"), ())]
+    <PmpDriver as platform::Driver>::IdInfo,
+    [
+        (of::DeviceId::new(c"apple,t8140-pmp-v2"), &HW_CFG_T8140),
+        (of::DeviceId::new(c"apple,t6000-pmp-v2"), &HW_CFG_DEFAULT),
+    ]
 );
 
 impl platform::Driver for PmpDriver {
-    type IdInfo = ();
+    type IdInfo = &'static PmpHwConfig;
     type Data<'bound> = PmpDriver;
 
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
 
     fn probe<'bound>(
         pdev: &'bound platform::Device<Core<'_>>,
-        _info: Option<&'bound Self::IdInfo>,
+        info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let dev: ARef<device::Device> = pdev.as_ref().into();
+        let cfg = info.ok_or(ENODEV)?;
+        if let Some(mask) = cfg.dma_mask {
+            // SAFETY: No DMA allocations or mappings exist for this device
+            // yet.
+            unsafe { pdev.dma_set_mask_and_coherent(mask)? };
+        }
         let pmp_req = pdev.io_request_by_name(c"pmp").ok_or(EINVAL)?;
         let pmp_mmio = pmp_req.iomap_sized::<PMP_MMIO_SIZE>()?;
         let pmp_mmio = pmp_mmio.as_view();
