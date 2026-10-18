@@ -397,6 +397,14 @@ struct brcmf_cfg80211_info {
 	struct work_struct escan_timeout_work;
 	struct list_head vif_list;
 	struct brcmf_cfg80211_vif_event vif_event;
+	/* Protected by vif_event.vif_event_lock. */
+	bool awdl_pending;
+	bool awdl_attaching;
+	struct brcmf_cfg80211_vif *awdl_vif;
+	struct brcmf_if *awdl_failed_ifp;
+	struct wiphy_delayed_work awdl_timeout;
+	struct wiphy_work awdl_cleanup;
+	char awdl_ifname[IFNAMSIZ];
 	struct completion vif_disabled;
 	struct brcmu_d11inf d11inf;
 	struct brcmf_assoclist_le assoclist;
@@ -508,6 +516,10 @@ bool brcmf_get_vif_state_any(struct brcmf_cfg80211_info *cfg,
 void brcmf_cfg80211_arm_vif_event(struct brcmf_cfg80211_info *cfg,
 				  struct brcmf_cfg80211_vif *vif);
 bool brcmf_cfg80211_vif_event_armed(struct brcmf_cfg80211_info *cfg);
+void brcmf_cfg80211_awdl_stop(struct brcmf_cfg80211_info *cfg);
+int brcmf_awdl_add_vif(struct wiphy *wiphy, const char *name);
+void brcmf_cfg80211_awdl_attach_pending(struct brcmf_if *ifp);
+int brcmf_awdl_del_vif(struct wiphy *wiphy, struct wireless_dev *wdev);
 int brcmf_cfg80211_wait_vif_event(struct brcmf_cfg80211_info *cfg,
 				  u8 action, ulong timeout);
 s32 brcmf_notify_escan_complete(struct brcmf_cfg80211_info *cfg,
