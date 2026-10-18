@@ -2325,4 +2325,5 @@ static struct kunit_suite fabric_suite = {
 
 kunit_test_suite(fabric_suite);
 
+MODULE_DESCRIPTION("KUnit tests for the Apple DCP display fabric");
 MODULE_LICENSE("Dual MIT/GPL");
