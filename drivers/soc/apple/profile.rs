@@ -180,9 +180,12 @@ pub(crate) struct PlatformProfile {
     pub(crate) key_store: KeyStore,
     /// Platforms with reboot-tested owner export and user-before-master saves.
     pub(crate) persistent_enrol: bool,
+    /// The `xart_guard` level when the parameter is left at its default (see
+    /// [`crate::xart_guard`]).
+    pub(crate) xart_guard: u8,
 }
 
-const T8103: PlatformProfile = PlatformProfile {
+pub(crate) const T8103: PlatformProfile = PlatformProfile {
     name: "T8103/J313",
     shmem_capacity: 0x3_0000,
     shmem_first_item: b"CNIP",
@@ -215,6 +218,8 @@ const T8103: PlatformProfile = PlatformProfile {
     },
     persistent_enrol: true,
     nonce_session: false,
+    // macOS shares this enclave: keep Linux to its own xART records.
+    xart_guard: 1,
 };
 
 /// M1 Pro (J316s). The M1 family cold-boots its SEP like T8103, so the boot
@@ -222,7 +227,7 @@ const T8103: PlatformProfile = PlatformProfile {
 /// SPI2 at the T6020 address, in the mode T6020 verified: the J313, J316s and
 /// J414s platform device trees describe the same sensor (id 0x3352)
 /// identically. Enrolment persistence is reboot-tested on J314s.
-const T6000: PlatformProfile = PlatformProfile {
+pub(crate) const T6000: PlatformProfile = PlatformProfile {
     name: "T6000/J316s",
     shmem_capacity: 0x3_0000,
     shmem_first_item: b"CNIP",
@@ -253,9 +258,13 @@ const T6000: PlatformProfile = PlatformProfile {
     },
     persistent_enrol: true,
     nonce_session: false,
+    // As T8103. On J316s, creating the identity keybag also rewrites a
+    // session record that predates Linux. The guard refuses that, so the
+    // keybag can only be created there with xart_guard=0.
+    xart_guard: 1,
 };
 
-const T6020: PlatformProfile = PlatformProfile {
+pub(crate) const T6020: PlatformProfile = PlatformProfile {
     name: "T6020/J414s",
     shmem_capacity: 0x4_0000,
     shmem_first_item: b"CINP",
@@ -284,6 +293,8 @@ const T6020: PlatformProfile = PlatformProfile {
     key_store: KeyStore::Variant5,
     persistent_enrol: true,
     nonce_session: false,
+    // A warm-attach enclave shared with macOS, as on T8112.
+    xart_guard: 1,
 };
 
 /// M2 Pro/Max on system firmware before 26.3. Their enclave refuses the
@@ -291,7 +302,7 @@ const T6020: PlatformProfile = PlatformProfile {
 /// and takes the 13.5 key store, as T8103 does; J414s on 26.0 enrols,
 /// matches, signs with the reference key and restores after a reboot this way.
 /// Everything else is [`T6020`].
-const T6020_SEPOS13: PlatformProfile = PlatformProfile {
+pub(crate) const T6020_SEPOS13: PlatformProfile = PlatformProfile {
     name: "T6020/J414s (13.5 key store)",
     keybag_create: KeybagCreate {
         variant: T8103.keybag_create.variant,
@@ -307,7 +318,7 @@ const T6020_SEPOS13: PlatformProfile = PlatformProfile {
 /// MacBook Neo. The J700 ADT records a pre-booted SEP, a spi2 Mesa sensor
 /// (0x3356), and a SEP DART aperture above 4 GiB. These values describe that
 /// board; device-tree nodes remain authoritative for addresses and resources.
-const T8140: PlatformProfile = PlatformProfile {
+pub(crate) const T8140: PlatformProfile = PlatformProfile {
     key_store: KeyStore::Variant5,
     persistent_enrol: true,
     name: "T8140/J700",
@@ -337,6 +348,9 @@ const T8140: PlatformProfile = PlatformProfile {
         arg: -1,
     },
     nonce_session: true,
+    // Linux records from before the guard's list exist here, and Linux has
+    // left the macOS records unchanged on this platform.
+    xart_guard: 0,
 };
 
 /// MacBook Air M2 (J413, J415). iBoot leaves the SEP running and the Mesa
@@ -349,7 +363,7 @@ const T8140: PlatformProfile = PlatformProfile {
 ///
 /// The shared-memory geometry and key-store dialect follow the other
 /// warm-registration platforms (T6020 on current firmware, T8140).
-const T8112: PlatformProfile = PlatformProfile {
+pub(crate) const T8112: PlatformProfile = PlatformProfile {
     name: "T8112/J415",
     shmem_capacity: 0x4_0000,
     shmem_first_item: b"CINP",
@@ -380,6 +394,8 @@ const T8112: PlatformProfile = PlatformProfile {
     key_store: KeyStore::Variant5,
     persistent_enrol: true,
     nonce_session: false,
+    // Guarded from its first Linux boot (2026-10-16): no record refused.
+    xart_guard: 1,
 };
 
 /// MacBook Air M3 (J613, J615). The J613 and J615 ADTs (26.6.2, 25G83) are
@@ -395,7 +411,7 @@ const T8112: PlatformProfile = PlatformProfile {
 /// geometry and key-store dialect follow it. J613 on system firmware 27.0
 /// (OS firmware 26.6.2) attaches, provisions the keybag, enrols, matches and
 /// restores the enrolment after a reboot; J615 has not been run.
-const T8122: PlatformProfile = PlatformProfile {
+pub(crate) const T8122: PlatformProfile = PlatformProfile {
     name: "T8122/J613",
     sensor: SensorProfile {
         controller_base: 0x2_a110_8000,
@@ -404,6 +420,8 @@ const T8122: PlatformProfile = PlatformProfile {
     wide_dma_mask: true,
     // Not T8112's 32-bit window: this DART needs the wide mask.
     dart_window: &DART_HIGH_ALIAS,
+    // A warm-attach enclave shared with macOS, as on T8112.
+    xart_guard: 1,
     ..T8112
 };
 
