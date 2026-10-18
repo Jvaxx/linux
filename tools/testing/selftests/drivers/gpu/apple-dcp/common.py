@@ -47,7 +47,12 @@ def source_defines(source):
 def tipd_pm_header(root):
     """CD321x PM state machine for host units, with a host clamp() for minmax.h."""
     header = (root / 'drivers/usb/typec/tipd/cd321x-pm.h').read_text()
-    header = header.replace('#include <linux/types.h>', '')
+    # Host integer types; a repeated identical typedef is valid C11.
+    header = header.replace('#include <linux/types.h>',
+        '#include <stdint.h>\ntypedef uint32_t u32;')
+    # Units that model probe, not DP status updates, leave cd321x_dp_send() unused.
+    header = header.replace('static inline enum cd321x_dp_send cd321x_dp_send(',
+        'static inline __attribute__((unused)) enum cd321x_dp_send cd321x_dp_send(')
     # The host units need the status bit, not kernel USB declarations.
     header = header.replace('#include <linux/usb/typec_dp.h>',
         '#ifndef DP_STATUS_IRQ_HPD\n#define DP_STATUS_IRQ_HPD (1U << 8)\n#endif')
