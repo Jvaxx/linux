@@ -51,6 +51,23 @@ pub(crate) fn plan(stage: u32, holds_sensor: bool, nonce_session: bool, sepos13:
     }
 }
 
+/// The bring-up stage an attempt that follows a failed one starts from.
+///
+/// A profile with a nonce session identifies the sensor and clears the
+/// enclave on every attempt (see [`plan`]), so its stage stands. A profile
+/// without one starts again from a fresh registration, as a reboot does:
+/// after an attach-time patch failed at the sequence counter init, a J314s
+/// refused the CLEAR_STATE and serial re-registration of every later
+/// attempt for the rest of the boot, while a fresh registration recovered.
+/// An M1 Pro failed the attach at that step on two plain boots in four.
+pub(crate) fn retry_stage(stage: u32, nonce_session: bool) -> u32 {
+    if nonce_session {
+        stage
+    } else {
+        FRESH
+    }
+}
+
 /// How the enclave answered REGISTER_SERIAL.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SerialAnswer {
@@ -613,6 +630,84 @@ mod tests {
         assert_eq!(bring_up(&VERIFY, &mut m), Outcome::GaveUp(3));
         assert_eq!(m.paused, 0);
         assert_eq!(m.failed, 2);
+    }
+
+    #[test]
+    fn a_retry_without_a_nonce_session_starts_from_a_fresh_registration() {
+        assert_eq!(retry_stage(ESTABLISHED, false), FRESH);
+        assert_eq!(retry_stage(IDENTIFIED, false), FRESH);
+        // Identify and register again, without the CLEAR_STATE the enclave
+        // refuses after a failed sequence counter init.
+        assert_eq!(
+            plan(retry_stage(ESTABLISHED, false), true, false, false),
+            Plan {
+                identify_first: false,
+                clear_state: false,
+                register_sensor: true,
+            }
+        );
+        // A nonce-session profile keeps its stage and clears instead.
+        assert_eq!(retry_stage(ESTABLISHED, true), ESTABLISHED);
+        assert_eq!(retry_stage(FRESH, true), FRESH);
+        assert!(plan(retry_stage(FRESH, true), true, true, false).clear_state);
+    }
+
+    /// A sensor that falls silent at the sequence counter init, as the
+    /// M1 Pro's did about 1.3 s after power-on, for its first `fail` attempts.
+    struct Silent {
+        fail: u32,
+        tries: u32,
+        elapsed_ms: u64,
+        pauses: [u32; 8],
+        paused: usize,
+    }
+
+    impl Silent {
+        fn new(fail: u32) -> Silent {
+            Silent {
+                fail,
+                tries: 0,
+                elapsed_ms: 0,
+                pauses: [0; 8],
+                paused: 0,
+            }
+        }
+    }
+
+    impl Attempts for Silent {
+        fn attempt(&mut self) -> bool {
+            self.tries += 1;
+            self.elapsed_ms += 1_300;
+            self.tries > self.fail
+        }
+        fn wanted(&self) -> bool {
+            true
+        }
+        fn elapsed_ms(&self) -> u64 {
+            self.elapsed_ms
+        }
+        fn failed(&mut self, _attempt: u32, _of: u32, _pause_ms: u32) {}
+        fn pause(&mut self, ms: u32) -> bool {
+            self.pauses[self.paused] = ms;
+            self.paused += 1;
+            self.elapsed_ms += u64::from(ms);
+            true
+        }
+    }
+
+    #[test]
+    fn a_sensor_that_did_not_wake_at_attach_is_retried_after_pauses() {
+        let mut s = Silent::new(2);
+        assert_eq!(bring_up(&ATTACH, &mut s), Outcome::Online(3));
+        assert_eq!(&s.pauses[..s.paused], &[500, 1000]);
+
+        // Never: four attempts of 1.3 s fit in the budget, then the late
+        // round is asked for.
+        let mut s = Silent::new(u32::MAX);
+        let outcome = bring_up(&ATTACH, &mut s);
+        assert_eq!(outcome, Outcome::GaveUp(4));
+        assert_eq!(&s.pauses[..s.paused], &[500, 1000, 2000]);
+        assert_eq!(after_round(outcome.online(), true), AttachState::Retrying);
     }
 
     #[test]

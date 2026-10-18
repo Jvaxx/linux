@@ -5,7 +5,9 @@ The first verify after a system suspend re-registers the sensor, and on a
 nonce-session profile that registration can fail in a way a new attempt from
 a power-cycled sensor recovers. A verify makes up to three attempts back to
 back and stops as soon as it is no longer wanted. Attach makes up to five,
-spaced 0.5, 1, 2 and 4 s apart, and asks for a late retry when all fail.
+spaced 0.5, 1, 2 and 4 s apart, on every profile, and asks for a late retry
+when all fail. Without a nonce session each attempt after the first starts
+from a fresh registration.
 """
 from pathlib import Path
 import re
@@ -52,7 +54,7 @@ PRELUDE = r'''
 #![allow(dead_code, unused_variables, unused_imports)]
 use std::cell::RefCell;
 use std::ffi::CStr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Relaxed};
 macro_rules! dev_err { ($($args:tt)*) => {} }
 macro_rules! dev_warn { ($($args:tt)*) => {} }
 macro_rules! dev_info { ($($args:tt)*) => {} }
@@ -78,6 +80,8 @@ struct Mock {
     late: bool,
     /// Milliseconds slept.
     clock_ms: u64,
+    /// The bring-up stage each attempt started from.
+    stages: Vec<u32>,
 }
 thread_local! { static MOCK: RefCell<Mock> = RefCell::new(Mock::default()); }
 
@@ -143,6 +147,7 @@ struct Driver {
     shutting_down: AtomicBool,
     capture_epoch: AtomicU64,
     bio_session: SessionLock,
+    bringup: AtomicU32,
 }
 
 impl Driver {
@@ -155,15 +160,23 @@ impl Driver {
             shutting_down: AtomicBool::new(false),
             capture_epoch: AtomicU64::new(1),
             bio_session: SessionLock(bio::Session),
+            bringup: AtomicU32::new(registration::FRESH),
         }
     }
-    fn bring_sensor_online(&self) -> bool {
-        let ok = MOCK.with(|m| {
+    /// The next scripted attempt. Its registration gets through and a
+    /// later step fails, as on the M1 Pro, leaving the stage established.
+    fn scripted_attempt(&self) -> bool {
+        let stage = self.bringup.swap(registration::ESTABLISHED, Relaxed);
+        MOCK.with(|m| {
             let mut m = m.borrow_mut();
+            m.stages.push(stage);
             let ok = m.script.get(m.attempts).copied().unwrap_or(false);
             m.attempts += 1;
             ok
-        });
+        })
+    }
+    fn bring_sensor_online(&self) -> bool {
+        let ok = self.scripted_attempt();
         // A bring-up that completes proves the identity view.
         self.device_view_synced.fetch_or(ok, Relaxed);
         ok
@@ -184,7 +197,9 @@ impl Driver {
             m.finished = Some(outcome);
         });
     }
-    fn wake_sensor(&self) -> Option<PatchLoaded> { Some(PatchLoaded(())) }
+    fn wake_sensor(&self) -> Option<PatchLoaded> {
+        self.scripted_attempt().then_some(PatchLoaded(()))
+    }
     fn complete_bringup(&self, _: PatchLoaded) -> bool { true }
 '''
 
@@ -235,6 +250,8 @@ fn main() {
     let m = run(&[false, false, true], None, true, false);
     assert_eq!((m.attempts, m.clock_ms, m.late), (3, 1500, false));
     assert_eq!(m.attach, Some(registration::AttachState::Attached));
+    // A nonce-session profile clears instead of starting afresh.
+    assert_eq!(m.stages, [registration::FRESH, registration::ESTABLISHED, registration::ESTABLISHED]);
 
     // An attach that never comes up: five attempts within the budget, then
     // a late retry is asked for and diag says so.
@@ -246,9 +263,19 @@ fn main() {
     assert_eq!((m.attempts, m.clock_ms, m.late), (1, 0, false));
     assert_eq!(m.attach, Some(registration::AttachState::Attached));
 
-    // Profiles without a nonce session keep their single bring-up.
+    // Without a nonce session: the M1 Pro's sensor did not wake at attach.
+    // The same spacing, each retry from a fresh registration.
+    let m = run(&[false, false, true], None, false, false);
+    assert_eq!((m.attempts, m.clock_ms, m.late), (3, 1500, false));
+    assert_eq!(m.stages, [registration::FRESH; 3]);
+    assert_eq!(m.attach, Some(registration::AttachState::Attached));
+
     let m = run(&[], None, false, false);
-    assert_eq!((m.attempts, m.late), (0, false));
+    assert_eq!((m.attempts, m.clock_ms, m.late), (5, 7500, true));
+    assert_eq!(m.attach, Some(registration::AttachState::Retrying));
+
+    let m = run(&[true], None, false, false);
+    assert_eq!((m.attempts, m.clock_ms, m.late), (1, 0, false));
     assert_eq!(m.attach, Some(registration::AttachState::Attached));
 }
 '''
@@ -260,9 +287,11 @@ class VerifyBringupTest(unittest.TestCase):
         methods = [method(source, name) for name in (
             'run_verify', 'attach_bringup',
             'bring_sensor_online_retrying', 'bring_sensor_online_for_verify',
+            'attach_bring_sensor_online', 'attach_complete',
             'verify_wanted')]
         self.assertTrue(all(methods))
-        attempts = (item(source, 'struct BringupAttempts<')
+        attempts = (item(source, '#[derive(Clone, Copy, PartialEq, Eq)]\nenum Bringup {')
+                    + '\n' + item(source, 'struct BringupAttempts<')
                     + '\n' + item(source, 'impl<W: Fn() -> bool> registration::Attempts'))
         program = (PRELUDE + '\n'.join(methods) + MAIN
                    + registration_module() + attempts)

@@ -219,9 +219,8 @@ Contact:	Ryan Murray <ryan@aurorasilicon.org>
 Description:
 		(RO) How far the automatic attach of the fingerprint sensor
 		got. Touch ID activation brings the sensor up, with spaced
-		retries on a profile with a nonce session, and if that falls
-		short one more round follows about 10 s later, once the
-		boot-time bring-up is over.
+		retries, and if that falls short one more round follows
+		about 10 s later, once the boot-time bring-up is over.
 
 		=========	============================================
 		unknown		Touch ID has not been activated, or its

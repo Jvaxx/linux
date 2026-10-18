@@ -1084,10 +1084,14 @@ impl SepData {
     ///
     /// A bring-up that fails on the bus leaves nothing a new attempt cannot
     /// undo: each attempt power-cycles the sensor and, after a failed one,
-    /// clears the enclave's partial registration first, as every verify does.
+    /// starts the registration again as [`registration::retry_stage`] says:
+    /// on a profile with a nonce session by clearing the enclave's partial
+    /// registration, as every verify does, and on one without from a fresh
+    /// registration, as a reboot does.
     fn bring_sensor_online_retrying(
         &self,
         purpose: &CStr,
+        kind: Bringup,
         retry: &registration::Retry,
         wanted: impl Fn() -> bool,
     ) -> registration::Outcome {
@@ -1096,31 +1100,40 @@ impl SepData {
             purpose,
             wanted,
             began_ns: shim::boottime_ns(),
+            attach: kind == Bringup::Attach,
+            restart: kind == Bringup::Late,
         };
         registration::bring_up(retry, &mut attempts)
+    }
+
+    /// One attach-time bring-up. A profile without a nonce session only
+    /// wakes and patches the sensor here; its first verify calibrates it.
+    fn attach_bring_sensor_online(&self) -> bool {
+        if self.profile.nonce_session {
+            return self.bring_sensor_online();
+        }
+        let bind = diag::sensor_bind();
+        let Some(patch) = self.wake_sensor() else {
+            dev_warn!(self.dev, "sbio: the sensor did not wake at attach\n");
+            diag::sensor_brought_up(bind, false);
+            return false;
+        };
+        let online = self.complete_bringup(patch);
+        diag::sensor_brought_up(bind, online);
+        online
+    }
+
+    /// Whether a bring-up that came online leaves the sensor attached: on a
+    /// profile with a nonce session only once the enclave's identity view
+    /// is proven too.
+    fn attach_complete(&self, online: bool) -> bool {
+        online && (!self.profile.nonce_session || self.device_view_synced.load(Relaxed))
     }
 
     /// Brings the sensor up as Touch ID is activated. Returns whether the
     /// attach fell short and a late retry should follow.
     fn attach_bringup(&self) -> bool {
-        if self.profile.nonce_session {
-            let outcome = self.bring_sensor_online_retrying(
-                c"attach-time",
-                &registration::ATTACH,
-                || !self.shutting_down.load(Relaxed),
-            );
-            let complete = outcome.online() && self.device_view_synced.load(Relaxed);
-            diag::sensor_attach(registration::after_round(complete, true));
-            if !complete {
-                dev_warn!(
-                    self.dev,
-                    "sensor: authenticated attach incomplete; capture unavailable; retrying in {} s\n",
-                    LATE_ATTACH_DELAY_MS / 1000
-                );
-            }
-            return !complete;
-        }
-        if !sensor::is_bound() {
+        if !self.profile.nonce_session && !sensor::is_bound() {
             dev_warn!(
                 self.dev,
                 "sbio: no sensor bound at attach; catacomb restore ran but capture is unavailable\n"
@@ -1128,26 +1141,30 @@ impl SepData {
             diag::sensor_attach(registration::AttachState::NotReady);
             return false;
         }
-        let bind = diag::sensor_bind();
-        let Some(patch) = self.wake_sensor() else {
-            dev_warn!(
-                self.dev,
-                "sbio: the sensor did not wake at attach; the next verify retries the bring-up\n"
-            );
-            diag::sensor_brought_up(bind, false);
-            diag::sensor_attach(registration::AttachState::NotReady);
-            return false;
-        };
-        let online = self.complete_bringup(patch);
-        diag::sensor_brought_up(bind, online);
-        diag::sensor_attach(registration::after_round(online, false));
-        if !online {
-            dev_warn!(
-                self.dev,
-                "sbio: attach-time sensor bring-up did not complete; matching remains unavailable until a later bring-up succeeds.\n"
-            );
+        let outcome = self.bring_sensor_online_retrying(
+            c"attach-time",
+            Bringup::Attach,
+            &registration::ATTACH,
+            || !self.shutting_down.load(Relaxed),
+        );
+        let complete = self.attach_complete(outcome.online());
+        diag::sensor_attach(registration::after_round(complete, true));
+        if !complete {
+            if self.profile.nonce_session {
+                dev_warn!(
+                    self.dev,
+                    "sensor: authenticated attach incomplete; capture unavailable; retrying in {} s\n",
+                    LATE_ATTACH_DELAY_MS / 1000
+                );
+            } else {
+                dev_warn!(
+                    self.dev,
+                    "sbio: attach-time sensor bring-up did not complete; matching unavailable; retrying in {} s\n",
+                    LATE_ATTACH_DELAY_MS / 1000
+                );
+            }
         }
-        false
+        !complete
     }
 
     /// One more round of sensor bring-up, some seconds after an attach-time
@@ -1170,7 +1187,7 @@ impl SepData {
             Self::defer_late_attach(this);
             return;
         }
-        if this.device_view_synced.load(Relaxed) {
+        if this.attach_complete(this.device_view_synced.load(Relaxed)) {
             // An enrol or a verify got there first.
             diag::sensor_attach(registration::AttachState::Attached);
             this.capture_end();
@@ -1182,6 +1199,7 @@ impl SepData {
         );
         let outcome = this.bring_sensor_online_retrying(
             c"late attach",
+            Bringup::Late,
             &registration::ATTACH,
             || !this.shutting_down.load(Relaxed) && !this.suspending.load(Relaxed),
         );
@@ -1193,7 +1211,7 @@ impl SepData {
         if outcome.online() {
             this.refresh_match_credential();
         }
-        let complete = outcome.online() && this.device_view_synced.load(Relaxed);
+        let complete = this.attach_complete(outcome.online());
         diag::sensor_attach(registration::after_round(complete, false));
         if complete {
             dev_info!(this.dev, "sensor: attached after the ready phase\n");
@@ -1520,7 +1538,7 @@ impl SepData {
         if !self.profile.nonce_session {
             return self.bring_sensor_online();
         }
-        self.bring_sensor_online_retrying(c"verify", &registration::VERIFY, || {
+        self.bring_sensor_online_retrying(c"verify", Bringup::Verify, &registration::VERIFY, || {
             self.verify_wanted()
         })
         .online()
@@ -3844,17 +3862,44 @@ impl SepData {
     }
 }
 
+/// Which bring-up a round of attempts makes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Bringup {
+    /// As Touch ID is activated.
+    Attach,
+    /// The late round after an attach that fell short.
+    Late,
+    /// Before a verify.
+    Verify,
+}
+
 /// A sensor bring-up with retries, as [`registration::bring_up`] drives it.
 struct BringupAttempts<'a, W: Fn() -> bool> {
     sep: &'a SepData,
     purpose: &'a CStr,
     wanted: W,
     began_ns: u64,
+    /// Each attempt is the attach-time one rather than a verify's.
+    attach: bool,
+    /// The next attempt follows a failed one: restart the registration.
+    restart: bool,
 }
 
 impl<W: Fn() -> bool> registration::Attempts for BringupAttempts<'_, W> {
     fn attempt(&mut self) -> bool {
-        self.sep.bring_sensor_online()
+        if self.restart {
+            let stage = registration::retry_stage(
+                self.sep.bringup.load(Relaxed),
+                self.sep.profile.nonce_session,
+            );
+            self.sep.bringup.store(stage, Relaxed);
+        }
+        self.restart = true;
+        if self.attach {
+            self.sep.attach_bring_sensor_online()
+        } else {
+            self.sep.bring_sensor_online()
+        }
     }
 
     fn wanted(&self) -> bool {
