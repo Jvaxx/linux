@@ -60,17 +60,23 @@ pub(crate) fn patch_loaded(nonce_session: bool, accepted: bool, needs_patch: boo
     accepted && !(nonce_session && needs_patch)
 }
 
-/// The bring-up stage an attempt that follows a failed one starts from.
+/// The bring-up stage retry `retry` (counted from 1) starts from.
 ///
-/// A profile with a nonce session identifies the sensor and clears the
-/// enclave on every attempt (see [`plan`]), so its stage stands. A profile
-/// without one starts again from a fresh registration, as a reboot does:
-/// after an attach-time patch failed at the sequence counter init, a J314s
-/// refused the CLEAR_STATE and serial re-registration of every later
-/// attempt for the rest of the boot, while a fresh registration recovered.
-/// An M1 Pro failed the attach at that step on two plain boots in four.
-pub(crate) fn retry_stage(stage: u32, nonce_session: bool) -> u32 {
-    if nonce_session {
+/// The stage an attempt left stands: once the serial is registered, [`plan`]
+/// sends CLEAR_STATE before the next registration, as every verify does, and
+/// the enclave then asks for the session share and commit again. A retry
+/// without it finds the enclave's session from the failed attempt still
+/// open: on an M1 Pro the enclave skipped the session share and sent its
+/// challenge to a sensor that, power-cycled, no longer held the session,
+/// and every such retry failed the same way.
+///
+/// A profile with a nonce session clears on every attempt anyway. On one
+/// without, every second retry starts from a fresh registration instead, as
+/// a reboot does and as a verify's second try does: after a failed sequence
+/// counter init a J314s refused the CLEAR_STATE re-registration for the
+/// rest of the boot, while a fresh one recovered.
+pub(crate) fn retry_stage(stage: u32, nonce_session: bool, retry: u32) -> u32 {
+    if nonce_session || retry % 2 == 1 {
         stage
     } else {
         FRESH
@@ -642,23 +648,90 @@ mod tests {
     }
 
     #[test]
-    fn a_retry_without_a_nonce_session_starts_from_a_fresh_registration() {
-        assert_eq!(retry_stage(ESTABLISHED, false), FRESH);
-        assert_eq!(retry_stage(IDENTIFIED, false), FRESH);
-        // Identify and register again, without the CLEAR_STATE the enclave
-        // refuses after a failed sequence counter init.
+    fn a_retry_clears_first_then_tries_a_fresh_registration() {
+        // Without a nonce session: the first retry keeps the stage, so a
+        // registered serial is cleared; the second starts fresh.
+        assert_eq!(retry_stage(ESTABLISHED, false, 1), ESTABLISHED);
+        assert!(plan(retry_stage(ESTABLISHED, false, 1), true, false, true).clear_state);
+        assert_eq!(retry_stage(ESTABLISHED, false, 2), FRESH);
         assert_eq!(
-            plan(retry_stage(ESTABLISHED, false), true, false, false),
+            plan(retry_stage(ESTABLISHED, false, 2), true, false, false),
             Plan {
                 identify_first: false,
                 clear_state: false,
                 register_sensor: true,
             }
         );
-        // A nonce-session profile keeps its stage and clears instead.
-        assert_eq!(retry_stage(ESTABLISHED, true), ESTABLISHED);
-        assert_eq!(retry_stage(FRESH, true), FRESH);
-        assert!(plan(retry_stage(FRESH, true), true, true, false).clear_state);
+        assert_eq!(retry_stage(ESTABLISHED, false, 3), ESTABLISHED);
+        assert_eq!(retry_stage(IDENTIFIED, false, 1), IDENTIFIED);
+        // A nonce-session profile keeps its stage and clears every time.
+        for retry in 1..=4 {
+            assert_eq!(retry_stage(ESTABLISHED, true, retry), ESTABLISHED);
+            assert!(plan(retry_stage(FRESH, true, retry), true, true, false).clear_state);
+        }
+    }
+
+    /// The M1 Pro (13.5 key store, no nonce session) enclave's view of a
+    /// bring-up: the session it shared survives a sensor power cycle and a
+    /// fresh registration, and only CLEAR_STATE ends it. A bring-up asks
+    /// for a session share only while it has none.
+    struct SessionEnclave {
+        stage: u32,
+        session: bool,
+        shares: [bool; 8],
+        attempt: usize,
+        /// The first `fail` attempts fail after the session commit, as at
+        /// the sequence counter's challenge.
+        fail: usize,
+    }
+
+    impl SessionEnclave {
+        fn attempt(&mut self, retry: u32) -> bool {
+            if retry > 0 {
+                self.stage = retry_stage(self.stage, false, retry);
+            }
+            if plan(self.stage, true, false, true).clear_state {
+                self.session = false;
+            }
+            self.stage = ESTABLISHED;
+            self.shares[self.attempt] = !self.session;
+            self.session = true;
+            // The sensor was power-cycled: it holds a session only if it
+            // took part in this attempt's share.
+            let ok = self.shares[self.attempt] && self.attempt >= self.fail;
+            self.attempt += 1;
+            ok
+        }
+    }
+
+    #[test]
+    fn a_retry_after_a_post_commit_failure_shares_the_session_again() {
+        let mut e = SessionEnclave {
+            stage: FRESH,
+            session: false,
+            shares: [false; 8],
+            attempt: 0,
+            fail: 1,
+        };
+        assert!(!e.attempt(0));
+        // The first retry clears the enclave, so it shares and commits again.
+        assert!(e.attempt(1));
+        assert_eq!(&e.shares[..2], &[true, true]);
+
+        // Had it started fresh, the enclave would have skipped the share.
+        let mut fresh = SessionEnclave {
+            stage: FRESH,
+            session: false,
+            shares: [false; 8],
+            attempt: 0,
+            fail: 1,
+        };
+        assert!(!fresh.attempt(0));
+        assert!(!fresh.attempt(2));
+        assert_eq!(&fresh.shares[..2], &[true, false]);
+        // The retry after it clears, and recovers.
+        assert!(fresh.attempt(3));
+        assert!(fresh.shares[2]);
     }
 
     /// A sensor that falls silent at the sequence counter init, as the

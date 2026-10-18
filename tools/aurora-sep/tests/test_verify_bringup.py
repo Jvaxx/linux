@@ -6,8 +6,9 @@ nonce-session profile that registration can fail in a way a new attempt from
 a power-cycled sensor recovers. A verify makes up to three attempts back to
 back and stops as soon as it is no longer wanted. Attach makes up to five,
 spaced 0.5, 1, 2 and 4 s apart, on every profile, and asks for a late retry
-when all fail. Without a nonce session each attempt after the first starts
-from a fresh registration.
+when all fail. A retry keeps the stage the failed attempt left, so a
+registered serial is cleared first; without a nonce session every second
+retry starts from a fresh registration instead.
 """
 from pathlib import Path
 import re
@@ -264,10 +265,11 @@ fn main() {
     assert_eq!(m.attach, Some(registration::AttachState::Attached));
 
     // Without a nonce session: the M1 Pro's sensor did not wake at attach.
-    // The same spacing, each retry from a fresh registration.
+    // The same spacing; the first retry clears the registered serial (and
+    // with it the enclave's session), the second starts fresh.
     let m = run(&[false, false, true], None, false, false);
     assert_eq!((m.attempts, m.clock_ms, m.late), (3, 1500, false));
-    assert_eq!(m.stages, [registration::FRESH; 3]);
+    assert_eq!(m.stages, [registration::FRESH, registration::ESTABLISHED, registration::FRESH]);
     assert_eq!(m.attach, Some(registration::AttachState::Attached));
 
     let m = run(&[], None, false, false);

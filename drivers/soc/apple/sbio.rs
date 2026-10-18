@@ -1084,10 +1084,10 @@ impl SepData {
     ///
     /// A bring-up that fails on the bus leaves nothing a new attempt cannot
     /// undo: each attempt power-cycles the sensor and, after a failed one,
-    /// starts the registration again as [`registration::retry_stage`] says:
-    /// on a profile with a nonce session by clearing the enclave's partial
-    /// registration, as every verify does, and on one without from a fresh
-    /// registration, as a reboot does.
+    /// starts the registration again as [`registration::retry_stage`] says,
+    /// clearing the enclave's registration and session as every verify does
+    /// and, on a profile without a nonce session, every second time from a
+    /// fresh registration instead.
     fn bring_sensor_online_retrying(
         &self,
         purpose: &CStr,
@@ -1101,7 +1101,8 @@ impl SepData {
             wanted,
             began_ns: shim::boottime_ns(),
             attach: kind == Bringup::Attach,
-            restart: kind == Bringup::Late,
+            // The late round follows the failed attach-time one.
+            retry: u32::from(kind == Bringup::Late),
         };
         registration::bring_up(retry, &mut attempts)
     }
@@ -3879,20 +3880,22 @@ struct BringupAttempts<'a, W: Fn() -> bool> {
     began_ns: u64,
     /// Each attempt is the attach-time one rather than a verify's.
     attach: bool,
-    /// The next attempt follows a failed one: restart the registration.
-    restart: bool,
+    /// How many failed attempts the next one follows, in this round or the
+    /// one before it; [`registration::retry_stage`] restarts from it.
+    retry: u32,
 }
 
 impl<W: Fn() -> bool> registration::Attempts for BringupAttempts<'_, W> {
     fn attempt(&mut self) -> bool {
-        if self.restart {
+        if self.retry > 0 {
             let stage = registration::retry_stage(
                 self.sep.bringup.load(Relaxed),
                 self.sep.profile.nonce_session,
+                self.retry,
             );
             self.sep.bringup.store(stage, Relaxed);
         }
-        self.restart = true;
+        self.retry += 1;
         if self.attach {
             self.sep.attach_bring_sensor_online()
         } else {
