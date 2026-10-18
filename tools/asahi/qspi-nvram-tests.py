@@ -2,6 +2,9 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """Check QSPIMC opcode admission and bounded NVRAM write sequences."""
 from pathlib import Path
+import argparse
+import contextlib
+import json
 import subprocess
 import tempfile
 
@@ -57,7 +60,10 @@ static int apple_qspi_policy_lock;
 struct kernel_param { void *arg; };
 static int kstrtobool(const char*s,bool*v){if(!strcmp(s,"Y"))*v=true;else if(!strcmp(s,"N"))*v=false;else return -EINVAL;return 0;}
 static int param_get_bool(char*b,const struct kernel_param*p){b[0]=*(bool*)p->arg?'Y':'N';return 1;}
-struct apple_qspi { bool nvram_policy, nvram_write_candidate, write_fault; };
+struct apple_qspi {
+ bool nvram_policy, nvram_write_candidate, write_fault, nvram_window;
+ u64 window_start, window_end;
+};
 struct spi_controller { struct apple_qspi *q; };
 struct spi_device { struct spi_controller *controller; unsigned int cs; int dev; };
 struct spi_mem { struct spi_device *spi; };
@@ -127,9 +133,27 @@ static void denied(struct spi_mem_op o){wire_count=0;assert(apple_qspi_exec_op(&
 int main(void){
  u8 data[256];memset(data,0x55,sizeof(data));reset();
  struct spi_mem_op wren=SPI_MEM_OP(SPI_MEM_OP_CMD(0x06,1),SPI_MEM_OP_NO_ADDR,SPI_MEM_OP_NO_DUMMY,SPI_MEM_OP_NO_DATA);
- /* The Neo transport keeps raw writes even while the J613 policy is read-only. */
- q.nvram_policy=false;
+ /* T8140 uses a separate nvram window while the J613 gate stays read-only.
+  * This synthetic window shares the flash model's range; KUnit also covers
+  * the J700 partition's exact bounds. */
+ q.nvram_policy=false;q.nvram_window=true;
+ q.window_start=0x700000;q.window_end=0x800000;
  assert(!apple_qspi_mem_exec_op(&mem,&wren) && wire_count==1 && sr[0]==2);
+ struct spi_mem_op window_program=program(0x700000,256,data);
+ assert(!apple_qspi_mem_exec_op(&mem,&window_program) && wire_count==2);
+ assert(!memcmp(flash+0x700000,data,256) && read_only);
+ const u64 outside_window[]={0,0x6fffff,0x800000,0x100700000ULL};
+ for(unsigned int i=0;i<ARRAY_SIZE(outside_window);i++){
+  struct spi_mem_op bad_window=program(outside_window[i],1,data);
+  assert(apple_qspi_mem_exec_op(&mem,&bad_window)==-EACCES && wire_count==2);
+ }
+ window_program=program(0x7fffff,2,data);
+ assert(apple_qspi_mem_exec_op(&mem,&window_program)==-EACCES && wire_count==2);
+ struct spi_mem_op status_write=wren;status_write.cmd.opcode=0x01;
+ assert(apple_qspi_mem_exec_op(&mem,&status_write)==-EACCES && wire_count==2);
+ q.window_start=q.window_end=0;window_program=program(0x700000,1,data);
+ assert(apple_qspi_mem_exec_op(&mem,&window_program)==-EACCES && wire_count==2);
+ puts("PASS T8140 window dispatch, bounded programs, rejected control writes and empty partition");
  reset();
  assert(apple_qspi_mem_exec_op(&mem,&wren)==-EACCES && !wire_count);
  arm();
@@ -181,15 +205,26 @@ int main(void){
 
 def run(code, path):
     path.write_text(code)
-    subprocess.run(['clang', '-std=gnu11', '-O1', '-g', '-Wall', '-Wextra',
+    command = ['clang', '-std=gnu11', '-O1', '-g', '-Wall', '-Wextra',
                     '-Werror', '-Wno-unused-parameter', '-Wno-unused-function',
                     '-Wno-missing-field-initializers', '-Wno-sign-compare',
                     '-fsanitize=address,undefined',
-                    str(path), '-o', str(path.with_suffix(''))], check=True)
-    return subprocess.run([str(path.with_suffix(''))], capture_output=True, text=True)
+                    str(path), '-o', str(path.with_suffix(''))]
+    path.with_suffix('.command.json').write_text(json.dumps(command) + '\n')
+    subprocess.run(command, check=True)
+    result = subprocess.run([str(path.with_suffix(''))], capture_output=True, text=True)
+    path.with_suffix('.stdout').write_text(result.stdout)
+    path.with_suffix('.stderr').write_text(result.stderr)
+    path.with_suffix('.exit').write_text(str(result.returncode) + '\n')
+    return result
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output', type=Path, help='retain generated C and test binaries')
+    args = parser.parse_args()
+    if args.output:
+        args.output.mkdir(parents=True, exist_ok=True)
     source = (ROOT / 'drivers/spi/spi-apple-qspi.c').read_text()
     policy = (ROOT / 'drivers/spi/spi-apple-qspi-policy.h').read_text()
     signatures = ['static int apple_qspi_set_read_only(', 'static int apple_qspi_get_read_only(',
@@ -198,14 +233,17 @@ def main():
                   'static int apple_qspi_read_register(', 'static int apple_qspi_command(',
                   'static int apple_qspi_read_array(', 'static int apple_qspi_status(',
                   'static int apple_qspi_nvram_modify(', 'static int apple_qspi_exec_op(',
+                  'static int apple_qspi_window_exec_op(',
                   'static int apple_qspi_mem_exec_op(']
     code = PREFIX + policy + '\n'.join(function(source, s) for s in signatures) + CONTROLS
-    with tempfile.TemporaryDirectory(prefix='qspi-nvram-') as directory:
+    output = contextlib.nullcontext(str(args.output)) if args.output else tempfile.TemporaryDirectory(prefix='qspi-nvram-')
+    with output as directory:
         current = run(code, Path(directory) / 'current.c')
         print(current.stdout, end='')
         if current.returncode:
             raise SystemExit(current.stderr)
         for name, old, new in [
+            ('t8140-window', 'start <= first && last <= end', 'start <= first'),
             ('range', 'addr >= APPLE_QSPI_NVRAM_START', 'addr >= 1'),
             ('read-only', 'read_only || !qspi->nvram_write_candidate || qspi->write_fault',
              '!qspi->nvram_write_candidate || qspi->write_fault'),
