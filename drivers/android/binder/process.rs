@@ -1650,7 +1650,7 @@ impl Process {
         if should_schedule {
             // Ignore failures to schedule to the workqueue. Those just mean that we're already
             // scheduled for execution.
-            let _ = workqueue::system().enqueue(this);
+            let _ = workqueue::system_dfl().enqueue(this);
         }
 
         drop(binderfs_file);
@@ -1667,7 +1667,7 @@ impl Process {
         if should_schedule {
             // Ignore failures to schedule to the workqueue. Those just mean that we're already
             // scheduled for execution.
-            let _ = workqueue::system().enqueue(Arc::from(this));
+            let _ = workqueue::system_dfl().enqueue(Arc::from(this));
         }
         Ok(())
     }
