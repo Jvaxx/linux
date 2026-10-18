@@ -79,6 +79,7 @@ Subsystem-specific APIs
 
    80211/index
    acpi/index
+   ../soc/apple/index
    backlight/lp855x-driver.rst
    clk
    coco/index
