@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 """Execute the actual wake_sensor body with synthetic status/registration mocks.
 
-The post-registration status read applies to nonce-session (J700) profiles;
-other profiles keep the patch decision on the status read before registration.
+Every profile reads the status again after registration; with a nonce
+session (J700) state 9 also asks for the patch, without one the patch
+acknowledgement alone decides (registration::patch_loaded).
 """
 from pathlib import Path
 import subprocess
@@ -22,6 +23,14 @@ class SensorWakeTest(unittest.TestCase):
             depth += (source[end] == '{') - (source[end] == '}')
             end += 1
         function = source[start:end]
+        registration = (APPLE / 'registration.rs').read_text()
+        start = registration.index('pub(crate) fn patch_loaded(')
+        opening = registration.index('{', start)
+        depth, end = 1, opening + 1
+        while depth:
+            depth += (registration[end] == '{') - (registration[end] == '}')
+            end += 1
+        patch_loaded = registration[start:end]
         program = r'''
 #![allow(dead_code, unused_variables)]
 use std::cell::RefCell;
@@ -35,6 +44,9 @@ mod module_parameters {
  #[allow(non_upper_case_globals)] pub static sensor_trace: Param = Param(0);
 }
 struct Profile { nonce_session: bool }
+mod registration {
+''' + patch_loaded + r'''
+}
 macro_rules! dev_err { ($($args:tt)*) => {} }
 mod kernel { pub mod time {
  pub struct Delta;
@@ -99,11 +111,18 @@ fn main() {
   assert_eq!(driver.wake_sensor().is_some(),ready);
   MOCK.with(|m| {let m=m.borrow();assert_eq!(m.reads,2);assert!(m.registered);assert_eq!(m.patch,patch);});
  }
- // Without a nonce session the pre-registration status decides, as before.
- MOCK.with(|m| *m.borrow_mut()=Mock::default());
- let driver = Driver::new();
- assert!(driver.wake_sensor().is_some());
- MOCK.with(|m| {let m=m.borrow();assert_eq!(m.reads,1);assert!(m.registered);assert_eq!(m.patch,None);});
+ // Without a nonce session the status is read after registration too, and
+ // its acknowledgement alone decides: state 9 does not ask for the patch.
+ for (next,ready,patch) in [
+  (Some(sensor::Status{state:9,ack:0x29,silent:false}),true,None),
+  (Some(sensor::Status{state:0,ack:0,silent:false}),true,Some(0)),
+  (None,false,None),
+ ] {
+  MOCK.with(|m| *m.borrow_mut()=Mock{next,..Mock::default()});
+  let driver = Driver::new();
+  assert_eq!(driver.wake_sensor().is_some(),ready);
+  MOCK.with(|m| {let m=m.borrow();assert_eq!(m.reads,2);assert!(m.registered);assert_eq!(m.patch,patch);});
+ }
 }
 '''
         with tempfile.TemporaryDirectory() as directory:
