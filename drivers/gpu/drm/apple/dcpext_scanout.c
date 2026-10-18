@@ -210,7 +210,7 @@ void dcpext_scanout_link_restored(struct apple_dcp *dcp)
 		return;
 	cancel_delayed_work(&scanout->bounce_work);
 	dev_info(scanout->firmware_dev, "external link returned; sending the pattern commands again\n");
-	queue_delayed_work(system_unbound_wq, &scanout->repattern_work,
+	queue_delayed_work(system_dfl_wq, &scanout->repattern_work,
 			   msecs_to_jiffies(SCANOUT_REPATTERN_DELAY_MS));
 }
 
@@ -658,7 +658,7 @@ static ssize_t dcpext_pattern_store(struct device *dev, struct device_attribute 
 	mutex_unlock(&dcp->hpd_mutex);
 	/* Firmware DMA and callbacks may outlive any error returned by this worker. */
 	__module_get(THIS_MODULE);
-	queue_work(system_unbound_wq, &scanout->work);
+	queue_work(system_dfl_wq, &scanout->work);
 	return count;
 }
 
@@ -698,7 +698,7 @@ static ssize_t dcpext_desktop_store(struct device *dev, struct device_attribute 
 		return -EAGAIN;
 	if (atomic_cmpxchg(&scanout->desktop_requested, 0, 1))
 		return -EALREADY;
-	queue_work(system_unbound_wq, &scanout->desktop_work);
+	queue_work(system_dfl_wq, &scanout->desktop_work);
 	return count;
 }
 

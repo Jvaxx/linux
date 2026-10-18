@@ -107,7 +107,7 @@ typedef uint32_t u32; typedef uint64_t u64;
 #define DCP_HOTPLUG_NOTIFY 1
 struct work_struct { bool pending; };
 struct delayed_work { struct work_struct work; };
-static int system_freezable_wq, system_wq;
+static int system_freezable_wq, system_dfl_wq;
 #define DCP_SWAP_WATCHDOG_MS 1000
 #define DCP_EXTERNAL_STOP_RETRIES 3
 static int schedule_work(struct work_struct *w) { w->pending = true; return 1; }
