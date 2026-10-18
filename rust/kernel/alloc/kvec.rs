@@ -798,14 +798,14 @@ where
     /// # Examples
     ///
     /// ```
-    /// let mut v = vec![1, 2, 3];
-    /// let u: Vec<_> = v.drain(1..).collect();
+    /// let mut v = kernel::kvec![1, 2, 3]?;
+    /// assert!(v.drain(1..).eq([2, 3]));
     /// assert_eq!(v, &[1]);
-    /// assert_eq!(u, &[2, 3]);
     ///
     /// // A full range clears the vector, like `clear()` does
     /// v.drain(..);
     /// assert_eq!(v, &[]);
+    /// # Ok::<(), Error>(())
     /// ```
     pub fn drain<R>(&mut self, range: R) -> Drain<'_, T, A>
     where
@@ -1757,25 +1757,29 @@ impl<T, A: Allocator, const N: usize> TryFrom<Vec<T, A>> for [T; N] {
     /// # Examples
     ///
     /// ```
-    /// assert_eq!(vec![1, 2, 3].try_into(), Ok([1, 2, 3]));
-    /// assert_eq!(<Vec<i32>>::new().try_into(), Ok([]));
+    /// assert_eq!(kernel::kvec![1, 2, 3]?.try_into(), Ok([1, 2, 3]));
+    /// assert_eq!(KVec::<i32>::new().try_into(), Ok([]));
+    /// # Ok::<(), Error>(())
     /// ```
     ///
     /// If the length doesn't match, the input comes back in `Err`:
     /// ```
-    /// let r: Result<[i32; 4], _> = (0..10).collect::<Vec<_>>().try_into();
-    /// assert_eq!(r, Err(vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]));
+    /// let r: Result<[i32; 4], _> = kernel::kvec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]?.try_into();
+    /// assert_eq!(r, Err(kernel::kvec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]?));
+    /// # Ok::<(), Error>(())
     /// ```
     ///
     /// If you're fine with just getting a prefix of the `Vec<T>`,
     /// you can call [`.truncate(N)`](Vec::truncate) first.
     /// ```
-    /// let mut v = String::from("hello world").into_bytes();
-    /// v.sort();
+    /// let mut v = KVec::new();
+    /// v.extend_from_slice(b"hello world", GFP_KERNEL)?;
+    /// v.sort_unstable();
     /// v.truncate(2);
-    /// let [a, b]: [_; 2] = v.try_into().unwrap();
+    /// let [a, b]: [_; 2] = v.try_into().map_err(|_| EINVAL)?;
     /// assert_eq!(a, b' ');
     /// assert_eq!(b, b'd');
+    /// # Ok::<(), Error>(())
     /// ```
     fn try_from(mut vec: Vec<T, A>) -> Result<[T; N], Vec<T, A>> {
         if vec.len() != N {

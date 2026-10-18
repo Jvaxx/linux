@@ -134,7 +134,11 @@ impl Drop for GpuContext {
 
         guard.registration_data_with(|reg_data| {
             let data = self.data.take().unwrap();
-            reg_data.gpu.free_context(data);
+            // A context only exists for the manager whose allocators created it, so the manager is
+            // always present.
+            if let Some(gpu) = reg_data.gpu.manager() {
+                gpu.free_context(data);
+            }
         })
     }
 }

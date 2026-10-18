@@ -6,6 +6,7 @@
 mod alloc;
 mod buffer;
 mod channel;
+mod cleanup;
 mod debug;
 mod driver;
 mod event;
@@ -13,6 +14,7 @@ mod file;
 mod float;
 mod fw;
 mod gem;
+mod g17;
 mod gpu;
 mod hw;
 mod initdata;
@@ -24,13 +26,38 @@ mod pgtable;
 mod queue;
 mod regs;
 mod slotalloc;
+mod stats;
+mod sysfs_exports;
 mod util;
 #[cfg(CONFIG_DRM_ASAHI_MAPLE_TREE)]
 mod vm;
 mod workqueue;
 
-kernel::module_platform_driver! {
-    type: driver::AsahiPlatformDriver,
+use kernel::prelude::*;
+
+#[pin_data]
+struct DriverModule {
+    // Field drop order unregisters/joins driver producers before queue teardown.
+    #[pin]
+    _driver: kernel::driver::Registration<kernel::platform::Adapter<driver::AsahiPlatformDriver>>,
+    _cleanup: cleanup::QueueOwner,
+}
+
+impl kernel::InPlaceModule for DriverModule {
+    fn init(module: &'static kernel::ThisModule) -> impl PinInit<Self, Error> {
+        try_pin_init!(Self {
+            // Initialize the queue first, before registration can invoke probe.
+            _cleanup: cleanup::QueueOwner::new()?,
+            _driver <- kernel::driver::Registration::new(
+                <Self as kernel::ModuleMetadata>::NAME,
+                module,
+            ),
+        })
+    }
+}
+
+module! {
+    type: DriverModule,
     name: "asahi",
     description: "AGX GPU driver for Apple silicon SoCs",
     license: "Dual MIT/GPL",
@@ -54,6 +81,11 @@ kernel::module_platform_driver! {
             default: 0,
             // permissions: 0o644,
             description: "Fully isolate GPU contexts (limits performance)",
+        },
+        stats_export: u8 {
+            default: 1,
+            // permissions: 0,
+            description: "Export AGX firmware stats to sysfs (1 = on, 0 = off)",
         },
     },
 }
