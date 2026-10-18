@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Read-only sensors supplied by the existing PMP firmware owner. */
 #include <linux/device.h>
+#include <linux/atomic.h>
 #include <linux/hwmon.h>
 #include <linux/io.h>
+#include <linux/ktime.h>
+#include <linux/module.h>
 #include <linux/of.h>
 #include <linux/mutex.h>
-#include <linux/module.h>
 #include <linux/rculist.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/pmp-telemetry.h>
 #include <linux/soc/apple/pmp-temps.h>
+#include <linux/soc/apple/pmp-power-policy.h>
 
 bool apple_pmp_telemetry_retained_board(void)
 {
@@ -20,6 +23,7 @@ bool apple_pmp_telemetry_retained_board(void)
 
 static LIST_HEAD(apple_pmp_telemetry_list);
 static DEFINE_MUTEX(apple_pmp_telemetry_lock);
+static atomic64_t apple_pmp_telemetry_generation = ATOMIC64_INIT(0);
 
 struct apple_pmp_telemetry {
 	struct device *dev;
@@ -27,6 +31,9 @@ struct apple_pmp_telemetry {
 	void __iomem *sram;
 	void __iomem *asc;
 	bool online;
+	atomic_t gpu_attached;
+	atomic64_t gpu_budget;
+	u64 generation;
 };
 
 static bool apple_pmp_telemetry_online(const struct apple_pmp_telemetry *sensors)
@@ -60,6 +67,108 @@ int apple_pmp_telemetry_get_hotspot(const struct device_node *np, long *value)
 	return ret;
 }
 EXPORT_SYMBOL_GPL(apple_pmp_telemetry_get_hotspot);
+
+struct apple_pmp_gpu {
+	struct device_node *node;
+	u64 generation;
+};
+
+struct apple_pmp_gpu *apple_pmp_gpu_get(struct device *dev)
+{
+	struct apple_pmp_telemetry *sensors;
+	struct apple_pmp_gpu *gpu;
+	int ret = -EPROBE_DEFER;
+
+	gpu = kzalloc_obj(*gpu);
+	if (!gpu)
+		return ERR_PTR(-ENOMEM);
+	gpu->node = of_parse_phandle(dev->of_node, "apple,pmp", 0);
+	if (!gpu->node) {
+		ret = -EINVAL;
+		goto fail;
+	}
+	rcu_read_lock();
+	list_for_each_entry_rcu(sensors, &apple_pmp_telemetry_list, list) {
+		if (sensors->dev->of_node != gpu->node || !READ_ONCE(sensors->online))
+			continue;
+		if (atomic_cmpxchg(&sensors->gpu_attached, 0, 1)) {
+			ret = -EBUSY;
+			break;
+		}
+		/* A CPU-only publication must never release a new GPU consumer. */
+		atomic64_set(&sensors->gpu_budget, 0);
+		gpu->generation = sensors->generation;
+		ret = 0;
+		break;
+	}
+	rcu_read_unlock();
+	if (!ret)
+		return gpu;
+fail:
+	of_node_put(gpu->node);
+	kfree(gpu);
+	return ERR_PTR(ret);
+}
+EXPORT_SYMBOL_GPL(apple_pmp_gpu_get);
+
+void apple_pmp_gpu_put(struct apple_pmp_gpu *gpu)
+{
+	struct apple_pmp_telemetry *sensors;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(sensors, &apple_pmp_telemetry_list, list) {
+		if (sensors->dev->of_node != gpu->node ||
+		    sensors->generation != gpu->generation)
+			continue;
+		atomic_set(&sensors->gpu_attached, 0);
+		atomic64_set(&sensors->gpu_budget, 0);
+		break;
+	}
+	rcu_read_unlock();
+	of_node_put(gpu->node);
+	kfree(gpu);
+}
+EXPORT_SYMBOL_GPL(apple_pmp_gpu_put);
+
+unsigned int apple_pmp_gpu_power_state(struct apple_pmp_gpu *gpu)
+{
+	struct apple_pmp_telemetry *sensors;
+	unsigned int level = 8;
+
+	rcu_read_lock();
+	list_for_each_entry_rcu(sensors, &apple_pmp_telemetry_list, list) {
+		if (sensors->dev->of_node != gpu->node ||
+		    sensors->generation != gpu->generation || !READ_ONCE(sensors->online))
+			continue;
+		if (readl(sensors->asc + 0x44) & BIT(4)) {
+			u64 publication = atomic64_read(&sensors->gpu_budget);
+
+			level = apple_pmp_gpu_budget_level(publication, ktime_get_ns());
+		}
+		break;
+	}
+	rcu_read_unlock();
+	return level;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_gpu_power_state);
+
+bool apple_pmp_gpu_active(const struct apple_pmp_sensor_data *data)
+{
+	struct apple_pmp_telemetry *sensors = data->cookie;
+
+	return atomic_read(&sensors->gpu_attached);
+}
+EXPORT_SYMBOL_GPL(apple_pmp_gpu_active);
+
+void apple_pmp_gpu_publish(const struct apple_pmp_sensor_data *data,
+			   unsigned int level, u64 sample_ns)
+{
+	struct apple_pmp_telemetry *sensors = data->cookie;
+
+	atomic64_set(&sensors->gpu_budget, sample_ns ?
+		     apple_pmp_gpu_budget_pack(level, sample_ns) : 0);
+}
+EXPORT_SYMBOL_GPL(apple_pmp_gpu_publish);
 
 static int apple_pmp_sensor_read(void *cookie, unsigned int channel,
 				 long *value)
@@ -180,6 +289,7 @@ int apple_pmp_telemetry_register(struct device *dev, void __iomem *sram,
 	sensors->sram = sram;
 	sensors->asc = asc;
 	sensors->online = true;
+	sensors->generation = atomic64_inc_return(&apple_pmp_telemetry_generation);
 	mutex_lock(&apple_pmp_telemetry_lock);
 	list_add_tail_rcu(&sensors->list, &apple_pmp_telemetry_list);
 	mutex_unlock(&apple_pmp_telemetry_lock);
@@ -191,6 +301,7 @@ int apple_pmp_telemetry_register(struct device *dev, void __iomem *sram,
 	}
 	data.read = apple_pmp_sensor_read;
 	data.cookie = sensors;
+	data.dev = dev;
 	child = platform_device_register_data(dev, "apple-pmp-thermal",
 					      PLATFORM_DEVID_AUTO, &data,
 					      sizeof(data));
