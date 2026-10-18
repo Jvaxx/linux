@@ -243,12 +243,12 @@ static void apple_crtc_atomic_disable(struct drm_crtc *crtc,
 		}
 	}
 
-	if (crtc->state->event && !crtc->state->active) {
+	if (crtc_state->event && !crtc_state->active) {
 		spin_lock_irq(&crtc->dev->event_lock);
-		drm_crtc_send_vblank_event(crtc, crtc->state->event);
+		drm_crtc_send_vblank_event(crtc, crtc_state->event);
 		spin_unlock_irq(&crtc->dev->event_lock);
 
-		crtc->state->event = NULL;
+		crtc_state->event = NULL;
 	}
 }
 
@@ -256,13 +256,14 @@ static void apple_crtc_atomic_begin(struct drm_crtc *crtc,
 				    struct drm_atomic_commit *commit)
 {
 	struct apple_crtc *apple_crtc = to_apple_crtc(crtc);
+	struct drm_crtc_state *new = drm_atomic_get_new_crtc_state(commit, crtc);
 	unsigned long flags;
 
-	if (crtc->state->event) {
+	if (new->event) {
 		spin_lock_irqsave(&crtc->dev->event_lock, flags);
-		apple_crtc->event = crtc->state->event;
+		apple_crtc->event = new->event;
 		spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
-		crtc->state->event = NULL;
+		new->event = NULL;
 	}
 }
 
@@ -967,13 +968,9 @@ static int apple_drm_init(struct device *dev)
 
 	dev_set_drvdata(dev, apple);
 
-	ret = component_bind_all(dev, apple);
-	if (ret)
-		return ret;
-
 	ret = drmm_mode_config_init(&apple->drm);
 	if (ret)
-		goto err_components;
+		return ret;
 
 	/*
 	 * IOMFB::UPPipeDCP_H13P::verify_surfaces produces the error "plane
@@ -994,6 +991,10 @@ static int apple_drm_init(struct device *dev)
 
 	apple->drm.mode_config.funcs = &apple_mode_config_funcs;
 	apple->drm.mode_config.helper_private = &apple_mode_config_helpers;
+
+	ret = component_bind_all(dev, apple);
+	if (ret)
+		return ret;
 
 	ret = apple_drm_init_dcp(dev);
 	if (ret)
@@ -1024,9 +1025,6 @@ err_unbind:
 	apple_drm_quiesce_connectors(&apple->drm);
 	component_unbind_all(dev, NULL);
 	dcp_unlink(&apple->drm);
-	return ret;
-err_components:
-	component_unbind_all(dev, NULL);
 	return ret;
 }
 
