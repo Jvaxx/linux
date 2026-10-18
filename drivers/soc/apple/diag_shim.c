@@ -342,8 +342,8 @@ void sep_diag_set_keybag(int state)
 }
 
 /*
- * Called from the SPI probe and remove of the one sensor device, which the
- * driver core never runs concurrently. A bring-up result racing this store is
+ * Called from the SPI probe and remove of the one sensor device (sensor_shim.c),
+ * which the driver core never runs concurrently. A bring-up result racing this store is
  * either overwritten by it or, arriving later, refused by the bind check below.
  */
 void sep_diag_set_sensor_bound(bool bound)
