@@ -5,7 +5,7 @@
 
 Name:           aurora-sep
 Version:        1
-Release:        3%{?dist}
+Release:        4%{?dist}
 Summary:        Loader and desktop integration for the Apple SEP fingerprint driver
 
 License:        GPL-2.0-only
@@ -99,6 +99,10 @@ echo 'enable aurora-sep.service' >%{buildroot}%{_presetdir}/80-aurora-sep.preset
 %{_presetdir}/80-aurora-sep.preset
 
 %changelog
+* Sun Oct 18 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-4
+- Report Touch ID ready only once the sensor attached and the
+  fingerprints were restored, and the reason when it is not
+
 * Sun Oct 11 2026 Ryan Murray <ryan@aurorasilicon.org> - 1-3
 - libfprint with the aurora driver is now built in aurora-sep-userspace
 

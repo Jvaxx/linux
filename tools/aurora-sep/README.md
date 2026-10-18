@@ -203,8 +203,16 @@ enrolled fingerprints from the enclave before the open returns, which takes
 a few seconds. `aurora-sep-ready.service`, which `aurora-sep.service` pulls
 in, makes that open at boot, before fprintd starts. The lock screen, sudo
 and polkit then find the reader and the fingerprints ready, and the first
-fingerprint request does not wait for the restore. A failed open is only
-logged. The packages install it; by hand:
+fingerprint request does not wait for the restore.
+
+An open that succeeds is not enough: the sensor can still fall short of
+attaching. The script reports Touch ID ready only once the driver's `diag`
+attributes show the sensor attached and the fingerprints restored (or none
+enrolled), the state in which the kernel logs `Touch ID: restored N`. The
+driver tries an attach that fell short once more about 10 s later, so the
+script waits for that, up to 50 s from its start. Otherwise it logs
+`Touch ID is NOT ready` with the reason and the unit fails; anything that
+merely wants it still starts. The packages install it; by hand:
 
 ```sh
 install -Dm755 aurora-sep-ready /usr/local/sbin/aurora-sep-ready

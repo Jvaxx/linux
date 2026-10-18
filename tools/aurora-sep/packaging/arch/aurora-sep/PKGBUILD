@@ -7,7 +7,7 @@
 
 pkgname=aurora-sep
 pkgver=1
-pkgrel=7
+pkgrel=8
 pkgdesc="Loader and desktop integration for the Apple SEP (Touch ID) driver"
 url="https://github.com/aurora-silicon/linux/tree/aurora-wip/tools/aurora-sep"
 arch=(any)
@@ -34,13 +34,13 @@ source=(load-driver
 sha256sums=('abea60bb264ced349f7cf671d8d26e1609a81a60ea4c34d66ec6f7f73b847dbb'
             '447f99cc3c7e683134f31b993aa825fadde24e4854954a3035c96e6631d4d4d0'
             'f8d0c4b9385e6716d5ac5dd9941a57459fbc551a8238383bcde36cd929d0523f'
-            '2db07d3a0191e8d14581a3056505a8c4225b2fc8e6ea4a1956ae5493abcbb0ae'
-            '5a5e5c7e93d1462d9d1023446fdb297926aeb93d8988867b515aca7adafe4487'
+            '7b6569459dfb89c72148ecef93362a9fa75812591a574a0259adf198fd6e89c9'
+            'f38421360c2f885bb102bc5076d81006d352d03d12b5fb35b4da8a5132f4ccc0'
             '8d8df0ba2a6861b2edb2110e606906d84ca4848617621ad3cb48493a1522971d'
             '0695bd9ce4c207241db13c3ea07819a032d8213417021378f5015ab9317cde12'
             '5936eb76db666496a8700dade7ac6bcb3785b517958dcea10685690f1822c86f'
             'ffab97b20bfd5f0eb1ab641179a131843349cf16890fff0cf2d893f0b5681b37'
-            '724eb4f8a2cf25bf47d3967ac8730ac0337520f08ea9b7c51f5838c67ec9ed0c'
+            '9c08a8298110baf001cdb6e2cfab2507472684c8bc443f6a4f29c5cb1bb3ee3d'
             '438e6bb9d361e3800c6612ec34e11f97a7b5db9e8996866a8a9f4c9b7f14225a')
 
 # A unit and the helper it runs ($1, installed as $3), pointed at the
