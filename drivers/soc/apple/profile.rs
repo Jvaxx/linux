@@ -122,6 +122,31 @@ pub(crate) enum KeyStore {
     Variant5,
 }
 
+/// The SEP DART DMA window a warm-attach profile programs when the device
+/// tree does not describe it, as `apple,dma-offset` and `apple,dma-range`
+/// cells.
+pub(crate) struct DartWindow {
+    pub(crate) name: &'static str,
+    pub(crate) offset: [u32; 2],
+    pub(crate) range: [u32; 4],
+}
+
+/// IOVAs 0..4 GiB, offset by BIT(40): `[0x100, 0]`. `[0x1, 0]` would be
+/// BIT(32) and miss the page tables.
+const DART_HIGH_ALIAS: DartWindow = DartWindow {
+    name: "offset BIT(40), range 0..4 GiB",
+    offset: [0x100, 0x0],
+    range: [0, 0, 1, 0],
+};
+
+/// The T8112 SEP DART has a 32-bit input aperture, 0x4000 + 0xffff0000, and
+/// no high alias.
+const DART_T8112: DartWindow = DartWindow {
+    name: "no offset, range 0x4000..4 GiB",
+    offset: [0x0, 0x0],
+    range: [0x0, 0x4000, 0x0, 0xffff_0000],
+};
+
 pub(crate) struct PlatformProfile {
     pub(crate) name: &'static str,
     /// Capacity of the boot shared-memory window. The layout is still checked
@@ -138,6 +163,8 @@ pub(crate) struct PlatformProfile {
     pub(crate) dart_range_required: bool,
     /// Whether the SEP DART IOVA window needs a DMA mask wider than 32 bits.
     pub(crate) wide_dma_mask: bool,
+    /// The SEP DART DMA window programmed on warm attach (see [`DartWindow`]).
+    pub(crate) dart_window: &'static DartWindow,
     /// Reserved-memory region holding the SEP firmware image (cold-boot path).
     pub(crate) firmware_region: &'static CStr,
     /// Identity keybag CREATE_KEYBAG field encoding (per-SoC; see [`KeybagCreate`]).
@@ -148,9 +175,12 @@ pub(crate) struct PlatformProfile {
     pub(crate) key_store: KeyStore,
     /// Platforms with reboot-tested owner export and user-before-master saves.
     pub(crate) persistent_enrol: bool,
+    /// The `xart_guard` level when the parameter is left at its default (see
+    /// [`crate::xart_guard`]).
+    pub(crate) xart_guard: u8,
 }
 
-const T8103: PlatformProfile = PlatformProfile {
+pub(crate) const T8103: PlatformProfile = PlatformProfile {
     name: "T8103/J313",
     shmem_capacity: 0x3_0000,
     shmem_first_item: b"CNIP",
@@ -168,6 +198,7 @@ const T8103: PlatformProfile = PlatformProfile {
     },
     dart_range_required: false,
     wide_dma_mask: false,
+    dart_window: &DART_HIGH_ALIAS,
     firmware_region: c"sepfw",
     // The 13.5 key store creates an identity bag with
     // version 2, type 0x400000, parent -1 (it accepts only -1 or <= -10).
@@ -182,6 +213,8 @@ const T8103: PlatformProfile = PlatformProfile {
     },
     persistent_enrol: true,
     nonce_session: false,
+    // macOS shares this enclave: keep Linux to its own xART records.
+    xart_guard: 1,
 };
 
 /// M1 Pro (J316s). The M1 family cold-boots its SEP like T8103, so the boot
@@ -189,7 +222,7 @@ const T8103: PlatformProfile = PlatformProfile {
 /// SPI2 at the T6020 address, in the mode T6020 verified: the J313, J316s and
 /// J414s platform device trees describe the same sensor (id 0x3352)
 /// identically. Enrolment persistence is reboot-tested on J314s.
-const T6000: PlatformProfile = PlatformProfile {
+pub(crate) const T6000: PlatformProfile = PlatformProfile {
     name: "T6000/J316s",
     shmem_capacity: 0x3_0000,
     shmem_first_item: b"CNIP",
@@ -207,6 +240,7 @@ const T6000: PlatformProfile = PlatformProfile {
     },
     dart_range_required: false,
     wide_dma_mask: false,
+    dart_window: &DART_HIGH_ALIAS,
     firmware_region: c"sepfw",
     keybag_create: KeybagCreate {
         variant: T8103.keybag_create.variant,
@@ -219,9 +253,13 @@ const T6000: PlatformProfile = PlatformProfile {
     },
     persistent_enrol: true,
     nonce_session: false,
+    // As T8103. On J316s, creating the identity keybag also rewrites a
+    // session record that predates Linux. The guard refuses that, so the
+    // keybag can only be created there with xart_guard=0.
+    xart_guard: 1,
 };
 
-const T6020: PlatformProfile = PlatformProfile {
+pub(crate) const T6020: PlatformProfile = PlatformProfile {
     name: "T6020/J414s",
     shmem_capacity: 0x4_0000,
     shmem_first_item: b"CINP",
@@ -239,6 +277,7 @@ const T6020: PlatformProfile = PlatformProfile {
     },
     dart_range_required: true,
     wide_dma_mask: false,
+    dart_window: &DART_HIGH_ALIAS,
     firmware_region: c"sepfw",
     // Proven encoding: the lenient enclave takes the variant in the first word.
     keybag_create: KeybagCreate {
@@ -249,12 +288,14 @@ const T6020: PlatformProfile = PlatformProfile {
     key_store: KeyStore::Variant5,
     persistent_enrol: true,
     nonce_session: false,
+    // A warm-attach enclave shared with macOS, as on T8112.
+    xart_guard: 1,
 };
 
 /// MacBook Neo. The J700 ADT records a pre-booted SEP, a spi2 Mesa sensor
 /// (0x3356), and a SEP DART aperture above 4 GiB. These values describe that
 /// board; device-tree nodes remain authoritative for addresses and resources.
-const T8140: PlatformProfile = PlatformProfile {
+pub(crate) const T8140: PlatformProfile = PlatformProfile {
     key_store: KeyStore::Variant5,
     persistent_enrol: true,
     name: "T8140/J700",
@@ -274,6 +315,7 @@ const T8140: PlatformProfile = PlatformProfile {
     },
     dart_range_required: true,
     wide_dma_mask: true,
+    dart_window: &DART_HIGH_ALIAS,
     firmware_region: c"sepfw",
     // J700 hardware refused the strict encoding and accepted this T6020 form
     // (first verified on hardware 2026-09-19).
@@ -283,6 +325,9 @@ const T8140: PlatformProfile = PlatformProfile {
         arg: -1,
     },
     nonce_session: true,
+    // Linux records from before the guard's list exist here, and Linux has
+    // left the macOS records unchanged on this platform.
+    xart_guard: 0,
 };
 
 /// MacBook Air M2 (J413, J415). iBoot leaves the SEP running and the Mesa
@@ -295,7 +340,7 @@ const T8140: PlatformProfile = PlatformProfile {
 ///
 /// The shared-memory geometry and key-store dialect follow the other
 /// warm-registration platforms (T6020, T8140).
-const T8112: PlatformProfile = PlatformProfile {
+pub(crate) const T8112: PlatformProfile = PlatformProfile {
     name: "T8112/J415",
     shmem_capacity: 0x4_0000,
     shmem_first_item: b"CINP",
@@ -313,6 +358,7 @@ const T8112: PlatformProfile = PlatformProfile {
     },
     dart_range_required: true,
     wide_dma_mask: false,
+    dart_window: &DART_T8112,
     firmware_region: c"sepfw",
     // J415 accepted the 13.5 GET_CAPABILITIES/SET_ENV init but refused the
     // strict CREATE_KEYBAG (mailbox status -1, empty reply), as J700 did;
@@ -325,6 +371,8 @@ const T8112: PlatformProfile = PlatformProfile {
     key_store: KeyStore::Variant5,
     persistent_enrol: true,
     nonce_session: false,
+    // Guarded from its first Linux boot (2026-10-16): no record refused.
+    xart_guard: 1,
 };
 
 static_assert!(T8103.shmem_capacity == 0x30000);
@@ -405,4 +453,37 @@ pub(crate) fn detect() -> Result<&'static PlatformProfile> {
         return Ok(&T8112);
     }
     Err(ENODEV)
+}
+
+#[kernel::macros::kunit_tests(apple_sep_dart_window)]
+mod dart_window_tests {
+    use super::*;
+
+    /// The 64-bit value of `apple,dma-offset`.
+    fn offset(window: &DartWindow) -> u64 {
+        (u64::from(window.offset[0]) << 32) | u64::from(window.offset[1])
+    }
+
+    /// `apple,dma-range` as the IOVAs it starts and ends at.
+    fn range(window: &DartWindow) -> (u64, u64) {
+        let start = (u64::from(window.range[0]) << 32) | u64::from(window.range[1]);
+        let size = (u64::from(window.range[2]) << 32) | u64::from(window.range[3]);
+        (start, start + size)
+    }
+
+    #[test]
+    fn t8112_has_no_offset_and_stays_below_4_gib() {
+        assert_eq!(offset(T8112.dart_window), 0);
+        assert_eq!(range(T8112.dart_window), (0x4000, 0x4000 + 0xffff_0000));
+        // The whole window fits the 32-bit DART input aperture.
+        assert!(range(T8112.dart_window).1 <= 1 << 32);
+    }
+
+    #[test]
+    fn the_other_profiles_keep_the_bit40_window() {
+        for profile in [&T8103, &T6000, &T6020, &T8140] {
+            assert_eq!(offset(profile.dart_window), 1 << 40);
+            assert_eq!(range(profile.dart_window), (0, 1 << 32));
+        }
+    }
 }
