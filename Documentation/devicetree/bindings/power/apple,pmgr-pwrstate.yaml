@@ -82,9 +82,12 @@ properties:
 
   apple,firmware-owned:
     description:
-      The boot loader hands over the coprocessor in this domain running, and its
-      firmware owns the domain's power state; writing it faults. The OS keeps the
-      domain on and never changes its power target, automatic gating or reset.
+      The boot loader hands over active hardware whose power domain remains
+      under firmware control. Its state register may not be CPU-accessible.
+      The OS keeps the domain on and never accesses its state register,
+      including reads, power target, automatic gating and reset. Availability
+      is supplied by the firmware handoff rather than determined by probing
+      the power-state register.
     type: boolean
 
   apple,min-state:

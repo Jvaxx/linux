@@ -30,8 +30,48 @@ description: >
   second eUSB2 PHY register bank whose per-device defaults are also provided by
   the bootloader.
 
+  The T8132 variant provides only USB2 and its pipehandler, without the
+  SuperSpeed core or its associated register banks and tunables.
+
 allOf:
   - $ref: /schemas/usb/usb-switch.yaml#
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8132-atcphy
+    then:
+      properties:
+        reg:
+          items:
+            - description: USB2 PHY specific controls
+            - description: USB3 PIPE interface controls
+        reg-names:
+          items:
+            - const: usb2phy
+            - const: pipehandler
+    else:
+      properties:
+        reg:
+          minItems: 5
+          items:
+            - description: Common controls for all PHYs (USB2/3/4, DisplayPort, TBT)
+            - description: DisplayPort Alternate Mode PHY specific controls
+            - description: Type-C PHY AXI to Apple Fabric interconnect controls
+            - description: USB2 PHY specific controls
+            - description: USB3 PIPE interface controls
+            - description: Secondary eUSB2 PHY register bank (T8140)
+        reg-names:
+          minItems: 5
+          items:
+            - const: core
+            - const: lpdptx
+            - const: axi2af
+            - const: usb2phy
+            - const: pipehandler
+            - const: usb2phy-reg
+      required:
+        - power-domains
   - if:
       properties:
         compatible:
@@ -82,28 +122,17 @@ properties:
               - apple,t8112-atcphy
           - const: apple,t8103-atcphy
       - const: apple,t8103-atcphy
+      - const: apple,t8132-atcphy
       - const: apple,t8140-atcphy
       - const: apple,t8142-atcphy
 
   reg:
-    minItems: 5
-    items:
-      - description: Common controls for all PHYs (USB2/3/4, DisplayPort, TBT)
-      - description: DisplayPort Alternate Mode PHY specific controls
-      - description: Type-C PHY AXI to Apple Fabric interconnect controls
-      - description: USB2 PHY specific controls
-      - description: USB3 PIPE interface controls
-      - description: Secondary eUSB2 PHY register bank (T8140)
+    minItems: 2
+    maxItems: 6
 
   reg-names:
-    minItems: 5
-    items:
-      - const: core
-      - const: lpdptx
-      - const: axi2af
-      - const: usb2phy
-      - const: pipehandler
-      - const: usb2phy-reg
+    minItems: 2
+    maxItems: 6
 
   "#phy-cells":
     const: 1
@@ -230,7 +259,6 @@ required:
   - "#reset-cells"
   - orientation-switch
   - mode-switch
-  - power-domains
   - ports
 
 additionalProperties: false
