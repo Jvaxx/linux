@@ -25,8 +25,10 @@
 #include <linux/jiffies.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/mfd/syscon.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/regmap.h>
 #include <linux/seq_file.h>
 #include <linux/soc/apple/pmc.h>
 #include <linux/workqueue.h>
@@ -59,6 +61,7 @@ struct apple_clpc_hw {
 	unsigned int rail[APPLE_CLPC_RAILS];
 	unsigned int sustain;
 	u8 map[APPLE_CLPC_RAILS][APPLE_CLPC_LEVELS];
+	bool gpu_demand;
 };
 
 struct apple_clpc_cluster {
@@ -96,6 +99,8 @@ struct apple_clpc {
 	unsigned long samples;
 	unsigned long update_errors;
 	struct dentry *debugfs;
+	struct regmap *gpu_pmgr;
+	u32 gpu_offset;
 };
 
 /* cpufreq policies can appear after probe; pick up new ones as they do. */
@@ -243,6 +248,17 @@ static void apple_clpc_sample(struct apple_clpc *clpc)
 		for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
 			demand[rail] = max(demand[rail], cl->request[rail]);
 	}
+	if (clpc->gpu_pmgr) {
+		u32 status;
+
+		/* Keep the qualified floor while graphics is powered. A failed
+		 * read must not silently starve a running graphics consumer.
+		 */
+		if (regmap_read(clpc->gpu_pmgr, clpc->gpu_offset, &status) ||
+		    (status & GENMASK(7, 4)) == GENMASK(7, 4))
+			for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
+				demand[rail] = clpc->hw->map[rail][APPLE_CLPC_LEVELS - 1];
+	}
 
 	for (rail = 0; rail < APPLE_CLPC_RAILS; rail++)
 		state[rail] = apple_clpc_vote(&clpc->vote[rail], demand[rail],
@@ -349,6 +365,20 @@ static int apple_clpc_probe(struct platform_device *pdev)
 	clpc->dev = dev;
 	clpc->pmc = dev->parent;
 	clpc->hw = of_device_get_match_data(dev);
+	if (clpc->hw->gpu_demand) {
+		struct device_node *gpu = of_parse_phandle(dev->of_node,
+							 "apple,gpu-power-state", 0);
+
+		if (!gpu)
+			return dev_err_probe(dev, -EINVAL, "missing graphics power state\n");
+		ret = of_property_read_u32(gpu, "reg", &clpc->gpu_offset);
+		clpc->gpu_pmgr = syscon_node_to_regmap(gpu->parent);
+		of_node_put(gpu);
+		if (ret)
+			return ret;
+		if (IS_ERR(clpc->gpu_pmgr))
+			return PTR_ERR(clpc->gpu_pmgr);
+	}
 	if (!apple_pmc_rail_count(clpc->pmc))
 		return dev_err_probe(dev, -ENODEV, "parent is not a PMC\n");
 
@@ -437,6 +467,18 @@ static DEFINE_SIMPLE_DEV_PM_OPS(apple_clpc_pm_ops, apple_clpc_suspend,
  * cluster raises the DCS one state per frequency quartile and leaves the
  * fabric alone.
  */
+/* Only the stock M5/F3 busy floor is qualified on T8132. Do not invent
+ * intermediate frequency-to-memory tables; idle can still release the vote.
+ */
+static const struct apple_clpc_hw apple_clpc_hw_t8132 = {
+	.rail = { [APPLE_CLPC_DCS] = 0, [APPLE_CLPC_SOC] = 1 },
+	.map = {
+		[APPLE_CLPC_DCS] = { 5, 5, 5, 5 },
+		[APPLE_CLPC_SOC] = { 3, 3, 3, 3 },
+	},
+	.gpu_demand = true,
+};
+
 static const struct apple_clpc_hw apple_clpc_hw_t8140 = {
 	.rail = { [APPLE_CLPC_DCS] = 0, [APPLE_CLPC_SOC] = 1 },
 	.map = {
@@ -468,6 +510,7 @@ static const struct apple_clpc_hw apple_clpc_hw_t6040 = {
 };
 
 static const struct of_device_id apple_clpc_of_match[] = {
+	{ .compatible = "apple,t8132-clpc", .data = &apple_clpc_hw_t8132 },
 	{ .compatible = "apple,t8140-clpc", .data = &apple_clpc_hw_t8140 },
 	{ .compatible = "apple,t6041-clpc", .data = &apple_clpc_hw_t6040 },
 	{}
