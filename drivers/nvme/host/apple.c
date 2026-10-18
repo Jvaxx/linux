@@ -198,6 +198,8 @@ struct apple_nvme_hw {
 	bool has_queue_count;
 	bool has_separate_nvmmu;
 	bool needs_ioq_registers;
+	/* T8132 needs a PMGR reset when starting a stopped coprocessor. */
+	bool cold_reset;
 	u32 max_queue_depth;
 	unsigned long quirks;
 };
@@ -210,6 +212,7 @@ struct apple_nvme {
 	/* Protects reset_ready against RTKit crash callbacks. */
 	spinlock_t event_lock;
 	bool reset_ready;
+	bool handoff_disabled;
 	struct list_head quarantine_node;
 	resource_size_t controller_start;
 	bool quarantined;
@@ -336,15 +339,33 @@ static bool apple_nvme_can_adopt_rtkit(struct apple_nvme *anv)
 		return false;
 	cc = readl(anv->mmio_nvme + NVME_REG_CC);
 	csts = readl(anv->mmio_nvme + NVME_REG_CSTS);
+	if (csts & NVME_CSTS_CFS)
+		return false;
 
 	/*
-	 * CPU_RUN and BOOT_STATUS alone survive a session that has gone
-	 * inactive. Only a controller that the previous owner left enabled
-	 * and ready identifies a live session. Borrowed buffers still require
-	 * reserved RAM and protected SART ranges.
+	 * CPU_RUN and BOOT_STATUS alone survive inactive sessions. A disabled
+	 * controller requires the producer's explicit live-session contract.
+	 * Borrowed buffers still require reserved RAM and protected SART ranges.
 	 */
-	return (cc & NVME_CC_ENABLE) && (csts & NVME_CSTS_RDY) &&
-	       !(csts & NVME_CSTS_CFS);
+	if (anv->handoff_disabled)
+		return !(cc & NVME_CC_ENABLE) && !(csts & NVME_CSTS_RDY);
+	return (cc & NVME_CC_ENABLE) && (csts & NVME_CSTS_RDY);
+}
+
+static int apple_nvme_read_handoff(struct apple_nvme *anv)
+{
+	const char *handoff;
+	int ret;
+
+	ret = of_property_read_string(anv->dev->of_node, "apple,rtkit-handoff",
+				      &handoff);
+	if (ret == -EINVAL)
+		return 0;
+	if (ret || !anv->hw->needs_ioq_registers ||
+	    strcmp(handoff, "nvme-disabled-v1"))
+		return -EINVAL;
+	anv->handoff_disabled = true;
+	return apple_nvme_can_adopt_rtkit(anv) ? 0 : -EIO;
 }
 
 static inline struct apple_nvme *queue_to_apple_nvme(struct apple_nvme_queue *q)
@@ -1634,7 +1655,7 @@ static void apple_nvme_reset_work(struct work_struct *work)
 	if (!(readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL) &
 		APPLE_ANS_COPROC_CPU_CONTROL_RUN)) {
 
-		if (anv->hw->needs_ioq_registers) {
+		if (anv->hw->needs_ioq_registers && !anv->hw->cold_reset) {
 			/*
 			 * Post-M4 ANS cannot be reset through PMGR: the reset
 			 * assert raises an SError. A previous boot stage that
@@ -2290,6 +2311,12 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 		anv->mmio_nvmmu = anv->mmio_nvme;
 	}
 
+	ret = apple_nvme_read_handoff(anv);
+	if (ret) {
+		dev_err_probe(dev, ret, "Invalid live firmware handoff\n");
+		goto out_detach_genpd;
+	}
+
 	if (anv->hw->has_lsq_nvmmu) {
 		anv->adminq.sq_db = anv->mmio_nvme + APPLE_ANS_LINEAR_ASQ_DB;
 		anv->adminq.cq_db = anv->mmio_nvme + APPLE_ANS_ACQ_DB;
@@ -2624,7 +2651,10 @@ static const struct apple_nvme_hw apple_nvme_t8132_hw = {
 	.has_lsq_nvmmu = true,
 	.has_separate_nvmmu = true,
 	.needs_ioq_registers = true,
+	.cold_reset = true,
 	.max_queue_depth = 64,
+	/* Explicit flushes are required for writes to survive a reset on J713. */
+	.quirks = NVME_QUIRK_BROKEN_FUA,
 };
 
 static const struct apple_nvme_hw apple_nvme_t8140_hw = {
