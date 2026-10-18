@@ -301,6 +301,7 @@ struct apple_dart {
 	bool reset_incomplete;
 	struct apple_tunable *tunables;
 	u16 version;
+	bool retained_mtp;
 
 	DECLARE_BITMAP(remapped, DART_MAX_STREAMS);
 	u8 remap_target[DART_MAX_STREAMS];
@@ -2001,7 +2002,8 @@ static int apple_dart_attach_dev_identity(struct iommu_domain *domain,
 		WARN_ON(pm_runtime_get_sync(stream_map->dart->dev) < 0);
 
 	for_each_stream_map(i, cfg, stream_map)
-		apple_dart_hw_enable_bypass(stream_map);
+		if (!stream_map->dart->retained_mtp)
+			apple_dart_hw_enable_bypass(stream_map);
 
 	for_each_stream_map(i, cfg, stream_map)
 		pm_runtime_put(stream_map->dart->dev);
@@ -2427,6 +2429,11 @@ static int apple_dart_def_domain_type(struct device *dev)
 {
 	struct apple_dart_master_cfg *cfg = dev_iommu_priv_get(dev);
 
+	if (cfg->stream_maps[0].dart->retained_mtp)
+		return IOMMU_DOMAIN_IDENTITY;
+	if (dev_is_pci(dev) && of_machine_is_compatible("apple,j713") &&
+	    cfg->supports_bypass && !cfg->locked)
+		return IOMMU_DOMAIN_IDENTITY;
 	if (cfg->stream_maps[0].dart->pgsize > PAGE_SIZE)
 		return IOMMU_DOMAIN_IDENTITY;
 	if (!cfg->supports_bypass)
@@ -2814,6 +2821,21 @@ static bool apple_dart_is_locked(struct apple_dart *dart)
 	return !!(apple_dart_readl(dart, dart->hw->lock) & dart->hw->lock_bit);
 }
 
+static bool apple_dart_streams_bypassed(struct apple_dart *dart)
+{
+	unsigned int sid;
+
+	for (sid = 0; sid < dart->num_streams; sid++) {
+		if ((apple_dart_readl(dart, DART_TCR(dart, sid)) &
+		     (DART_T8110_TCR_BYPASS_DART | DART_T8110_TCR_TRANSLATE_ENABLE)) !=
+		    DART_T8110_TCR_BYPASS_DART ||
+		    (apple_dart_readl(dart, DART_TTBR(dart, sid, 0)) & dart->hw->ttbr_valid))
+			return false;
+	}
+	return true;
+}
+
+
 static void apple_dart_iounmap_np(void *data)
 {
 	iounmap((__force void __iomem *)data);
@@ -2862,6 +2884,18 @@ static int apple_dart_probe(struct platform_device *pdev)
 	bool tunneled = dev->of_node->parent &&
 			 of_node_name_prefix(dev->of_node->parent,
 					     "usb4-pcie-tunnel-");
+
+	bool j713_radio;
+
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	if (res && !tunneled && of_machine_is_compatible("apple,j713") &&
+	    of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
+	    (res->start == 0x30a300000ULL || res->start == 0x30a340000ULL))
+		return -ENODEV; /* The bootloader still owns the display. */
+	j713_radio = res && !tunneled && of_machine_is_compatible("apple,j713") &&
+		of_machine_is_compatible("apple,t8132") &&
+		of_device_is_compatible(dev->of_node, "apple,t8132-dart") &&
+		res->start == 0x490000000ULL;
 
 	dart = devm_kzalloc(dev, sizeof(*dart), GFP_KERNEL);
 	if (!dart)
@@ -2926,9 +2960,17 @@ static int apple_dart_probe(struct platform_device *pdev)
 		}
 	}
 
-	dart->irq = platform_get_irq(pdev, 0);
-	if (dart->irq < 0)
-		return -ENODEV;
+	if (j713_radio) {
+		dart->irq = platform_get_irq_optional(pdev, 0);
+		if (dart->irq == -ENXIO)
+			dart->irq = -1;
+		else if (dart->irq < 0)
+			return dart->irq;
+	} else {
+		dart->irq = platform_get_irq(pdev, 0);
+		if (dart->irq < 0)
+			return -ENODEV;
+	}
 
 	ret = devm_clk_bulk_get_all(dev, &dart->clks);
 	if (ret < 0)
@@ -3103,7 +3145,15 @@ params_done:
 	dart->fw_mirror = dart->locked && !dart->fw_handoff &&
 		(of_device_is_compatible(dev->of_node, "apple,t8140-dart") ||
 		 of_device_is_compatible(dev->of_node, "apple,t8142-dart"));
-	if (!dart->locked) {
+	if (of_machine_is_compatible("apple,j713") &&
+	    of_machine_is_compatible("apple,t8132") &&
+	    res->start == 0x394800000ULL && dart->hw->type == DART_T8110 &&
+	    !dart->locked && !tunneled && dart->supports_bypass &&
+	    apple_dart_streams_bypassed(dart)) {
+		dart->retained_mtp = true;
+		dev_info(dev, "Retaining the live J713 MTP bypass\n");
+	}
+	if (!dart->locked && !dart->retained_mtp) {
 		ret = apple_dart_hw_reset(dart);
 		if (ret)
 			goto err_clk_disable;
@@ -3112,10 +3162,12 @@ params_done:
 	if (dart->locked)
 		apple_dart_drain_stale_exceptions(dart);
 
-	ret = request_irq(dart->irq, apple_dart_irq, IRQF_SHARED,
-			  "apple-dart fault handler", dart);
-	if (ret)
-		goto err_clk_disable;
+	if (dart->irq >= 0) {
+		ret = request_irq(dart->irq, apple_dart_irq, IRQF_SHARED,
+				  "apple-dart fault handler", dart);
+		if (ret)
+			goto err_clk_disable;
+	}
 
 	ret = iommu_device_sysfs_add(&dart->iommu, dev, NULL, "apple-dart.%s",
 				     dev_name(&pdev->dev));
@@ -3126,7 +3178,8 @@ params_done:
 	if (ret)
 		goto err_sysfs_remove;
 
-	pm_runtime_put(dev);
+	if (!dart->retained_mtp)
+		pm_runtime_put(dev);
 
 	dev_dbg(
 		&pdev->dev,
@@ -3138,7 +3191,8 @@ params_done:
 err_sysfs_remove:
 	iommu_device_sysfs_remove(&dart->iommu);
 err_free_irq:
-	free_irq(dart->irq, dart);
+	if (dart->irq >= 0)
+		free_irq(dart->irq, dart);
 err_clk_disable:
 	pm_runtime_put(dev);
 	clk_bulk_disable_unprepare(dart->num_clks, dart->clks);
@@ -3256,7 +3310,8 @@ static void apple_dart_remove(struct platform_device *pdev)
 	if (!dart->locked && !READ_ONCE(dart->commands_gated))
 		apple_dart_hw_reset(dart);
 
-	free_irq(dart->irq, dart);
+	if (dart->irq >= 0)
+		free_irq(dart->irq, dart);
 
 	iommu_device_unregister(&dart->iommu);
 	iommu_device_sysfs_remove(&dart->iommu);
@@ -3381,7 +3436,7 @@ static __maybe_unused int apple_dart_suspend(struct device *dev)
 	if (READ_ONCE(dart->commands_gated))
 		return 0;
 	/* The tunneled DART has no state to save when its domain stays on. */
-	if (dart->power_retained)
+	if (dart->power_retained || dart->retained_mtp)
 		return 0;
 
 	/* Locked DARTs can't be restored so skip saving their registers. */
@@ -3477,7 +3532,7 @@ static __maybe_unused int apple_dart_resume(struct device *dev)
 	 * state. Resetting one here is unnecessary; DART access must remain
 	 * ordered after PCIe-C port resume.
 	 */
-	if (dart->power_retained || READ_ONCE(dart->commands_gated))
+	if (dart->power_retained || dart->retained_mtp || READ_ONCE(dart->commands_gated))
 		return 0;
 
 	/* Locked DARTs can't be restored, and they should not need it */
