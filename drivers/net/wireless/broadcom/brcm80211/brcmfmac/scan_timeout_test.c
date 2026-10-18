@@ -77,4 +77,5 @@ static struct kunit_suite brcmf_scan_timeout_suite = {
 
 kunit_test_suite(brcmf_scan_timeout_suite);
 
+MODULE_DESCRIPTION("KUnit tests for the brcmfmac scan timeout budget");
 MODULE_LICENSE("GPL");
