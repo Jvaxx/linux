@@ -51,6 +51,15 @@ pub(crate) fn plan(stage: u32, holds_sensor: bool, nonce_session: bool, sepos13:
     }
 }
 
+/// Whether the sensor's patch is in place, from the status read after a
+/// registration: `accepted` is its patch acknowledgement (status[8]) reading
+/// accepted and `needs_patch` its state reading 9. On a profile with a nonce
+/// session state 9 overrides an accepted acknowledgement; on one without,
+/// the acknowledgement alone decides, as it always has there.
+pub(crate) fn patch_loaded(nonce_session: bool, accepted: bool, needs_patch: bool) -> bool {
+    accepted && !(nonce_session && needs_patch)
+}
+
 /// The bring-up stage an attempt that follows a failed one starts from.
 ///
 /// A profile with a nonce session identifies the sensor and clears the
@@ -708,6 +717,19 @@ mod tests {
         assert_eq!(outcome, Outcome::GaveUp(4));
         assert_eq!(&s.pauses[..s.paused], &[500, 1000, 2000]);
         assert_eq!(after_round(outcome.online(), true), AttachState::Retrying);
+    }
+
+    #[test]
+    fn the_status_after_registration_decides_the_patch() {
+        // Nonce session: state 9 asks for the patch even when acknowledged.
+        assert!(patch_loaded(true, true, false));
+        assert!(!patch_loaded(true, true, true));
+        assert!(!patch_loaded(true, false, false));
+        // Without one, the acknowledgement alone decides.
+        assert!(patch_loaded(false, true, false));
+        assert!(patch_loaded(false, true, true));
+        assert!(!patch_loaded(false, false, false));
+        assert!(!patch_loaded(false, false, true));
     }
 
     #[test]

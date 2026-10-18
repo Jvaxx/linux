@@ -2238,40 +2238,38 @@ impl SepData {
                 return None;
             }
 
-            if self.profile.nonce_session {
-                // Registration can reset the sensor session. Do not reuse the
-                // acknowledgement sampled before CLEAR_STATE and authentication.
-                let st = match sensor::status() {
-                    Ok(st) if !st.is_silent() => st,
-                    Ok(_) => {
-                        dev_warn!(
-                            self.dev,
-                            "sensor: status unavailable after registration: silent {} ms after power-on\n",
-                            self.sensor_ms()
-                        );
-                        return None;
-                    }
-                    Err(e) => {
-                        dev_warn!(
-                            self.dev,
-                            "sensor: status unavailable after registration: read failed ({:?}) {} ms after power-on\n",
-                            e,
-                            self.sensor_ms()
-                        );
-                        return None;
-                    }
-                };
-                if st.patch_ack() == sensor::PATCH_ACCEPTED
-                    && st.state != sensor::STATE_NEEDS_PATCH
-                {
-                    return Some(PatchLoaded(()));
+            // Read the status again before anything else goes to the sensor,
+            // on every profile. Registration can reset an authenticated
+            // session, so the acknowledgement sampled before it is stale; and
+            // on a T6000 the session share that followed a registration
+            // without this read was dropped or answered wrongly on 4 boots in
+            // 15, while the kernels that made it never failed. See
+            // registration::patch_loaded for what decides.
+            let st = match sensor::status() {
+                Ok(st) if !st.is_silent() => st,
+                Ok(_) => {
+                    dev_warn!(
+                        self.dev,
+                        "sensor: status unavailable after registration: silent {} ms after power-on\n",
+                        self.sensor_ms()
+                    );
+                    return None;
                 }
-                return self.apply_sensor_patch(st.patch_ack());
-            }
-
-            // Nonce-free profiles keep the patch acknowledgement read before
-            // registration; their status[8], rather than state 9, decides.
-            if st.patch_ack() == sensor::PATCH_ACCEPTED {
+                Err(e) => {
+                    dev_warn!(
+                        self.dev,
+                        "sensor: status unavailable after registration: read failed ({:?}) {} ms after power-on\n",
+                        e,
+                        self.sensor_ms()
+                    );
+                    return None;
+                }
+            };
+            if registration::patch_loaded(
+                self.profile.nonce_session,
+                st.patch_ack() == sensor::PATCH_ACCEPTED,
+                st.state == sensor::STATE_NEEDS_PATCH,
+            ) {
                 return Some(PatchLoaded(()));
             }
             return self.apply_sensor_patch(st.patch_ack());
