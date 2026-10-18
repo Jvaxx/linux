@@ -4112,7 +4112,7 @@ static void atcphy_typec_mux_unregister(void *data)
  * Only a timeout of this PHY counts, not one of the display route that shares
  * the connector. The PHY's other timeouts, of its power and PLL polls, are
  * faults that retrying does not clear, but the Type-C driver stops retrying
- * after about two minutes, which bounds those as well.
+ * once a hold-up has lasted two minutes, which bounds those as well.
  */
 static bool atcphy_mux_transient_timeouts(const struct apple_atcphy *atcphy)
 {

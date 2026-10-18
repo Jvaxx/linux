@@ -788,20 +788,24 @@ static void cd321x_retry_revalidation(struct cd321x *cd321x, bool reconnect)
 
 static void cd321x_retry_held_mux(struct cd321x *cd321x)
 {
-	unsigned int delay;
+	unsigned int now_ms = jiffies_to_msecs(jiffies);
+	unsigned int retries, held_ms, delay;
 
 	lockdep_assert_held(&cd321x->tps.lock);
+	/* For the warning, should the retries end here */
+	retries = cd321x->pm.mux_retries;
+	held_ms = now_ms - cd321x->pm.mux_since_ms;
 	cd321x->state_valid = false;
 	if (!cd321x->pm.mux_retry_ms)
 		dev_info(cd321x->tps.dev, "Type-C mux held up, retrying\n");
-	delay = cd321x_pm_mux_held(&cd321x->pm);
+	delay = cd321x_pm_mux_held(&cd321x->pm, now_ms);
 	if (delay)
 		mod_delayed_work(system_freezable_wq, &cd321x->resume_work,
 				 msecs_to_jiffies(delay));
 	else
 		dev_warn(cd321x->tps.dev,
-			 "Type-C mux still held up after %u retries, waiting for the next event\n",
-			 CD321X_MUX_RETRIES);
+			 "Type-C mux still held up after %u retries in %u s, waiting for the next event\n",
+			 retries, held_ms / 1000);
 }
 
 static void cd321x_update_done(struct cd321x *cd321x)
