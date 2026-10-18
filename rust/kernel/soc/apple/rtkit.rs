@@ -230,11 +230,18 @@ impl<T: Operations> RtKit<T> {
         } else {
             None
         },
+        shmem_setup_ep: None,
         shmem_destroy: if T::HAS_SHMEM_ALLOC || T::HAS_SHMEM_MAP {
             Some(shmem_destroy_callback::<T>)
         } else {
             None
         },
+        protocol_version: 0,
+    };
+
+    const COREANALYTICS_VTABLE: bindings::apple_rtkit_ops = bindings::apple_rtkit_ops {
+        flags: Self::VTABLE.flags | bindings::APPLE_RTKIT_NEEDS_COREANALYTICS,
+        ..Self::VTABLE
     };
 
     /// Creates a new RTKit client for a given device and optional mailbox name or index.
@@ -243,6 +250,29 @@ impl<T: Operations> RtKit<T> {
         mbox_name: Option<&'static CStr>,
         mbox_idx: usize,
         data: T::Data,
+    ) -> Result<Self> {
+        Self::new_with_ops(dev, mbox_name, mbox_idx, data, &Self::VTABLE)
+    }
+
+    /// Creates a client that requires CoreAnalytics setup during boot.
+    ///
+    /// The caller must qualify this dependency for the particular firmware
+    /// instance. This selects immutable operations before mailbox RX starts.
+    pub fn new_with_coreanalytics(
+        dev: &device::Device,
+        mbox_name: Option<&'static CStr>,
+        mbox_idx: usize,
+        data: T::Data,
+    ) -> Result<Self> {
+        Self::new_with_ops(dev, mbox_name, mbox_idx, data, &Self::COREANALYTICS_VTABLE)
+    }
+
+    fn new_with_ops(
+        dev: &device::Device,
+        mbox_name: Option<&'static CStr>,
+        mbox_idx: usize,
+        data: T::Data,
+        ops: &'static bindings::apple_rtkit_ops,
     ) -> Result<Self> {
         let ptr: *mut crate::ffi::c_void = data.into_foreign().cast();
         let guard = ScopeGuard::new(|| {
@@ -260,7 +290,7 @@ impl<T: Operations> RtKit<T> {
                     None => ptr::null(),
                 },
                 mbox_idx.try_into()?,
-                &Self::VTABLE,
+                ops,
             ))
         }?;
 
