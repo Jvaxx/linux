@@ -2726,11 +2726,9 @@ void dcp_poweron(struct platform_device *pdev)
 	}
 
 	if (dcp_is_typec_output(dcp)) {
-		/* T8122 dcpext only, see dcp_poweroff() */
-		if (dcp->ext_failsafe) {
-			scoped_guard(mutex, &dcp->hpd_mutex)
-				dcp->crtc_unplugs = dcp->typec_unplugs;
-		}
+		/* This CRTC now owns the current Type-C display session. */
+		scoped_guard(mutex, &dcp->hpd_mutex)
+			dcp->crtc_unplugs = dcp->typec_unplugs;
 		wait_for_typec_hpd = READ_ONCE(dcp->typec_crtc_off) &&
 				    READ_ONCE(dcp->typec_cable_connected);
 		WRITE_ONCE(dcp->typec_crtc_off, false);
@@ -2853,12 +2851,13 @@ void dcp_poweroff(struct platform_device *pdev)
 	 * release: dropping its HPD makes the firmware report the new display
 	 * inactive, and it stays dark.
 	 *
-	 * Only the T8122 dcpext (ext_failsafe) takes this path, the one
-	 * pipeline where it was run. Every other Type-C output releases its
-	 * connection below as before: the M1/M2 dcpext routes, and the T6030
-	 * split second port and external retry.
+	 * This applies to every Type-C output.  In particular, an M1/M2 dock can
+	 * disappear and return while its old disconnect is still making the
+	 * desktop turn the CRTC off.  Releasing the replacement session then
+	 * leaves the dock in USB2-only mode with no later sink attention to
+	 * trigger a relink.
 	 */
-	if (dcp->ext_failsafe && dcp_is_typec_output(dcp)) {
+	if (dcp_is_typec_output(dcp)) {
 		scoped_guard(mutex, &dcp->hpd_mutex)
 			display_gone = dcp->typec_unplugs != dcp->crtc_unplugs;
 		if (display_gone) {

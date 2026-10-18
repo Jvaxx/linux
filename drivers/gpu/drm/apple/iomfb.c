@@ -2101,6 +2101,11 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 
 	action = dcp_mode_finish(&dcp->mode_state, !ret, dcp->connector ?
 				&dcp->connector->connected : NULL);
+	/* A successful mode set makes the CRTC owner of this Type-C session. */
+	if (!ret && dcp_is_typec_output(dcp)) {
+		scoped_guard(mutex, &dcp->hpd_mutex)
+			dcp->crtc_unplugs = dcp->typec_unplugs;
+	}
 	/* An external mode set that failed leaves the CRTC without a link too. */
 	if (ret && dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		action |= DCP_HOTPLUG_NOTIFY;

@@ -30,10 +30,11 @@ The modules contain public synthetic host boundaries and retained assertions:
   warm reset and legacy T8103/T8122/T8140/T8142 route controls.
 * lifecycle: actual physical-disconnect authority and ownership despite failed
   teardown; a fast dock replug whose DPTX link never configures (withdrawn,
-  unacknowledged, unanswered, refused and live failures); a dock that leaves
-  during the first mode set, whose dropped present keeps the IOMFB queue busy
-  (deferred and retried stop, never-retired, post-power-off and crashed-queue
-  latches); DWC3/core/PHY PM
+  unacknowledged, unanswered, refused and live failures); an old disconnect's
+  delayed CRTC power-off racing a replacement M1/M2 Type-C session; a dock
+  that leaves during the first mode set, whose dropped present keeps the IOMFB
+  queue busy (deferred and retried stop, never-retired, post-power-off and
+  crashed-queue latches); DWC3/core/PHY PM
   and reset-reference recovery; exact firmware
   tuple/resource admission, unsupported VRR rejection and power reply bounds;
   15,552 D134 dispatcher scope/length/context and legacy reply cases.
