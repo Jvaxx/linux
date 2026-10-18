@@ -425,6 +425,13 @@ struct apple_dart_master_cfg {
 	u32 supports_bypass : 1;
 	u32 locked : 1;
 
+	/*
+	 * DMA aperture start and end to be overridden by "iommus"' phandle
+	 * args. By default determined by DART's ias but may be outside of it.
+	 */
+	dma_addr_t dma_min;
+	dma_addr_t dma_max;
+
 	struct apple_dart_stream_map stream_maps[MAX_DARTS_PER_DEVICE];
 };
 
@@ -1604,8 +1611,8 @@ static int apple_dart_finalize_domain(struct apple_dart_domain *dart_domain,
 {
 	struct apple_dart *dart = cfg->stream_maps[0].dart;
 	struct io_pgtable_cfg pgtbl_cfg;
-	dma_addr_t dma_min = dart_domain->has_dma_range ? dart_domain->dma_min : dart->dma_min;
-	dma_addr_t dma_max = dart_domain->has_dma_range ? dart_domain->dma_max : dart->dma_max;
+	dma_addr_t dma_min = dart_domain->has_dma_range ? dart_domain->dma_min : cfg->dma_min;
+	dma_addr_t dma_max = dart_domain->has_dma_range ? dart_domain->dma_max : cfg->dma_max;
 	u64 translated_max;
 	u32 ias;
 	int ret = 0;
@@ -1981,6 +1988,52 @@ static void apple_dart_domain_free(struct iommu_domain *domain)
 	kfree(dart_domain);
 }
 
+static int apple_dart_parse_dma_window(struct device *dev,
+				       const struct apple_dart *dart,
+				       const struct of_phandle_args *args,
+				       dma_addr_t *dma_min,
+				       dma_addr_t *dma_max)
+{
+	dma_addr_t length;
+
+	*dma_min = dart->dma_min;
+	*dma_max = dart->dma_max;
+
+	if (args->args_count == 1)
+		return 0;
+	if (args->args_count != 5)
+		return -EINVAL;
+
+	length = ((dma_addr_t)args->args[3] << 32) | args->args[4];
+	if (!length)
+		return -EINVAL;
+
+	if (*dma_min != 0 || *dma_max != DMA_BIT_MASK(dart->ias))
+		dev_err(dev, "still using legacy \"apple,dma-range\" property\n");
+
+	*dma_min = ((dma_addr_t)args->args[1] << 32) | args->args[2];
+
+	if (!IS_ALIGNED(*dma_min, dart->pgsize) ||
+	    !IS_ALIGNED(length, dart->pgsize)) {
+		dev_err(dev, "Unaligned DMA window %pad, %pad (0x%x)\n",
+			dma_min, &length, dart->pgsize);
+		return -EINVAL;
+	}
+	if (check_add_overflow(*dma_min, length - 1, dma_max)) {
+		dev_err(dev, "DMA window length (%pad) overflows range for start %pad\n",
+			&length, dma_min);
+		return -EINVAL;
+	}
+
+	/* Ensure that the DMA window does not exceed the DART's ias. */
+	if ((*dma_min ^ *dma_max) & ~DMA_BIT_MASK(dart->ias)) {
+		dev_err(dev, "Invalid DMA window for ias=%d\n", dart->ias);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
 static int apple_dart_of_xlate(struct device *dev,
 			       const struct of_phandle_args *args)
 {
@@ -1988,12 +2041,16 @@ static int apple_dart_of_xlate(struct device *dev,
 	struct platform_device *iommu_pdev = of_find_device_by_node(args->np);
 	struct apple_dart *dart = platform_get_drvdata(iommu_pdev);
 	struct apple_dart *cfg_dart;
+	dma_addr_t dma_max;
+	dma_addr_t dma_min;
 	int i, sid;
 
 	put_device(&iommu_pdev->dev);
 
-	if (args->args_count != 1)
-		return -EINVAL;
+	i = apple_dart_parse_dma_window(dev, dart, args, &dma_min, &dma_max);
+	if (i)
+		return i;
+
 	sid = args->args[0];
 
 	if (!cfg) {
@@ -2004,6 +2061,18 @@ static int apple_dart_of_xlate(struct device *dev,
 		cfg->supports_bypass = true;
 		/* Will be ORed with DART capabilities*/
 		cfg->locked = false;
+		/* Will be merged with other DARTs to the common range. */
+		cfg->dma_min = dma_min;
+		cfg->dma_max = dma_max;
+	} else {
+		if (dma_min >= cfg->dma_max || cfg->dma_min >= dma_max) {
+			dev_err(dev, "non-overlapping DMA windows: %pad..%pad, %pad..%pad\n",
+				&dma_min, &dma_max,
+				&cfg->dma_min, &cfg->dma_max);
+			return -EINVAL;
+		}
+		cfg->dma_min = max(dma_min, cfg->dma_min);
+		cfg->dma_max = min(dma_max, cfg->dma_max);
 	}
 	dev_iommu_priv_set(dev, cfg);
 
