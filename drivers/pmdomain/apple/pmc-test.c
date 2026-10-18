@@ -165,9 +165,30 @@ static void apple_pmc_test_release_restores_ap_vote(struct kunit *test)
 		KUNIT_EXPECT_EQ(test, apple_pmc_enable_read(pmc, rail), pmc->saved_enable[rail]);
 }
 
+/* A busy T8132 agent must not have its in-flight command overwritten. */
+static void apple_pmc_test_pending_floor(struct kunit *test)
+{
+	struct apple_pmc *pmc = apple_pmc_test_alloc(test);
+	struct device dev = {};
+	void __iomem *reg;
+
+	pmc->hw = &apple_pmc_hw_t8132;
+	dev_set_drvdata(&dev, pmc);
+	reg = pmc->voters + pmc->hw->ap_agent * pmc->hw->agent_stride;
+	writel(0xa500, reg);
+	writel(BIT(pmc->hw->ap_agent), reg + 4);
+	KUNIT_EXPECT_EQ(test, apple_pmc_floor_update(&dev, 3, 0xff, 0x35), -ETIMEDOUT);
+	KUNIT_EXPECT_EQ(test, readl(reg), 0xa500U);
+	writel(0, reg + 4);
+	KUNIT_EXPECT_EQ(test, apple_pmc_floor_update(&dev, 3, 0xff, 0x35), 0);
+	KUNIT_EXPECT_EQ(test, readl(reg), 0xa535U);
+	KUNIT_EXPECT_EQ(test, apple_pmc_floor_update(&dev, 4, 0xff, 0x35), -EINVAL);
+}
+
 static struct kunit_case apple_pmc_test_cases[] = {
 	KUNIT_CASE(apple_pmc_test_partial_enable),
 	KUNIT_CASE(apple_pmc_test_release_restores_ap_vote),
+	KUNIT_CASE(apple_pmc_test_pending_floor),
 	KUNIT_CASE(apple_pmc_test_agent_enable),
 	KUNIT_CASE(apple_pmc_test_agent_rails),
 	KUNIT_CASE(apple_pmc_test_dcs_limit_restores_ap_vote),
