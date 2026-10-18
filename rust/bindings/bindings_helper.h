@@ -100,6 +100,7 @@
 #include <linux/serdev.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/mailbox.h>
+#include <linux/soc/apple/pmp-telemetry.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/pmp.h>
 #include <linux/sys_soc.h>

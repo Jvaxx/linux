@@ -6,6 +6,7 @@
 //! Copyright (C) The Asahi Linux Contributors
 
 use core::mem;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 mod pmp_bootargs;
 mod pmp_power;
@@ -23,11 +24,15 @@ use kernel::{
         Device as _,
         DmaMask, //
     },
+    error::to_result,
     io::{
+        mem::DevresIoMem,
         Io,
+        IoBackend,
         IoBase,
         IoSysMap,
         Mmio,
+        MmioBackend,
         Region, //
     },
     kvec,
@@ -145,10 +150,13 @@ impl PmpState {
 #[pin_data]
 struct PmpData {
     dev: ARef<device::Device>,
+    pmp_mmio: DevresIoMem<PMP_MIN_MMIO_SIZE>,
+    asc_mmio: DevresIoMem<ASC_MMIO_SIZE>,
     #[pin]
     rtkit: Mutex<Option<rtkit::RtKit<PmpData>>>,
     #[pin]
     state: Mutex<PmpState>,
+    failed: AtomicBool,
     #[pin]
     power_command: Mutex<Command>,
     #[pin]
@@ -157,6 +165,10 @@ struct PmpData {
 
 impl PmpData {
     fn new(dev: &platform::Device<Core<'_>>) -> Result<Arc<PmpData>> {
+        let pmp_req = dev.io_request_by_name(c"pmp").ok_or(EINVAL)?;
+        let pmp_mmio = pmp_req.iomap_sized::<PMP_MIN_MMIO_SIZE>()?.into_devres()?;
+        let asc_req = dev.io_request_by_name(c"asc").ok_or(EINVAL)?;
+        let asc_mmio = asc_req.iomap_sized::<ASC_MMIO_SIZE>()?.into_devres()?;
         Arc::pin_init(
             try_pin_init!(
                 PmpData {
@@ -165,6 +177,9 @@ impl PmpData {
                     state <- new_mutex!(PmpState::new()?),
                     power_command <- new_mutex!(Command::Idle),
                     power_reply <- new_condvar!(),
+                    failed: AtomicBool::new(false),
+                    pmp_mmio,
+                    asc_mmio,
                 }
             ),
             GFP_KERNEL,
@@ -391,6 +406,11 @@ impl PmpData {
         let msg = (OPC_SET_IOREG | OPC_ACK_MASK) << OPC_SHIFT | len;
         Ok(msg)
     }
+    fn fail_telemetry(&self) {
+        self.failed.store(true, Ordering::SeqCst);
+        // SAFETY: the telemetry provider is owned by this live PMP device.
+        unsafe { bindings::apple_pmp_telemetry_stop(self.dev.as_raw()) };
+    }
     fn recv_message(&self, msg: u64) -> Result<()> {
         let pm_command = (msg >> PM_COMMAND_SHIFT) & 0xff;
         if msg & PM_COMMAND_MARKER != 0 && (pm_command == 0x0f || pm_command == 0x10) {
@@ -506,6 +526,7 @@ impl rtkit::Operations for PmpData {
     fn recv_message(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, _ep: u8, msg: u64) {
         let ret = data.recv_message(msg);
         if let Err(e) = ret {
+            data.fail_telemetry();
             dev_err!(data.dev, "Failed to handle rtkit message, error: {:?}", e);
         }
     }
@@ -513,6 +534,7 @@ impl rtkit::Operations for PmpData {
     fn crashed(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, _crashlog: Option<&[u8]>) {
         *data.power_command.lock() = Command::Failed;
         data.power_reply.notify_all();
+        data.fail_telemetry();
         dev_err!(data.dev, "PMP firmware crashed");
     }
 }
@@ -528,17 +550,20 @@ struct PmpHwConfig {
     /// Check the firmware's `uuid` header before trusting the boot argument
     /// block it points to.
     check_bootargs_uuid: bool,
+    coreanalytics: bool,
 }
 
 const HW_CFG_DEFAULT: PmpHwConfig = PmpHwConfig {
     dma_mask: None,
     check_bootargs_uuid: false,
+    coreanalytics: false,
 };
 
 /// T8140: the DART translates 42 bits and its DMA window starts at 1 TiB.
 const HW_CFG_T8140: PmpHwConfig = PmpHwConfig {
     dma_mask: Some(DmaMask::new::<42>()),
     check_bootargs_uuid: false,
+    coreanalytics: false,
 };
 
 /// T6041: the DART window starts at 1 TiB; the boot argument header is
@@ -546,6 +571,13 @@ const HW_CFG_T8140: PmpHwConfig = PmpHwConfig {
 const HW_CFG_T6041: PmpHwConfig = PmpHwConfig {
     dma_mask: Some(DmaMask::new::<42>()),
     check_bootargs_uuid: true,
+    coreanalytics: false,
+};
+
+const HW_CFG_T8132: PmpHwConfig = PmpHwConfig {
+    dma_mask: None,
+    check_bootargs_uuid: false,
+    coreanalytics: true,
 };
 
 impl Drop for PmpDriver {
@@ -559,6 +591,7 @@ kernel::of_device_table!(
     OF_TABLE,
     <PmpDriver as platform::Driver>::IdInfo,
     [
+        (of::DeviceId::new(c"apple,t8132-pmp-v2"), &HW_CFG_T8132),
         (of::DeviceId::new(c"apple,t8140-pmp-v2"), &HW_CFG_T8140),
         (of::DeviceId::new(c"apple,t6041-pmp-v2"), &HW_CFG_T6041),
         (of::DeviceId::new(c"apple,t6000-pmp-v2"), &HW_CFG_DEFAULT),
@@ -568,6 +601,12 @@ kernel::of_device_table!(
 impl platform::Driver for PmpDriver {
     type IdInfo = &'static PmpHwConfig;
     type Data<'bound> = PmpDriver;
+
+    fn suppress_bind_attrs() -> bool {
+        // Firmware and its telemetry consumers are retained until reboot.
+        // SAFETY: read-only machine compatibility check.
+        unsafe { bindings::apple_pmp_telemetry_retained_board() }
+    }
 
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
 
@@ -582,13 +621,9 @@ impl platform::Driver for PmpDriver {
             // yet.
             unsafe { pdev.dma_set_mask_and_coherent(mask)? };
         }
-        let pmp_req = pdev.io_request_by_name(c"pmp").ok_or(EINVAL)?;
-        let pmp_mmio = pmp_req.iomap_sized::<PMP_MIN_MMIO_SIZE>()?;
-        let pmp_mmio = pmp_mmio.as_view();
-        let asc_req = pdev.io_request_by_name(c"asc").ok_or(EINVAL)?;
-        let asc_mmio = asc_req.iomap_sized::<ASC_MMIO_SIZE>()?;
-        let asc_mmio = asc_mmio.as_view().relaxed();
         let data = PmpData::new(pdev)?;
+        let pmp_mmio = data.pmp_mmio.access(pdev.as_ref())?.as_view();
+        let asc_mmio = data.asc_mmio.access(pdev.as_ref())?.as_view();
         let node = dev.fwnode().ok_or(EIO)?;
         let dvid = node
             .property_read(c"apple,dram-vendor-id")
@@ -608,10 +643,30 @@ impl platform::Driver for PmpDriver {
             patches.push((from_fourcc(b"PMCB"), (v >> 3) & 1), GFP_KERNEL)?;
         }
         data.patch_bootargs(&pmp_mmio, &patches, cfg.check_bootargs_uuid)?;
-        let rtkit = rtkit::RtKit::<PmpData>::new(&dev, None, 0, data.clone())?;
+        // EP7 is a qualified startup dependency only on the retained J713 PMP.
+        // SAFETY: the predicate only reads machine compatibility.
+        let needs_coreanalytics = cfg.coreanalytics
+            && unsafe { bindings::apple_pmp_telemetry_retained_board() };
+        let rtkit = if needs_coreanalytics {
+            rtkit::RtKit::<PmpData>::new_with_coreanalytics(&dev, None, 0, data.clone())?
+        } else {
+            rtkit::RtKit::<PmpData>::new(&dev, None, 0, data.clone())?
+        };
         data.rtkit.lock().as_mut().set(Some(rtkit));
-        asc_mmio.update(ASC_CPU_CONTROL, |r| r.with_const_cpu_run::<1>());
+        asc_mmio.relaxed().update(ASC_CPU_CONTROL, |r| r.with_const_cpu_run::<1>());
         data.start()?;
+        // SAFETY: the PMP owner retains both Devres mappings; managed child
+        // teardown and provider cleanup precede device mapping revocation.
+        to_result(unsafe {
+            bindings::apple_pmp_telemetry_register(
+                dev.as_raw(), MmioBackend::as_ptr(pmp_mmio).cast(), pmp_mmio.size(),
+                MmioBackend::as_ptr(asc_mmio).cast(),
+            )
+        })?;
+        if data.failed.load(Ordering::SeqCst) {
+            // SAFETY: registration returned the live managed provider.
+            unsafe { bindings::apple_pmp_telemetry_stop(dev.as_raw()) };
+        }
         dev_info!(dev, "PMP firmware and endpoint ready");
         // SAFETY: PmpDriver retains this Arc and unregisters it before dropping it.
         let ret = unsafe { bindings::apple_pmp_register(dev.as_raw(), Arc::as_ptr(&data).cast()) };
@@ -619,6 +674,10 @@ impl platform::Driver for PmpDriver {
             return Err(Error::from_errno(ret));
         }
         Ok(PmpDriver(data))
+    }
+
+    fn unbind<'bound>(_dev: &'bound platform::Device<Core<'_>>, this: Pin<&Self::Data<'bound>>) {
+        this.0.fail_telemetry();
     }
 }
 
