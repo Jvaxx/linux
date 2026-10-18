@@ -333,6 +333,15 @@ impl Vm {
         drop(previous);
     }
 
+    /// Whether the client's handle of this VM is gone ([`Self::unmap_user_ranges`] closed
+    /// admission for good). G15 releases its per-VM state after that.
+    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    pub(crate) fn is_closed(&self) -> bool {
+        self.lifetime
+            .as_ref()
+            .is_some_and(|lifetime| lifetime.state.lock().closed)
+    }
+
     /// Tests mappings and reservations which userspace must never replace.
     pub(crate) fn driver_range_overlaps(&self, range: Range<u64>) -> bool {
         let Some(lifetime) = self.lifetime.as_ref() else {

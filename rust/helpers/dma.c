@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 
 #include <linux/dma-mapping.h>
+#include <linux/dma-map-ops.h>
 
 __rust_helper void *rust_helper_dma_alloc_attrs(struct device *dev, size_t size,
 						dma_addr_t *dma_handle,
@@ -48,4 +49,9 @@ __rust_helper void rust_helper_dma_set_max_seg_size(struct device *dev,
 						    unsigned int size)
 {
 	dma_set_max_seg_size(dev, size);
+}
+
+__rust_helper bool rust_helper_dev_is_dma_coherent(struct device *dev)
+{
+	return dev_is_dma_coherent(dev);
 }

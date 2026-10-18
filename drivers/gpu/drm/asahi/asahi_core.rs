@@ -29,6 +29,7 @@ mod regs;
 mod slotalloc;
 mod stats;
 mod sysfs_exports;
+mod timestamp;
 mod util;
 #[cfg(CONFIG_DRM_ASAHI_MAPLE_TREE)]
 mod vm;

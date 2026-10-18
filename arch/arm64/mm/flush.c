@@ -15,6 +15,9 @@
 #include <asm/cache.h>
 #include <asm/tlbflush.h>
 
+EXPORT_SYMBOL_GPL(dcache_clean_poc);
+EXPORT_SYMBOL_GPL(dcache_inval_poc);
+
 void sync_icache_aliases(unsigned long start, unsigned long end)
 {
 	if (icache_is_aliasing()) {

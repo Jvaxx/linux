@@ -21,8 +21,10 @@ use kernel::{
         }, //
     },
     error::Result,
+    new_mutex,
     prelude::*,
     sync::aref::ARef,
+    sync::Mutex,
     uapi, //
 };
 
@@ -60,6 +62,9 @@ pub(crate) struct AsahiObject {
     kernel: bool,
     /// Driver aliases outside the user GPUVA tree; they pin the backing.
     kernel_mappings: AtomicU64,
+    /// Serializes overlapping timestamp writes through every binding of this BO.
+    #[pin]
+    pub(crate) timestamp_lock: Mutex<()>,
 }
 
 /// Type alias for the shmem GEM object type for this driver.
@@ -308,6 +313,7 @@ impl DriverObject for AsahiObject {
             exportable: args.exportable,
             kernel: args.kernel,
             kernel_mappings: AtomicU64::new(0),
+            timestamp_lock <- new_mutex!((), "Asahi timestamp stores"),
         })
     }
 
@@ -375,6 +381,49 @@ impl AsahiObject {
     pub(crate) fn idle_reclaim_candidate(&self) -> bool {
         !self.kernel && !self.exportable && self.kernel_mappings.load(Ordering::Acquire) == 0
     }
+}
+
+/// Populates and pins a new user object through its DMA mapping, before any CPU view exists.
+///
+/// On a device that is not DMA-coherent, the DMA mapping cleans the cacheable kernel alias of the
+/// freshly zeroed pages to the point of coherency, so that no dirty line can later overwrite data
+/// written through a write-combined view. The pin keeps reclaim from creating a new cacheable
+/// alias. Only used when the GPU asks for it ([`crate::gpu::Gpu::prepare_new_objects`]).
+///
+/// The DMA mapping only cleans if the device is not marked DMA-coherent (G15's synthesized node
+/// has no `dma-coherent`). Should it ever be marked so, the pages are cleaned here instead.
+pub(crate) fn prepare_new_object(gem: &Object, dev: &kernel::device::Device<kernel::device::Bound>) -> Result {
+    let sgt = gem.sg_table(dev)?;
+    // SAFETY: The device outlives its GEM objects; the flag is fixed when the device is probed.
+    if !unsafe { kernel::bindings::dev_is_dma_coherent(dev.as_raw()) } {
+        return Ok(());
+    }
+    static WARNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        dev_warn!(
+            dev,
+            "GPU marked DMA-coherent: cleaning new objects to the point of coherency explicitly\n"
+        );
+    }
+    let page_size = kernel::page::PAGE_SIZE;
+    for segment in sgt.iter() {
+        // Without an IOMMU in front of the GPU, its DMA addresses are physical addresses.
+        let start = segment.dma_address() as kernel::addr::PhysicalAddr;
+        let len = segment.dma_len() as usize;
+        let mut offset = 0;
+        while offset < len {
+            let phys = start + offset as kernel::addr::PhysicalAddr;
+            // SAFETY: The pinned SG table keeps these shmem pages allocated.
+            let page = unsafe { kernel::page::Page::borrow_phys(&phys) }.ok_or(EIO)?;
+            page.with_pointer_into_page(0, page_size, |p| {
+                crate::pgtable::clean_poc(p, page_size);
+                Ok(())
+            })?;
+            offset += page_size;
+        }
+    }
+    crate::pgtable::poc_barrier();
+    Ok(())
 }
 
 /// Purge advice for a VM-private, non-exportable object. Returns whether the
