@@ -53,6 +53,12 @@ properties:
   gpio-ranges:
     maxItems: 1
 
+  apple,irq-group-base:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    maximum: 6
+    default: 0
+    description: First hardware interrupt group owned by the host.
+
   apple,npins:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: The number of pins in this GPIO controller.
