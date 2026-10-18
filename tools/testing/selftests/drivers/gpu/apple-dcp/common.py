@@ -48,6 +48,9 @@ def tipd_pm_header(root):
     """CD321x PM state machine for host units, with a host clamp() for minmax.h."""
     header = (root / 'drivers/usb/typec/tipd/cd321x-pm.h').read_text()
     header = header.replace('#include <linux/types.h>', '')
+    # The host units need the status bit, not kernel USB declarations.
+    header = header.replace('#include <linux/usb/typec_dp.h>',
+        '#ifndef DP_STATUS_IRQ_HPD\n#define DP_STATUS_IRQ_HPD (1U << 8)\n#endif')
     # Single line: probe-mux-pm-dispatch filters duplicate definitions per line.
     return header.replace('#include <linux/minmax.h>',
         '#define clamp(val, lo, hi) ({ __auto_type _v = (val); '

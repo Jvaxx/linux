@@ -39,7 +39,9 @@ def disconnect(root):
 #define BIT(n) (1U << (n))
 #endif
 #define CD321X_DATA_STATUS_HPD_IRQ (1U << 9)
+#ifndef DP_STATUS_IRQ_HPD
 #define DP_STATUS_IRQ_HPD BIT(8)
+#endif
 #define trace_cd321x_dp_hotplug(...) ((void)0)
 ''' + dp + '\n'
     notify = (('drivers/usb/typec/tipd/core.c', 'cd321x_dp_notify'),) if dp else ()
@@ -118,6 +120,7 @@ struct apple_connector { bool connected, edid_invalidation_pending; };
 struct dcp_announce { int ends; };
 struct apple_dcp {
  int external_lock, hpd_mutex;
+ int relink_lock, relink;
  struct { int lock; bool presentation_paused; } iomfb;
  struct { bool connected; void *service; } dptxport[1];
  struct apple_connector *connector;
@@ -146,7 +149,7 @@ static int dcp_dptx_connect_raw(struct apple_dcp *d, u32 port, bool *waiting)
  if (!raw_error) d->dptxport[0].connected = true;
  return raw_error; }
 static bool dcp_is_typec_output(struct apple_dcp *d) { (void)d; return true; }
-static int dcp_dptx_connect(struct apple_dcp *d, u32 port) { (void)d; (void)port; return 0; }
+static int __attribute__((unused)) dcp_dptx_connect(struct apple_dcp *d, u32 port) { (void)d; (void)port; return 0; }
 #define DPTX_RECONNECT_DELAY 500
 static int settle_error, power_error, hpd_error, release_error;
 static int settles, powers, releases, detaches, notices;
@@ -441,8 +444,21 @@ int main(void)
             ' const struct dcp_fabric_session *session, bool cable, bool recovery)\n'
             '{ assert(port == 0); assert(!session && !cable && !recovery); *waiting = false; raw_links++;')
         prefix += ('/* Only a Type-C (non-H17P) output queues the session reconnect. */\n'
-                   'static void dcp_queue_typec_reconnect(struct apple_dcp *d, unsigned long delay)\n'
+                   'static void __attribute__((unused)) dcp_queue_typec_reconnect(struct apple_dcp *d, unsigned long delay)\n'
                    '{ (void)d; (void)delay; assert(!"Type-C session reconnect for H17P"); }\n')
+    # Shared out-of-band connect also contains the legacy relink branch.
+    # These scenarios are native H17P: reaching that branch is a test failure.
+    if 'dcp_typec_attach_locked(dcp)' in funcs:
+        prefix += r"""
+static void dcp_typec_attach_locked(struct apple_dcp *d)
+{ (void)d; assert(!"legacy Type-C attachment in an H17P scenario"); }
+static int dcp_dptx_connect_attached(struct apple_dcp *d, u32 port)
+{ (void)d; (void)port; assert(!"legacy Type-C connect in an H17P scenario"); return -EINVAL; }
+static void dcp_relink_attach(int *s, u64 generation)
+{ (void)s; (void)generation; assert(!"legacy relink in an H17P scenario"); }
+static void __attribute__((unused)) dcp_relink_link_up(int *s, u64 generation, unsigned long now)
+{ (void)s; (void)generation; (void)now; assert(!"legacy relink timestamp in an H17P scenario"); }
+"""
     # How long a held mux has been retried is measured on the driver's clock.
     if 'jiffies_to_msecs(jiffies)' in funcs:
         shim += ('\nstatic unsigned long jiffies;\n'
@@ -501,6 +517,7 @@ typedef uint8_t u8;
 #define dev_dbg(...) ((void)0)
 #define dev_info(...) ((void)0)
 #define DRM_MODE_CONNECTOR_DisplayPort 10
+#define DCP_FIRMWARE_H17P 17
 #define DPTX_CONNECT_TIMEOUT 2000
 #define DPTX_TUNNEL_CONNECT_TIMEOUT 8000
 static void mutex_lock(int *m) { (void)m; }
@@ -645,6 +662,8 @@ int main(void)
                      '/* Never reached: the H17P external link passes no session. */\n'
                      'static bool dcp_session_valid_locked(struct apple_dcp *d, struct dcp_fabric_session s, bool cable)\n'
                      '{ (void)d; (void)s; (void)cable; assert(!"session check for a sessionless link"); return false; }\n')
+    if 'static unsigned long jiffies;' not in unit:
+        firmware += '\nstatic unsigned long jiffies;\n'
     # unless the update work already needed the clock
     clock = 'static unsigned jiffies_to_msecs(unsigned long t) { return t; }\n'
     if clock in unit:

@@ -1248,7 +1248,9 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		av_service_connect(dcp);
 
 	/* Do not timestamp a new attachment after an older link wait. */
-	if (!port && dcp_is_typec_output(dcp)) {
+	if (!port && dcp_is_typec_output(dcp) && !dcp_is_usb4_output(dcp) &&
+	    dcp->fw_compat != DCP_FIRMWARE_H17P && !dcp->external_native &&
+	    !dcp_is_external_h17p(dcp)) {
 		guard(mutex)(&dcp->hpd_mutex);
 		if (dcp->typec_generation == generation && dcp->typec_cable_connected) {
 			scoped_guard(spinlock_irqsave, &dcp->relink_lock)
