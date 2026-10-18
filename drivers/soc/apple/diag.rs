@@ -12,7 +12,10 @@ use kernel::{
     prelude::*, //
 };
 
-use crate::profile;
+use crate::{
+    profile,
+    registration, //
+};
 
 extern "C" {
     // `struct device *`, passed untyped: its lockdep map is a zero-sized
@@ -33,6 +36,8 @@ extern "C" {
     fn sep_diag_set_sensor_result(bind: c_uint, online: bool);
     fn sep_diag_set_bio_published();
     fn sep_diag_set_touchid(started: bool);
+    fn sep_diag_set_sensor_attach(state: c_int);
+    fn sep_diag_set_restore(state: c_int);
     fn sep_diag_bringup_ended();
 }
 
@@ -42,6 +47,19 @@ pub(crate) enum Keybag {
     Present = 1,
     Missing = 2,
     Failed = 3,
+}
+
+/// The enrolled fingerprints at attach, as `SEP_DIAG_RESTORE_*` in `shim.h`
+/// spells it.
+#[derive(Clone, Copy)]
+pub(crate) enum Restore {
+    /// The enclave listed them and the restore was proven: the driver logged
+    /// "Touch ID: restored N".
+    Restored = 1,
+    /// The enclave lists no enrolled identity.
+    Empty = 2,
+    /// It lists some, but the restore could not be proven.
+    Unproven = 3,
 }
 
 /// Adds the `diag` group to the SEP device, with the facts fixed at probe. The
@@ -125,6 +143,18 @@ pub(crate) fn bio_published() {
 pub(crate) fn touchid(started: bool) {
     // SAFETY: no preconditions; stores one word.
     unsafe { sep_diag_set_touchid(started) };
+}
+
+/// How far the attach of the sensor got, `SEP_DIAG_SENSOR_ATTACH_*`.
+pub(crate) fn sensor_attach(state: registration::AttachState) {
+    // SAFETY: no preconditions; stores one word.
+    unsafe { sep_diag_set_sensor_attach(state as c_int) };
+}
+
+/// What became of the enrolled fingerprints at attach.
+pub(crate) fn restore(state: Restore) {
+    // SAFETY: no preconditions; stores one word.
+    unsafe { sep_diag_set_restore(state as c_int) };
 }
 
 /// The boot-time bring-up is over, however far it got.

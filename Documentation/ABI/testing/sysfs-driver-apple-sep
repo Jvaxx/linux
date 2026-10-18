@@ -3,8 +3,9 @@ Date:		October 2026
 KernelVersion:	7.1
 Contact:	Chris Kearney <chris@kearneymail.com>
 Description:
-		(RO) Version of the diag interface: "1" for the attributes
-		and values described in this file.
+		(RO) Version of the diag interface: "2" for the attributes
+		and values described in this file. Version 2 added
+		sensor_attach and restore; version 1 had neither.
 
 		The diag directory holds passive diagnostics of the Apple
 		SEP (Secure Enclave Processor) driver, apple_sep, for
@@ -210,3 +211,55 @@ Description:
 		tool waiting for "ready" has to open it, or let its client
 		do so, first. Enrol and verify also need xart to read
 		"enabled".
+
+What:		/sys/bus/platform/devices/<unit>.sep/diag/sensor_attach
+Date:		October 2026
+KernelVersion:	7.1
+Contact:	Ryan Murray <ryan@aurorasilicon.org>
+Description:
+		(RO) How far the automatic attach of the fingerprint sensor
+		got. Touch ID activation brings the sensor up, with spaced
+		retries on a profile with a nonce session, and if that falls
+		short one more round follows about 10 s later, once the
+		boot-time bring-up is over.
+
+		=========	============================================
+		unknown		Touch ID has not been activated, or its
+				attach has not decided yet.
+		attached	The sensor came online and the enclave's
+				identity view was proven; restore says what
+				became of the enrolled fingerprints.
+		retrying	The attach-time bring-up fell short and the
+				later round has still to run.
+		not-ready	Every automatic bring-up fell short. Capture
+				is unavailable until an enrol or verify
+				brings the sensor up.
+		=========	============================================
+
+		touchid follows every later bring-up, while this attribute
+		describes the attach alone.
+
+What:		/sys/bus/platform/devices/<unit>.sep/diag/restore
+Date:		October 2026
+KernelVersion:	7.1
+Contact:	Ryan Murray <ryan@aurorasilicon.org>
+Description:
+		(RO) What became of the enrolled fingerprints when the sensor
+		was first attached this boot. Decided once, by the first
+		bring-up that reaches the enclave's identity view.
+
+		========	============================================
+		unknown		No bring-up has reached the identity view.
+		restored	The enclave lists the enrolled fingerprints
+				and their restore was proven; the driver
+				logged "Touch ID: restored N".
+		empty		The enclave lists no enrolled fingerprint.
+				Touch ID can enrol, and has nothing to match.
+		unproven	The enclave lists fingerprints, but their
+				restore could not be proven. Matching is
+				refused this boot.
+		========	============================================
+
+		A tool deciding whether Touch ID is ready to match at boot
+		reads touchid "ready", sensor_attach "attached" and restore
+		"restored" (or "empty", with nothing to match).

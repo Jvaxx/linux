@@ -1078,48 +1078,55 @@ impl SepData {
         Ok(())
     }
 
-    /// Brings the sensor up, starting again after a failed attempt for as
-    /// long as `wanted` says the result is still needed.
+    /// Brings the sensor up, starting again after a failed attempt as
+    /// `retry` allows and for as long as `wanted` says the result is still
+    /// needed.
     ///
     /// A bring-up that fails on the bus leaves nothing a new attempt cannot
     /// undo: each attempt power-cycles the sensor and, after a failed one,
     /// clears the enclave's partial registration first, as every verify does.
-    fn bring_sensor_online_retrying(&self, purpose: &CStr, wanted: impl Fn() -> bool) -> bool {
-        const ATTEMPTS: u32 = 3;
-        for attempt in 1..=ATTEMPTS {
-            if self.bring_sensor_online() {
-                return true;
-            }
-            if attempt == ATTEMPTS || !wanted() {
-                break;
-            }
-            dev_warn!(
-                self.dev,
-                "sensor: {} bring-up attempt {} of {} failed; starting again\n",
-                purpose,
-                attempt,
-                ATTEMPTS
-            );
-        }
-        false
+    fn bring_sensor_online_retrying(
+        &self,
+        purpose: &CStr,
+        retry: &registration::Retry,
+        wanted: impl Fn() -> bool,
+    ) -> registration::Outcome {
+        let mut attempts = BringupAttempts {
+            sep: self,
+            purpose,
+            wanted,
+            began_ns: shim::boottime_ns(),
+        };
+        registration::bring_up(retry, &mut attempts)
     }
 
-    fn attach_bringup(&self) {
+    /// Brings the sensor up as Touch ID is activated. Returns whether the
+    /// attach fell short and a late retry should follow.
+    fn attach_bringup(&self) -> bool {
         if self.profile.nonce_session {
-            if !self.bring_sensor_online_retrying(c"attach-time", || true) {
+            let outcome = self.bring_sensor_online_retrying(
+                c"attach-time",
+                &registration::ATTACH,
+                || !self.shutting_down.load(Relaxed),
+            );
+            let complete = outcome.online() && self.device_view_synced.load(Relaxed);
+            diag::sensor_attach(registration::after_round(complete, true));
+            if !complete {
                 dev_warn!(
                     self.dev,
-                    "sensor: authenticated attach incomplete; capture unavailable\n"
+                    "sensor: authenticated attach incomplete; capture unavailable; retrying in {} s\n",
+                    LATE_ATTACH_DELAY_MS / 1000
                 );
             }
-            return;
+            return !complete;
         }
         if !sensor::is_bound() {
             dev_warn!(
                 self.dev,
                 "sbio: no sensor bound at attach; catacomb restore ran but capture is unavailable\n"
             );
-            return;
+            diag::sensor_attach(registration::AttachState::NotReady);
+            return false;
         }
         let bind = diag::sensor_bind();
         let Some(patch) = self.wake_sensor() else {
@@ -1128,16 +1135,103 @@ impl SepData {
                 "sbio: the sensor did not wake at attach; the next verify retries the bring-up\n"
             );
             diag::sensor_brought_up(bind, false);
-            return;
+            diag::sensor_attach(registration::AttachState::NotReady);
+            return false;
         };
         let online = self.complete_bringup(patch);
         diag::sensor_brought_up(bind, online);
+        diag::sensor_attach(registration::after_round(online, false));
         if !online {
             dev_warn!(
                 self.dev,
                 "sbio: attach-time sensor bring-up did not complete; matching remains unavailable until a later bring-up succeeds.\n"
             );
         }
+        false
+    }
+
+    /// One more round of sensor bring-up, some seconds after an attach-time
+    /// one fell short and once the boot-time bring-up is over. Without it
+    /// the sensor stayed offline until the first verify, which the login
+    /// screen does not make. It runs at most once a boot, waits for neither
+    /// a capture nor a suspend, and ends within the attach's attempts.
+    pub(crate) fn run_late_attach(this: &Arc<SepData>) {
+        if this.shutting_down.load(Relaxed) {
+            return;
+        }
+        if this.phase.load(Relaxed) != PHASE_READY || this.suspending.load(Relaxed) {
+            Self::defer_late_attach(this);
+            return;
+        }
+        // Enrol, verify and deletion drive the sensor and the enclave under
+        // the same lock, and `capture_begin` lets a suspend wait for us.
+        let _writer = this.catacomb_writer.lock();
+        if !this.capture_begin() {
+            Self::defer_late_attach(this);
+            return;
+        }
+        if this.device_view_synced.load(Relaxed) {
+            // An enrol or a verify got there first.
+            diag::sensor_attach(registration::AttachState::Attached);
+            this.capture_end();
+            return;
+        }
+        dev_info!(
+            this.dev,
+            "sensor: retrying the attach-time bring-up after the ready phase\n"
+        );
+        let outcome = this.bring_sensor_online_retrying(
+            c"late attach",
+            &registration::ATTACH,
+            || !this.shutting_down.load(Relaxed) && !this.suspending.load(Relaxed),
+        );
+        if let registration::Outcome::Abandoned(_) = outcome {
+            this.capture_end();
+            Self::defer_late_attach(this);
+            return;
+        }
+        if outcome.online() {
+            this.refresh_match_credential();
+        }
+        let complete = outcome.online() && this.device_view_synced.load(Relaxed);
+        diag::sensor_attach(registration::after_round(complete, false));
+        if complete {
+            dev_info!(this.dev, "sensor: attached after the ready phase\n");
+        } else {
+            dev_warn!(
+                this.dev,
+                "sensor: authenticated attach incomplete after the late retry; capture unavailable until an enrol or verify brings the sensor up\n"
+            );
+        }
+        this.capture_end();
+    }
+
+    /// The late attach could not run yet; try again later, a few times.
+    fn defer_late_attach(this: &Arc<SepData>) {
+        if this.shutting_down.load(Relaxed) {
+            return;
+        }
+        if this.late_attach_defers.fetch_add(1, Relaxed) < LATE_ATTACH_DEFERS {
+            Self::queue_late_attach(this.clone());
+            return;
+        }
+        dev_warn!(
+            this.dev,
+            "sensor: the late attach could not run; capture unavailable until an enrol or verify brings the sensor up\n"
+        );
+        diag::sensor_attach(registration::AttachState::NotReady);
+    }
+
+    pub(crate) fn queue_late_attach(this: Arc<SepData>) {
+        let delay = time::msecs_to_jiffies(LATE_ATTACH_DELAY_MS);
+        let _ = workqueue::system_dfl()
+            .enqueue_delayed::<Arc<SepData>, LATE_ATTACH_WORK_ID>(this, delay);
+    }
+
+    /// Whether the activation that just ended wants a late attach. True at
+    /// most once.
+    pub(crate) fn take_late_attach(&self) -> bool {
+        self.late_attach_wanted.xchg(false, Relaxed)
     }
 
     fn bring_sensor_online(&self) -> bool {
@@ -1332,7 +1426,9 @@ impl SepData {
         self.sks_machine_refkey(handle, stored.secret());
         let prepared = self.cold_match_continue(handle, uuid, stored.uuid_provenance());
         self.ensure_restored_after(prepared);
-        self.attach_bringup();
+        if self.attach_bringup() {
+            self.late_attach_wanted.store(true, Relaxed);
+        }
         self.probe_owner_export();
         self.refresh_match_credential();
         self.touchid_started.store(true, Relaxed);
@@ -1424,7 +1520,10 @@ impl SepData {
         if !self.profile.nonce_session {
             return self.bring_sensor_online();
         }
-        self.bring_sensor_online_retrying(c"verify", || self.verify_wanted())
+        self.bring_sensor_online_retrying(c"verify", &registration::VERIFY, || {
+            self.verify_wanted()
+        })
+        .online()
     }
 
     pub(crate) fn run_verify(&self) {
@@ -1927,22 +2026,18 @@ impl SepData {
             }
         }
 
-        let serial = match sensor::read_sensor_serial() {
-            Ok(serial) => serial,
-            Err(e) => {
-                dev_warn!(self.dev, "sensor: serial read failed: {:?}\n", e);
-                self.sensor_step_failed(c"serial read");
+        if self.profile.nonce_session {
+            if !self.authenticate_sensor() {
                 return false;
             }
-        };
-        self.sensor_trace(c"serial read");
-
-        let op = crate::sbio::sbio_register_sensor_serial(&serial);
-        if self.sensor_enclave_step(&op).is_none() {
-            return false;
-        }
-        if self.profile.nonce_session && !self.authenticate_sensor_session() {
-            return false;
+        } else {
+            let Some(serial) = self.read_serial_logged() else {
+                return false;
+            };
+            let op = crate::sbio::sbio_register_sensor_serial(&serial);
+            if self.sensor_enclave_step(&op).is_none() {
+                return false;
+            }
         }
         self.bringup.store(BRINGUP_ESTABLISHED, Relaxed);
         self.note_sensor_recoveries();
@@ -1976,17 +2071,61 @@ impl SepData {
         }
     }
 
-    fn authenticate_sensor_session(&self) -> bool {
-        let nonce = match sensor::session_nonce() {
-            Ok(nonce) => nonce,
-            Err(error) => {
-                dev_err!(self.dev, "sensor: nonce read failed: {:?}\n", error);
-                self.sensor_step_failed(c"nonce read");
-                return false;
+    fn read_serial_logged(&self) -> Option<sensor::SensorSerial> {
+        match sensor::read_sensor_serial() {
+            Ok(serial) => {
+                self.sensor_trace(c"serial read");
+                Some(serial)
             }
+            Err(e) => {
+                dev_warn!(self.dev, "sensor: serial read failed: {:?}\n", e);
+                self.sensor_step_failed(c"serial read");
+                None
+            }
+        }
+    }
+
+    /// Authenticates the sensor on a profile with a nonce session, in the
+    /// order [`registration::authenticate`] gives.
+    fn authenticate_sensor(&self) -> bool {
+        let mut steps = SensorAuthentication {
+            sep: self,
+            refused16: false,
         };
-        self.sensor_trace(c"nonce read");
-        if !self.sensor_session_request(0x81, c"SENSOR_NONCE", &nonce) {
+        let mut unfinished = self.serial_unfinished.load(Relaxed);
+        let result = registration::authenticate(&mut steps, &mut unfinished);
+        self.serial_unfinished.store(unfinished, Relaxed);
+        match result {
+            Ok(registration::Authenticated::Registered) => true,
+            Ok(registration::Authenticated::Resumed) => {
+                dev_info!(
+                    self.dev,
+                    "sensor: REGISTER_SERIAL answered 0x16 while the enclave held the unfinished registration of an earlier attempt; the session opened on that one\n"
+                );
+                true
+            }
+            Err(registration::Stopped::RegisterSerial) if steps.refused16 => {
+                dev_warn!(self.dev, "sensor: REGISTER_SERIAL refused with status 0x16\n");
+                self.sensor_step_failed(c"REGISTER_SERIAL");
+                false
+            }
+            // Each step has said why it failed.
+            Err(_) => false,
+        }
+    }
+
+    /// SENSOR_NONCE, the signed root key once a boot, and the session share.
+    fn sensor_nonce_session(&self, nonce: &[u8; 32]) -> bool {
+        if *module_parameters::sensor_test_fault.value() != 0
+            && !self.sensor_test_fault_done.xchg(true, Relaxed)
+        {
+            dev_warn!(
+                self.dev,
+                "sensor: sensor_test_fault: stopping before SENSOR_NONCE, so that the enclave holds an unfinished registration\n"
+            );
+            return false;
+        }
+        if !self.sensor_session_request(0x81, c"SENSOR_NONCE", nonce) {
             self.sensor_step_failed(c"SENSOR_NONCE");
             return false;
         }
@@ -2221,10 +2360,12 @@ impl SepData {
             match count {
                 Some(0) => {
                     self.templates_restored.store(false, Relaxed);
+                    diag::restore(diag::Restore::Empty);
                 }
                 Some(n) if (self.templates_restored.load(Relaxed)
                     || self.cold_restore_candidate.load(Relaxed)) && self.prove_restore() => {
                     self.templates_restored.store(true, Relaxed);
+                    diag::restore(diag::Restore::Restored);
                     dev_info!(
                         self.dev,
                         "Touch ID: restored {} enrolled identity/identities; enrolment survived reboot\n",
@@ -2233,9 +2374,11 @@ impl SepData {
                 }
                 Some(_) => {
                     self.templates_restored.store(false, Relaxed);
+                    diag::restore(diag::Restore::Unproven);
                 }
                 None => {
                     self.templates_restored.store(false, Relaxed);
+                    diag::restore(diag::Restore::Unproven);
                 }
             }
             dev_info!(self.dev, "sbio: restore-ready after device-view proof {}\n", self.templates_restored.load(Relaxed));
@@ -3698,6 +3841,133 @@ impl SepData {
 
     pub(crate) fn bio_ready(&self) -> bool {
         self.bio_session.lock().ready()
+    }
+}
+
+/// A sensor bring-up with retries, as [`registration::bring_up`] drives it.
+struct BringupAttempts<'a, W: Fn() -> bool> {
+    sep: &'a SepData,
+    purpose: &'a CStr,
+    wanted: W,
+    began_ns: u64,
+}
+
+impl<W: Fn() -> bool> registration::Attempts for BringupAttempts<'_, W> {
+    fn attempt(&mut self) -> bool {
+        self.sep.bring_sensor_online()
+    }
+
+    fn wanted(&self) -> bool {
+        (self.wanted)()
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        shim::boottime_ns().saturating_sub(self.began_ns) / 1_000_000
+    }
+
+    fn failed(&mut self, attempt: u32, of: u32, pause_ms: u32) {
+        if pause_ms == 0 {
+            dev_warn!(
+                self.sep.dev,
+                "sensor: {} bring-up attempt {} of {} failed; starting again\n",
+                self.purpose,
+                attempt,
+                of
+            );
+        } else {
+            dev_warn!(
+                self.sep.dev,
+                "sensor: {} bring-up attempt {} of {} failed; starting again in {} ms\n",
+                self.purpose,
+                attempt,
+                of,
+                pause_ms
+            );
+        }
+    }
+
+    // In short steps, so that a suspend or an unbind is not kept waiting.
+    fn pause(&mut self, ms: u32) -> bool {
+        let mut left = ms;
+        while left > 0 {
+            if !(self.wanted)() {
+                return false;
+            }
+            let step = left.min(BRINGUP_PAUSE_STEP_MS);
+            kernel::time::delay::fsleep(kernel::time::Delta::from_millis(i64::from(step)));
+            left -= step;
+        }
+        (self.wanted)()
+    }
+}
+
+/// The requests of a nonce-session authentication, as
+/// [`registration::authenticate`] orders them. Every failure is logged where
+/// it happens, except a 0x16 refusal of REGISTER_SERIAL, which may be the
+/// enclave pointing at a registration it already holds.
+struct SensorAuthentication<'a> {
+    sep: &'a SepData,
+    refused16: bool,
+}
+
+impl registration::Authentication for SensorAuthentication<'_> {
+    type Serial = sensor::SensorSerial;
+    type Nonce = [u8; 32];
+
+    fn read_serial(&mut self) -> Option<sensor::SensorSerial> {
+        self.sep.read_serial_logged()
+    }
+
+    fn read_nonce(&mut self) -> Option<[u8; 32]> {
+        match sensor::session_nonce() {
+            Ok(nonce) => {
+                self.sep.sensor_trace(c"nonce read");
+                Some(nonce)
+            }
+            Err(error) => {
+                dev_err!(self.sep.dev, "sensor: nonce read failed: {:?}\n", error);
+                self.sep.sensor_step_failed(c"nonce read");
+                None
+            }
+        }
+    }
+
+    fn register_serial(&mut self, serial: &sensor::SensorSerial) -> registration::SerialAnswer {
+        let op = crate::sbio::sbio_register_sensor_serial(serial);
+        match self.sep.sbio_transfer(&op) {
+            Ok(done) if done.status.is_ok() => {
+                self.sep.sensor_trace(op.name());
+                registration::SerialAnswer::Accepted
+            }
+            Ok(done)
+                if matches!(
+                    done.status.answered(),
+                    Some(err) if err as u16 == crate::sbio::SBIO_STATUS_16
+                ) =>
+            {
+                self.refused16 = true;
+                registration::SerialAnswer::Refused16
+            }
+            Ok(done) => {
+                dev_warn!(
+                    self.sep.dev,
+                    "sensor: {} refused with status {}\n",
+                    op.name(),
+                    done.status
+                );
+                self.sep.sensor_step_failed(op.name());
+                registration::SerialAnswer::Failed
+            }
+            Err(e) => {
+                dev_warn!(self.sep.dev, "sensor: {} transfer failed: {:?}\n", op.name(), e);
+                self.sep.sensor_step_failed(op.name());
+                registration::SerialAnswer::Failed
+            }
+        }
+    }
+
+    fn open_session(&mut self, nonce: &[u8; 32]) -> bool {
+        self.sep.sensor_nonce_session(nonce)
     }
 }
 

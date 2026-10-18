@@ -98,6 +98,20 @@ static_assert!(ENROL_WORK_ID != SETTLE_WORK_ID && ENROL_WORK_ID != 0);
 const VERIFY_WORK_ID: u64 = 3;
 static_assert!(VERIFY_WORK_ID != ENROL_WORK_ID && VERIFY_WORK_ID != SETTLE_WORK_ID);
 static_assert!(VERIFY_WORK_ID != 0);
+const LATE_ATTACH_WORK_ID: u64 = 4;
+static_assert!(LATE_ATTACH_WORK_ID != VERIFY_WORK_ID && LATE_ATTACH_WORK_ID != ENROL_WORK_ID);
+static_assert!(LATE_ATTACH_WORK_ID != SETTLE_WORK_ID && LATE_ATTACH_WORK_ID != 0);
+
+// When an attach-time sensor bring-up falls short, one more round runs this
+// long after Touch ID was activated. A round that cannot run yet, because the
+// boot-time bring-up is still going or the system is going to sleep, is put
+// off by the same delay, at most this many times.
+const LATE_ATTACH_DELAY_MS: time::Msecs = 10_000;
+const LATE_ATTACH_DEFERS: u32 = 3;
+
+// The step in which a pause between bring-up attempts checks whether the
+// result is still wanted.
+const BRINGUP_PAUSE_STEP_MS: u32 = 100;
 
 // J700 traces show the key-store endpoint arriving around 43 s after boot,
 // well after the first infrastructure endpoints. The wait exits promptly on
@@ -666,6 +680,15 @@ struct SepData {
     // The enclave accepted an identification of the sensor since it booted,
     // even if the registration it began then failed.
     sensor_held: Atomic<bool>,
+    // The enclave may hold a serial registration whose session never opened;
+    // see registration::authenticate.
+    serial_unfinished: Atomic<bool>,
+    sensor_test_fault_done: Atomic<bool>,
+
+    // Activation left the sensor short of attached; the opener queues the
+    // late attach. And how often that has been put off.
+    late_attach_wanted: Atomic<bool>,
+    late_attach_defers: Atomic<u32>,
 
     #[pin]
     ool_sks: Mutex<Option<OolPair>>,
@@ -767,6 +790,9 @@ struct SepData {
 
     #[pin]
     verify_work: Work<SepData, VERIFY_WORK_ID>,
+
+    #[pin]
+    late_attach_work: DelayedWork<SepData, LATE_ATTACH_WORK_ID>,
 }
 
 impl_has_work! {
@@ -777,6 +803,7 @@ impl_has_work! {
 
 impl_has_delayed_work! {
     impl HasDelayedWork<Self, 1> for SepData { self.settle_work }
+    impl HasDelayedWork<Self, LATE_ATTACH_WORK_ID> for SepData { self.late_attach_work }
 }
 
 // SAFETY: every field is either internally synchronised (the mutexes, the
@@ -890,6 +917,10 @@ impl SepData {
                 sks_wedged: Atomic::new(0),
                 bringup: Atomic::new(BRINGUP_FRESH),
                 sensor_held: Atomic::new(false),
+                serial_unfinished: Atomic::new(false),
+                sensor_test_fault_done: Atomic::new(false),
+                late_attach_wanted: Atomic::new(false),
+                late_attach_defers: Atomic::new(0),
                 keybag_designated: Atomic::new(false),
                 bringup_started: Atomic::new(false),
                 touchid_started: Atomic::new(false),
@@ -951,6 +982,7 @@ impl SepData {
                 enrol_work <- new_work!("SepData::enrol_work"),
                 verify_work <- new_work!("SepData::verify_work"),
                 settle_work <- new_delayed_work!("SepData::settle_work"),
+                late_attach_work <- new_delayed_work!("SepData::late_attach_work"),
             }),
             GFP_KERNEL,
         )
@@ -2353,7 +2385,7 @@ impl SepData {
 
         *self.mbox.lock() = None;
 
-        // SAFETY: all four pointers refer to pinned work fields in `self`.
+        // SAFETY: all five pointers refer to pinned work fields in `self`.
         // Shutdown blocks requeueing, and the mailbox can no longer add work.
         unsafe {
             sep_cancel_work_sync(Work::raw_get(core::ptr::addr_of!(self.rx_work)).cast());
@@ -2361,6 +2393,9 @@ impl SepData {
             sep_cancel_work_sync(Work::raw_get(core::ptr::addr_of!(self.verify_work)).cast());
             sep_cancel_delayed_work_sync(
                 DelayedWork::raw_as_work(core::ptr::addr_of!(self.settle_work)).cast(),
+            );
+            sep_cancel_delayed_work_sync(
+                DelayedWork::raw_as_work(core::ptr::addr_of!(self.late_attach_work)).cast(),
             );
         }
 
@@ -2409,7 +2444,17 @@ unsafe extern "C" fn bio_open_trampoline(ctx: *mut c_void) -> c_int {
     // SAFETY: per the contract above.
     let this = unsafe { &*ctx.cast::<SepData>() };
     match this.bio_open() {
-        Ok(()) => 0,
+        Ok(()) => {
+            if this.take_late_attach() {
+                // SAFETY: as in `bio_ioctl_trampoline`: `ctx` is the pointer
+                // the driver's own `Arc<SepData>` was made from, and that
+                // `Arc` outlives every callback.
+                let borrow =
+                    unsafe { kernel::sync::ArcBorrow::<SepData>::from_raw(ctx.cast::<SepData>()) };
+                SepData::queue_late_attach(borrow.into());
+            }
+            0
+        }
         Err(e) => e.to_errno(),
     }
 }
@@ -2516,6 +2561,14 @@ impl WorkItem<SETTLE_WORK_ID> for SepData {
             return;
         }
         SepData::settle_tick(&this);
+    }
+}
+
+impl WorkItem<LATE_ATTACH_WORK_ID> for SepData {
+    type Pointer = Arc<SepData>;
+
+    fn run(this: Arc<SepData>) {
+        SepData::run_late_attach(&this);
     }
 }
 
@@ -2709,6 +2762,10 @@ module! {
         sensor_trace: u8 {
             default: 0,
             description: "Trace Touch ID sensor registration steps and timing, never sensor data",
+        },
+        sensor_test_fault: u8 {
+            default: 0,
+            description: "Test only: stop the first nonce-session sensor authentication of the boot after REGISTER_SERIAL, leaving the enclave an unfinished registration to recover from",
         },
         xarm_trace: u8 {
             default: 0,
