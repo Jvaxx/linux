@@ -801,6 +801,7 @@ typedef uint64_t u64;
 #define APPLE_RTKIT_EP_MGMT 0
 #define APPLE_RTKIT_EP_CRASHLOG 1
 #define APPLE_RTKIT_EP_SYSLOG 2
+#define APPLE_RTKIT_EP_DEBUG 3
 #define APPLE_RTKIT_EP_IOREPORT 4
 #define APPLE_RTKIT_EP_OSLOG 8
 #define APPLE_RTKIT_APP_ENDPOINT_START 0x20
@@ -838,7 +839,7 @@ struct apple_dcp {
 };
 struct afk_receive_message_work { struct apple_dcp_afkep *ep; u64 message; struct work_struct work; };
 struct apple_rtkit_ops { void (*recv_message)(void *,u8,u64); };
-struct apple_rtkit { bool shutting_down; const struct apple_rtkit_ops *ops; void *cookie,*dev; };
+struct apple_rtkit { bool shutting_down, sync_syslog_ack; const struct apple_rtkit_ops *ops; void *cookie,*dev; };
 struct apple_rtkit_rx_work { struct apple_rtkit *rtk; u8 ep; u64 msg; struct work_struct work; };
 #define current ((void *)1)
 static pthread_mutex_t reply_lock=PTHREAD_MUTEX_INITIALIZER;
@@ -869,10 +870,11 @@ static void iomfb_recv_message(struct apple_dcp *d,u64 message)
     u32 length=64;
     assert(dcpep_cb_prop_start(d,&length));
 }
-#define rx_unused(name) static void name(struct apple_rtkit *r,u64 m) { (void)r;(void)m; }
+#define rx_unused(name) static void __attribute__((unused)) name(struct apple_rtkit *r,u64 m) { (void)r;(void)m; }
 rx_unused(apple_rtkit_management_rx)
 rx_unused(apple_rtkit_crashlog_rx)
 rx_unused(apple_rtkit_syslog_rx)
+rx_unused(apple_rtkit_kdebug_rx)
 rx_unused(apple_rtkit_ioreport_rx)
 rx_unused(apple_rtkit_oslog_rx)
 '''
