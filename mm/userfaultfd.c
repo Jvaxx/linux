@@ -34,6 +34,7 @@
 #include <linux/cleanup.h>
 #include <linux/mm_subpage.h>
 #include <linux/shmem_fs.h>
+#include <kunit/visibility.h>
 #include <asm/tlbflush.h>
 #include <asm/tlb.h>
 #include "internal.h"
@@ -2443,7 +2444,7 @@ static void uffd_move_unlock(struct vm_area_struct *dst_vma,
  * in the regions or not, but preventing the risk of having to split
  * the hugepmd during the remap.
  */
-static ssize_t move_pages(struct userfaultfd_ctx *ctx, unsigned long dst_start,
+VISIBLE_IF_KUNIT ssize_t move_pages(struct userfaultfd_ctx *ctx, unsigned long dst_start,
 		   unsigned long src_start, unsigned long len, __u64 mode)
 {
 	struct mm_struct *mm = ctx->mm;
