@@ -45,7 +45,7 @@ apple-sep-y := sep.o hwrng_shim.o store_shim.o bio_shim.o sha_shim.o \
 		pm_shim.o diag_shim.o
 
 obj-$(CONFIG_APPLE_PMP) += apple-pmp.o
-apple-pmp-y := pmp.o pmp-export.o
+apple-pmp-y := pmp.o pmp-export.o pmp-telemetry.o
 
 obj-$(CONFIG_APPLE_MCC) += apple-mcc.o
 apple-mcc-y := mcc.o
