@@ -303,8 +303,14 @@ pub(crate) fn check_stream(bytes: &[u8], early_tiling: bool) -> Result {
         }
         match entry.kind {
             CMD_RENDER => {
-                let packet: uapi::drm_asahi_cmd_render_with_prior = payload(entry.payload)?;
-                let cmd = &packet.legacy;
+                let packet: uapi::drm_asahi_cmd_render = payload(entry.payload)?;
+                let cmd = &packet;
+                // Ray-query extensions belong to G17; reject every nonzero byte
+                // beyond the common historical-prefix fields on G16.
+                let end = offset_of!(uapi::drm_asahi_cmd_render, prior_cdm) + size_of::<u64>();
+                if entry.payload.get(end..).is_some_and(|tail| tail.iter().any(|&b| b != 0)) {
+                    return Err(EINVAL);
+                }
                 check_render_helpers(cmd)?;
                 // M4 HAL200 resource words carry all four high halves.
                 let allowed = PROCESS_EMPTY_TILES
@@ -346,8 +352,8 @@ pub(crate) fn check_stream(bytes: &[u8], early_tiling: bool) -> Result {
                 counts[RENDER] += 1;
             }
             CMD_COMPUTE => {
-                let packet: uapi::drm_asahi_cmd_compute_with_prior = payload(entry.payload)?;
-                let cmd = &packet.legacy;
+                let packet: uapi::drm_asahi_cmd_compute = payload(entry.payload)?;
+                let cmd = &packet;
                 if cmd.flags != 0
                     || cmd.cdm_ctrl_stream_end <= cmd.cdm_ctrl_stream_base
                     || !inside(
@@ -400,7 +406,7 @@ pub(crate) fn cover(vm: &mmu::Vm, start: u64, end: u64, read: bool, write: bool)
     let first = start & !mask;
     let last = end.checked_add(mask).ok_or(EINVAL)? & !mask;
     // Every G16 driver mapping of a user VM is a client alias inside the fixed reserved ranges
-    // (`vm::ClientAlias::check`), so testing those three ranges finds every driver range without
+    // (`vm::ClientAlias::check`), so testing those two ranges finds every driver range without
     // walking the alias mappings under the VM's lifetime lock on each span.
     if super::vm::reserved_ranges()
         .iter()
@@ -641,16 +647,16 @@ pub(crate) fn prepare<'a>(
         let entry = entry?;
         let outputs = match entry.kind {
             CMD_RENDER => {
-                let packet: uapi::drm_asahi_cmd_render_with_prior = payload(entry.payload)?;
-                let cmd = &packet.legacy;
+                let packet: uapi::drm_asahi_cmd_render = payload(entry.payload)?;
+                let cmd = &packet;
                 crate::timestamp::Destinations::resolve_aligned(
                     objects,
                     &[cmd.ts_vtx, cmd.ts_frag],
                 )?
             }
             CMD_COMPUTE => {
-                let packet: uapi::drm_asahi_cmd_compute_with_prior = payload(entry.payload)?;
-                let cmd = &packet.legacy;
+                let packet: uapi::drm_asahi_cmd_compute = payload(entry.payload)?;
+                let cmd = &packet;
                 crate::timestamp::Destinations::resolve_aligned(objects, &[cmd.ts])?
             }
             _ => continue,
@@ -665,11 +671,11 @@ pub(crate) fn prepare<'a>(
         let entry = entry?;
         let (engine, prior) = match entry.kind {
             CMD_RENDER => {
-                let packet: uapi::drm_asahi_cmd_render_with_prior = payload(entry.payload)?;
+                let packet: uapi::drm_asahi_cmd_render = payload(entry.payload)?;
                 (RENDER, [packet.prior_vdm, packet.prior_cdm])
             }
             CMD_COMPUTE => {
-                let packet: uapi::drm_asahi_cmd_compute_with_prior = payload(entry.payload)?;
+                let packet: uapi::drm_asahi_cmd_compute = payload(entry.payload)?;
                 (COMPUTE, [packet.prior_vdm, packet.prior_cdm])
             }
             _ => continue,
@@ -711,8 +717,8 @@ impl Prepared<'_> {
                 SET_FRAGMENT_ATTACHMENTS => fragment = attachment_list(entry.payload)?,
                 SET_COMPUTE_ATTACHMENTS => compute = attachment_list(entry.payload)?,
                 CMD_RENDER => {
-                    let packet: uapi::drm_asahi_cmd_render_with_prior = payload(entry.payload)?;
-                    let cmd = &packet.legacy;
+                    let packet: uapi::drm_asahi_cmd_render = payload(entry.payload)?;
+                    let cmd = &packet;
                     let outputs = resolved.next().ok_or(EINVAL)?;
                     check_render(context, cmd)?;
                     check_attachments(context.vm, &vertex, true)?;
@@ -731,8 +737,8 @@ impl Prepared<'_> {
                     )?;
                 }
                 CMD_COMPUTE => {
-                    let packet: uapi::drm_asahi_cmd_compute_with_prior = payload(entry.payload)?;
-                    let cmd = &packet.legacy;
+                    let packet: uapi::drm_asahi_cmd_compute = payload(entry.payload)?;
+                    let cmd = &packet;
                     check_compute(context, cmd, &compute)?;
                     let outputs = resolved.next().ok_or(EINVAL)?;
                     commands.push(

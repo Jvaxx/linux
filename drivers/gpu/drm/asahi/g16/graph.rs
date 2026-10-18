@@ -16,7 +16,7 @@ use super::fw::graph::{self, job_list, notifier_page, qinfo, qstate, sched_ctx};
 use super::hw::{pte, sizes, tuning};
 use super::object::{Class, FwObject, Objects, Placement, Request};
 use super::Firmware;
-use crate::driver::AsahiDevice;
+use crate::driver::AsahiDrmDevice;
 
 pub(crate) const fn cmd_fw() -> Class {
     if tuning::FW_CACHED {
@@ -73,6 +73,26 @@ pub(crate) fn alloc(
         offset,
         client: client.map(|c| (c.page, c.leaf)),
         lower: if lower { client.map(|c| c.page) } else { None },
+        cpu: true,
+    })
+}
+
+/// Work lists belong to the kernel GPU task. Firmware prepares them through the upper
+/// mapping and hardware reads the existing lower address; applications get no alias.
+/// Preserve the established cache classes and wire addresses while separating ownership.
+pub(crate) fn alloc_work(
+    objects: &mut Objects,
+    size: usize,
+    lower: u64,
+    offset: usize,
+) -> Result<Arc<FwObject>> {
+    objects.alloc(Request {
+        size,
+        class: cmd_shared(),
+        placement: Placement::Anywhere,
+        offset,
+        client: None,
+        lower: Some(lower),
         cpu: true,
     })
 }
@@ -230,11 +250,11 @@ pub(crate) struct Graphs {
     pub(crate) render: RenderGraph,
 }
 impl Graphs {
-    pub(crate) fn new(dev: &AsahiDevice, o: &mut Objects) -> Result<Self> {
+    pub(crate) fn new(dev: &AsahiDrmDevice, o: &mut Objects) -> Result<Self> {
         let compute = ComputeGraph::new(o)?;
         let render = RenderGraph::new(o, compute.sched_ctx.clone())?;
         Ok(Self {
-            dev: dev.as_ref().into(),
+            dev: dev.as_ref().as_ref().into(),
             compute,
             render,
         })

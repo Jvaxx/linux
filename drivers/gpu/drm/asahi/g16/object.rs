@@ -29,7 +29,7 @@ use kernel::{
 use super::hw::{self, pte};
 use super::regs::{rmb, wmb};
 use super::uat;
-use crate::driver::AsahiDevice;
+use crate::driver::AsahiDrmDevice;
 use crate::{gem, mmu};
 
 /// Firmware-side cache class of an object (the leaf words of [`super::hw::pte`]).
@@ -81,6 +81,8 @@ pub(crate) struct FwObject {
     pub(crate) va: u64,
     /// Client GVA of byte 0, if aliased into every user VM.
     pub(crate) gva: Option<u64>,
+    /// Kernel GPU task lower address of byte 0, independent of any application alias.
+    pub(crate) lower_gva: Option<u64>,
     /// Payload size.
     pub(crate) size: usize,
     /// Payload offset inside the first page.
@@ -90,8 +92,6 @@ pub(crate) struct FwObject {
     /// Client alias leaf word.
     client_leaf: u64,
     cpu: Option<NonNull<u8>>,
-    /// Holds the pages for the device.
-    _sgt: kernel::drm::gem::shmem::SGTable<gem::AsahiObject>,
     backing: gem::ObjectRef,
 }
 
@@ -235,7 +235,7 @@ pub(crate) struct Request {
     /// Client alias GVA of the page holding the payload, and its leaf word
     /// ([`pte::LEAF_NC`], [`pte::LEAF_CACHED`] or [`pte::LEAF_PB_LIST`]).
     pub(crate) client: Option<(u64, u64)>,
-    /// Context-0 lower alias GVA of the first page (the client alias page).
+    /// Context-0 lower alias GVA of the first page, independent of an application alias.
     pub(crate) lower: Option<u64>,
     /// GPU-only objects need no CPU mapping (zeroed at allocation).
     pub(crate) cpu: bool,
@@ -243,7 +243,7 @@ pub(crate) struct Request {
 
 /// The firmware object allocator and the set of retained objects.
 pub(crate) struct Objects {
-    dev: ARef<AsahiDevice>,
+    dev: ARef<AsahiDrmDevice>,
     uat: Arc<mmu::Uat>,
     /// The host window: shared L2 mirror and PPL handoff.
     pub(crate) window: uat::Window,
@@ -264,7 +264,7 @@ pub(crate) struct Objects {
 }
 
 impl Objects {
-    pub(crate) fn new(dev: &AsahiDevice, uat: Arc<mmu::Uat>, window: uat::Window) -> Self {
+    pub(crate) fn new(dev: &AsahiDrmDevice, uat: Arc<mmu::Uat>, window: uat::Window) -> Self {
         Self {
             dev: dev.into(),
             uat,
@@ -362,7 +362,10 @@ impl Objects {
         // Populate and DMA-map first: this cleans the zeroed pages' cacheable alias to the
         // point of coherency before any write-combined access.
         let mut backing = gem::new_kernel_object_wc(&self.dev, bytes)?;
-        let sgt = gem::held_sg_table(&backing.gem)?;
+        // SAFETY: allocation runs during platform probe or under the bound G16
+        // owner's admission lock. Its session and supplier remain retained.
+        let bound = unsafe { self.dev.as_ref().as_ref().as_bound() };
+        let sgt = gem::held_sg_table(&backing.gem, bound)?;
         for range in sgt.iter() {
             let pa = range.dma_address() as u64;
             let len = range.dma_len() as u64;
@@ -375,10 +378,10 @@ impl Objects {
             }
         }
         let cpu = if req.cpu {
-            let mut vmap = backing.vmap()?;
-            vmap.memset(0);
-            let ptr = NonNull::new(vmap.as_mut_ptr()).ok_or(ENOMEM)?;
-            core::mem::drop(vmap);
+            let vmap = backing.vmap()?;
+            let ptr = NonNull::new(vmap.addr.cast::<u8>()).ok_or(ENOMEM)?;
+            // SAFETY: this fresh private WC mapping spans bytes and is unpublished.
+            unsafe { core::ptr::write_bytes(ptr.as_ptr(), 0, bytes) };
             Some(ptr)
         } else {
             None
@@ -390,12 +393,12 @@ impl Objects {
             .write(FwObject {
                 va: page_va + offset as u64,
                 gva: req.client.map(|(gpage, _)| gpage + offset as u64),
+                lower_gva: req.lower.map(|gpage| gpage + offset as u64),
                 size: req.size,
                 offset,
                 bytes,
                 client_leaf: req.client.map_or(pte::LEAF_NC, |(_, leaf)| leaf),
                 cpu,
-                _sgt: sgt,
                 backing,
             })
             .into();
@@ -415,7 +418,7 @@ impl Objects {
                         kernel_vm.map_at(
                             page_va,
                             bytes,
-                            object.gem(),
+                            &object.gem(),
                             mmu::Prot::from_pte(req.class.pte()),
                             guard,
                         )?,
@@ -457,7 +460,7 @@ impl Objects {
                     self.uat.kernel_lower_vm().map_at(
                         lower,
                         bytes,
-                        object.gem(),
+                        &object.gem(),
                         mmu::Prot::from_pte(pte::LOWER),
                         false,
                     )?,
@@ -533,7 +536,7 @@ impl Objects {
         let mapping =
             self.uat
                 .kernel_vm()
-                .map_io(va, usize::try_from(pa)?, usize::try_from(size)?, prot)?;
+                .map_io(self.dev.as_ref().as_ref(), va, usize::try_from(pa)?, usize::try_from(size)?, prot)?;
         self.mappings.push(mapping, GFP_KERNEL)?;
         let result = self.window.sync_range(&self.uat, va..end);
         if let Err(error) = result {
@@ -566,7 +569,9 @@ impl Objects {
         self.mappings
             .reserve(window.len() + lower.len(), GFP_KERNEL)?;
         let scratch = gem::new_kernel_object_wc(&self.dev, hw::PAGE as usize)?;
-        let sgt = gem::held_sg_table(&scratch.gem)?;
+        // SAFETY: self-checks run before the bound platform probe returns.
+        let bound = unsafe { self.dev.as_ref().as_ref().as_bound() };
+        let sgt = gem::held_sg_table(&scratch.gem, bound)?;
         let pa = sgt.iter().next().ok_or(EINVAL)?.dma_address() as u64;
         let checks = Iterator::chain(
             window
@@ -588,7 +593,7 @@ impl Objects {
             let mapping = vm.map_at(
                 va,
                 hw::PAGE as usize,
-                scratch.gem.clone(),
+                &scratch.gem,
                 mmu::Prot::from_pte(word),
                 false,
             )?;

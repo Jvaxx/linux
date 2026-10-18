@@ -12,7 +12,7 @@ use super::fw::buffer::{self, uma_manager};
 use super::hw::{client, engine, pte};
 use super::object::{Class, FwObject, Objects, Placement, Request};
 use super::Firmware;
-use crate::driver::AsahiDevice;
+use crate::driver::AsahiDrmDevice;
 use core::fmt;
 use kernel::{
     device,
@@ -248,13 +248,13 @@ impl Allocator {
     }
 }
 impl Pools {
-    pub(crate) fn new(dev: &AsahiDevice, o: &mut Objects) -> Result<Self> {
+    pub(crate) fn new(dev: &AsahiDrmDevice, o: &mut Objects) -> Result<Self> {
         let mut units = KVec::with_capacity(2, GFP_KERNEL)?;
         for k in 0..2 {
             units.push(Allocator::new(o, k)?, GFP_KERNEL)?;
         }
         Ok(Self {
-            dev: dev.as_ref().into(),
+            dev: dev.as_ref().as_ref().into(),
             units,
             stats: PbStats::default(),
         })

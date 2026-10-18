@@ -407,7 +407,7 @@ pub(crate) struct Engine {
     pub(crate) chan_wait: bool,
     /// Progress tracking of the oldest prefix.
     pub(crate) progress_flight: u64,
-    pub(crate) progress: [u32; 3],
+    pub(crate) progress: [Option<u32>; 3],
     pub(crate) stats: Stats,
     /// Phase timers (debug_flags bit 49).
     pub(crate) prof: Prof,
@@ -447,7 +447,7 @@ impl Engine {
             ta_registered: false,
             chan_wait: false,
             progress_flight: 0,
-            progress: [0; 3],
+            progress: [None; 3],
             stats: Stats::default(),
             prof: Prof::default(),
             debugfs: None,
@@ -989,14 +989,16 @@ impl Firmware {
             if render {
                 self.pools
                     .publish(f.claims.pass[0] as usize, f.uma_submitted)?;
-                self.graph.render.threshold.w64(0, prefix.draw)?;
-                self.graph.render.threshold.w64(8, prefix.draw)?;
+                // Notifier service dereferences u32 counters; the host ordering ledger
+                // remains u64. Eight-byte spacing is retained allocation padding.
+                self.graph.render.threshold.w32(0, prefix.draw as u32)?;
+                self.graph.render.threshold.w32(8, prefix.draw as u32)?;
             } else {
                 let k = f.claims.slot[0] as usize;
                 self.slots.scrub.compute[k]
                     .counter
                     .w64(0, f.uma_submitted)?;
-                self.graph.compute.threshold.w64(0, prefix.n)?;
+                self.graph.compute.threshold.w32(0, prefix.n as u32)?;
             }
             wmb();
             if render {
@@ -1115,7 +1117,7 @@ impl Firmware {
             user_stamp: g.notifier.va + notifier_page::COMPUTE_STAMP as u64,
             fw_stamp: g.fw_stamp.va,
             work: s.work.va,
-            work_gva: s.work.gva.ok_or(EINVAL)?,
+            work_gva: s.work.lower_gva.ok_or(EINVAL)?,
             // Exact embedded sequence: every self-reference then matches the 25G83 layout.
             seq: s.work.va + 0x900,
             preempt_gva: s.preempt.gva.ok_or(EINVAL)?,
@@ -1131,9 +1133,12 @@ impl Firmware {
             record_fw: g.notifier.va + notifier_page::COMPUTE_RECORD as u64,
             binding_generation: generation,
             uma_slot: 1,
-            // Native work carries the low u32 event sequence; software ordering and
-            // the 64-bit publication threshold retain the full logical ordinal.
-            event_sequence: (n - 1) as u32 as u64,
+            // Preserve the already qualified packet bytes while expressing the native
+            // fields separately. This compatibility identifier is not proof of native
+            // global command-ID allocation or uniqueness after compute-index wrap.
+            command_id: (u64::from((n - 1) as u32) << 32) | 1,
+            compute_index: (n - 1) as u32,
+            work_818: 0,
             target_stamp: target,
             submitted,
         };

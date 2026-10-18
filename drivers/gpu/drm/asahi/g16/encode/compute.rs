@@ -41,7 +41,12 @@ pub(crate) struct ComputeRefs {
     pub(crate) record_fw: u64,
     pub(crate) binding_generation: u8,
     pub(crate) uma_slot: u32,
-    pub(crate) event_sequence: u64,
+    /// Native command descriptor identifier (work+0x820), independent of compute index.
+    pub(crate) command_id: u64,
+    /// Native u32 compute sequence/index (StartCompute+0x38).
+    pub(crate) compute_index: u32,
+    /// Opaque native work+0x818 value, copied separately to StartCompute+0x3c.
+    pub(crate) work_818: u32,
     pub(crate) target_stamp: u32,
     /// Cumulative private UMA submissions; never derived from the engine stamp.
     pub(crate) submitted: u64,
@@ -162,7 +167,6 @@ pub(crate) fn encode_compute(
         || r.uma_slot == 0
         || r.uma_slot > 32
         || r.target_stamp & 0xff != 0
-        || r.event_sequence > u32::MAX as u64
         || r.submitted == 0
     {
         return Err(ComputeEncodeError::Chronology);
@@ -290,8 +294,8 @@ pub(crate) fn encode_compute(
     put32(w, 0x810, r.target_stamp);
     put32(w, 0x814, compute::EVENT);
     put32(w, 0x81c, 1);
-    put32(w, 0x820, 1);
-    put32(w, 0x824, r.event_sequence as u32);
+    put32(w, 0x818, r.work_818);
+    put64(w, 0x820, r.command_id);
     put64(w, 0x834, r.its);
     put64(w, 0x83c, r.its + 8);
     put64(w, 0x844, ts_va[0]);
@@ -309,7 +313,8 @@ pub(crate) fn encode_compute(
     put64(q, 0x24, r.qinfo);
     put32(q, 0x2c, ctx);
     put32(q, 0x30, u32::from(fault_mask != 0));
-    put64(q, 0x38, r.event_sequence);
+    put32(q, 0x38, r.compute_index);
+    put32(q, 0x3c, r.work_818);
     put64(q, 0x44, r.work + 0x76c);
     put32(q, 0x50, 1);
     for (i, a) in att.iter().enumerate() {
@@ -369,7 +374,9 @@ pub(crate) fn encode_compute(
     put32(w, d + 0x40, 4);
     put32(w, d + 0x48, 128);
     put64(w, compute::DESCRIPTOR_COUNTER, r.counter_fw);
-    // Native M+0x5c is the compute-exclusion flag. Initialize once for a fresh unit;
+    // Native M+0x5c distinguishes shared compute from per-workqueue-private pools.
+    // Retain the existing value for these persistent units reused across queues;
+    // their custom pool topology does not establish native pool-role equivalence.
     // preserve_compute_descriptor retains ASC bookkeeping on every later use.
     put32(w, d + manager::COMPUTE_EXCLUSION, 1);
     put32(w, d + 0x84, 1);

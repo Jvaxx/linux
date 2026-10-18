@@ -25,7 +25,7 @@ use kernel::{
 
 use super::hw;
 use super::regs::{mb, Mapping};
-use crate::driver::AsahiDevice;
+use crate::driver::AsahiDrmDevice;
 use crate::{mmu, pgtable};
 
 /// Entries of a UAT table page.
@@ -51,7 +51,7 @@ const fn indices(va: u64) -> [usize; 3] {
 
 /// Creates the adopted UAT over the ADT regions (step 2 above).
 pub(crate) fn adopt(
-    dev: &AsahiDevice,
+    dev: &AsahiDrmDevice,
     cfg: &'static super::Config,
     adt: &super::adt::GpuAdt,
 ) -> Result<Arc<mmu::Uat>> {

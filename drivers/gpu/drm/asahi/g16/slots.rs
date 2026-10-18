@@ -10,7 +10,7 @@ use kernel::{prelude::*, sync::Arc};
 
 use super::encode::{Geometry, PassRefs};
 use super::fw::work::{barrier, fs, ta};
-use super::graph::{alloc, cmd_fw, cmd_shared, Client};
+use super::graph::{alloc, alloc_work, cmd_fw, Client};
 use super::hw::{client, sizes};
 use super::object::{Class, FwObject, Objects};
 use super::pools::lifetime::Lifetime;
@@ -62,14 +62,7 @@ impl ComputeSlot {
                 0,
                 false,
             )?,
-            work: alloc(
-                o,
-                0x2000,
-                cmd_shared(),
-                Client::nc(client::WORK_PAGE + k * client::CWORK_STRIDE),
-                0,
-                true,
-            )?,
+            work: alloc_work(o, 0x2000, client::WORK_PAGE + k * client::CWORK_STRIDE, 0)?,
             seq: alloc(o, 0x300, cmd_fw(), None, 0, false)?,
             barrier: alloc(o, barrier::SIZE, cmd_fw(), None, 0, false)?,
             pool: o.alloc(super::object::Request {
@@ -219,21 +212,17 @@ impl PassSlot {
             0,
             false,
         )?;
-        let fs_work = alloc(
+        let fs_work = alloc_work(
             o,
             fs::WORK_SIZE,
-            cmd_shared(),
-            Client::nc(client::FS_WORK_PAGE + ws),
+            client::FS_WORK_PAGE + ws,
             client::FS_WORK_OFF as usize,
-            true,
         )?;
-        let ta_work = alloc(
+        let ta_work = alloc_work(
             o,
             ta::WORK_SIZE,
-            cmd_shared(),
-            Client::nc(client::TA_WORK_PAGE + ws),
+            client::TA_WORK_PAGE + ws,
             client::TA_WORK_OFF as usize,
-            true,
         )?;
         Ok(Self {
             aux,
@@ -297,9 +286,9 @@ impl PassSlot {
     pub(crate) fn refs(&self) -> PassRefs {
         PassRefs {
             ta_work: self.ta_work.va,
-            ta_work_gva: self.ta_work.gva.unwrap_or(0),
+            ta_work_gva: self.ta_work.lower_gva.unwrap_or(0),
             fs_work: self.fs_work.va,
-            fs_work_gva: self.fs_work.gva.unwrap_or(0),
+            fs_work_gva: self.fs_work.lower_gva.unwrap_or(0),
             ta_seq: self.ta_seq.va,
             fs_seq: self.fs_seq.va,
             scene: self.scene.va,

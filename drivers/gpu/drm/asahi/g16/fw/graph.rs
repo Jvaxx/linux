@@ -54,7 +54,8 @@ pub(crate) mod sched_ctx {
     pub(crate) const SIZE: usize = 0x38;
 }
 
-/// Notifier (0x118 bytes): u64 threshold VA at +0, 0x50 at +0x10, 8 x 0xff at +0xa8; the
+/// Notifier (0x118 bytes): u64 VA of a u32 threshold at +0, 0x50 at +0x10,
+/// 8 x 0xff at +0xa8; the
 /// completing works store their context at +0x24 (firmware-owned once exposed).
 pub(crate) mod notifier {
     pub(crate) const SIZE: usize = 0x118;

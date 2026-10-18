@@ -31,7 +31,7 @@ use super::hw;
 use super::initdata::{self, InitData};
 use super::object::Objects;
 use super::{identity, regs, uat, Config, Shared};
-use crate::driver::AsahiDevice;
+use crate::driver::AsahiDrmDevice;
 use crate::{mmu, regs as shared_regs};
 use kernel::io::Io;
 
@@ -423,10 +423,10 @@ impl Orphan {
 
 /// Probe-time admission.
 pub(crate) fn admit(
-    pdev: &platform::Device<Core>,
-    _dev: &AsahiDevice,
+    pdev: &platform::Device<Core<'_>>,
+    _dev: &AsahiDrmDevice,
     cfg: &'static Config,
-    res: shared_regs::Resources,
+    res: shared_regs::G16Resources,
 ) -> Result<Admitted> {
     let dev = pdev.as_ref();
     if !glue::board() {
@@ -632,7 +632,7 @@ fn run(
 /// Brings the firmware to READY.
 pub(crate) fn start(
     admitted: Admitted,
-    dev: &AsahiDevice,
+    dev: &AsahiDrmDevice,
     cfg: &'static Config,
     shared: &Arc<Shared>,
 ) -> Result<Booted> {

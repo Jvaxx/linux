@@ -2,7 +2,7 @@
 
 //! G16 MMIO: SGX identification, power, core and status windows, and ASC control.
 //!
-//! Windows inside `sgx` (accessed through shared [`crate::regs::Resources`] runtime-offset
+//! Windows inside `sgx` (accessed through shared [`crate::regs::G16Resources`] runtime-offset
 //! accessors): id `+0xd04000` (`+0` version, `+0x10` counts), core `+0xe00000`
 //! (`+0x1500` core mask, `+0x1000` pstate), status `+0xc000`
 //! (`+0x20`/`+0x120` busy, `+0x1800` bank select, `+0x18c0` fault status, `+0x18c8` fault
@@ -16,12 +16,12 @@
 use kernel::{
     bindings, c_str,
     device::Core,
-    io::{Io, Mmio, MmioRaw},
+    io::{Io, Mmio, MmioRaw, Region},
     platform,
     prelude::*,
 };
 
-use crate::regs::Resources;
+use crate::regs::G16Resources;
 
 /// Write memory barrier (`wmb()`): `dsb st`.
 #[inline(always)]
@@ -58,10 +58,10 @@ enum Kind {
 ///
 /// # Invariants
 ///
-/// `raw` describes a live mapping of `raw.maxsize()` bytes created as `kind` says, which is
+/// `raw` describes a live mapping of `raw.size()` bytes created as `kind` says, which is
 /// unmapped only on drop.
 pub(crate) struct Mapping {
-    raw: MmioRaw<0>,
+    raw: MmioRaw<Region>,
     phys: u64,
     kind: Kind,
 }
@@ -91,7 +91,7 @@ impl Mapping {
             return Err(ENOMEM);
         }
         Ok(Self {
-            raw: MmioRaw::new(addr as usize, size)?,
+            raw: MmioRaw::new_region(addr as usize, size)?,
             phys,
             kind: Kind::Device,
         })
@@ -109,16 +109,16 @@ impl Mapping {
             return Err(ENOMEM);
         }
         Ok(Self {
-            raw: MmioRaw::new(addr as usize, size)?,
+            raw: MmioRaw::new_region(addr as usize, size)?,
             phys,
             kind: Kind::WriteCombined,
         })
     }
 
     /// The `readl`/`writel` accessors of this mapping.
-    pub(crate) fn io(&self) -> &Mmio {
+    pub(crate) fn io(&self) -> Mmio<'_, Region> {
         // SAFETY: By the type invariant `raw` describes a live mapping of `maxsize` bytes.
-        unsafe { Mmio::from_raw(&self.raw) }
+        unsafe { Mmio::from_raw(self.raw) }
     }
 
     /// Physical address of byte 0.
@@ -170,7 +170,7 @@ impl EngineState {
 /// G16 register access.
 pub(crate) struct Regs {
     /// The shared SGX mapping.
-    pub(crate) res: Resources,
+    pub(crate) res: G16Resources,
     /// ASC control (`asc`, 0x4000).
     asc: Mapping,
     /// SGX status window (`sgx + 0xc000`, 0x4000).
@@ -181,7 +181,7 @@ pub(crate) struct Regs {
 
 impl Regs {
     /// Maps the ASC control page and the SGX status window.
-    pub(crate) fn new(pdev: &platform::Device<Core>, res: Resources) -> Result<Self> {
+    pub(crate) fn new(pdev: &platform::Device<Core<'_>>, res: G16Resources) -> Result<Self> {
         let window = |name: &CStr, offset: u64| -> Result<Mapping> {
             let r = pdev.resource_by_name(name).ok_or(EINVAL)?;
             let nonposted = r

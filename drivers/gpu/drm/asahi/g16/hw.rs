@@ -152,8 +152,8 @@ pub(crate) mod client {
     pub(crate) const CLIENT_APERTURE: Range<u64> = 0x7000000000..0x7100000000;
     pub(crate) const COMPACT_WINDOW: Range<u64> = 0x1000000000..0x9000000000;
 
-    // Two private compute units, each in its own 64 MiB interval. Every alias is inside
-    // Mesa's reserved driver hole; no shader/client allocation is displaced.
+    // Two persistent compute units, each in its own 64 MiB interval and reused across
+    // application queues. Every alias is inside Mesa's reserved driver hole.
     pub(crate) const fn compute_base(k: u64) -> u64 { 0x7001000000 + k * 0x04000000 }
     pub(crate) const fn compute_pool(k: u64) -> u64 { compute_base(k) }
     pub(crate) const fn compute_state(k: u64) -> u64 { compute_base(k) + 0x2000000 }

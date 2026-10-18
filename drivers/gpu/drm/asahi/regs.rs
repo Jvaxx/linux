@@ -291,21 +291,6 @@ impl Resources<'_> {
             .expect("64-bit read failed!")
     }
 
-    #[cfg(CONFIG_DRM_ASAHI_G16)]
-    /// Reads a 32-bit SGX register at a runtime offset (G15 identification, power and fault
-    /// windows).
-    pub(crate) fn sgx_read32_at(&self, offset: usize) -> Result<u32> {
-        let sgx = self.sgx.as_view();
-        sgx.try_read32(offset)
-    }
-
-    #[cfg(CONFIG_DRM_ASAHI_G16)]
-    /// Writes a 32-bit SGX register at a runtime offset (G15).
-    pub(crate) fn sgx_write32_at(&self, offset: usize, value: u32) -> Result {
-        let sgx = self.sgx.as_view();
-        sgx.try_write32(value, offset)
-    }
-
     /// Initialize the MMIO registers for the GPU.
     pub(crate) fn init_mmio(&self) -> Result {
         // Nothing to do for now...
@@ -772,4 +757,27 @@ fn gpu_revision(dev: &platform::Device, id_version: u32) -> Result<(hw::GpuRevis
             return Err(ENODEV);
         }
     })
+}
+
+/// Device-managed SGX mapping retained by the G16 firmware session.
+#[cfg(CONFIG_DRM_ASAHI_G16)]
+#[derive(Clone)]
+pub(crate) struct G16Resources {
+    sgx: Arc<Devres<IoMem<'static, SGX_SIZE>>>,
+}
+
+#[cfg(CONFIG_DRM_ASAHI_G16)]
+impl G16Resources {
+    pub(crate) fn new(pdev: &platform::Device<Core<'_>>) -> Result<Self> {
+        let req = pdev.io_request_by_name(c"sgx").ok_or(EINVAL)?;
+        Ok(Self { sgx: Arc::new(req.iomap_sized::<SGX_SIZE>()?.into_devres()?, GFP_KERNEL)? })
+    }
+    pub(crate) fn sgx_read32_at(&self, offset: usize) -> Result<u32> {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        (&*sgx).as_view().try_read32(offset)
+    }
+    pub(crate) fn sgx_write32_at(&self, offset: usize, value: u32) -> Result {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        (&*sgx).as_view().try_write32(value, offset)
+    }
 }
