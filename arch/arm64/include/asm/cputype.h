@@ -155,6 +155,7 @@
 #define APPLE_CPU_PART_M2_AVALANCHE_PRO	0x035
 #define APPLE_CPU_PART_M2_BLIZZARD_MAX	0x038
 #define APPLE_CPU_PART_M2_AVALANCHE_MAX	0x039
+#define APPLE_CPU_PART_M4_DONAN_E		0x052
 #define APPLE_CPU_PART_TAHITI_E		0x060
 #define APPLE_CPU_PART_TAHITI_P		0x061
 #define APPLE_CPU_PART_T8142_E		0x062
@@ -285,6 +286,13 @@
 static inline u32 __attribute_const__ read_cpuid_id(void)
 {
 	return read_cpuid(MIDR_EL1);
+}
+
+/* Apple part numbers from Donan onward identify the M4 and later generations. */
+static inline bool midr_is_apple_m4_or_later(u32 midr)
+{
+	return MIDR_IMPLEMENTOR(midr) == ARM_CPU_IMP_APPLE &&
+	       MIDR_PARTNUM(midr) >= APPLE_CPU_PART_M4_DONAN_E;
 }
 
 /*
