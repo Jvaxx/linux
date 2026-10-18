@@ -5264,4 +5264,6 @@ MODULE_LICENSE("GPL");
 
 #if IS_ENABLED(CONFIG_PHY_APPLE_ATC_KUNIT_TEST)
 #include "atc-test.c"
+#include "atc-t8122-dp-test.c"
+#include "atc-tunnel-test.c"
 #endif

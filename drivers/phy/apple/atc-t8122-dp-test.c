@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-2-Clause
 #include <kunit/test.h>
-#include <linux/module.h>
 
 #include "atc-t8122-dp.h"
 
@@ -140,6 +139,3 @@ static struct kunit_suite atc_t8122_dp_test_suite = {
 	.test_cases = atc_t8122_dp_test_cases,
 };
 kunit_test_suite(atc_t8122_dp_test_suite);
-
-MODULE_DESCRIPTION("KUnit tests for the Apple ATC T8122 DisplayPort helpers");
-MODULE_LICENSE("Dual BSD/GPL");

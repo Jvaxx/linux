@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-2-Clause
 #include <kunit/test.h>
-#include <linux/module.h>
 
 #include "atc-tunnel.h"
 
@@ -104,5 +103,3 @@ static struct kunit_suite atc_tunnel_suite = {
 };
 
 kunit_test_suite(atc_tunnel_suite);
-
-MODULE_LICENSE("Dual BSD/GPL");
