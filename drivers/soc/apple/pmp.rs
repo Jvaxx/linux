@@ -3,10 +3,13 @@
 
 //! Apple PMP driver
 //!
+//! The Rust owner of the PMP RTKit session. It is linked into the pmp module
+//! together with the retained J713 power-vote bridge and read-only telemetry.
+//!
 //! Copyright (C) The Asahi Linux Contributors
 
 use core::mem;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
 
 mod pmp_bootargs;
 mod pmp_power;
@@ -144,11 +147,14 @@ struct PmpData {
     rtkit: Mutex<Option<rtkit::RtKit<PmpData>>>,
     #[pin]
     state: Mutex<PmpState>,
-    failed: AtomicBool,
     #[pin]
     power_command: Mutex<Command>,
     #[pin]
     power_reply: CondVar,
+    /// The C power-vote bridge, published once and retained until reboot.
+    display: AtomicPtr<bindings::apple_pmp_display>,
+    /// The first failure seen before or after the bridge was published.
+    display_error: AtomicI32,
 }
 
 impl PmpData {
@@ -165,9 +171,10 @@ impl PmpData {
                     state <- new_mutex!(PmpState::new()?),
                     power_command <- new_mutex!(Command::Idle),
                     power_reply <- new_condvar!(),
-                    failed: AtomicBool::new(false),
                     pmp_mmio,
                     asc_mmio,
+                    display: AtomicPtr::new(core::ptr::null_mut()),
+                    display_error: AtomicI32::new(0),
                 }
             ),
             GFP_KERNEL,
@@ -372,10 +379,26 @@ impl PmpData {
         let msg = (OPC_SET_IOREG | OPC_ACK_MASK) << OPC_SHIFT | len;
         Ok(msg)
     }
-    fn fail_telemetry(&self) {
-        self.failed.store(true, Ordering::SeqCst);
-        // SAFETY: the telemetry provider is owned by this live PMP device.
+    fn fail_display(&self, error: Error) {
+        *self.power_command.lock() = Command::Failed;
+        self.power_reply.notify_all();
+        // SAFETY: a published telemetry provider is retained by this PMP device.
         unsafe { bindings::apple_pmp_telemetry_stop(self.dev.as_raw()) };
+        // Pair with lazy publication: either the publisher sees this error, or
+        // this path sees the published bridge. Never lose a pre-vote crash/reply.
+        let _ = self.display_error.compare_exchange(
+            0,
+            error.to_errno(),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        // SAFETY: NULL is accepted, and a published bridge is never freed in this epoch.
+        unsafe {
+            bindings::apple_pmp_display_fail(
+                self.display.load(Ordering::SeqCst),
+                self.display_error.load(Ordering::SeqCst),
+            )
+        };
     }
     fn recv_message(&self, msg: u64) -> Result<()> {
         let pm_command = (msg >> PM_COMMAND_SHIFT) & 0xff;
@@ -409,6 +432,58 @@ impl PmpData {
         rtk.send_message(PMP_ENDPOINT, reply)?;
         Ok(())
     }
+}
+
+unsafe extern "C" fn display_send(cookie: *const kernel::ffi::c_void, word: u64) -> i32 {
+    // SAFETY: the C bridge holds this Arc's foreign reference until reboot.
+    let _data = unsafe { Arc::<PmpData>::borrow(cookie.cast_mut()) };
+    // Use the shared, serialized PMP command path for all power consumers.
+    // It validates supplier readiness and consumes the exact untagged reply.
+    match word {
+        0x0020f50100000000 => unsafe { bindings::apple_pmp_set_device_power(0x0f, 5, 1) },
+        0x0020f80100000000 => unsafe { bindings::apple_pmp_set_device_power(0x0f, 8, 1) },
+        _ => EINVAL.to_errno(),
+    }
+}
+
+/// Private bridge entry: resolve typed data only after the PMP provider has bound.
+///
+/// # Safety
+/// `raw` is a live, fully bound device with its device lock held by the caller.
+#[kernel::macros::export]
+unsafe extern "C" fn apple_pmp_display_bound_owner(
+    raw: *mut bindings::device,
+) -> *mut bindings::apple_pmp_display {
+    // SAFETY: guaranteed by the C caller under the supplier device lock.
+    let dev = unsafe { device::Device::<device::Normal>::from_raw(raw) };
+    // SAFETY: the C caller checked the bound PMP driver and holds its device lock.
+    let ptr = dev.get_drvdata::<PmpDriver>();
+    if ptr.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: the checked PMP driver stored this pinned PmpDriver, and the
+    // device lock excludes unbind for the entire read-only borrow.
+    let driver = unsafe { &*ptr };
+    let data = &driver.0;
+    let existing = data.display.load(Ordering::Acquire);
+    if !existing.is_null() {
+        return existing;
+    }
+    let cookie = data.clone().into_foreign();
+    // SAFETY: callback borrows this Arc; registration validates identity and sends nothing.
+    let display = unsafe { bindings::apple_pmp_display_register(raw, cookie, Some(display_send)) };
+    if display.is_null() {
+        // SAFETY: registration did not take ownership of the foreign reference.
+        drop(unsafe { Arc::<PmpData>::from_foreign(cookie) });
+    } else {
+        data.display.store(display, Ordering::SeqCst);
+        let error = data.display_error.load(Ordering::SeqCst);
+        if error != 0 {
+            // SAFETY: the bridge is now retained and must inherit earlier failures.
+            unsafe { bindings::apple_pmp_display_fail(display, error) };
+        }
+    }
+    display
 }
 
 unsafe impl Send for PmpData {}
@@ -492,15 +567,13 @@ impl rtkit::Operations for PmpData {
     fn recv_message(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, _ep: u8, msg: u64) {
         let ret = data.recv_message(msg);
         if let Err(e) = ret {
-            data.fail_telemetry();
+            data.fail_display(e);
             dev_err!(data.dev, "Failed to handle rtkit message, error: {:?}", e);
         }
     }
 
     fn crashed(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, _crashlog: Option<&[u8]>) {
-        *data.power_command.lock() = Command::Failed;
-        data.power_reply.notify_all();
-        data.fail_telemetry();
+        data.fail_display(EIO);
         dev_err!(data.dev, "PMP firmware crashed");
     }
 }
@@ -555,9 +628,9 @@ impl platform::Driver for PmpDriver {
     type Data<'bound> = PmpDriver;
 
     fn suppress_bind_attrs() -> bool {
-        // Firmware and its telemetry consumers are retained until reboot.
-        // SAFETY: read-only machine compatibility check.
-        unsafe { bindings::apple_pmp_telemetry_retained_board() }
+        // Retained J713 power votes have no teardown path.
+        // SAFETY: read-only board identity check; other boards remain unchanged.
+        unsafe { bindings::apple_pmp_display_retained_board() }
     }
 
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
@@ -615,7 +688,7 @@ impl platform::Driver for PmpDriver {
                 MmioBackend::as_ptr(asc_mmio).cast(),
             )
         })?;
-        if data.failed.load(Ordering::SeqCst) {
+        if data.display_error.load(Ordering::SeqCst) != 0 {
             // SAFETY: registration returned the live managed provider.
             unsafe { bindings::apple_pmp_telemetry_stop(dev.as_raw()) };
         }
@@ -629,7 +702,7 @@ impl platform::Driver for PmpDriver {
     }
 
     fn unbind<'bound>(_dev: &'bound platform::Device<Core<'_>>, this: Pin<&Self::Data<'bound>>) {
-        this.0.fail_telemetry();
+        this.0.fail_display(ENODEV);
     }
 }
 

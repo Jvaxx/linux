@@ -401,7 +401,6 @@ err:
 	apple_pmgr_ps_release_foreign(taken, n);
 	return ret;
 }
-
 static int apple_pmgr_ps_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
