@@ -265,6 +265,10 @@ module! {
             default: 0,
             description: "G15: advertise FRAGMENT_BARRIERS, mapped to early tiling (slower on 2419)",
         },
+        g15_accept_text_prefix: u64 {
+            default: 0,
+            description: "G15: admit an unpinned GPU firmware build whose TEXT SHA-256 starts with these 8 bytes (bring-up only)",
+        },
 
         // NOTE: every `permissions:` line in this block is commented out, so
         // the macro gives each parameter permissions 0. That means NONE of
