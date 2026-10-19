@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
  * G15 (T6030/T6031, M3 Pro/Max) helpers that have no Rust bindings: static inlines,
- * macros and THIS_MODULE. Built only with CONFIG_DRM_ASAHI_G15.
+ * macros and THIS_MODULE.
  */
 #include <crypto/sha2.h>
 #include <linux/device.h>
