@@ -2538,8 +2538,8 @@ int cs42l42_suspend(struct device *dev)
 	 * is shared.
 	 */
 	scoped_guard(mutex, &cs42l42->irq_lock) {
-	if (cs42l42->remote_active)
-		cs42l83_remote_restore(cs42l42, false);
+		if (cs42l42->remote_active)
+			cs42l83_remote_restore(cs42l42, false);
 		cs42l42->suspended = true;
 
 		/* Save register values that will be overwritten by shutdown sequence */
