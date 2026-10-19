@@ -3575,8 +3575,10 @@ static bool dcp_show_notch(struct apple_dcp *dcp)
  * acknowledged that request: the running PMP owns the SoC power and
  * performance states and treats a block whose request it has not taken as
  * idle. The internal display started the PMP long before this, so the wait
- * is short; it is bounded, and without an acknowledgement the processor is
- * started anyway (as before the request existed), with a warning.
+ * is short. It is bounded, and without an acknowledgment the processor is
+ * not started: the bind fails, the dcpext becomes an unusable pipe and the
+ * internal display goes on without it. A dcpext without the request (a
+ * device tree from before it existed) starts as before.
  */
 #define DCP_EXT_PMP_TIMEOUT_MS	3000
 
@@ -3598,18 +3600,18 @@ static int dcp_ext_pmp_wait_ready(struct device_node *entry,
 	return ret;
 }
 
-static void dcp_ext_wait_pmp(struct apple_dcp *dcp)
+static int dcp_ext_wait_pmp(struct apple_dcp *dcp)
 {
 	struct device_node *entry;
 	unsigned long deadline;
 	int ret;
 
 	if (!dcp_ext_dptx_607(dcp))
-		return;
+		return 0;
 	entry = of_parse_phandle(dcp->dev->of_node, "apple,pmp-report", 0);
 	if (!entry) {
 		dev_info(dcp->dev, "no PMP DISPEXT request; starting without one\n");
-		return;
+		return 0;
 	}
 	deadline = jiffies + msecs_to_jiffies(DCP_EXT_PMP_TIMEOUT_MS);
 	for (;;) {
@@ -3621,12 +3623,14 @@ static void dcp_ext_wait_pmp(struct apple_dcp *dcp)
 		msleep(20);
 	}
 	of_node_put(entry);
-	if (ret)
-		dev_warn(dcp->dev,
-			 "the PMP has not acknowledged the DISPEXT request (%d); starting anyway\n",
-			 ret);
-	else
-		dev_info(dcp->dev, "PMP acknowledged the DISPEXT request\n");
+	if (ret) {
+		dev_err(dcp->dev,
+			"the PMP has not acknowledged the DISPEXT request (%d); not starting the external display processor\n",
+			ret);
+		return ret;
+	}
+	dev_info(dcp->dev, "PMP acknowledged the DISPEXT request\n");
+	return 0;
 }
 
 static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *data)
@@ -3814,7 +3818,9 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 		}
 	}
 
-	dcp_ext_wait_pmp(dcp);
+	ret = dcp_ext_wait_pmp(dcp);
+	if (ret)
+		goto err_piodma;
 
 	if (!dcp->hw.adopt_live_session) {
 		cpu_ctrl =
