@@ -19,6 +19,7 @@ config APPLE_PMP_REPORT
 	depends on OF
 	depends on PM
 	select PM_GENERIC_DOMAINS
+	select OF_DYNAMIC
 
 config APPLE_PMC
 	bool "Apple PMC voter interface"
