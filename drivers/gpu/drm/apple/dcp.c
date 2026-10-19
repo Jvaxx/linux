@@ -2852,6 +2852,10 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 			return ret;
 	}
 	if (fw_compat == DCP_FIRMWARE_V_14_7 && !dcp->external) {
+		/* The panel's level policy (dcp_backlight.c), presented in nits. */
+		ret = dcp_backlight_init(dcp, dev);
+		if (ret)
+			return ret;
 		ret = iomfb_v14_7_probe(dcp);
 		if (ret)
 			return ret;
@@ -3302,6 +3306,9 @@ static int dcp_platform_suspend(struct device *dev)
 		return dcp_platform_suspend_h17p(dev);
 	if (READ_ONCE(dcp->ext_dead))
 		return 0;
+	/* The 14.7 panel: no brightness-only present once the mailbox sleeps. */
+	if (dcp_is_v14_7_panel(dcp))
+		iomfb_v14_7_backlight_suspend(dcp);
 
 	/* Serialize PM against explicit bring-up, including queued startup work.
 	 * Before a startup attempt the device remains suspendable. After any
