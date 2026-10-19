@@ -3197,7 +3197,6 @@ unsafe extern "C" fn hpai_pcm_hw_params(
 
 kernel::of_device_table!(
     OF_TABLE,
-    MODULE_OF_TABLE,
     <SndSocT8140AopDriver as platform::Driver>::IdInfo,
     [(of::DeviceId::new(c_str!("apple,t8140-aop-audio")), ())]
 );
