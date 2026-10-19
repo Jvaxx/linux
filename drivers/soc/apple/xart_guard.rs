@@ -35,8 +35,10 @@ pub(crate) const OWNED_PATH: &CStr = c"/var/lib/aurora-sep-xart-owned.bin";
 
 const ENTRY_SIZE: usize = 32;
 const ENTRY_MAGIC: &[u8; 4] = b"AXGO";
-/// Bounds the file the driver reads at probe. The gigalocker has at most a
-/// few hundred slots, so a longer list is damaged.
+/// Bounds the file the driver reads at probe, counted in entries the file
+/// holds, torn and repeated ones included. The gigalocker has at most a few
+/// hundred slots, so a longer list is damaged. Appending stops at the same
+/// bound, so the driver never writes a list it would refuse to read.
 const MAX_ENTRIES: usize = 4096;
 /// Refusals are logged individually up to this count, then only counted.
 const LOGGED_REFUSALS: usize = 8;
@@ -231,7 +233,9 @@ impl<F: ListFile> Guard<F> {
 
     fn adopt(&mut self, key: &Key) -> Result<()> {
         let file = self.file.as_ref().ok_or(ENOENT)?;
-        if self.owned.len() >= MAX_ENTRIES {
+        // The file's length, not the number of distinct keys: a torn or
+        // repeated entry still counts against what load() accepts.
+        if usize::try_from(self.end).map_or(true, |end| end / ENTRY_SIZE >= MAX_ENTRIES) {
             return Err(ENOSPC);
         }
         file.write_all(self.end, &encode(key))?;
@@ -437,6 +441,84 @@ mod tests {
         assert_eq!(guard.check(&first, true), Ok(()));
         assert_eq!(guard.check(&second, true), Ok(()));
         assert_eq!(listed(&bytes).as_slice(), &[Some(first), Some(second)]);
+        Ok(())
+    }
+
+    /// A list file of `entries`, each written as given.
+    fn list_of(entries: &[Key]) -> Result<KVec<u8>> {
+        let mut bytes = KVec::with_capacity(entries.len() * ENTRY_SIZE, GFP_KERNEL)?;
+        for key in entries {
+            bytes.extend_from_slice(&encode(key), GFP_KERNEL)?;
+        }
+        Ok(bytes)
+    }
+
+    fn numbered(i: usize) -> Key {
+        let mut uuid = [0u8; 16];
+        uuid[..8].copy_from_slice(&(i as u64 + 1).to_le_bytes());
+        Key::new(4, uuid)
+    }
+
+    #[test]
+    fn a_full_list_stops_adopting_and_still_opens() -> Result<()> {
+        let mut all = KVec::with_capacity(MAX_ENTRIES, GFP_KERNEL)?;
+        for i in 0..MAX_ENTRIES {
+            all.push(numbered(i), GFP_KERNEL)?;
+        }
+        let bytes = RefCell::new(list_of(&all)?);
+        let mut guard = Guard::with_file(1, KVec::new(), Ok(MemFile(&bytes)));
+        assert!(guard.file.is_some());
+        assert_eq!(guard.check(&numbered(MAX_ENTRIES), true), Err(ENOSPC));
+        assert_eq!(bytes.borrow().len(), MAX_ENTRIES * ENTRY_SIZE);
+        drop(guard);
+        // Reopened: still within what load() accepts, and Linux's records
+        // are still Linux's.
+        let mut guard = Guard::with_file(1, keys(&[numbered(7)])?, Ok(MemFile(&bytes)));
+        assert!(guard.file.is_some());
+        assert_eq!(guard.check(&numbered(7), true), Ok(()));
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_entries_count_against_the_bound() -> Result<()> {
+        // Fewer distinct keys than the bound, but as many entries: a list
+        // that reached its length through repeats.
+        let distinct = MAX_ENTRIES - 96;
+        let mut all = KVec::with_capacity(MAX_ENTRIES, GFP_KERNEL)?;
+        for i in 0..MAX_ENTRIES {
+            all.push(numbered(i % distinct), GFP_KERNEL)?;
+        }
+        let bytes = RefCell::new(list_of(&all)?);
+        let mut guard = Guard::with_file(1, KVec::new(), Ok(MemFile(&bytes)));
+        assert_eq!(guard.owned.len(), distinct);
+        // Appending would make a list the next boot refuses.
+        assert_eq!(guard.check(&numbered(MAX_ENTRIES), true), Err(ENOSPC));
+        assert_eq!(bytes.borrow().len(), MAX_ENTRIES * ENTRY_SIZE);
+        drop(guard);
+        let guard = Guard::with_file(1, KVec::new(), Ok(MemFile(&bytes)));
+        assert!(guard.file.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn a_torn_tail_at_the_bound_takes_the_last_entry() -> Result<()> {
+        let mut all = KVec::with_capacity(MAX_ENTRIES - 1, GFP_KERNEL)?;
+        for i in 0..MAX_ENTRIES - 1 {
+            all.push(numbered(i), GFP_KERNEL)?;
+        }
+        let mut list = list_of(&all)?;
+        list.extend_from_slice(&encode(&numbered(MAX_ENTRIES))[..10], GFP_KERNEL)?;
+        let bytes = RefCell::new(list);
+
+        let mut guard = Guard::with_file(1, KVec::new(), Ok(MemFile(&bytes)));
+        // The torn tail is overwritten by the one entry that still fits.
+        assert_eq!(guard.check(&numbered(MAX_ENTRIES), true), Ok(()));
+        assert_eq!(bytes.borrow().len(), MAX_ENTRIES * ENTRY_SIZE);
+        assert_eq!(guard.check(&numbered(MAX_ENTRIES + 1), true), Err(ENOSPC));
+        drop(guard);
+        let mut guard = Guard::with_file(1, KVec::new(), Ok(MemFile(&bytes)));
+        assert!(guard.file.is_some());
+        assert_eq!(guard.check(&numbered(MAX_ENTRIES), true), Ok(()));
         Ok(())
     }
 
