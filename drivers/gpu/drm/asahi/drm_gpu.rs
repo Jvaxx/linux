@@ -82,6 +82,28 @@ pub(crate) trait DrmGpu: Send + Sync {
     fn syncobj_wait_hint(&self) -> Option<(u32, u32)> {
         None
     }
+    /// Whether this GPU uses the tracked submission model of `file.rs` (besides G17, which
+    /// `file.rs` recognizes by its backend): VM_BIND batches are validated as a whole against
+    /// driver-reserved ranges before any change, and SUBMIT copies the command buffer before
+    /// resolving syncs because the queue installs a fence in every output sync even on failure.
+    fn tracked_submission(&self) -> bool {
+        false
+    }
+    /// Whether SOFT_FAULTS may be advertised when `fault_control` selects soft faults.
+    fn soft_faults(&self) -> bool {
+        true
+    }
+    /// Whether new user objects must be populated, cleaned to the point of coherency and pinned
+    /// at creation, before any CPU view exists.
+    fn prepare_new_objects(&self) -> bool {
+        false
+    }
+    /// The largest VM_BIND batch, if the GPU's UAPI contract bounds it; with a bound, a batch
+    /// also needs at least one operation, a non-null pointer and a stride that is a multiple of 8
+    /// and at most a page (EINVAL otherwise). `None` keeps the shared rules.
+    fn bind_batch_limit(&self) -> Option<u32> {
+        None
+    }
 }
 
 /// Publish an existing manager without allocating another reference-counted adapter.

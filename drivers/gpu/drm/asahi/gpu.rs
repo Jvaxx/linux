@@ -588,6 +588,40 @@ pub(crate) trait Gpu: Send + Sync {
     fn syncobj_wait_hint(&self) -> Option<(u32, u32)> {
         None
     }
+    // The five hooks below are read through the G15 `drm_gpu::DrmGpu` adapter when that
+    // generation is configured; without it nothing calls them.
+    /// The VA range that user VMs may use (`vm_start..vm_end` of GET_PARAMS).
+    #[allow(dead_code)]
+    fn user_range(&self) -> Range<u64> {
+        self.uat_geometry().user_usable_range()
+    }
+    /// Whether this GPU uses the tracked submission model of `file.rs` (besides G17, which
+    /// `file.rs` recognizes by its backend): VM_BIND batches are validated as a whole against
+    /// driver-reserved ranges before any change, and SUBMIT copies the command buffer before
+    /// resolving syncs because the queue installs a fence in every output sync even on failure.
+    #[allow(dead_code)]
+    fn tracked_submission(&self) -> bool {
+        false
+    }
+    /// Whether SOFT_FAULTS may be advertised when `fault_control` selects soft faults.
+    #[allow(dead_code)]
+    fn soft_faults(&self) -> bool {
+        true
+    }
+    /// Whether new user objects must be populated, cleaned to the point of coherency and pinned
+    /// at creation, before any CPU view exists (GPUs whose device is not DMA-coherent and whose
+    /// default CPU mappings are write-combined).
+    #[allow(dead_code)]
+    fn prepare_new_objects(&self) -> bool {
+        false
+    }
+    /// The largest VM_BIND batch, if the GPU's UAPI contract bounds it; with a bound, a batch also
+    /// needs at least one operation, a non-null pointer and a stride that is a multiple of 8 and at
+    /// most a page (EINVAL otherwise). `None` keeps the shared rules.
+    #[allow(dead_code)]
+    fn bind_batch_limit(&self) -> Option<u32> {
+        None
+    }
     /// Frequency of the CPU timer that GPU timestamps are derived from.
     fn base_clock_hz(&self) -> u32;
     /// Return the GPU address space geometry.
