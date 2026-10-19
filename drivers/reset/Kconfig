@@ -25,6 +25,7 @@ config RESET_A10SR
 config RESET_APPLE_CIO
 	tristate "Apple SoC CIO block reset driver"
 	depends on ARCH_APPLE || COMPILE_TEST
+	default ARCH_APPLE
 	select MFD_SYSCON
 	help
 	  This enables the reset driver for the CIO (USB4/Thunderbolt) blocks
