@@ -888,6 +888,8 @@ static void isp_collect_gc_surface(struct apple_isp *isp)
 	isp->log_surf = NULL;
 	isp->bt_surf = NULL;
 
+	isp_free_released_surfaces(isp);
+
 	list_for_each_entry_safe_reverse(surf, tmp, &isp->gc, head) {
 		isp_dbg(isp, "freeing iova: %pad size: 0x%llx virt: %pS\n",
 			&surf->iova, surf->size, (void *)surf->virt);
@@ -1020,10 +1022,20 @@ int apple_isp_firmware_boot(struct apple_isp *isp)
 /* The end of a stream or of the camera detection at probe */
 void apple_isp_firmware_shutdown(struct apple_isp *isp)
 {
-	if (isp->hw->resident_fw)
+	if (!isp->hw->resident_fw) {
+		apple_isp_firmware_halt(isp);
 		return;
+	}
 
-	apple_isp_firmware_halt(isp);
+	/*
+	 * Resident firmware keeps running, so the surfaces it allocated for
+	 * the stream and freed again are not collected by a firmware stop.
+	 * The stream has stopped, so free them now: wait for the interrupt
+	 * thread to finish the free requests the firmware has already sent.
+	 */
+	if (isp->fw_state == ISP_FW_RUNNING)
+		synchronize_irq(isp->irq);
+	isp_free_released_surfaces(isp);
 }
 
 /* Stop the firmware; resident firmware cannot be started again. */

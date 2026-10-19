@@ -318,7 +318,13 @@ struct apple_isp {
 	struct isp_surf *bt_surf;
 	struct isp_surf *meta_surfs[ISP_MAX_BUFFERS];
 	struct isp_surf *capmeta_surfs[ISP_CAPMETA_BUFFERS];
+	/*
+	 * SHAREDMALLOC surfaces: those the firmware holds on @gc, those it has
+	 * freed on @gc_released until the stream that freed them has stopped.
+	 */
 	struct list_head gc;
+	struct list_head gc_released;
+	struct mutex gc_lock; /* protects @gc and @gc_released */
 	struct workqueue_struct *wq;
 
 	int num_ipc_chans;

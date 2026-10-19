@@ -495,6 +495,8 @@ static int apple_isp_probe(struct platform_device *pdev)
 	spin_lock_init(&isp->buf_lock);
 	init_waitqueue_head(&isp->wait);
 	INIT_LIST_HEAD(&isp->gc);
+	INIT_LIST_HEAD(&isp->gc_released);
+	mutex_init(&isp->gc_lock);
 	INIT_LIST_HEAD(&isp->bufs_pending);
 	INIT_LIST_HEAD(&isp->bufs_submitted);
 	isp->wq = alloc_workqueue("apple-isp-wq", WQ_UNBOUND, 0);

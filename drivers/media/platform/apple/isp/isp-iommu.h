@@ -12,6 +12,7 @@ struct isp_surf *__isp_alloc_surface(struct apple_isp *isp, u64 size, bool gc);
 struct isp_surf *isp_alloc_surface_vmap(struct apple_isp *isp, u64 size);
 int isp_surf_vmap(struct apple_isp *isp, struct isp_surf *surf);
 void isp_free_surface(struct apple_isp *isp, struct isp_surf *surf);
+void isp_free_released_surfaces(struct apple_isp *isp);
 
 int apple_isp_iommu_map_sgt(struct apple_isp *isp, struct isp_surf *surf,
 			    struct sg_table *sgt, u64 size);
