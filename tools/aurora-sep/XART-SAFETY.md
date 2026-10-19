@@ -104,6 +104,30 @@ the kernel log names the refused kind. What to do depends on the case:
 Turning the guard back on later does not list the records written while it
 was off.
 
+### What `aurora-sep-ready` reports
+
+"Touch ID: restored N" says the fingerprints came back; it does not say a
+match can save its state. The driver's `diag` attributes (see
+`Documentation/ABI/testing/sysfs-driver-apple-sep`) report the guard's
+effective level (`xart_guard`), whether its list loaded
+(`xart_guard_list`), how many writes it refused (`xart_guard_refusals`),
+and from those `matching`:
+
+| `matching` | When | `aurora-sep-ready` |
+| --- | --- | --- |
+| `usable` | xART writes enabled, no guard | ready |
+| `unverified` | guard on a warm-attach Mac, list loaded, nothing refused yet | restored, matching UNVERIFIED (not called ready; exit 0) |
+| `blocked` | xART writes disabled, a refusal seen, no list, or a guard on a cold-boot Mac | NOT ready (exit 1), with the reason and the `xart_guard=0` opt-out |
+| absent | a kernel that does not report it | restored, matching UNVERIFIED (exit 0) |
+
+The diag ABI stays at version 2: these attributes were added to it, and a
+reader tests for them rather than for a version.
+
+An empty list next to an existing keybag is not taken as a sign that Touch
+ID was set up without the guard: a guarded keybag creation on an M2 wrote no
+record, and a rollback can empty the list. Such a Mac stays `unverified`
+until the guard refuses a write.
+
 ### The list of Linux's records
 
 `/var/lib/aurora-sep-xart-owned.bin` holds 32-byte entries, one per session

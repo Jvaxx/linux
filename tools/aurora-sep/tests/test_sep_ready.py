@@ -56,7 +56,8 @@ class SepReadyTest(unittest.TestCase):
 
     def test_ready_after_restore(self):
         self.state(touchid="ready", sensor="online",
-                   sensor_attach="attached", restore="restored")
+                   sensor_attach="attached", restore="restored",
+                   matching="usable")
         rc, log = self.run_ready()
         self.assertEqual(rc, 0)
         self.assertIn("is ready", log)
@@ -64,9 +65,11 @@ class SepReadyTest(unittest.TestCase):
 
     def test_ready_with_nothing_enrolled(self):
         self.state(touchid="ready", sensor="online",
-                   sensor_attach="attached", restore="empty")
+                   sensor_attach="attached", restore="empty",
+                   matching="usable")
         rc, log = self.run_ready()
         self.assertEqual(rc, 0)
+        self.assertIn("is ready", log)
         self.assertIn("no fingerprint is enrolled", log)
 
     def test_unproven_restore_is_not_ready(self):
@@ -76,13 +79,111 @@ class SepReadyTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("were not restored", log)
 
+    def attached(self, restore="restored", **attrs):
+        self.state(touchid="ready", sensor="online", sensor_attach="attached",
+                   restore=restore, **attrs)
+
+    def test_restored_with_matching_usable(self):
+        # The Neo: no guard runs.
+        self.attached(matching="usable", xart="enabled", xart_guard="0",
+                      xart_guard_list="none", xart_guard_refusals="0", boot="warm")
+        rc, log = self.run_ready()
+        self.assertEqual(rc, 0, log)
+        self.assertIn("is ready", log)
+        self.assertIn("restored; matching is usable", log)
+
+    def assert_unverified(self, log):
+        self.assertIn("restored, matching UNVERIFIED", log)
+        self.assertNotIn("is ready", log)
+        self.assertNotIn("NOT ready", log)
+
+    def test_restored_with_matching_unverified(self):
+        # An M2 set up under the guard (level 1), which has refused nothing.
+        # An empty list is "loaded" too: it does not prove an unguarded setup.
+        self.attached(matching="unverified", xart="enabled", xart_guard="1",
+                      xart_guard_list="loaded", xart_guard_refusals="0", boot="warm")
+        rc, log = self.run_ready()
+        self.assertEqual(rc, 0, log)
+        self.assert_unverified(log)
+        self.assertIn("level 1", log)
+        self.assertIn("the enrolled fingerprints are restored", log)
+
+    def assert_blocked(self, log, *reasons, optout=True):
+        self.assertIn("NOT ready", log)
+        self.assertNotIn("is ready", log)
+        self.assertIn("matching is blocked", log)
+        for reason in reasons:
+            self.assertIn(reason, log)
+        if optout:
+            self.assertIn("xart_guard=0", log)
+            self.assertIn("macOS", log)
+        else:
+            self.assertNotIn("xart_guard=0", log)
+
+    def test_cold_boot_guard_blocks_matching(self):
+        # A cold-boot M1-family Mac under the default level 1: restored, but
+        # every match is refused.
+        self.attached(matching="blocked", xart="enabled", xart_guard="1",
+                      xart_guard_list="loaded", xart_guard_refusals="0", boot="cold")
+        rc, log = self.run_ready()
+        self.assertEqual(rc, 1, log)
+        self.assert_blocked(log, "the enrolled fingerprints are restored", "cold-boot")
+
+    def test_refusals_block_matching(self):
+        self.attached(matching="blocked", xart="enabled", xart_guard="1",
+                      xart_guard_list="loaded", xart_guard_refusals="3", boot="warm")
+        rc, log = self.run_ready()
+        self.assertEqual(rc, 1, log)
+        self.assert_blocked(log, "refused 3 write(s)", "level 1")
+
+    def test_unloadable_list_blocks_matching(self):
+        self.attached(matching="blocked", xart="enabled", xart_guard="1",
+                      xart_guard_list="unavailable", xart_guard_refusals="0", boot="warm")
+        rc, log = self.run_ready()
+        self.assertEqual(rc, 1, log)
+        self.assert_blocked(log, "could not load its list")
+
+    def test_read_only_xart_blocks_matching(self):
+        self.attached(matching="blocked", xart="disabled", xart_guard="0",
+                      xart_guard_list="none", xart_guard_refusals="0", boot="warm")
+        rc, log = self.run_ready()
+        self.assertEqual(rc, 1, log)
+        self.assert_blocked(log, "xART writes are disabled", optout=False)
+
+    def test_blocked_with_nothing_enrolled_is_not_ready(self):
+        self.attached(restore="empty", matching="blocked", xart="enabled",
+                      xart_guard="1", xart_guard_list="loaded",
+                      xart_guard_refusals="0", boot="cold")
+        rc, log = self.run_ready()
+        self.assertEqual(rc, 1, log)
+        self.assert_blocked(log, "no fingerprint is enrolled")
+
+    def test_cold_boot_without_a_guard_is_ready(self):
+        # An M1 Pro pinned to xart_guard=0.
+        self.attached(matching="usable", xart="enabled", xart_guard="0",
+                      xart_guard_list="none", xart_guard_refusals="0", boot="cold")
+        rc, log = self.run_ready()
+        self.assertEqual(rc, 0, log)
+        self.assertIn("is ready", log)
+        self.assertIn("matching is usable", log)
+
+    def test_kernel_without_the_guard_attributes(self):
+        # Restored, from a kernel that does not report the guard: it cannot
+        # be known, so it is neither ready nor blocked.
+        self.attached()
+        rc, log = self.run_ready()
+        self.assertEqual(rc, 0, log)
+        self.assert_unverified(log)
+        self.assertIn("does not report whether the xART guard allows matching", log)
+
     def test_waits_for_the_late_retry(self):
         self.state(touchid="not-ready", sensor="failed",
                    sensor_attach="retrying", restore="unknown")
 
         def attach():
             time.sleep(1.5)
-            self.state(touchid="ready", sensor="online", restore="restored")
+            self.state(touchid="ready", sensor="online", restore="restored",
+                       matching="usable")
             self.state(sensor_attach="attached")
 
         writer = threading.Thread(target=attach)

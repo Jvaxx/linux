@@ -244,7 +244,16 @@ enrolled), the state in which the kernel logs `Touch ID: restored N`. The
 driver tries an attach that fell short once more about 10 s later, so the
 script waits for that, up to 50 s from its start. Otherwise it logs
 `Touch ID is NOT ready` with the reason and the unit fails; anything that
-merely wants it still starts. The packages install it; by hand:
+merely wants it still starts.
+
+Restored is not the same as able to match: a match rewrites xART session
+records, which the xART guard can refuse. The script reads the driver's
+`matching` attribute: `usable` is ready, `blocked` is NOT ready with the
+reason and the `xart_guard=0` opt-out, and `unverified` (or a kernel that
+does not say) logs `Touch ID is restored, matching UNVERIFIED` and does not
+fail the unit. See `XART-SAFETY.md`.
+
+The packages install it; by hand:
 
 ```sh
 install -Dm755 aurora-sep-ready /usr/local/sbin/aurora-sep-ready
