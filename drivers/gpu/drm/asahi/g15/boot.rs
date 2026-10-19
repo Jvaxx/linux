@@ -63,6 +63,7 @@ pub(crate) mod glue {
         fn asahi_g15_board() -> bool;
         fn asahi_g15_machine(compatible: *const core::ffi::c_char) -> bool;
         fn asahi_g15_hold_power(dev: *mut core::ffi::c_void);
+        fn asahi_g15_release_power(dev: *mut core::ffi::c_void);
         fn asahi_g15_module_get();
         fn asahi_g15_adt_phram(start: *mut u64, size: *mut u64) -> core::ffi::c_int;
         fn asahi_g15_ram_disjoint(start: u64, size: u64) -> bool;
@@ -95,6 +96,12 @@ pub(crate) mod glue {
     pub(crate) fn hold_power(dev: &device::Device) {
         // SAFETY: `dev` is a valid device; runtime-PM accounting on it has no other requirement.
         unsafe { asahi_g15_hold_power(dev.as_raw().cast()) };
+    }
+
+    /// Gives the GFX power domain hold back after a start that touched nothing firmware-visible.
+    pub(crate) fn release_power(dev: &device::Device) {
+        // SAFETY: `dev` is the device `hold_power` was called with.
+        unsafe { asahi_g15_release_power(dev.as_raw().cast()) };
     }
 
     static RETAINED: AtomicBool = AtomicBool::new(false);
@@ -142,6 +149,28 @@ pub(crate) mod glue {
     pub(crate) fn ioremap_wc(start: u64, size: usize) -> *mut core::ffi::c_void {
         // SAFETY: Creates a new mapping of a device range; no other effect.
         unsafe { asahi_g15_ioremap_wc(start, size) }
+    }
+}
+
+/// The PMP AGX vote of a start, released on drop until the session is retained ([`Vote::keep`]).
+struct Vote(bool);
+
+impl Vote {
+    /// The session is retained: the vote stays with it until reboot.
+    fn keep(mut self) {
+        self.0 = false;
+    }
+}
+
+impl Drop for Vote {
+    fn drop(&mut self) {
+        if self.0 {
+            // SAFETY: Sends one message through the registered PMP; no pointer is passed.
+            let ret = unsafe { bindings::apple_pmp_set_device_power(0x0f, 5, 0) };
+            if ret != 0 {
+                pr_warn!("G15: PMP AGX vote release failed: {}\n", ret);
+            }
+        }
     }
 }
 
@@ -553,6 +582,8 @@ pub(crate) fn start(
 ) -> Result<Booted> {
     let Admitted { regs, adt } = admitted;
     let d: ARef<device::Device> = shared.dev.clone();
+    // Released by an early failure below, until the session is retained.
+    let mut vote = Vote(false);
     if cfg.platform == hw::Platform::AdtWithPmp {
         // The PMP AGX vote: power command 0x0f for PMP device 5 (AGX), the request the J514S
         // bridge sent (0x0020f50100000000). The PMP driver's bridge waits for the acknowledgement.
@@ -568,6 +599,7 @@ pub(crate) fn start(
             dev_err!(d, "PMP AGX vote failed: {:?}\n", err);
             return Err(err);
         }
+        vote = Vote(true);
     }
     let id = regs.identity(cfg)?;
     dev_info!(
@@ -632,8 +664,9 @@ pub(crate) fn start(
         return Err(e);
     }
 
-    // From here on the firmware is touched: nothing it can reach is freed.
+    // From here on the firmware is touched: nothing it can reach is freed, the vote included.
     glue::retain_module();
+    vote.keep();
     let rtkit = match Rtkit::new(&d, shared) {
         Ok(rtkit) => rtkit,
         Err(e) => {
