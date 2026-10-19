@@ -1386,3 +1386,7 @@ module_exit(apple_pmp_report_exit);
 
 MODULE_DESCRIPTION("PMP power state reporting driver for Apple SoCs");
 MODULE_LICENSE("Dual MIT/GPL");
+
+#if IS_ENABLED(CONFIG_APPLE_PMP_REPORT_START_KUNIT_TEST)
+#include "pmp-report-start-test.c"
+#endif

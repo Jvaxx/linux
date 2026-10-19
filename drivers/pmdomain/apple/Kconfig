@@ -65,6 +65,18 @@ config APPLE_PMC_KUNIT_TEST
 	  that lifting a DCS limit gives the AP agent its own vote back. The
 	  registers are simulated in memory. Only useful for kernel developers.
 
+config APPLE_PMP_REPORT_START_KUNIT_TEST
+	bool "KUnit tests for starting a halted Apple PMP" if !KUNIT_ALL_TESTS
+	depends on APPLE_PMP_REPORT && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Injects faults into the start of a halted PMP (APPLE_PMP_REPORT):
+	  failed checks, a PMP driver that does not bind, a PMP that does not
+	  report ready or acknowledge its startup requests, consumers that
+	  time out, and the teardown of the report and its entries while a
+	  start or a consumer waits. The report region is simulated in
+	  memory. Only useful for kernel developers.
+
 endif
 
 config APPLE_PMP_REPORT_KUNIT_TEST
