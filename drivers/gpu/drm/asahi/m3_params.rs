@@ -643,6 +643,26 @@ pub(crate) fn t6030_backend(pdev: &platform::Device<Core>) -> T6030Backend {
     }
 }
 
+/// Whether the G15 generation starts on this T6031: `asahi.m3_backend=g15`, or `auto` on the
+/// J516C (where the generation was qualified, aurora-silicon/linux PR #363). Every other value,
+/// and every other board, keeps the T6031 runtime selection (`asahi.t6031_start`), as does a
+/// kernel without the generation.
+#[cfg(CONFIG_DRM_ASAHI_G15)]
+pub(crate) fn t6031_g15(pdev: &platform::Device<Core>) -> bool {
+    let dev = pdev.as_ref();
+    match M3_BACKEND.load(Ordering::Relaxed) {
+        BACKEND_G15 => {
+            dev_info!(dev, "M3 G15C: asahi.m3_backend=g15: starting the G15 generation\n");
+            true
+        }
+        BACKEND_AUTO if crate::m3_board::board_is_any(&[b"apple,j516c"]) => {
+            dev_info!(dev, "M3 G15C: asahi.m3_backend=auto: starting the G15 generation\n");
+            true
+        }
+        _ => false,
+    }
+}
+
 fn parse_t8122_number(text: &str) -> Option<u64> {
     Some(crate::t8122_knobs::parse_number(text))
 }

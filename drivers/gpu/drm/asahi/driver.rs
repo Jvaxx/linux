@@ -536,6 +536,10 @@ impl platform::Driver for AsahiDriver {
                 return Ok(Self { runtime: AsahiRuntime::M3(runtime) });
             }
             ProbeConfig::Agx3Diagnostic(soc) if soc.chip_id == 0x6031 => {
+                #[cfg(CONFIG_DRM_ASAHI_G15)]
+                if crate::m3_params::t6031_g15(pdev) {
+                    return Self::probe_g15(pdev, &g15::hw::t6031::CONFIG);
+                }
                 match crate::t6031_knobs::start(&crate::m3_params::t6031_params()) {
                     crate::t6031_knobs::Start::Off => {
                         if crate::m3_params::t6031_params().values_given() {

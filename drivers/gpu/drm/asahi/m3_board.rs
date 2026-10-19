@@ -30,6 +30,12 @@ pub(crate) fn runtime_validated_board(soc: &Soc) -> bool {
     soc.validated_boards.iter().any(|board| board_is(board))
 }
 
+/// Whether this machine is one of `boards` (root compatibles).
+#[cfg(CONFIG_DRM_ASAHI_G15)]
+pub(crate) fn board_is_any(boards: &[&[u8]]) -> bool {
+    boards.iter().any(|board| board_is(board))
+}
+
 /// The number of core slots of `soc` (2 x 10 on T6030, 4 x 10 on T6031).
 pub(crate) fn core_slots(soc: &Soc) -> u32 {
     soc.cores_per_cluster * soc.clusters
