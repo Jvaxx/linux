@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! T6031 (M3 Max, G15C: J514C, J516C) configuration.
+//! T6031 (M3 Max, G15C) configuration, admitted on J516C only.
 //!
 //! One die, four clusters of ten core slots. The firmware is the same RTKit 2419 generation as
 //! the T6030's and the initdata graph keeps the T6030 canonical VAs; what differs is the SoC
@@ -127,6 +127,7 @@ pub(crate) const CONFIG: Config = Config {
     firmware: &[
         FirmwareBuild {
             name: "macOS 14.7 stub firmware (iBoot-10151.140.19.700.2), J516C",
+            machine: None,
             text_size: 0x64000,
             data_size: 0x140000,
             marker: 0x5cf28,
@@ -138,6 +139,7 @@ pub(crate) const CONFIG: Config = Config {
         },
         FirmwareBuild {
             name: "macOS 14.8 stub firmware, J516C",
+            machine: None,
             text_size: 0x64000,
             data_size: 0x140000,
             marker: 0x5cf28,
@@ -148,7 +150,9 @@ pub(crate) const CONFIG: Config = Config {
             ],
         },
     ],
-    machine: kernel::c_str!("apple,t6031"),
+    // The pinned board images and measured layout belong to the J516C, not
+    // every T6031 board (in particular, not the 14-inch J514C).
+    machine: kernel::c_str!("apple,j516c"),
     platform: super::Platform::DeviceTree,
     layout: &LAYOUT,
     board: super::Board::Blob {

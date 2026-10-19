@@ -178,7 +178,7 @@ fn blob(
         sha256,
         [layout.hwdata_size, globals::SIZE, power::SIZE],
     )?;
-    let mut hw_img = images.hardware;
+    let hw_img = images.hardware;
     for map in layout.iomaps.iter() {
         let at = hwdata::IOMAPS + hwdata::IOMAP_STRIDE * map.slot as usize;
         let pa = u64::from(get32(&hw_img, at)?) | u64::from(get32(&hw_img, at + 4)?) << 32;
@@ -194,12 +194,6 @@ fn blob(
         }
     }
     let max_mhz = adt.perf_mhz.iter().copied().max().unwrap_or(0);
-    let now: u64;
-    // SAFETY: Reading the architectural counter has no side effects.
-    unsafe {
-        core::arch::asm!("mrs {}, cntpct_el0", out(reg) now, options(nomem, nostack, preserves_flags))
-    };
-    put64(&mut hw_img, hwdata::HWDATA_A + HWDATA_A_INIT_TIMESTAMP, now)?;
     dev_info!(
         dev,
         "board data: {} images, {} MHz top operating point\n",
@@ -209,13 +203,31 @@ fn blob(
     Ok((hw_img, images.globals, images.power, max_mhz * 1000))
 }
 
-/// Builds the initdata graph. Returns it with its channels and the top DVFS frequency in kHz.
-/// Nothing is published here.
-pub(crate) fn build(
+/// Verified board bytes, prepared before any GPU firmware is started.
+pub(crate) type BoardImages = (KVVec<u8>, KVVec<u8>, KVVec<u8>, u32);
+
+/// Check availability, digest, layout and machine-derived tables before firmware start.
+/// Keep the verified bytes so a later firmware request cannot change the admitted data.
+pub(crate) fn prepare_board(
     dev: &device::Device,
     cfg: &Config,
     adt: &GpuAdt,
+) -> Result<BoardImages> {
+    match cfg.board {
+        hw::Board::Templates => templates(dev, adt),
+        hw::Board::Blob { name, sha256 } => blob(dev, cfg, adt, name, &sha256),
+        hw::Board::None => Err(ENODEV),
+    }
+}
+
+/// Builds the initdata graph. Returns it with its channels and the top DVFS frequency in kHz.
+/// Nothing is published here.
+pub(crate) fn build(
+    _dev: &device::Device,
+    cfg: &Config,
+    adt: &GpuAdt,
     objects: &mut Objects,
+    board_images: BoardImages,
 ) -> Result<(InitData, Channels, u32)> {
     let mut init = InitData::new();
     let fw = Class::Fw;
@@ -264,11 +276,16 @@ pub(crate) fn build(
     }
 
     // Board images, verified, then the owned replacements.
-    let (mut hw_img, mut glob, pwr, max_khz) = match cfg.board {
-        hw::Board::Templates => templates(dev, adt)?,
-        hw::Board::Blob { name, sha256 } => blob(dev, cfg, adt, name, &sha256)?,
-        hw::Board::None => return Err(ENODEV),
-    };
+    let (mut hw_img, mut glob, pwr, max_khz) = board_images;
+    if matches!(cfg.board, hw::Board::Blob { .. }) {
+        // This timestamp belongs to initdata creation, not board-data preflight.
+        let now: u64;
+        // SAFETY: Reading the architectural counter has no side effects.
+        unsafe {
+            core::arch::asm!("mrs {}, cntpct_el0", out(reg) now, options(nomem, nostack, preserves_flags))
+        };
+        put64(&mut hw_img, hwdata::HWDATA_A + HWDATA_A_INIT_TIMESTAMP, now)?;
+    }
     if hw_img.len() != layout.hwdata_size {
         return Err(EINVAL);
     }

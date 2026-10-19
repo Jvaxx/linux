@@ -220,12 +220,6 @@ fn inside(start: u64, size: u64, range: &Range<u64>) -> bool {
     size != 0 && start >= range.start && start < range.end && size <= range.end - start
 }
 
-/// Whether no timestamp copy is requested (the copy arrays of the common command layout, which
-/// G15 does not implement).
-fn timestamps_empty(copies: &[uapi::drm_asahi_timestamp]) -> bool {
-    copies.iter().all(|ts| ts.handle == 0 && ts.offset == 0)
-}
-
 fn helper_is_empty(helper: &uapi::drm_asahi_helper_program) -> bool {
     helper.binary == 0 && helper.cfg == 0 && helper.data == 0
 }
@@ -292,10 +286,6 @@ pub(crate) fn check_stream(bytes: &[u8], early_tiling: bool) -> Result {
                 {
                     return Err(EINVAL);
                 }
-                // RENDER_TIMESTAMP_COPIES is never advertised: the copies must be empty.
-                if !timestamps_empty(&cmd.ts_frag_end_copies) {
-                    return Err(EINVAL);
-                }
                 // Never discard unflagged high words, nor accept the flag without them.
                 if cmd.flags & RSRC_SPEC_HI != 0 && entry.payload.len() < RSRC_SPEC_HI_MIN {
                     return Err(EINVAL);
@@ -320,10 +310,6 @@ pub(crate) fn check_stream(bytes: &[u8], early_tiling: bool) -> Result {
                         &range,
                     )
                 {
-                    return Err(EINVAL);
-                }
-                // COMPUTE_TIMESTAMP_COPIES is never advertised: the copies must be empty.
-                if !timestamps_empty(&cmd.ts_end_copies) {
                     return Err(EINVAL);
                 }
                 // The G17P scratch layout and intersection tables: never on G15.

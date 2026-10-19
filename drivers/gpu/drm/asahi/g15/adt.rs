@@ -16,8 +16,10 @@
 //! `collect_perf`; `/arm-io/gfx-asc` `segment-ranges` (2 x 32 bytes) and `segment-names`
 //! (`__TEXT;__DATA`); `/arm-io/gfx-asc/iop-gfx-nub` `segment-ranges` (identical, length
 //! checked too) and `pre-loaded == 1`; `/chosen` `dram-base`/`dram-size`.
-//! Admission: every region page-aligned, inside DRAM, disjoint from System RAM and from each
-//! other; TEXT at [`super::hw::UPPER`], DATA right after it.
+//! Admission: every region page-aligned, inside DRAM and disjoint from the others;
+//! TEXT at [`super::hw::UPPER`], DATA right after it. Firmware stays outside System RAM.
+//! The maintained native-GPU profile also admits the four UAT regions as reserved RAM,
+//! only with their exact enabled reserved-memory owners and every page PageReserved.
 //!
 //! # T6031: the device tree node
 //!
@@ -294,11 +296,19 @@ fn parse(dev: &device::Device, adt: &Adt<'_>) -> Result<GpuAdt> {
         dev_err!(dev, "ADT DRAM bounds unreadable\n");
         return Err(EINVAL);
     };
-    // Structural admission: the ADT says where; this checks it is sane.
-    // The kernel device tree of this tree also describes the T6030 UAT regions as
-    // reserved-memory nodes the boot loader fills; whether it marks them no-map is not fixed
-    // here, so a region the kernel maps as System RAM is admitted on this platform too.
-    admit_regions(dev, &region, Some(dram_base..dram_base + dram_size), true)?;
+    // The maintained loader deliberately retains the UAT's linear mapping.
+    // Cross-check every ADT range against its exact enabled FDT reservation;
+    // admit_regions still rejects holes, allocator-owned pages and overlaps.
+    let reserved_ram = cfg!(CONFIG_SILICONFOREST_NATIVE_GPU);
+    if reserved_ram {
+        for (i, r) in region[..4].iter().enumerate() {
+            if !glue::reserved_uat(i as u32, r.start, r.end - r.start) {
+                dev_err!(dev, "GPU UAT {} has no matching boot reservation\n", REGION_NAMES[i]);
+                return Err(EINVAL);
+            }
+        }
+    }
+    admit_regions(dev, &region, Some(dram_base..dram_base + dram_size), reserved_ram)?;
     let [ttbs, tables, handoff, shared_l2, text, data] = region;
     let mut out = GpuAdt {
         ttbs,
@@ -318,8 +328,8 @@ fn parse(dev: &device::Device, adt: &Adt<'_>) -> Result<GpuAdt> {
 /// Structural admission of the six regions (same order as [`REGION_NAMES`]): page-aligned,
 /// addressable, the fixed UAT sizes, disjoint from each other, and either outside System RAM
 /// (the T6030 carveouts) or, with `reserved_ram` and for the four UAT regions only, lying
-/// entirely in System RAM as reserved memory the GPU node names (the T6031 device tree, and the
-/// T6030 nodes of this tree's device tree). The firmware segments are always outside System RAM.
+/// entirely in System RAM as reserved memory the GPU node names (the T6031 device tree). The
+/// firmware segments are always outside System RAM.
 fn admit_regions(
     dev: &device::Device,
     region: &[Range<u64>; 6],

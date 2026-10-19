@@ -14,10 +14,9 @@
 //!
 //! # Plugging into the shared driver
 //!
-//! - The shared platform driver binds this generation to `apple,agx-t6030` and
-//!   `apple,agx-t6031` ([`crate::driver::ProbeConfig::G15`]) and probes it with
-//!   [`crate::driver::AsahiDriver::probe_g15`]. A probe that fails once the firmware has been
-//!   touched keeps the device bound and the session retained ([`retained`]).
+//! - [`Driver`] is a separate platform driver for `apple,agx-t6030` without a module alias, so
+//!   probing (which boots the firmware) happens when userspace loads the module after the native
+//!   display is up. It calls [`crate::driver::AsahiDriver::probe_g15`].
 //! - [`Gpu`] implements [`crate::gpu::Gpu`]: GET_PARAMS identity, VM creation (`new_vm`),
 //!   queues (`new_queue`, see [`queue`]) and timestamp buffers.
 //! - User VMs are shared-layer [`mmu::Vm`]s on a [`mmu::Uat::new_adopted`] UAT with tracked
@@ -46,6 +45,9 @@
 mod adt;
 mod board;
 mod boot;
+
+// One admission rule for the generation mappings and shared adopted UAT.
+pub(crate) use boot::glue::memory_mode;
 mod channel;
 mod command;
 mod encode;
@@ -70,15 +72,16 @@ mod regs;
 mod slots;
 mod timestamp;
 mod uat;
-pub(crate) mod vm;
+mod vm;
 
 use core::any::Any;
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
 use kernel::{
+    c_str,
     device::{self, Core},
-    impl_has_delayed_work, new_delayed_work, new_mutex, platform,
+    impl_has_delayed_work, new_delayed_work, new_mutex, of, platform,
     prelude::*,
     sync::{aref::ARef, Arc, Mutex},
     time::hrtimer::{ArcHrTimerHandle, HrTimer},
@@ -86,8 +89,11 @@ use kernel::{
     workqueue::{DelayedWork, WorkItem},
 };
 
-use crate::driver::AsahiDevice;
+use crate::driver::{AsahiDevice, AsahiDriver};
 use crate::{alloc, gem, gpu, mmu, regs as shared_regs};
+
+/// Name of the G15 platform driver.
+pub(crate) const DRIVER_NAME: &CStr = c_str!("asahi-g15");
 
 /// GPU generation reported to userspace.
 pub(crate) const GPU_GENERATION: u32 = 15;
@@ -132,10 +138,69 @@ impl Config {
     }
 }
 
-/// Whether the firmware has been touched: the module is pinned and the session is retained
-/// until reboot, whatever the probe's outcome.
-pub(crate) fn retained() -> bool {
-    boot::glue::retained()
+/// OF match table of the G15 platform driver.
+///
+/// Deliberately not exported with `module_device_table!`: without a module alias, the asahi
+/// module is not loaded at boot for this GPU, and the firmware only starts when userspace loads
+/// the module after the native display is up (the J514S bring-up order). A built-in driver
+/// probes when the GPU node is populated.
+const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, &'static Config, 2> =
+    kernel::device_id::IdArray::new([
+        (
+            of::DeviceId::new(c_str!("apple,agx-t6030")),
+            &hw::t6030::CONFIG,
+        ),
+        (
+            of::DeviceId::new(c_str!("apple,agx-t6031")),
+            &hw::t6031::CONFIG,
+        ),
+    ]);
+
+/// The G15 platform driver: the shared [`AsahiDriver`] probed through
+/// [`AsahiDriver::probe_g15`].
+///
+/// `None` after a probe that failed once the firmware had been touched: the device stays bound
+/// (unbinding would detach and power off the GFX domain under the running firmware), the
+/// firmware session is retained until reboot and no DRM device exists.
+pub(crate) struct Driver(Option<AsahiDriver>);
+
+impl platform::Driver for Driver {
+    type IdInfo = &'static Config;
+    type Data<'bound> = Self;
+    const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
+
+    /// The firmware session cannot be stopped once started.
+    fn suppress_bind_attrs() -> bool {
+        true
+    }
+
+    fn probe<'bound>(
+        pdev: &'bound platform::Device<Core<'_>>,
+        info: Option<&'bound Self::IdInfo>,
+    ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
+        let cfg = *info.ok_or(ENODEV)?;
+        dev_info!(pdev.as_ref(), "G15: probing ({})\n", cfg.name);
+        match AsahiDriver::probe_g15(pdev, cfg) {
+            Ok(driver) => Ok(Driver(Some(driver))),
+            Err(error) if boot::glue::retained() => {
+                dev_err!(
+                    pdev.as_ref(),
+                    "G15: probe failed after the firmware start ({:?}); device kept bound, firmware retained until reboot\n",
+                    error
+                );
+                Ok(Driver(None))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn unbind<'bound>(_pdev: &'bound platform::Device<Core<'_>>, this: Pin<&Self::Data<'bound>>) {
+        if let Some(driver) = &this.0 {
+            if let Some(gpu) = driver.drm().gpu().ok().and_then(|gpu| gpu.as_any().downcast_ref::<Gpu>()) {
+                gpu.retain();
+            }
+        }
+    }
 }
 
 /// Work item ID of the poll work.
@@ -299,7 +364,7 @@ impl Gpu {
     /// READY, then the compute and render graphs. On success the module is pinned: the
     /// firmware session lasts until reboot.
     pub(crate) fn new(
-        pdev: &platform::Device<Core>,
+        pdev: &platform::Device<Core<'_>>,
         dev: &AsahiDevice,
         cfg: &'static Config,
         res: shared_regs::Resources,
@@ -524,6 +589,10 @@ impl gpu::Gpu for Gpu {
     // VM_BIND operations per call at most.
     fn bind_batch_limit(&self) -> Option<u32> {
         Some(params::MAX_BINDS)
+    }
+
+    fn vm_closed(&self) {
+        vm::closed(self)
     }
 
     fn new_vm(&self, kernel_range: Range<u64>) -> Result<mmu::Vm> {

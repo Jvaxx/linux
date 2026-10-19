@@ -190,7 +190,7 @@ impl Registry {
     /// Drops the registry's references to VMs whose client handle is closed. Called on VM close
     /// ([`closed`]), on queue destruction and before a new VM is created: a closed VM's page
     /// tables, bound objects and TTBAT slot go as soon as its last queue or job is gone.
-    pub(crate) fn prune(&self) {
+    fn prune(&self) {
         let mut closed = KVec::new();
         {
             let mut vms = self.vms.lock();
@@ -308,8 +308,8 @@ pub(crate) fn new_vm(gpu: &Gpu, kernel_range: Range<u64>) -> Result<mmu::Vm> {
     Ok(vm)
 }
 
-/// A client's VM handle is gone (`DrmGpu::vm_closed`): drop the registry's references to closed
-/// VMs now, outside the device lock, instead of at the next VM creation.
+/// A client's VM handle is gone (`gpu::Gpu::vm_closed`): drop the registry's references to
+/// closed VMs now, outside the device lock, instead of at the next VM creation.
 pub(crate) fn closed(gpu: &Gpu) {
     let registry = gpu
         .shared

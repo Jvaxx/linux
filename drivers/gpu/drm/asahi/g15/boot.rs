@@ -2,22 +2,19 @@
 
 //! Admission and firmware start to READY.
 //!
-//! Admission (no firmware-visible writes): machine check (the T6030 board check, J514S/J516S,
-//! or the SoC's machine compatible), the PMP supplier link on a SoC with the PMP AGX vote
-//! (`apple_pmp_link_device` when the GPU node names one with `apple,pmp`; may return
-//! EPROBE_DEFER), the GPU regions and segments ([`super::adt`]: the ADT export, or the GPU
-//! device tree node), exact firmware TEXT identity ([`super::identity`]), MMIO windows,
-//! runtime-PM hold of the GFX domain.
+//! Admission (no firmware-visible writes): machine check (the T6030 board check
+//! `apple_pmp_t6030_board`, or the SoC's machine compatible), the PMP supplier on a SoC with
+//! the PMP AGX vote (`apple_pmp_j514s_gpu_prepare`, may return EPROBE_DEFER), the GPU regions and
+//! segments ([`super::adt`]: the ADT export, or the GPU device tree node), exact firmware TEXT
+//! identity ([`super::identity`]), MMIO windows, runtime-PM hold of the GFX domain.
 //!
-//! Start: PMP AGX vote (`apple_pmp_set_device_power`, PMP device 5 on, through the PMP driver's
-//! C bridge; ENODEV while no PMP is registered defers the probe) where the SoC takes one,
-//! hardware identity and core masks (one word, or two above 32 core slots), `sgx_open`
+//! Start: PMP AGX vote (`apple_pmp_j514s_gpu_get`) where the SoC takes one, hardware identity
+//! and core masks (one word, or two above 32 core slots), `sgx_open`
 //! 0x70001, cold-only check (ASC RUN clear, TTBAT all zero), UAT adoption and the PTE self-check
 //! (nothing firmware-visible yet), RTKit init (the node's mailbox), wake, endpoints 0x20/0x21,
 //! PPL/UAT bootstrap ([`super::uat`]), initdata graph ([`super::initdata`]), EP 0x20
 //! `0x0081 << 48 | ROOT`, DEVCTL 0x13 then 9, readiness (`Runtime+0x314 == 0xabcdabcd` and
-//! `Flags+4 == 1`, 2 s, draining rings), DEVCTL 0x13 again. RTKit runs on the GPU node's single
-//! `mboxes` entry (the kernel device tree names no mailbox).
+//! `Flags+4 == 1`, 2 s, draining rings), DEVCTL 0x13 again.
 //!
 //! RTKit receive: EP 0x20 `0x0042 << 48` in interrupt context only kicks the poll work
 //! ([`super::Shared::kick`]); a crash latches fail-stop. The callbacks are registered through
@@ -32,7 +29,7 @@ use core::ffi::c_void;
 use core::sync::atomic::Ordering;
 
 use kernel::{
-    bindings, device,
+    bindings, c_str, device,
     device::Core,
     error::{from_err_ptr, to_result},
     platform,
@@ -68,8 +65,13 @@ pub(crate) mod glue {
         fn asahi_g15_adt_phram(start: *mut u64, size: *mut u64) -> core::ffi::c_int;
         fn asahi_g15_ram_disjoint(start: u64, size: u64) -> bool;
         fn asahi_g15_ram_within(start: u64, size: u64) -> bool;
+        fn asahi_g15_memory_mode(start: u64, size: u64) -> u32;
         fn asahi_g15_ioremap_wc(start: u64, size: usize) -> *mut core::ffi::c_void;
         fn asahi_g15_dma_coherent(dev: *mut core::ffi::c_void) -> bool;
+        pub(crate) fn asahi_g15_pmp_prepare(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
+        pub(crate) fn asahi_g15_pmp_get(dev: *mut core::ffi::c_void) -> core::ffi::c_int;
+        pub(crate) fn asahi_g15_pmp_put(dev: *mut core::ffi::c_void);
+        fn asahi_g15_reserved_uat(index: u32, start: u64, size: u64) -> bool;
     }
 
     /// SHA-256 (`sha256()`).
@@ -80,10 +82,16 @@ pub(crate) mod glue {
         out
     }
 
-    /// A J514S/J516S T6030 board (`of_machine_is_compatible()`).
+    /// A J514S/J516S T6030 board (`apple_pmp_t6030_board()`).
     pub(crate) fn board() -> bool {
         // SAFETY: Reads the machine compatible strings only.
         unsafe { asahi_g15_board() }
+    }
+
+    /// Exact enabled UAT reservation from the maintained boot-loader handoff.
+    pub(crate) fn reserved_uat(index: u32, start: u64, size: u64) -> bool {
+        // SAFETY: Queries and releases OF nodes; no physical memory is accessed.
+        unsafe { asahi_g15_reserved_uat(index, start, size) }
     }
 
     /// Whether the machine carries `compatible` (`of_machine_is_compatible()`).
@@ -133,10 +141,19 @@ pub(crate) mod glue {
         unsafe { asahi_g15_ram_disjoint(start, size) }
     }
 
-    /// The physical range lies entirely in System RAM.
+    /// Every page is valid System RAM and remains reserved from the allocator.
     pub(crate) fn ram_within(start: u64, size: u64) -> bool {
         // SAFETY: Only queries the resource tree.
         unsafe { asahi_g15_ram_within(start, size) }
+    }
+
+    /// WB for complete reserved RAM, WC for aligned non-RAM carveouts; reject everything else.
+    pub(crate) fn memory_mode(start: u64, size: u64) -> Result<u32> {
+        // SAFETY: Only queries resources and page metadata; it does not create a mapping.
+        match unsafe { asahi_g15_memory_mode(start, size) } {
+            0 => Err(EINVAL),
+            mode => Ok(mode),
+        }
     }
 
     /// Whether the device's DMA mappings skip cache maintenance.
@@ -153,23 +170,21 @@ pub(crate) mod glue {
 }
 
 /// The PMP AGX vote of a start, released on drop until the session is retained ([`Vote::keep`]).
-struct Vote(bool);
+struct Vote(Option<ARef<device::Device>>);
 
 impl Vote {
     /// The session is retained: the vote stays with it until reboot.
     fn keep(mut self) {
-        self.0 = false;
+        self.0 = None;
     }
 }
 
 impl Drop for Vote {
     fn drop(&mut self) {
-        if self.0 {
-            // SAFETY: Sends one message through the registered PMP; no pointer is passed.
-            let ret = unsafe { bindings::apple_pmp_set_device_power(0x0f, 5, 0) };
-            if ret != 0 {
-                pr_warn!("G15: PMP AGX vote release failed: {}\n", ret);
-            }
+        // The vote is a level, not a count: never give it back under a retained session.
+        if let Some(d) = self.0.take().filter(|_| !glue::retained()) {
+            // SAFETY: `d` is the device `asahi_g15_pmp_get` voted for.
+            unsafe { glue::asahi_g15_pmp_put(d.as_raw().cast()) };
         }
     }
 }
@@ -312,13 +327,20 @@ unsafe impl Send for Rtkit {}
 unsafe impl Sync for Rtkit {}
 
 impl Rtkit {
-    /// Initializes RTKit on the GPU node's first mailbox (not device-managed: retained): the
-    /// kernel device tree names no GPU mailbox on either SoC.
-    fn new(dev: &device::Device, shared: &Arc<Shared>) -> Result<Self> {
+    /// Initializes RTKit on the GPU node's mailbox (not device-managed: retained): the one
+    /// named "mbox" where the node names its mailboxes (the synthesized T6030 node), else the
+    /// first.
+    fn new(dev: &device::Device, shared: &Arc<Shared>, named: bool) -> Result<Self> {
         let cookie = Arc::into_raw(shared.clone()) as *mut c_void;
-        // SAFETY: `dev` is valid, a null name selects mailbox index 0 and the ops are static.
+        let name = if named {
+            c_str!("mbox").as_char_ptr()
+        } else {
+            core::ptr::null()
+        };
+        // SAFETY: `dev` is valid, the name is a NUL-terminated string or null and the ops are
+        // static.
         let rtk = from_err_ptr(unsafe {
-            bindings::apple_rtkit_init(dev.as_raw(), cookie, core::ptr::null(), 0, &RTKIT_OPS)
+            bindings::apple_rtkit_init(dev.as_raw(), cookie, name, 0, &RTKIT_OPS)
         });
         match rtk {
             // INVARIANT: The cookie stays leaked from here on.
@@ -365,6 +387,7 @@ impl Rtkit {
 pub(crate) struct Admitted {
     pub(crate) regs: regs::Regs,
     pub(crate) adt: GpuAdt,
+    pub(crate) board_images: initdata::BoardImages,
 }
 
 /// The running firmware session: RTKit, MMIO and the adopted UAT. (The
@@ -434,7 +457,7 @@ impl Orphan {
 
 /// Probe-time admission.
 pub(crate) fn admit(
-    pdev: &platform::Device<Core>,
+    pdev: &platform::Device<Core<'_>>,
     _dev: &AsahiDevice,
     cfg: &'static Config,
     res: shared_regs::Resources,
@@ -445,19 +468,15 @@ pub(crate) fn admit(
         if !glue::board() {
             return Err(ENODEV);
         }
-        // Retain the PMP supplier before any vote when the GPU node names it. The kernel device
-        // tree's J514S GPU node has no `apple,pmp` (the T6030 PMP is added by the display gate's
-        // overlay at init), so the vote itself at start is then the readiness check.
-        if crate::m3_board::has_pmp_link(pdev) {
-            // SAFETY: `dev` is the bound GPU device.
-            let ret = unsafe { bindings::apple_pmp_link_device(dev.as_raw()) };
-            if ret != 0 {
-                let err = Error::from_errno(ret);
-                if err != EPROBE_DEFER {
-                    dev_err!(dev, "PMP supplier not ready: {:?}\n", err);
-                }
-                return Err(err);
+        // Retain the PMP supplier (and its AGX bridge) before any vote.
+        // SAFETY: `dev` is the bound GPU device.
+        let ret = unsafe { glue::asahi_g15_pmp_prepare(dev.as_raw().cast()) };
+        if ret != 0 {
+            let err = Error::from_errno(ret);
+            if err != EPROBE_DEFER {
+                dev_err!(dev, "PMP supplier not ready: {:?}\n", err);
             }
+            return Err(err);
         }
     } else if !glue::machine(cfg.machine) {
         dev_err!(dev, "G15: not a {} machine\n", cfg.name);
@@ -485,11 +504,12 @@ pub(crate) fn admit(
         );
         return Err(EINVAL);
     }
+    let board_images = initdata::prepare_board(dev, cfg, &adt)?;
     let regs = regs::Regs::new(pdev, res)?;
     // Keep the GFX domain powered for the whole (retained) session.
     glue::hold_power(dev);
     dev_info!(dev, "{} admitted, ASC={:#x}\n", cfg.name, regs.asc_control()?);
-    Ok(Admitted { regs, adt })
+    Ok(Admitted { regs, adt, board_images })
 }
 
 /// Posts one device control with only the opcode and waits for it.
@@ -510,6 +530,7 @@ fn run(
     objects: &mut Objects,
     events: &mut Events,
     built: &mut Option<(InitData, Channels, u32)>,
+    board_images: initdata::BoardImages,
 ) -> Result {
     let dev = session.dev.clone();
     session.rtkit.wake()?;
@@ -522,7 +543,7 @@ fn run(
     session.rtkit.start_endpoint(hw::ep::DOORBELL)?;
     let uat = session.uat.clone();
     objects.window.bootstrap(&dev, &uat)?;
-    let (init, channels, _) = built.insert(initdata::build(&dev, cfg, &session.adt, objects)?);
+    let (init, channels, _) = built.insert(initdata::build(&dev, cfg, &session.adt, objects, board_images)?);
     uat::tlbi_all();
     dev_info!(
         dev,
@@ -580,26 +601,18 @@ pub(crate) fn start(
     cfg: &'static Config,
     shared: &Arc<Shared>,
 ) -> Result<Booted> {
-    let Admitted { regs, adt } = admitted;
+    let Admitted { regs, adt, board_images } = admitted;
     let d: ARef<device::Device> = shared.dev.clone();
     // Released by an early failure below, until the session is retained.
-    let mut vote = Vote(false);
+    let mut vote = Vote(None);
     if cfg.platform == hw::Platform::AdtWithPmp {
-        // The PMP AGX vote: power command 0x0f for PMP device 5 (AGX), the request the J514S
-        // bridge sent (0x0020f50100000000). The PMP driver's bridge waits for the acknowledgement.
-        // SAFETY: Sends one message through the registered PMP; no pointer is passed.
-        let ret = unsafe { bindings::apple_pmp_set_device_power(0x0f, 5, 1) };
+        // SAFETY: `d` is the bound GPU device.
+        let ret = unsafe { glue::asahi_g15_pmp_get(d.as_raw().cast()) };
         if ret != 0 {
-            let err = Error::from_errno(ret);
-            if err == ENODEV {
-                // No PMP registered yet: the display gate adds and starts it; probe again then.
-                dev_info!(d, "PMP not registered yet; deferring the GPU start\n");
-                return Err(EPROBE_DEFER);
-            }
-            dev_err!(d, "PMP AGX vote failed: {:?}\n", err);
-            return Err(err);
+            dev_err!(d, "PMP AGX vote failed: {}\n", ret);
+            return Err(Error::from_errno(ret));
         }
-        vote = Vote(true);
+        vote = Vote(Some(d.clone()));
     }
     let id = regs.identity(cfg)?;
     dev_info!(
@@ -667,9 +680,14 @@ pub(crate) fn start(
     // From here on the firmware is touched: nothing it can reach is freed, the vote included.
     glue::retain_module();
     vote.keep();
-    let rtkit = match Rtkit::new(&d, shared) {
+    // Full-stack T6030 synthesizes a named mailbox. The maintained T6030
+    // DT instead has one unnamed mailbox, like the other device-tree GPUs.
+    let named_mailbox = cfg.platform == hw::Platform::AdtWithPmp
+        && !cfg!(CONFIG_SILICONFOREST_NATIVE_GPU);
+    let rtkit = match Rtkit::new(&d, shared, named_mailbox) {
         Ok(rtkit) => rtkit,
         Err(e) => {
+            dev_err!(d, "G15: RTKit mailbox initialization failed: {:?}\n", e);
             core::mem::forget(objects);
             return Err(e);
         }
@@ -688,7 +706,7 @@ pub(crate) fn start(
     let result = events
         .reserve()
         .and_then(|_| session.regs.set_asc_control(control | regs::ASC_RUN))
-        .and_then(|_| run(&mut session, cfg, &mut objects, &mut events, &mut built));
+        .and_then(|_| run(&mut session, cfg, &mut objects, &mut events, &mut built, board_images));
     if let Err(e) = result {
         dev_err!(
             d,

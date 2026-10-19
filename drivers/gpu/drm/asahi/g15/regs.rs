@@ -125,7 +125,8 @@ impl Mapping {
         if size == 0 {
             return Err(EINVAL);
         }
-        if !super::boot::glue::ram_within(phys, size as u64) {
+        let mode = super::boot::glue::memory_mode(phys, size as u64)?;
+        if mode == bindings::MEMREMAP_WC as u32 {
             return Self::write_combined(phys, size);
         }
         // SAFETY: memremap() of System RAM with MEMREMAP_WB returns its existing mapping; the
@@ -212,7 +213,7 @@ pub(crate) struct Regs {
 
 impl Regs {
     /// Maps the ASC control page and the SGX status window.
-    pub(crate) fn new(pdev: &platform::Device<Core>, res: Resources) -> Result<Self> {
+    pub(crate) fn new(pdev: &platform::Device<Core<'_>>, res: Resources) -> Result<Self> {
         let window = |name: &CStr, offset: u64| -> Result<Mapping> {
             let r = pdev.resource_by_name(name).ok_or(EINVAL)?;
             let nonposted = r
