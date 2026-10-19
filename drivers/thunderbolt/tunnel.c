@@ -48,6 +48,9 @@
 #define TB_DP_AUX_PRIORITY		2
 #define TB_DP_AUX_WEIGHT		1
 
+/* struct tb_regs_hop::initial_credits is 7 bits wide */
+#define TB_MAX_CREDITS			127
+
 /* Minimum number of credits needed for PCIe path */
 #define TB_MIN_PCIE_CREDITS		6U
 /*
@@ -1113,7 +1116,7 @@ static void tb_dp_dprx_work(struct work_struct *work)
 	}
 	mutex_unlock(&tb->lock);
 
-	tunnel->callback(tunnel);
+	tunnel->callback(tunnel, tunnel->callback_data);
 	tb_tunnel_put(tunnel);
 	tb_domain_put(tb);
 }
@@ -1589,6 +1592,7 @@ static void tb_dp_dump(struct tb_tunnel *tunnel)
  * @alloc_hopid: Allocate HopIDs from visited ports
  * @callback: Callback that is called when the DP tunnel is fully
  *	      activated (or there is an error)
+ * @callback_data: Data for @callback
  *
  * If @in adapter is active, follows the tunnel to the DP out adapter
  * and back. Returns the discovered tunnel or %NULL if there was no
@@ -1598,7 +1602,8 @@ static void tb_dp_dump(struct tb_tunnel *tunnel)
  */
 struct tb_tunnel *tb_tunnel_discover_dp(struct tb *tb, struct tb_port *in,
 					bool alloc_hopid,
-					void (*callback)(struct tb_tunnel *))
+					void (*callback)(struct tb_tunnel *, void *),
+					void *callback_data)
 {
 	struct tb_tunnel *tunnel;
 	struct tb_port *port;
@@ -1623,6 +1628,7 @@ struct tb_tunnel *tb_tunnel_discover_dp(struct tb *tb, struct tb_port *in,
 	tunnel->consumed_bandwidth = tb_dp_consumed_bandwidth;
 	tunnel->src_port = in;
 	tunnel->callback = callback;
+	tunnel->callback_data = callback_data;
 	INIT_DELAYED_WORK(&tunnel->dprx_work, tb_dp_dprx_work);
 
 	path = tb_path_discover(in, TB_DP_VIDEO_HOPID, NULL, -1,
@@ -1693,6 +1699,7 @@ err_free:
  *	      %0 if no available bandwidth.
  * @callback: Callback that is called when the DP tunnel is fully
  *	      activated (or there is an error)
+ * @callback_data: Data for @callback
  *
  * Allocates a tunnel between @in and @out that is capable of tunneling
  * Display Port traffic. The @callback is called after tb_tunnel_activate()
@@ -1706,7 +1713,8 @@ err_free:
 struct tb_tunnel *tb_tunnel_alloc_dp(struct tb *tb, struct tb_port *in,
 				     struct tb_port *out, int link_nr,
 				     int max_up, int max_down,
-				     void (*callback)(struct tb_tunnel *))
+				     void (*callback)(struct tb_tunnel *, void *),
+				     void *callback_data)
 {
 	struct tb_tunnel *tunnel;
 	struct tb_path **paths;
@@ -1732,6 +1740,7 @@ struct tb_tunnel *tb_tunnel_alloc_dp(struct tb *tb, struct tb_port *in,
 	tunnel->max_up = max_up;
 	tunnel->max_down = max_down;
 	tunnel->callback = callback;
+	tunnel->callback_data = callback_data;
 	INIT_DELAYED_WORK(&tunnel->dprx_work, tb_dp_dprx_work);
 
 	paths = tunnel->paths;
@@ -1792,8 +1801,7 @@ static int tb_dma_reserve_credits(struct tb_path_hop *hop, unsigned int credits)
 		if (available < TB_MIN_DMA_CREDITS)
 			return -ENOSPC;
 
-		while (credits > available)
-			credits--;
+		credits = min(credits, available);
 
 		tb_port_dbg(port, "reserving %u credits for DMA path\n",
 			    credits);
@@ -1922,7 +1930,7 @@ struct tb_tunnel *tb_tunnel_alloc_dma(struct tb *tb, struct tb_port *nhi,
 	struct tb_tunnel *tunnel;
 	size_t npaths = 0, i = 0;
 	struct tb_path *path;
-	int credits;
+	unsigned int credits;
 
 	/* Ring 0 is reserved for control channel */
 	if (WARN_ON(!receive_ring || !transmit_ring))
@@ -1945,6 +1953,11 @@ struct tb_tunnel *tb_tunnel_alloc_dma(struct tb *tb, struct tb_port *nhi,
 	tunnel->destroy = tb_dma_destroy;
 
 	credits = min_not_zero(dma_credits, nhi->sw->max_dma_credits);
+	if (credits > TB_MAX_CREDITS) {
+		tb_tunnel_dbg(tunnel, "%u credits do not fit a hop, using %u\n",
+			      credits, TB_MAX_CREDITS);
+		credits = TB_MAX_CREDITS;
+	}
 
 	if (receive_ring > 0) {
 		path = tb_path_alloc(tb, dst, receive_path, nhi, receive_ring, 0,

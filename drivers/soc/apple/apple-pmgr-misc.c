@@ -5,17 +5,18 @@
  * Copyright The Asahi Linux Contributors
  */
 
-#include <linux/bitops.h>
 #include <linux/bitfield.h>
+#include <linux/bitops.h>
 #include <linux/err.h>
 #include <linux/io.h>
+#include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
-#include <linux/module.h>
 
 #define APPLE_CLKGEN_PSTATE 0
 #define APPLE_CLKGEN_PSTATE_DESIRED GENMASK(3, 0)
 
+#define DCS_DEV_PSTATE_MIN_T600X 7
 #define SYS_DEV_PSTATE_SUSPEND 1
 
 enum sys_device {
@@ -28,6 +29,10 @@ struct apple_pmgr_sys_device {
 	void __iomem *base;
 	u32 active_state;
 	u32 suspend_state;
+};
+
+struct apple_pmgr_misc_hw {
+	u32 dev_min_ps[DEV_MAX];
 };
 
 struct apple_pmgr_misc {
@@ -49,12 +54,11 @@ static void apple_pmgr_sys_dev_set_pstate(struct apple_pmgr_misc *misc,
 	else
 		pstate = misc->devices[dev].suspend_state;
 
-	printk("set %d ps to pstate %d\n", dev, pstate);
+	dev_dbg(misc->dev, "set %d ps to pstate %d\n", dev, pstate);
 
 	val = readl_relaxed(misc->devices[dev].base + APPLE_CLKGEN_PSTATE);
-	val &= ~APPLE_CLKGEN_PSTATE_DESIRED;
-	val |= FIELD_PREP(APPLE_CLKGEN_PSTATE_DESIRED, pstate);
-	writel_relaxed(val, misc->devices[dev].base);
+	FIELD_MODIFY(APPLE_CLKGEN_PSTATE_DESIRED, &val, pstate);
+	writel_relaxed(val, misc->devices[dev].base + APPLE_CLKGEN_PSTATE);
 }
 
 static int __maybe_unused apple_pmgr_misc_suspend_noirq(struct device *dev)
@@ -79,8 +83,10 @@ static int __maybe_unused apple_pmgr_misc_resume_noirq(struct device *dev)
 	return 0;
 }
 
-static bool apple_pmgr_init_device(struct apple_pmgr_misc *misc,
-				   enum sys_device dev, const char *device_name)
+static int apple_pmgr_init_device(struct apple_pmgr_misc *misc,
+				  const struct apple_pmgr_misc_hw *hw,
+				  enum sys_device dev,
+				  const char *device_name)
 {
 	void __iomem *base;
 	char name[32];
@@ -90,48 +96,65 @@ static bool apple_pmgr_init_device(struct apple_pmgr_misc *misc,
 
 	base = devm_platform_ioremap_resource_byname(
 		to_platform_device(misc->dev), name);
-	if (!base)
-		return false;
+	if (IS_ERR(base))
+		return PTR_ERR(base);
 
 	val = readl_relaxed(base + APPLE_CLKGEN_PSTATE);
 
 	misc->devices[dev].base = base;
 	misc->devices[dev].active_state =
 		FIELD_GET(APPLE_CLKGEN_PSTATE_DESIRED, val);
-	misc->devices[dev].suspend_state = SYS_DEV_PSTATE_SUSPEND;
+	misc->devices[dev].suspend_state = hw->dev_min_ps[dev];
 
-	snprintf(name, sizeof(name), "apple,%s-min-ps", device_name);
-	of_property_read_u32(misc->dev->of_node, name,
-			     &misc->devices[dev].suspend_state);
-
-	return true;
+	return 0;
 }
 
 static int apple_pmgr_misc_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
+	const struct apple_pmgr_misc_hw *hw;
 	struct apple_pmgr_misc *misc;
-	int ret = -ENODEV;
+	int ret;
 
 	misc = devm_kzalloc(dev, sizeof(*misc), GFP_KERNEL);
 	if (!misc)
 		return -ENOMEM;
 
 	misc->dev = dev;
+	hw = of_device_get_match_data(dev);
+	if (!hw)
+		return -EINVAL;
 
-	if (apple_pmgr_init_device(misc, DEV_FABRIC, "fabric"))
-		ret = 0;
+	ret = apple_pmgr_init_device(misc, hw, DEV_FABRIC, "fabric");
+	if (ret)
+		return ret;
 
-	if (apple_pmgr_init_device(misc, DEV_DCS, "dcs"))
-		ret = 0;
+	ret = apple_pmgr_init_device(misc, hw, DEV_DCS, "dcs");
+	if (ret)
+		return ret;
 
 	platform_set_drvdata(pdev, misc);
 
-	return ret;
+	return 0;
 }
 
+static const struct apple_pmgr_misc_hw apple_pmgr_misc_hw_t600x = {
+	.dev_min_ps = {
+		[DEV_FABRIC] = SYS_DEV_PSTATE_SUSPEND,
+		[DEV_DCS] = DCS_DEV_PSTATE_MIN_T600X,
+	},
+};
+
+static const struct apple_pmgr_misc_hw apple_pmgr_misc_hw_t602x = {
+	.dev_min_ps = {
+		[DEV_FABRIC] = SYS_DEV_PSTATE_SUSPEND,
+		[DEV_DCS] = SYS_DEV_PSTATE_SUSPEND,
+	},
+};
+
 static const struct of_device_id apple_pmgr_misc_of_match[] = {
-	{ .compatible = "apple,t6000-pmgr-misc" },
+	{ .compatible = "apple,t6000-pmgr-misc", .data = &apple_pmgr_misc_hw_t600x },
+	{ .compatible = "apple,t6020-pmgr-misc", .data = &apple_pmgr_misc_hw_t602x },
 	{}
 };
 
@@ -153,6 +176,6 @@ static struct platform_driver apple_pmgr_misc_driver = {
 
 MODULE_AUTHOR("Hector Martin <marcan@marcan.st>");
 MODULE_DESCRIPTION("PMGR misc driver for Apple SoCs");
-MODULE_LICENSE("GPL v2");
+MODULE_LICENSE("GPL");
 
 module_platform_driver(apple_pmgr_misc_driver);

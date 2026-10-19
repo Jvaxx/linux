@@ -584,6 +584,7 @@ mod tests {
     }
 
     impl From<MemoryType> for Bounded<u64, 4> {
+        #[inline(always)]
         fn from(mt: MemoryType) -> Bounded<u64, 4> {
             Bounded::from_expr(mt as u64)
         }
@@ -609,6 +610,7 @@ mod tests {
     }
 
     impl From<Priority> for Bounded<u16, 2> {
+        #[inline(always)]
         fn from(p: Priority) -> Bounded<u16, 2> {
             Bounded::from_expr(p as u16)
         }

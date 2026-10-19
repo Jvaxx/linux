@@ -9,10 +9,10 @@ use kernel::{
     dma::{
         Coherent,
         CoherentBox,
-        DmaAddress,
-        DmaMask, //
+        DmaAddress, //
     },
     io::{
+        io_project,
         poll::read_poll_timeout,
         register::{
             RegisterBase,
@@ -500,7 +500,7 @@ impl<'a, E: FalconEngine + 'static> Falcon<'a, E> {
         Ok(())
     }
 
-    /// Perform a DMA write according to `load_offsets` from `dma_handle` into the falcon's
+    /// Perform a DMA write according to `load_offsets` from `dma_obj` into the falcon's
     /// `target_mem`.
     ///
     /// `sec` is set if the loaded firmware is expected to run in secure mode.
@@ -512,20 +512,31 @@ impl<'a, E: FalconEngine + 'static> Falcon<'a, E> {
     ) -> Result {
         const DMA_LEN: u32 = num::usize_into_u32::<{ MEM_BLOCK_ALIGNMENT }>();
 
+        // DMA transfers can only be done in units of 256 bytes. Compute how many such transfers we
+        // need to perform.
+        let num_transfers = load_offsets.len.div_ceil(DMA_LEN);
+
         // For IMEM, we want to use the start offset as a virtual address tag for each page, since
         // code addresses in the firmware (and the boot vector) are virtual.
         //
-        // For DMEM we can fold the start offset into the DMA handle.
+        // For DMEM, the start offset is folded into the DMA address.
         let (src_start, dma_start) = match target_mem {
-            FalconMem::ImemSecure | FalconMem::ImemNonSecure => {
-                (load_offsets.src_start, dma_obj.dma_handle())
-            }
-            FalconMem::Dmem => (
-                0,
-                dma_obj.dma_handle() + DmaAddress::from(load_offsets.src_start),
-            ),
+            FalconMem::ImemSecure | FalconMem::ImemNonSecure => (load_offsets.src_start, 0),
+            FalconMem::Dmem => (0, usize::from_safe_cast(load_offsets.src_start)),
         };
-        if dma_start % DmaAddress::from(DMA_LEN) > 0 {
+
+        let dma_address = {
+            // Upper limit of transfer is `(num_transfers * DMA_LEN) + load_offsets.src_start`.
+            let dma_end = num_transfers
+                .checked_mul(DMA_LEN)
+                .and_then(|size| size.checked_add(load_offsets.src_start))
+                .map(usize::from_safe_cast)
+                .ok_or(EOVERFLOW)?;
+
+            io_project!(dma_obj, [try: dma_start..dma_end]).dma_address()
+        };
+
+        if dma_address % DmaAddress::from(DMA_LEN) > 0 {
             dev_err!(
                 self.dev,
                 "DMA transfer start addresses must be a multiple of {}\n",
@@ -534,33 +545,6 @@ impl<'a, E: FalconEngine + 'static> Falcon<'a, E> {
             return Err(EINVAL);
         }
 
-        // The DMATRFBASE/1 register pair only supports a 49-bit address.
-        if dma_start > DmaMask::new::<49>().value() {
-            dev_err!(self.dev, "DMA address {:#x} exceeds 49 bits\n", dma_start);
-            return Err(ERANGE);
-        }
-
-        // DMA transfers can only be done in units of 256 bytes. Compute how many such transfers we
-        // need to perform.
-        let num_transfers = load_offsets.len.div_ceil(DMA_LEN);
-
-        // Check that the area we are about to transfer is within the bounds of the DMA object.
-        // Upper limit of transfer is `(num_transfers * DMA_LEN) + load_offsets.src_start`.
-        match num_transfers
-            .checked_mul(DMA_LEN)
-            .and_then(|size| size.checked_add(load_offsets.src_start))
-        {
-            None => {
-                dev_err!(self.dev, "DMA transfer length overflow\n");
-                return Err(EOVERFLOW);
-            }
-            Some(upper_bound) if usize::from_safe_cast(upper_bound) > dma_obj.size() => {
-                dev_err!(self.dev, "DMA transfer goes beyond range of DMA object\n");
-                return Err(EINVAL);
-            }
-            Some(_) => (),
-        };
-
         // Set up the base source DMA address.
 
         self.bar.write(
@@ -568,12 +552,12 @@ impl<'a, E: FalconEngine + 'static> Falcon<'a, E> {
             regs::NV_PFALCON_FALCON_DMATRFBASE::zeroed().with_base(
                 // CAST: `as u32` is used on purpose since we do want to strip the upper bits,
                 // which will be written to `NV_PFALCON_FALCON_DMATRFBASE1`.
-                (dma_start >> 8) as u32,
+                (dma_address >> 8) as u32,
             ),
         );
         self.bar.write(
             WithBase::of::<E>(),
-            regs::NV_PFALCON_FALCON_DMATRFBASE1::zeroed().try_with_base(dma_start >> 40)?,
+            regs::NV_PFALCON_FALCON_DMATRFBASE1::zeroed().try_with_base(dma_address >> 40)?,
         );
 
         let cmd = regs::NV_PFALCON_FALCON_DMATRFCMD::zeroed()
@@ -749,9 +733,20 @@ impl<'a, E: FalconEngine + 'static> Falcon<'a, E> {
 
     /// Check if the RISC-V core is active.
     ///
+    /// Note that this does not guarantee that the RISC-V core is halted if it returns `false`.
+    ///
     /// Returns `true` if the RISC-V core is active, `false` otherwise.
     pub(crate) fn is_riscv_active(&self) -> bool {
         self.hal.is_riscv_active(self)
+    }
+
+    /// Checks whether the RISC-V core is halted.
+    ///
+    /// Note that this does not guarantee that the RISC-V core is active if it returns `false`.
+    ///
+    /// Returns [`ENOTSUPP`] if the status is not available.
+    pub(crate) fn is_riscv_halted(&self) -> Result<bool> {
+        self.hal.is_riscv_halted(self)
     }
 
     /// Load a firmware image into Falcon memory, using the preferred method for the current

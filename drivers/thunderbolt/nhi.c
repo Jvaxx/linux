@@ -15,6 +15,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/interrupt.h>
 #include <linux/iommu.h>
+#include <linux/lockdep.h>
 #include <linux/module.h>
 #include <linux/delay.h>
 #include <linux/property.h>
@@ -626,6 +627,8 @@ static struct tb_ring *tb_ring_alloc(struct tb_nhi *nhi, u32 hop, int size,
 	INIT_LIST_HEAD(&ring->in_flight);
 	INIT_WORK(&ring->work, ring_work);
 	init_waitqueue_head(&ring->wait);
+	lockdep_register_key(&ring->lock_key);
+	lockdep_init_map(&ring->work.lockdep_map, "ring.work", &ring->lock_key, 0);
 
 	ring->nhi = nhi;
 	ring->hop = hop;
@@ -664,6 +667,7 @@ err_free_descs:
 			  ring->size * sizeof(*ring->descriptors),
 			  ring->descriptors, ring->descriptors_dma);
 err_free_ring:
+	lockdep_unregister_key(&ring->lock_key);
 	kfree(ring);
 
 	return NULL;
@@ -903,6 +907,7 @@ void tb_ring_free(struct tb_ring *ring)
 	 * to finish before freeing the ring.
 	 */
 	flush_work(&ring->work);
+	lockdep_unregister_key(&ring->lock_key);
 	kfree(ring);
 }
 EXPORT_SYMBOL_GPL(tb_ring_free);
@@ -1333,6 +1338,8 @@ int nhi_probe(struct tb_nhi *nhi)
 			"failed to determine connection manager, aborting\n");
 
 	dev_dbg(dev, "NHI initialized, starting thunderbolt\n");
+
+	nhi->host_reset = host_reset;
 
 	res = tb_domain_add(tb, host_reset);
 	if (res) {
