@@ -24,7 +24,9 @@
 #include <uapi/linux/kexec.h>
 #include <linux/verification.h>
 
-/* Built-in users only: reason must remain immutable for the whole boot. */
+/* The guard and reason must remain valid and immutable for the whole boot.
+ * Modular callers must pin their module before acquiring a retained guard.
+ */
 struct kexec_blocker {
 	atomic_t users;
 	const char *reason;

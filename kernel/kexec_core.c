@@ -13,6 +13,7 @@
 #include <linux/slab.h>
 #include <linux/fs.h>
 #include <linux/kexec.h>
+#include <linux/export.h>
 #include <linux/mutex.h>
 #include <linux/list.h>
 #include <linux/liveupdate.h>
@@ -53,13 +54,13 @@ atomic_t __kexec_lock = ATOMIC_INIT(0);
 
 /* Acquisition is serialized with load and execution by __kexec_lock. */
 static atomic_t kexec_blockers = ATOMIC_INIT(0);
-/* An immutable built-in reason remains valid after its guard is released. */
+/* An immutable boot-lifetime reason stays valid after its guard is released. */
 static const char *kexec_first_reason;
 
 /**
  * kexec_block - prevent loading and executing kernels while memory is retained
  *
- * @blocker: built-in guard with a boot-lifetime immutable reason
+ * @blocker: boot-lifetime guard with an immutable reason
  *
  * Acquire before publishing memory to hardware that cannot be quiesced for
  * kexec. Existing normal and crash images remain loaded, but cannot execute.
@@ -82,6 +83,7 @@ int kexec_block(struct kexec_blocker *blocker)
 	kexec_unlock();
 	return 0;
 }
+EXPORT_SYMBOL_GPL(kexec_block);
 
 /**
  * kexec_unblock - release a successful kexec_block() acquisition
@@ -97,6 +99,7 @@ void kexec_unblock(struct kexec_blocker *blocker)
 	/* Releasing after DMA stops cannot make any transition unsafe. */
 	WARN_ON_ONCE(atomic_dec_if_positive(&kexec_blockers) < 0);
 }
+EXPORT_SYMBOL_GPL(kexec_unblock);
 
 /* All callers hold __kexec_lock, so checking and execution cannot race. */
 bool notrace kexec_blocked(void)
