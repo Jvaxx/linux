@@ -2,12 +2,17 @@
 /*
  * KUnit test of the display gate, run on test device trees instead of a
  * Mac's: the gate's own init code decides, applies its changes and adds the
- * PMP from its built-in overlay.
+ * PMP from its built-in overlay (T6030), or completes the PMP the test tree
+ * describes (T6031, T8122).
+ *  - T6030 (t6030-gate-test.dtso): on by default, as before, and
+ *    the T6031 switch does not change it. Run first: the T6031 and T8122
+ *    trees describe a PMP, and the T6030 gate refuses to add a second one.
  *  - T6031 (t6031-gate-test.dtso): off by default, enabled only by
  *    apple_t6031_display.enable=1 with the full handoff, and nothing changed
  *    when a check fails.
- *  - T6030 (t6030-gate-test.dtso): on by default, as before, and
- *    the T6031 switch does not change it.
+ *  - T8122 (t8122-gate-test.dtso): on by default, with the full handoff,
+ *    and nothing changed when a check of the handoff or of the reused PMP
+ *    topology fails.
  * Included at the end of t6030-display-gate.c.
  *
  * The test trees are applied once and stay: the gate gives some properties
@@ -21,6 +26,8 @@ extern const u8 __dtbo_t6031_gate_test_begin[];
 extern const u8 __dtbo_t6031_gate_test_end[];
 extern const u8 __dtbo_t6030_gate_test_begin[];
 extern const u8 __dtbo_t6030_gate_test_end[];
+extern const u8 __dtbo_t8122_gate_test_begin[];
+extern const u8 __dtbo_t8122_gate_test_end[];
 
 /* One SoC's test tree and what the gate should make of it. */
 struct gt_soc {
@@ -31,6 +38,9 @@ struct gt_soc {
 	const char *ps[PMP_PS_NR];		/* as PMP_PS_* */
 	const char *report_compat, *disp_entry, *pmp_compat, *pmp_dart, *pmp_mbox;
 	const char *pmp_uuid;			/* the PMP image of the fixture */
+	/* The reused PMP topology (soc->reuse_pmp): its nodes in the test tree. */
+	const char *report, *pmp, *disp, *ans;
+	bool pmp_always_on;			/* the tree already keeps PMP on */
 };
 
 static const struct gt_soc gt_t6031 __initconst = {
@@ -54,8 +64,43 @@ static const struct gt_soc gt_t6031 __initconst = {
 	.disp_entry = "report@10",
 	.pmp_compat = "apple,t6031-pmp-v2",
 	.pmp_dart = "iommu@290300000",
-	.pmp_mbox = "mailbox@290c08000",
+	.pmp_mbox = "mbox@290c08000",
 	.pmp_uuid = "07FF4C5B-CB2E-3DE6-95FF-3B107D19B7AB",
+	.report = "/soc/pmp_report@2903c0000",
+	.pmp = "/soc/pmp@290700000",
+	.disp = "/soc/pmp_report@2903c0000/report@10",
+	.ans = "/soc/pmp_report@2903c0000/report@21",
+};
+
+static const struct gt_soc gt_t8122 __initconst = {
+	.soc = &gate_t8122,
+	.fixture = __dtbo_t8122_gate_test_begin,
+	.fixture_end = __dtbo_t8122_gate_test_end,
+	.nodes = { "/t8122-soc/dcp@28ec00000", "/t8122-soc/display-subsystem",
+		   "/t8122-soc/mailbox@28ec08000", "/t8122-soc/iommu@28d30c000",
+		   "/t8122-soc/iommu@28d304000" },
+	.dcp = "/t8122-soc/dcp@28ec00000",
+	.display = "/t8122-soc/display-subsystem",
+	.values = "/chosen/asahi,t8122-pmp",
+	.aic = "/t8122-soc/interrupt-controller@2d1000000",
+	.ps = {
+		[PMP_PS_DISP_SYS] = "/t8122-soc/power-management@2d0700000/power-controller@1d8",
+		[PMP_PS_DISP_FE] = "/t8122-soc/power-management@2d0700000/power-controller@208",
+		[PMP_PS_DISP_CPU] = "/t8122-soc/power-management@2d0700000/power-controller@10000",
+		[PMP_PS_PMP] = "/t8122-soc/power-management@2d0700000/power-controller@450",
+		[PMP_PS_PMS_SRAM] = "/t8122-soc/power-management@2d0700000/power-controller@458",
+	},
+	.report_compat = "apple,t8122-pmp-v2-report",
+	.disp_entry = "report@7",
+	.pmp_compat = "apple,t8122-pmp-v2",
+	.pmp_dart = "iommu@2d0300000",
+	.pmp_mbox = "mbox@2d0c08000",
+	.pmp_uuid = "3B18C886-4C70-349B-B1C4-70F35DE2C5CD",
+	.report = "/t8122-soc/pmp_report@2d03c0000",
+	.pmp = "/t8122-soc/pmp@2d0500000",
+	.disp = "/t8122-soc/pmp_report@2d03c0000/report@7",
+	.ans = "/t8122-soc/pmp_report@2d03c0000/report@11",
+	.pmp_always_on = true,
 };
 
 static const struct gt_soc gt_t6030 __initconst = {
@@ -85,6 +130,7 @@ static const struct gt_soc gt_t6030 __initconst = {
 
 static int gt_fixture_t6031 __initdata = -1;
 static int gt_fixture_t6030 __initdata = -1;
+static int gt_fixture_t8122 __initdata = -1;
 
 /*
  * Whether the booted tree has its own /soc, checked before the first fixture
@@ -171,6 +217,24 @@ static u32 __init gt_u32(struct kunit *test, const char *path, const char *name)
 	return val;
 }
 
+/*
+ * Nothing enabled and no PMP completed, where the case itself changed the
+ * reused PMP topology that gt_expect_untouched() also checks.
+ */
+static void __init gt_expect_refused(struct kunit *test)
+{
+	struct gate_test *t = test->priv;
+	const struct gt_soc *s = t->s;
+	int i;
+
+	for (i = 0; i < GATE_NR_NODES; i++)
+		KUNIT_EXPECT_FALSE_MSG(test, gt_okay(test, s->nodes[i]), "%s enabled", s->nodes[i]);
+	KUNIT_EXPECT_FALSE(test, gate_pmp_reused);
+	KUNIT_EXPECT_EQ(test, gate_pmp_ovcs, 0);
+	KUNIT_EXPECT_FALSE(test, of_property_present(gt_node(test, s->ps[PMP_PS_DISP_SYS]),
+						     "apple,min-state"));
+}
+
 /* Nothing enabled, no PMP added, no property of the gate's left behind. */
 static void __init gt_expect_untouched(struct kunit *test)
 {
@@ -181,14 +245,32 @@ static void __init gt_expect_untouched(struct kunit *test)
 
 	for (i = 0; i < GATE_NR_NODES; i++)
 		KUNIT_EXPECT_FALSE_MSG(test, gt_okay(test, s->nodes[i]), "%s enabled", s->nodes[i]);
-	report = of_find_compatible_node(NULL, NULL, s->report_compat);
-	KUNIT_EXPECT_NULL(test, report);
-	of_node_put(report);
-	KUNIT_EXPECT_FALSE(test, of_property_present(gt_node(test, s->dcp), "apple,pmp-report"));
+	if (s->soc->reuse_pmp) {
+		/* The tree's own PMP topology is as described, without values. */
+		KUNIT_EXPECT_FALSE(test, gate_pmp_reused);
+		KUNIT_EXPECT_FALSE(test, of_property_present(gt_node(test, s->pmp),
+							     "apple,tunable-uuid"));
+		KUNIT_EXPECT_FALSE(test, of_property_present(gt_node(test, s->pmp),
+							     "apple,board-id"));
+		KUNIT_EXPECT_FALSE(test, gt_okay(test, s->pmp));
+		KUNIT_EXPECT_FALSE(test, of_property_present(gt_node(test, s->ans),
+							     "apple,no-ack"));
+		KUNIT_EXPECT_FALSE(test, of_property_present(gt_node(test, s->ans),
+							     "apple,always-on"));
+		KUNIT_EXPECT_FALSE(test, of_property_present(gt_node(test, s->disp),
+							     "apple,soc-device-record"));
+	} else {
+		report = of_find_compatible_node(NULL, NULL, s->report_compat);
+		KUNIT_EXPECT_NULL(test, report);
+		of_node_put(report);
+		KUNIT_EXPECT_FALSE(test, of_property_present(gt_node(test, s->dcp),
+							     "apple,pmp-report"));
+	}
 	KUNIT_EXPECT_FALSE(test, of_property_present(gt_node(test, s->ps[PMP_PS_DISP_SYS]),
 						     "apple,min-state"));
-	KUNIT_EXPECT_FALSE(test, of_property_present(gt_node(test, s->ps[PMP_PS_PMP]),
-						     "apple,always-on"));
+	if (!s->pmp_always_on)
+		KUNIT_EXPECT_FALSE(test, of_property_present(gt_node(test, s->ps[PMP_PS_PMP]),
+							     "apple,always-on"));
 	KUNIT_EXPECT_EQ(test, gate_pmp_ovcs, 0);
 }
 
@@ -205,7 +287,20 @@ static void __init gt_expect_enabled(struct kunit *test)
 	for (i = 0; i < GATE_NR_NODES; i++)
 		KUNIT_EXPECT_TRUE_MSG(test, gt_okay(test, s->nodes[i]), "%s not enabled",
 				      s->nodes[i]);
-	KUNIT_EXPECT_NE(test, gate_pmp_ovcs, 0);
+	if (s->soc->reuse_pmp) {
+		KUNIT_EXPECT_EQ(test, gate_pmp_ovcs, 0);
+		KUNIT_EXPECT_TRUE(test, gate_pmp_reused);
+		/* Storage is requested from the start, and never acknowledged. */
+		KUNIT_EXPECT_TRUE(test, of_property_read_bool(gt_node(test, s->ans),
+							      "apple,always-on"));
+		KUNIT_EXPECT_TRUE(test, of_property_read_bool(gt_node(test, s->ans),
+							      "apple,no-ack"));
+		KUNIT_EXPECT_EQ(test, of_property_read_bool(gt_node(test, s->disp),
+							    "apple,soc-device-record"),
+				s->soc->records);
+	} else {
+		KUNIT_EXPECT_NE(test, gate_pmp_ovcs, 0);
+	}
 
 	/* The DCP waits for the internal display request. */
 	entry = of_parse_phandle(gt_node(test, s->dcp), "apple,pmp-report", 0);
@@ -237,8 +332,11 @@ static void __init gt_expect_enabled(struct kunit *test)
 	KUNIT_ASSERT_NOT_NULL(test, mbox);
 	KUNIT_EXPECT_STREQ(test, of_node_full_name(dart), s->pmp_dart);
 	KUNIT_EXPECT_STREQ(test, of_node_full_name(mbox), s->pmp_mbox);
-	KUNIT_EXPECT_FALSE(test, of_device_is_available(dart));
-	KUNIT_EXPECT_FALSE(test, of_device_is_available(mbox));
+	/* The overlay's stay disabled; the reused ones stay as described. */
+	if (!s->soc->reuse_pmp) {
+		KUNIT_EXPECT_FALSE(test, of_device_is_available(dart));
+		KUNIT_EXPECT_FALSE(test, of_device_is_available(mbox));
+	}
 	KUNIT_EXPECT_EQ(test, of_property_read_u32(dart, "interrupt-parent", &parent), 0);
 	KUNIT_EXPECT_EQ(test, parent, aic->phandle);
 	parent = 0;
@@ -278,6 +376,11 @@ static int __init gt_suite_init_t6030(struct kunit_suite *suite)
 	return gt_apply_fixture(&gt_t6030, &gt_fixture_t6030);
 }
 
+static int __init gt_suite_init_t8122(struct kunit_suite *suite)
+{
+	return gt_apply_fixture(&gt_t8122, &gt_fixture_t8122);
+}
+
 static int __init gt_init(struct kunit *test, const struct gt_soc *s)
 {
 	struct gate_test *t = kunit_kzalloc(test, sizeof(*t), GFP_KERNEL);
@@ -293,6 +396,7 @@ static int __init gt_init(struct kunit *test, const struct gt_soc *s)
 	gate_soc = s->soc;
 	gate_pmp_values = NULL;
 	gate_pmp_ovcs = 0;
+	gate_pmp_reused = false;
 	gate_requested = true;
 	gate_t6031_requested = false;
 	if (gt_live_soc)
@@ -310,6 +414,11 @@ static int __init gt_init_t6030(struct kunit *test)
 	return gt_init(test, &gt_t6030);
 }
 
+static int __init gt_init_t8122(struct kunit *test)
+{
+	return gt_init(test, &gt_t8122);
+}
+
 static void __init gt_exit(struct kunit *test)
 {
 	struct gate_test *t = test->priv;
@@ -320,6 +429,12 @@ static void __init gt_exit(struct kunit *test)
 		of_changeset_destroy(&gate_pmp_cs);
 		of_overlay_remove(&gate_pmp_ovcs);
 		gate_pmp_ovcs = 0;
+		of_changeset_revert(&gate_cs);
+		of_changeset_destroy(&gate_cs);
+	} else if (gate_pmp_reused) {
+		of_changeset_revert(&gate_pmp_cs);
+		of_changeset_destroy(&gate_pmp_cs);
+		gate_pmp_reused = false;
 		of_changeset_revert(&gate_cs);
 		of_changeset_destroy(&gate_cs);
 	}
@@ -477,6 +592,65 @@ static void __init gate_t6031_not_inherited_on(struct kunit *test)
 	gt_expect_untouched(test);
 }
 
+/* The reused PMP topology must be complete and unused. */
+static void __init gate_t6031_no_report_pmp_link(struct kunit *test)
+{
+	KUNIT_ASSERT_EQ(test, gate_setup_t6031("1"), 0);
+	gt_remove(test, gt_t6031.report, "apple,pmp");
+	gt_run(test);
+	gt_expect_untouched(test);
+}
+
+static void __init gate_t6031_pmp_enabled(struct kunit *test)
+{
+	KUNIT_ASSERT_EQ(test, gate_setup_t6031("1"), 0);
+	gt_set_string(test, gt_t6031.pmp, "status", "okay");
+	gt_run(test);
+	gt_expect_refused(test);
+}
+
+static void __init gate_t6031_pmp_has_values(struct kunit *test)
+{
+	KUNIT_ASSERT_EQ(test, gate_setup_t6031("1"), 0);
+	gt_add_u32(test, gt_t6031.pmp, "apple,board-id", 1);
+	gt_run(test);
+	gt_expect_refused(test);
+}
+
+static void __init gate_t6031_no_dcp_report_link(struct kunit *test)
+{
+	KUNIT_ASSERT_EQ(test, gate_setup_t6031("1"), 0);
+	gt_remove(test, gt_t6031.dcp, "apple,pmp-report");
+	gt_run(test);
+	gt_expect_untouched(test);
+}
+
+/* The DCP must wait for the display request, not the storage one. */
+static void __init gate_t6031_dcp_links_storage(struct kunit *test)
+{
+	KUNIT_ASSERT_EQ(test, gate_setup_t6031("1"), 0);
+	gt_set_u32(test, gt_t6031.dcp, "apple,pmp-report",
+		   gt_node(test, gt_t6031.ans)->phandle);
+	gt_run(test);
+	gt_expect_untouched(test);
+}
+
+static void __init gate_t6031_disp_not_always_on(struct kunit *test)
+{
+	KUNIT_ASSERT_EQ(test, gate_setup_t6031("1"), 0);
+	gt_remove(test, gt_t6031.disp, "apple,always-on");
+	gt_run(test);
+	gt_expect_untouched(test);
+}
+
+static void __init gate_t6031_no_storage_request(struct kunit *test)
+{
+	KUNIT_ASSERT_EQ(test, gate_setup_t6031("1"), 0);
+	gt_set_string(test, gt_t6031.ans, "status", "disabled");
+	gt_run(test);
+	gt_expect_refused(test);
+}
+
 /* Last: the enabled path again, after every refusal was undone. */
 static void __init gate_t6031_enabled_again(struct kunit *test)
 {
@@ -538,6 +712,117 @@ static void __init gate_t6030_enabled_again(struct kunit *test)
 	gt_expect_enabled(test);
 }
 
+/* T8122: on by default, with the device tree's own PMP */
+
+static void __init gate_t8122_default_on(struct kunit *test)
+{
+	gt_run(test);
+	gt_expect_enabled(test);
+}
+
+static void __init gate_t8122_escape(struct kunit *test)
+{
+	KUNIT_ASSERT_EQ(test, gate_setup_t8122("0"), 0);
+	gt_run(test);
+	gt_expect_untouched(test);
+}
+
+/* The T6031 switch is not the T8122 one. */
+static void __init gate_t8122_t6031_switch(struct kunit *test)
+{
+	KUNIT_ASSERT_EQ(test, gate_setup_t6031("0"), 0);
+	gt_run(test);
+	gt_expect_enabled(test);
+}
+
+static void __init gate_t8122_no_marker(struct kunit *test)
+{
+	gt_remove(test, gt_t8122.display, "apple,t8122-handoff");
+	gt_run(test);
+	gt_expect_untouched(test);
+}
+
+static void __init gate_t8122_no_pmp_values(struct kunit *test)
+{
+	gt_detach(test, gt_t8122.values);
+	gt_run(test);
+	gt_expect_untouched(test);
+}
+
+static void __init gate_t8122_t6031_pmp_image(struct kunit *test)
+{
+	gt_set_string(test, gt_t8122.values, "apple,tunable-uuid",
+		      "07FF4C5B-CB2E-3DE6-95FF-3B107D19B7AB");
+	gt_run(test);
+	gt_expect_untouched(test);
+}
+
+static void __init gate_t8122_no_report_pmp_link(struct kunit *test)
+{
+	gt_remove(test, gt_t8122.report, "apple,pmp");
+	gt_run(test);
+	gt_expect_untouched(test);
+}
+
+static void __init gate_t8122_pmp_enabled(struct kunit *test)
+{
+	gt_set_string(test, gt_t8122.pmp, "status", "okay");
+	gt_run(test);
+	gt_expect_refused(test);
+}
+
+static void __init gate_t8122_pmp_has_values(struct kunit *test)
+{
+	gt_add_u32(test, gt_t8122.pmp, "apple,dram-vendor-id", 6);
+	gt_run(test);
+	gt_expect_refused(test);
+}
+
+static void __init gate_t8122_no_pmp_dart(struct kunit *test)
+{
+	gt_remove(test, gt_t8122.pmp, "iommus");
+	gt_run(test);
+	gt_expect_untouched(test);
+}
+
+static void __init gate_t8122_no_dcp_report_link(struct kunit *test)
+{
+	gt_remove(test, gt_t8122.dcp, "apple,pmp-report");
+	gt_run(test);
+	gt_expect_untouched(test);
+}
+
+/* The display request must be acknowledged: the DCP waits for it. */
+static void __init gate_t8122_disp_no_ack(struct kunit *test)
+{
+	struct gate_test *t = test->priv;
+
+	KUNIT_ASSERT_EQ(test, of_changeset_add_prop_bool(&t->cs, gt_node(test, gt_t8122.disp),
+							 "apple,no-ack"), 0);
+	gt_run(test);
+	gt_expect_untouched(test);
+}
+
+static void __init gate_t8122_no_storage_request(struct kunit *test)
+{
+	gt_detach(test, gt_t8122.ans);
+	gt_run(test);
+	gt_expect_refused(test);
+}
+
+static void __init gate_t8122_not_inherited_on(struct kunit *test)
+{
+	gt_remove(test, gt_t8122.ps[PMP_PS_DISP_FE], "apple,inherited-on");
+	gt_run(test);
+	gt_expect_untouched(test);
+}
+
+static void __init gate_t8122_enabled_again(struct kunit *test)
+{
+	gt_run(test);
+	gt_expect_enabled(test);
+}
+
 /* The case and suite structs outlive init: only the functions are init code. */
 static struct kunit_case gate_t6031_cases[] __refdata = {
 	KUNIT_CASE(gate_t6031_param),
@@ -554,6 +839,13 @@ static struct kunit_case gate_t6031_cases[] __refdata = {
 	KUNIT_CASE(gate_t6031_other_pmp_image),
 	KUNIT_CASE(gate_t6031_t6030_power_layout),
 	KUNIT_CASE(gate_t6031_not_inherited_on),
+	KUNIT_CASE(gate_t6031_no_report_pmp_link),
+	KUNIT_CASE(gate_t6031_pmp_enabled),
+	KUNIT_CASE(gate_t6031_pmp_has_values),
+	KUNIT_CASE(gate_t6031_no_dcp_report_link),
+	KUNIT_CASE(gate_t6031_dcp_links_storage),
+	KUNIT_CASE(gate_t6031_disp_not_always_on),
+	KUNIT_CASE(gate_t6031_no_storage_request),
 	KUNIT_CASE(gate_t6031_enabled_again),
 	{}
 };
@@ -585,4 +877,32 @@ static struct kunit_suite gate_t6030_suite __refdata = {
 	.test_cases = gate_t6030_cases,
 };
 
-kunit_test_init_section_suites(&gate_t6031_suite, &gate_t6030_suite);
+static struct kunit_case gate_t8122_cases[] __refdata = {
+	KUNIT_CASE(gate_t8122_default_on),
+	KUNIT_CASE(gate_t8122_escape),
+	KUNIT_CASE(gate_t8122_t6031_switch),
+	KUNIT_CASE(gate_t8122_no_marker),
+	KUNIT_CASE(gate_t8122_no_pmp_values),
+	KUNIT_CASE(gate_t8122_t6031_pmp_image),
+	KUNIT_CASE(gate_t8122_no_report_pmp_link),
+	KUNIT_CASE(gate_t8122_pmp_enabled),
+	KUNIT_CASE(gate_t8122_pmp_has_values),
+	KUNIT_CASE(gate_t8122_no_pmp_dart),
+	KUNIT_CASE(gate_t8122_no_dcp_report_link),
+	KUNIT_CASE(gate_t8122_disp_no_ack),
+	KUNIT_CASE(gate_t8122_no_storage_request),
+	KUNIT_CASE(gate_t8122_not_inherited_on),
+	KUNIT_CASE(gate_t8122_enabled_again),
+	{}
+};
+
+static struct kunit_suite gate_t8122_suite __refdata = {
+	.name = "apple-display-gate-t8122",
+	.suite_init = gt_suite_init_t8122,
+	.init = gt_init_t8122,
+	.exit = gt_exit,
+	.test_cases = gate_t8122_cases,
+};
+
+/* T6030 first: the T6031 and T8122 trees describe a PMP, which it refuses. */
+kunit_test_init_section_suites(&gate_t6030_suite, &gate_t6031_suite, &gate_t8122_suite);

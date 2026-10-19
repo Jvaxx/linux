@@ -42,8 +42,11 @@
  *
  * What differs between SoCs is in struct gate_soc. On T8122 (M3) the gate
  * serves the same handoff, marked apple,t8122-handoff by the boot loader on
- * apple,t8122-dcp and apple,t8122-display-subsystem nodes, and adds the T8122
- * PMP the same way. There is no T8122 fallback: the boot loader must pass
+ * apple,t8122-dcp and apple,t8122-display-subsystem nodes. Its device tree
+ * already describes the PMP, its DART, mailbox and report (disabled where it
+ * must be), so the gate adds no overlay there: it checks that the PMP
+ * topology is complete and unused, and then completes it (see
+ * gate_reuse_resolve()). There is no T8122 fallback: the boot loader must pass
  * this Mac's PMP values in /chosen/asahi,t8122-pmp, or nothing is enabled. A
  * T8122 device tree without display nodes is normal and the gate says
  * nothing. apple_t8122_display.enable=0 has the same effect as the T6030
@@ -53,7 +56,8 @@
  * apple,t6031-handoff, but only when apple_t6031_display.enable=1 is on the
  * kernel command line: the native display is off by default there until it
  * has been seen to work. The PMP values must come from the boot loader, in
- * /chosen/asahi,t6031-pmp; there is no fallback. The T6031 display power
+ * /chosen/asahi,t6031-pmp; there is no fallback. Its PMP topology is
+ * reused from the device tree, as on T8122. The T6031 display power
  * states nest the other way round (the DCP's DISP_FE under DISP_CPU under
  * DISP_SYS), and its PMP power states are in another PMGR block. On every
  * T6031 boot the gate also logs what the boot loader handed over, so that
@@ -111,10 +115,6 @@ extern const u8 __dtbo_t6030_pmp_begin[];
 extern const u8 __dtbo_t6030_pmp_end[];
 extern const u8 __dtbo_t6030_j516s_pmp_begin[];
 extern const u8 __dtbo_t6030_j516s_pmp_end[];
-extern const u8 __dtbo_t8122_pmp_begin[];
-extern const u8 __dtbo_t8122_pmp_end[];
-extern const u8 __dtbo_t6031_pmp_begin[];
-extern const u8 __dtbo_t6031_pmp_end[];
 
 /* This Mac's PMP values, from the boot loader, or NULL. */
 static struct device_node *gate_pmp_values __initdata;
@@ -156,9 +156,20 @@ struct gate_soc {
 	const char *dcp_full_name;	/* the DCP node the PMP overlay expects, under /soc */
 	const char *pmp_values;		/* the boot loader's PMP values for this Mac */
 	const char *pmp_uuid;		/* the PMP image the PMP support is written for */
-	const char *report_compat;	/* the PMP report the overlay adds */
+	const char *report_compat;	/* the PMP report the overlay adds, or the reused one */
 	const char *disp_entry;		/* its display request entry, which the DCP waits for */
 	const u8 *pmp_dtbo, *pmp_dtbo_end;	/* NULL: no PMP description built in */
+	/*
+	 * Set: the device tree describes the PMP (pmp_compat), its DART, its
+	 * mailbox and its report, and the gate completes those nodes instead of
+	 * adding an overlay. ans_entry is the storage request the PMP must see
+	 * when it starts; dispext_entry the external display request.
+	 */
+	bool reuse_pmp;
+	const char *pmp_compat;
+	const char *ans_entry;
+	const char *dispext_entry;
+	bool records;			/* PTD bits are soc-device records (T8122) */
 	const char *fallback_board;	/* gets the fallback overlay without boot loader values */
 	const u8 *fallback_dtbo, *fallback_dtbo_end;
 	bool *requested;		/* the command line switch */
@@ -196,8 +207,8 @@ static const struct gate_soc gate_t6030 __initconst = {
 };
 
 /*
- * T8122 (M3 MacBook Air): the same handoff and power states, and a PMP
- * overlay at the T8122 addresses. The PMP values must come from the boot
+ * T8122 (M3 MacBook Air): the same handoff and power states. The PMP and its
+ * report are the device tree's own. The PMP values must come from the boot
  * loader: there is no built-in fallback.
  */
 static const struct gate_soc gate_t8122 __initconst = {
@@ -213,8 +224,11 @@ static const struct gate_soc gate_t8122 __initconst = {
 	.pmp_uuid = gate_t8122_pmp_uuid,
 	.report_compat = "apple,t8122-pmp-v2-report",
 	.disp_entry = "report@7",
-	.pmp_dtbo = __dtbo_t8122_pmp_begin,
-	.pmp_dtbo_end = __dtbo_t8122_pmp_end,
+	.reuse_pmp = true,
+	.pmp_compat = "apple,t8122-pmp-v2",
+	.ans_entry = "report@11",
+	.dispext_entry = "report@8",
+	.records = true,
 	.requested = &gate_requested,
 	.ps_chain = { PMP_PS_DISP_CPU, PMP_PS_DISP_FE, PMP_PS_DISP_SYS },
 	.quiet_without_nodes = true,
@@ -241,8 +255,9 @@ static const struct gate_soc gate_t6031 __initconst = {
 	.pmp_uuid = gate_t6031_pmp_uuid,
 	.report_compat = "apple,t6031-pmp-v2-report",
 	.disp_entry = "report@10",
-	.pmp_dtbo = __dtbo_t6031_pmp_begin,
-	.pmp_dtbo_end = __dtbo_t6031_pmp_end,
+	.reuse_pmp = true,
+	.pmp_compat = "apple,t6031-pmp-v2",
+	.ans_entry = "report@21",
 	.requested = &gate_t6031_requested,
 	.opt_in = "apple_t6031_display.enable=1",
 	.ps_chain = { PMP_PS_DISP_FE, PMP_PS_DISP_CPU, PMP_PS_DISP_SYS },
@@ -279,6 +294,26 @@ static struct of_changeset gate_cs;
 static struct of_changeset gate_pmp_cs;
 /* The PMP overlay, once applied; only the KUnit test removes it again. */
 static int gate_pmp_ovcs __initdata;
+/* gate_pmp_cs completed the device tree's own PMP; only the KUnit test reverts it. */
+static bool gate_pmp_reused __initdata;
+
+/* The device tree's own PMP topology, found by gate_reuse_resolve(). */
+struct gate_reuse {
+	struct device_node *report, *pmp, *dart, *mbox, *disp, *ans;
+};
+
+static struct gate_reuse gate_reuse __initdata;
+
+static void __init gate_reuse_put(void)
+{
+	of_node_put(gate_reuse.ans);
+	of_node_put(gate_reuse.disp);
+	of_node_put(gate_reuse.mbox);
+	of_node_put(gate_reuse.dart);
+	of_node_put(gate_reuse.pmp);
+	of_node_put(gate_reuse.report);
+	memset(&gate_reuse, 0, sizeof(gate_reuse));
+}
 
 static int __init gate_setup(char *arg)
 {
@@ -523,6 +558,88 @@ static struct device_node *__init gate_ps_unique(const char *label)
 	return found;
 }
 
+/* The available report entry of @report named @full_name. */
+static struct device_node *__init gate_report_entry(struct device_node *report,
+						    const char *full_name)
+{
+	struct device_node *child;
+
+	for_each_available_child_of_node(report, child) {
+		if (!strcmp(of_node_full_name(child), full_name) &&
+		    of_device_is_compatible(child, "apple,t6000-pmp-v2-report-entry"))
+			return child;
+	}
+	return NULL;
+}
+
+/*
+ * The PMP topology a device tree describes itself (T8122, T6031): the report,
+ * linked to its PMP by apple,pmp; the PMP, disabled and with no values yet,
+ * with one DART stream and one ASC mailbox; the display request entry, always
+ * on and the DCP's apple,pmp-report; and the storage request entry. Nothing
+ * here is changed. The report driver starts the PMP, and enables it, once the
+ * display driver asks; the DART and the mailbox are left as described.
+ */
+static int __init gate_reuse_resolve(struct device_node **np)
+{
+	struct gate_reuse *r = &gate_reuse;
+	struct device_node *other, *link;
+	bool single;
+
+	r->report = gate_find_one(gate_soc->report_compat);
+	if (!r->report || !of_device_is_available(r->report)) {
+		gate_warn("PMP not added: need exactly one available %s node\n",
+			  gate_soc->report_compat);
+		return -ENODEV;
+	}
+	r->pmp = of_parse_phandle(r->report, "apple,pmp", 0);
+	other = gate_find_one(gate_soc->pmp_compat);
+	single = r->pmp && r->pmp == other;
+	of_node_put(other);
+	if (!single || !of_device_is_compatible(r->pmp, "apple,t6000-pmp-v2") ||
+	    !gate_disabled(r->pmp) || !r->pmp->phandle) {
+		gate_warn("PMP not added: %pOF apple,pmp is not the only %s node, disabled\n",
+			  r->report, gate_soc->pmp_compat);
+		return -ENODEV;
+	}
+	if (of_property_present(r->pmp, "apple,board-id") ||
+	    of_property_present(r->pmp, "apple,dram-vendor-id") ||
+	    of_property_present(r->pmp, "apple,tunable-uuid")) {
+		gate_warn("PMP not added: %pOF already has PMP values\n", r->pmp);
+		return -EEXIST;
+	}
+	r->dart = gate_target(r->pmp, "iommus", "#iommu-cells", 1, 0, "apple,t8110-dart");
+	r->mbox = gate_target(r->pmp, "mboxes", "#mbox-cells", 0, 0, "apple,asc-mailbox-v4");
+	if (!r->dart || !r->mbox) {
+		gate_warn("PMP not added: %pOF is not on one apple,t8110-dart stream 0 and one apple,asc-mailbox-v4\n",
+			  r->pmp);
+		return -EINVAL;
+	}
+
+	r->disp = gate_report_entry(r->report, gate_soc->disp_entry);
+	if (!r->disp || !r->disp->phandle ||
+	    !of_property_read_bool(r->disp, "apple,always-on") ||
+	    of_property_read_bool(r->disp, "apple,no-ack")) {
+		gate_warn("PMP not added: %pOF has no acknowledged always-on display request %s\n",
+			  r->report, gate_soc->disp_entry);
+		return -ENODEV;
+	}
+	link = of_parse_phandle(np[GATE_DCP], "apple,pmp-report", 0);
+	of_node_put(link);
+	if (link != r->disp) {
+		gate_warn("PMP not added: %pOF apple,pmp-report is not %pOF\n",
+			  np[GATE_DCP], r->disp);
+		return -EINVAL;
+	}
+	r->ans = gate_report_entry(r->report, gate_soc->ans_entry);
+	if (!r->ans) {
+		gate_warn("PMP not added: %pOF has no storage request %s\n",
+			  r->report, gate_soc->ans_entry);
+		return -ENODEV;
+	}
+	return 0;
+}
+
 /*
  * The display domains are the DCP's power domain and its parents, in the
  * SoC's order; the PMP and PMS_SRAM domains are found by label beside them,
@@ -535,7 +652,7 @@ static int __init gate_pmp_resolve(struct device_node **np, struct device_node *
 	struct device_node *pmgr, *other;
 	int i;
 
-	if (!gate_soc->pmp_dtbo) {
+	if (!gate_soc->reuse_pmp && !gate_soc->pmp_dtbo) {
 		gate_warn("PMP not added: no %s PMP description is built in\n", gate_soc->name);
 		return -ENODEV;
 	}
@@ -567,22 +684,29 @@ static int __init gate_pmp_resolve(struct device_node **np, struct device_node *
 		return -ENODEV;
 	}
 
-	other = of_find_compatible_node(NULL, NULL, "apple,t6000-pmp-v2");
-	if (!other)
-		other = of_find_compatible_node(NULL, NULL, gate_soc->report_compat);
-	if (other) {
-		gate_warn("PMP not added: %pOF already exists\n", other);
-		of_node_put(other);
-		return -EEXIST;
-	}
+	if (gate_soc->reuse_pmp) {
+		int ret = gate_reuse_resolve(np);
 
-	/* The overlay's DCP fragment names this path. */
-	if (strcmp(of_node_full_name(np[GATE_DCP]), gate_soc->dcp_full_name) ||
-	    !of_node_name_eq(np[GATE_DCP]->parent, "soc") ||
-	    !of_node_is_root(np[GATE_DCP]->parent->parent)) {
-		gate_warn("PMP not added: the DCP is %pOF, not /soc/%s\n",
-			np[GATE_DCP], gate_soc->dcp_full_name);
-		return -EINVAL;
+		if (ret)
+			return ret;
+	} else {
+		other = of_find_compatible_node(NULL, NULL, "apple,t6000-pmp-v2");
+		if (!other)
+			other = of_find_compatible_node(NULL, NULL, gate_soc->report_compat);
+		if (other) {
+			gate_warn("PMP not added: %pOF already exists\n", other);
+			of_node_put(other);
+			return -EEXIST;
+		}
+
+		/* The overlay's DCP fragment names this path. */
+		if (strcmp(of_node_full_name(np[GATE_DCP]), gate_soc->dcp_full_name) ||
+		    !of_node_name_eq(np[GATE_DCP]->parent, "soc") ||
+		    !of_node_is_root(np[GATE_DCP]->parent->parent)) {
+			gate_warn("PMP not added: the DCP is %pOF, not /soc/%s\n",
+				  np[GATE_DCP], gate_soc->dcp_full_name);
+			return -EINVAL;
+		}
 	}
 
 	ps[chain[0]] = gate_ps_parent(np[GATE_DCP]);
@@ -615,6 +739,9 @@ static int __init gate_pmp_resolve(struct device_node **np, struct device_node *
 		}
 	}
 
+	/* Only the overlay's nodes need it: the reused ones have their own. */
+	if (gate_soc->reuse_pmp)
+		return 0;
 	*aic = of_parse_phandle(np[GATE_DCP_MBOX], "interrupt-parent", 0);
 	if (!*aic || !of_property_read_bool(*aic, "interrupt-controller")) {
 		gate_warn("PMP not added: %pOF has no interrupt parent\n", np[GATE_DCP_MBOX]);
@@ -705,6 +832,72 @@ out:
 	return ret;
 }
 
+/* Adds the boolean @name to @np unless it is there already. */
+static int __init gate_add_bool(struct of_changeset *cs, struct device_node *np,
+				const char *name)
+{
+	if (of_property_read_bool(np, name))
+		return 0;
+	return of_changeset_add_prop_bool(cs, np, name);
+}
+
+/*
+ * Completes the device tree's own PMP topology (gate_reuse_resolve()) in one
+ * changeset, as the overlay path completes the overlay's:
+ *  - the display request is requested by soc-device record where the PTD
+ *    is indexed that way (T8122);
+ *  - the storage request is always on, and not acknowledged, as the PMP
+ *    keeps a block up only if its request was set when it started;
+ *  - the T8122 GPU, if available, is linked to the PMP;
+ *  - the display domains' floor, and the PMP and PMS_SRAM domains kept on;
+ *  - this Mac's PMP values on the PMP node.
+ * The PMP stays disabled: the report driver enables it once it starts it.
+ */
+static int __init gate_reuse_apply(struct device_node **ps)
+{
+	struct gate_reuse *r = &gate_reuse;
+	int ret = 0, i, values = 0;
+
+	of_changeset_init(&gate_pmp_cs);
+	if (gate_soc->records)
+		ret = gate_add_bool(&gate_pmp_cs, r->disp, "apple,soc-device-record");
+	if (!ret)
+		ret = gate_add_bool(&gate_pmp_cs, r->ans, "apple,always-on");
+	/* The PMP does not acknowledge storage requests. */
+	if (!ret)
+		ret = gate_add_bool(&gate_pmp_cs, r->ans, "apple,no-ack");
+	/* The current14 T8122 GPU needs an inner AGX vote from this Mac's PMP. */
+	if (!ret)
+		ret = gate_t8122_gpu_pmp_link(&gate_pmp_cs, r->pmp);
+	/* The display domains' floor, applied by the PMGR driver when it probes. */
+	for (i = PMP_PS_DISP_SYS; i <= PMP_PS_DISP_CPU && !ret; i++)
+		ret = gate_set_u32(&gate_pmp_cs, ps[i], "apple,min-state", PMGR_PS_ACTIVE);
+	/* Linux would otherwise power these off as unused. */
+	for (i = PMP_PS_PMP; i <= PMP_PS_PMS_SRAM && !ret; i++)
+		ret = gate_add_bool(&gate_pmp_cs, ps[i], "apple,always-on");
+	if (!ret) {
+		values = gate_pmp_copy_values(&gate_pmp_cs, r->pmp);
+		ret = values < 0 ? values : 0;
+	}
+	if (!ret)
+		ret = of_changeset_apply(&gate_pmp_cs);
+	if (ret) {
+		of_changeset_destroy(&gate_pmp_cs);
+		gate_err("PMP not added: changeset failed: %d\n", ret);
+		return ret;
+	}
+	gate_pmp_reused = true;
+
+	gate_info("PMP: this Mac's %d values from %pOF on %pOF\n", values, gate_pmp_values,
+		  r->pmp);
+	gate_info("completed %pOF with its display (%pOF) and storage (%pOF) requests; minimum power state of %s, %s and %s raised to active; %s and %s kept on\n",
+		  r->report, r->disp, r->ans,
+		  pmp_ps_labels[PMP_PS_DISP_SYS], pmp_ps_labels[PMP_PS_DISP_FE],
+		  pmp_ps_labels[PMP_PS_DISP_CPU], pmp_ps_labels[PMP_PS_PMP],
+		  pmp_ps_labels[PMP_PS_PMS_SRAM]);
+	return 0;
+}
+
 static int __init gate_pmp_apply(struct device_node *dcp, struct device_node **ps,
 				 struct device_node *aic)
 {
@@ -714,6 +907,9 @@ static int __init gate_pmp_apply(struct device_node *dcp, struct device_node **p
 		gate_soc->fallback_dtbo_end - gate_soc->fallback_dtbo;
 	struct device_node *report, *disp = NULL, *pmp = NULL, *dart = NULL, *mbox = NULL;
 	int ovcs_id = 0, ret, i, values = 0;
+
+	if (gate_soc->reuse_pmp)
+		return gate_reuse_apply(ps);
 
 	ret = of_overlay_fdt_apply(dtbo, size, &ovcs_id, NULL);
 	if (ret) {
@@ -1489,12 +1685,11 @@ static void __init gate_describe(void)
  *    display DART is the one the dcpext's piodma child names);
  *  - an active floor on the dcpext's CPU power state, as on T6030, so that
  *    the running PMP cannot power the processor down under its firmware;
- *  - if the PMP was added, its DISPEXT request (pmp-dispext0), as on
- *    T6030: once the PMP runs it owns the SoC power and performance states
- *    and keeps a block up only if that block's request bit was set when it
- *    started. The dcpext points at the entry (apple,pmp-report) and the
- *    display driver waits for its acknowledgement before it runs the dcpext
- *    CPU.
+ *  - its DISPEXT request, the report entry the dcpext names in
+ *    apple,pmp-report, made always on, as on T6030: once the PMP runs it
+ *    owns the SoC power and performance states and keeps a block up only if
+ *    that block's request bit was set when it started. The display driver
+ *    waits for its acknowledgment before it runs the dcpext CPU.
  * The DARTs, the mailbox and the crossbars must be described and still
  * disabled. Without the marker, with other firmware, or if anything does not
  * check out, all of them stay disabled and the ATC power states are left
@@ -1559,7 +1754,7 @@ static bool __init gate_node_in(struct device_node *const *nodes, int n,
 static void __init gate_t8122_dcpext_one(struct device_node *np)
 {
 	struct device_node *dart = NULL, *mbox = NULL, *piodma = NULL;
-	struct device_node *disp_dart = NULL, *ps = NULL, *entry = NULL;
+	struct device_node *disp_dart = NULL, *ps = NULL, *entry = NULL, *link;
 	struct device_node *xbar[GATE_T8122_XBARS] = {};
 	struct device_node *common[GATE_T8122_XBARS] = {};
 	struct of_phandle_args args;
@@ -1629,11 +1824,16 @@ static void __init gate_t8122_dcpext_one(struct device_node *np)
 	/*
 	 * The PMP DISPEXT request: the first external mode set does not
 	 * complete without it, so there is no dcpext without it, as on T6030.
+	 * It is the device tree's own entry, which the dcpext names in
+	 * apple,pmp-report, and nothing requests it yet.
 	 */
-	entry = gate_pmp_dispext_entry(0);
-	if (!entry || !entry->phandle ||
-	    !of_device_is_compatible(entry, "apple,t6000-pmp-v2-report-entry") ||
-	    !gate_disabled(entry)) {
+	entry = gate_reuse.report ?
+		gate_report_entry(gate_reuse.report, gate_soc->dispext_entry) : NULL;
+	link = of_parse_phandle(np, "apple,pmp-report", 0);
+	of_node_put(link);
+	if (!entry || !entry->phandle || link != entry ||
+	    of_property_read_bool(entry, "apple,always-on") ||
+	    of_property_read_bool(entry, "apple,no-ack")) {
 		gate_ext_refuse(np, "its PMP DISPEXT request is not described or not usable");
 		goto put;
 	}
@@ -1644,12 +1844,17 @@ static void __init gate_t8122_dcpext_one(struct device_node *np)
 		goto put;
 	}
 	ret = gate_set_u32(cs, ps, "apple,min-state", PMGR_PS_ACTIVE);
-	/* The driver waits for this request's acknowledgement before RUN. */
-	if (!ret) {
-		ret = gate_set_u32(cs, np, "apple,pmp-report", entry->phandle);
-		if (!ret)
-			ret = of_changeset_update_prop_string(cs, entry, "status", "okay");
-	}
+	/*
+	 * The driver waits for this request's acknowledgment before RUN. It
+	 * is seeded with the display's, by soc-device record, and a missing
+	 * acknowledgment must not hold up the panel.
+	 */
+	if (!ret)
+		ret = gate_add_bool(cs, entry, "apple,always-on");
+	if (!ret)
+		ret = gate_add_bool(cs, entry, "apple,soc-device-record");
+	if (!ret)
+		ret = gate_add_bool(cs, entry, "apple,defer-startup-ack");
 	if (!ret)
 		ret = of_changeset_update_prop_string(cs, dart, "status", "okay");
 	if (!ret)
@@ -1749,6 +1954,7 @@ static void __init gate_run(void)
 		gate_dcpext(panel ? NULL : "the internal display was not handed over");
 	if (gate_soc == &gate_t8122)
 		gate_t8122_dcpext(panel);
+	gate_reuse_put();
 	of_node_put(aic);
 	for (i = 0; i < PMP_PS_NR; i++)
 		of_node_put(ps[i]);

@@ -165,13 +165,17 @@ config APPLE_T6030_DISPLAY_GATE
 	  apple_t6030_display.enable=0 keeps the boot framebuffer.
 
 	  The same gate serves T8122 (M3) device trees with
-	  apple,t8122-handoff and the T8122 PMP overlay. It enables the T8122
-	  external display processor only when the boot loader has marked it
-	  apple,t8122-dcpext-firmware-ready, and not with nomodeset.
+	  apple,t8122-handoff. There it adds no overlay: it completes the PMP,
+	  report and requests the device tree describes, with the values the
+	  boot loader passes, and the PMP report driver starts the PMP. It
+	  enables the T8122 external display processor only when the boot
+	  loader has marked it apple,t8122-dcpext-firmware-ready, and not with
+	  nomodeset.
 
 	  It also serves T6031 (M3 Max) device trees with apple,t6031-handoff,
-	  but only for a boot with apple_t6031_display.enable=1 on the kernel
-	  command line, and only with the PMP values the boot loader passes.
+	  in the same way, but only for a boot with
+	  apple_t6031_display.enable=1 on the kernel command line, and only
+	  with the PMP values the boot loader passes.
 
 	  Say 'y' if you want the native display on M3 Pro MacBook Pros.
 
@@ -180,12 +184,14 @@ config APPLE_DISPLAY_GATE_KUNIT_TEST
 	depends on KUNIT=y && APPLE_T6030_DISPLAY_GATE
 	default KUNIT_ALL_TESTS
 	help
-	  Runs the display gate on test device trees with the T6031 and the
-	  T6030 display nodes, without Apple hardware. On T6031: off by
+	  Runs the display gate on test device trees with the T6030, T6031
+	  and T8122 display nodes, without Apple hardware. On T6031: off by
 	  default, enabled only by apple_t6031_display.enable=1, only with the
 	  boot loader's handoff marker and this Mac's PMP values, and with
 	  nothing changed when a check fails. On T6030: on by default, as
-	  before, whatever the T6031 option says.
+	  before, whatever the T6031 option says. On T8122: on by default,
+	  and nothing changed when the handoff or the device tree's own PMP
+	  topology does not check out.
 
 endmenu
 
