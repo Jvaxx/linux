@@ -111,6 +111,8 @@
 		      <0x2 0x8e850000 0x0 0x4000>;
 		power-domains = <&ps_disp_cpu>;
 		clocks = <&clk_disp0>;
+		/* The 14.x firmware runs once the PMP acknowledges this request. */
+		apple,pmp-report = <&pmp_report_disp>;
 		#address-cells = <2>;
 		#size-cells = <2>;
 		ranges;
@@ -210,6 +212,8 @@
 		power-domains = <&ps_dispext_cpu>;
 		resets = <&ps_dispext_cpu>;
 		clocks = <&clk_dispext0>;
+		/* Its first mode set completes only with this PMP request. */
+		apple,pmp-report = <&pmp_report_dispext>;
 		apple,dcp-index = <1>;
 		status = "disabled";
 

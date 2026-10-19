@@ -13,8 +13,14 @@
 	apple,j613-25g83-profile = <1>;
 	apple,firmware-compat = <26 6 2>;
 	apple,pmp = <&pmp>;
+	/* The 26.6 firmware takes its PMP through apple,pmp, not a request. */
+	/delete-property/ apple,pmp-report;
 	/delete-property/ clocks;
 	status = "disabled";
+};
+
+&dcpext {
+	/delete-property/ apple,pmp-report;
 };
 
 &disp0_piodma {
@@ -24,6 +30,8 @@
 /* Reuse the complete Asahi PMP topology, with this profile left disabled. */
 &pmp_report {
 	compatible = "apple,j613-25g83-pmp-report";
+	/* The native PMP names its report instead (apple,pmp-report). */
+	/delete-property/ apple,pmp;
 	status = "disabled";
 };
 

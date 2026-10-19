@@ -734,6 +734,8 @@
 			compatible = "apple,t8122-pmp-v2-report";
 			reg = <0x2 0xd03c0000 0x0 0x20000>;
 			power-domains = <&ps_pms_sram>;
+			/* The PMP that reports here; started only after a display handoff. */
+			apple,pmp = <&pmp>;
 			#address-cells = <1>;
 			#size-cells = <0>;
 

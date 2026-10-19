@@ -102,6 +102,8 @@
 		      <0x3 0x86850000 0x0 0x4000>;
 		power-domains = <&ps_disp_fe>;
 		clocks = <&clk_disp0>;
+		/* The 14.x firmware runs once the PMP acknowledges this request. */
+		apple,pmp-report = <&pmp_report_disp>;
 		#address-cells = <2>;
 		#size-cells = <2>;
 		ranges;
@@ -131,4 +133,9 @@
 &ps_disp_cpu {
 	/* The bootloader leaves the internal display powered. */
 	apple,inherited-on;
+};
+
+/* The PMP that reports here; started only after a display handoff. */
+&pmp_report {
+	apple,pmp = <&pmp>;
 };
