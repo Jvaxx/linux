@@ -288,6 +288,25 @@ impl<T: DriverObject> Object<T> {
             return Err(EINVAL);
         }
 
+        // SAFETY: `import_attach` is set before an imported object is published and does not
+        // change until the object is freed.
+        if !unsafe { (*self.as_raw()).import_attach }.is_null() {
+            // The SG table of an imported object is the dma-buf attachment's mapping, which the
+            // exporter made for this device at import time. It belongs to the attachment, and
+            // `drm_gem_shmem_release()` hands it back to the exporter through
+            // `drm_prime_gem_destroy()`. It must not be placed in `sgt_res`, whose `SGTableMap`
+            // would unmap and free it as if these helpers had built it.
+            //
+            // SAFETY: `sgt` of an imported object is set before the object is published and stays
+            // valid and unmodified until the object is freed, which `'a` cannot outlive.
+            let sgt = unsafe { (*self.as_raw_shmem()).sgt };
+            if sgt.is_null() {
+                return Err(EINVAL);
+            }
+            // SAFETY: See above.
+            return Ok(unsafe { scatterlist::SGTable::from_raw(sgt) });
+        }
+
         // The borrowed reference can outlive any lock, so pin the backing permanently.
         self.acquire_sgt_access(true)?;
 
