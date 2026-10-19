@@ -83,6 +83,15 @@ pub(crate) fn retry_stage(stage: u32, nonce_session: bool, retry: u32) -> u32 {
     }
 }
 
+/// Whether a bring-up may go on to its next protocol stage (registration,
+/// session and sequence counter, patch, completion). Not once the system
+/// has begun going to sleep or the driver is going away: the attempt then
+/// stops where it is, and the next one after resume clears what it left
+/// with the enclave, as any retry does (see [`retry_stage`]).
+pub(crate) fn may_continue(shutting_down: bool, suspending: bool) -> bool {
+    !shutting_down && !suspending
+}
+
 /// How the enclave answered REGISTER_SERIAL.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SerialAnswer {
@@ -683,55 +692,154 @@ mod tests {
         /// The first `fail` attempts fail after the session commit, as at
         /// the sequence counter's challenge.
         fail: usize,
+        /// As the J314s did after a failed sequence counter init: the
+        /// enclave refuses the serial re-registration that follows
+        /// CLEAR_STATE, and a fresh registration starts a new session.
+        clear_refused: bool,
+        /// Whether the system begins to sleep during this attempt, once the
+        /// serial is registered and before the session share.
+        suspend_at: Option<usize>,
+        suspending: bool,
     }
 
     impl SessionEnclave {
+        fn new(fail: usize) -> SessionEnclave {
+            SessionEnclave {
+                stage: FRESH,
+                session: false,
+                shares: [false; 8],
+                attempt: 0,
+                fail,
+                clear_refused: false,
+                suspend_at: None,
+                suspending: false,
+            }
+        }
+
         fn attempt(&mut self, retry: u32) -> bool {
+            let this = self.attempt;
+            self.attempt += 1;
             if retry > 0 {
                 self.stage = retry_stage(self.stage, false, retry);
             }
-            if plan(self.stage, true, false, true).clear_state {
+            let clear = plan(self.stage, true, false, true).clear_state;
+            if clear && self.clear_refused {
+                // REGISTER_SERIAL after CLEAR_STATE: 0x16.
+                return false;
+            }
+            if clear || (self.clear_refused && self.stage == FRESH) {
                 self.session = false;
             }
             self.stage = ESTABLISHED;
-            self.shares[self.attempt] = !self.session;
+            if self.suspend_at == Some(this) {
+                self.suspending = true;
+            }
+            if !may_continue(false, self.suspending) {
+                // Stopped between registration and the session share.
+                return false;
+            }
+            self.shares[this] = !self.session;
             self.session = true;
             // The sensor was power-cycled: it holds a session only if it
             // took part in this attempt's share.
-            let ok = self.shares[self.attempt] && self.attempt >= self.fail;
-            self.attempt += 1;
-            ok
+            self.shares[this] && this >= self.fail
+        }
+    }
+
+    /// A round of attempts on [`SessionEnclave`], as the driver makes them.
+    struct Round<'a> {
+        enclave: &'a mut SessionEnclave,
+        retry: u32,
+    }
+
+    impl Attempts for Round<'_> {
+        fn attempt(&mut self) -> bool {
+            let retry = self.retry;
+            self.retry += 1;
+            self.enclave.attempt(retry)
+        }
+        fn wanted(&self) -> bool {
+            may_continue(false, self.enclave.suspending)
+        }
+        fn elapsed_ms(&self) -> u64 {
+            0
+        }
+        fn failed(&mut self, _attempt: u32, _of: u32, _pause_ms: u32) {}
+        fn pause(&mut self, _ms: u32) -> bool {
+            self.wanted()
         }
     }
 
     #[test]
     fn a_retry_after_a_post_commit_failure_shares_the_session_again() {
-        let mut e = SessionEnclave {
-            stage: FRESH,
-            session: false,
-            shares: [false; 8],
-            attempt: 0,
-            fail: 1,
-        };
+        let mut e = SessionEnclave::new(1);
         assert!(!e.attempt(0));
         // The first retry clears the enclave, so it shares and commits again.
         assert!(e.attempt(1));
         assert_eq!(&e.shares[..2], &[true, true]);
 
         // Had it started fresh, the enclave would have skipped the share.
-        let mut fresh = SessionEnclave {
-            stage: FRESH,
-            session: false,
-            shares: [false; 8],
-            attempt: 0,
-            fail: 1,
-        };
+        let mut fresh = SessionEnclave::new(1);
         assert!(!fresh.attempt(0));
         assert!(!fresh.attempt(2));
         assert_eq!(&fresh.shares[..2], &[true, false]);
         // The retry after it clears, and recovers.
         assert!(fresh.attempt(3));
         assert!(fresh.shares[2]);
+    }
+
+    #[test]
+    fn a_refused_clear_is_followed_by_a_fresh_registration_that_recovers() {
+        // The J314s: after a failed sequence counter init, the CLEAR_STATE
+        // re-registration is refused for the rest of the boot.
+        let mut e = SessionEnclave::new(1);
+        e.clear_refused = true;
+        let mut round = Round {
+            enclave: &mut e,
+            retry: 0,
+        };
+        assert_eq!(bring_up(&ATTACH, &mut round), Outcome::Online(3));
+        // Attempt 1 shared and failed later, attempt 2 was refused at the
+        // re-registration, attempt 3 started fresh and shared again.
+        assert_eq!(&e.shares[..3], &[true, false, true]);
+        assert_eq!(e.stage, ESTABLISHED);
+    }
+
+    #[test]
+    fn a_suspend_mid_attempt_stops_cleanly_and_resume_recovers() {
+        // The system begins to sleep after the first attempt registered the
+        // serial and before its session share.
+        let mut e = SessionEnclave::new(0);
+        e.suspend_at = Some(0);
+        let mut round = Round {
+            enclave: &mut e,
+            retry: 0,
+        };
+        // No further stage and no further attempt.
+        assert_eq!(bring_up(&ATTACH, &mut round), Outcome::Abandoned(1));
+        assert_eq!(e.attempt, 1);
+        assert_eq!(e.shares[0], false);
+        // What it left: a registered serial, which the next attempt clears.
+        assert_eq!(e.stage, ESTABLISHED);
+        assert!(plan(retry_stage(e.stage, false, 1), true, false, true).clear_state);
+
+        // Resumed: the late round counts on from the round before it.
+        e.suspending = false;
+        let mut round = Round {
+            enclave: &mut e,
+            retry: 1,
+        };
+        assert_eq!(bring_up(&ATTACH, &mut round), Outcome::Online(1));
+        assert!(e.shares[1]);
+        assert!(e.session);
+    }
+
+    #[test]
+    fn a_bring_up_continues_only_while_wanted() {
+        assert!(may_continue(false, false));
+        assert!(!may_continue(false, true));
+        assert!(!may_continue(true, false));
+        assert!(!may_continue(true, true));
     }
 
     /// A sensor that falls silent at the sequence counter init, as the

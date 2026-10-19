@@ -1119,9 +1119,32 @@ impl SepData {
             diag::sensor_brought_up(bind, false);
             return false;
         };
+        if !self.bringup_may_continue(c"the sensor's completion") {
+            diag::sensor_brought_up(bind, false);
+            return false;
+        }
         let online = self.complete_bringup(patch);
         diag::sensor_brought_up(bind, online);
         online
+    }
+
+    /// Checked between the protocol stages of one bring-up attempt: once the
+    /// system has begun going to sleep or the driver is going away, the
+    /// attempt stops before `next`. The attempt then counts as failed, and a
+    /// bring-up whose result is no longer wanted makes no other.
+    fn bringup_may_continue(&self, next: &CStr) -> bool {
+        if registration::may_continue(
+            self.shutting_down.load(Relaxed),
+            self.suspending.load(Relaxed),
+        ) {
+            return true;
+        }
+        dev_info!(
+            self.dev,
+            "sensor: bring-up stopped before {}: the system is going to sleep or the driver is going away\n",
+            next
+        );
+        false
     }
 
     /// Whether a bring-up that came online leaves the sensor attached: on a
@@ -1146,7 +1169,12 @@ impl SepData {
             c"attach-time",
             Bringup::Attach,
             &registration::ATTACH,
-            || !self.shutting_down.load(Relaxed),
+            || {
+                registration::may_continue(
+                    self.shutting_down.load(Relaxed),
+                    self.suspending.load(Relaxed),
+                )
+            },
         );
         let complete = self.attach_complete(outcome.online());
         diag::sensor_attach(registration::after_round(complete, true));
@@ -1286,6 +1314,10 @@ impl SepData {
             }
         }
 
+        if !self.bringup_may_continue(c"the sensor's completion") {
+            diag::sensor_brought_up(bind, false);
+            return false;
+        }
         let ok = match parameters {
             Some(parameters) => self.finish_sensor_setup(patch, parameters),
             None => self.complete_bringup(patch),
@@ -2236,6 +2268,9 @@ impl SepData {
             }
             if !self.register_sensor(&id) {
                 dev_warn!(self.dev, "sensor: the enclave did not register the sensor\n");
+                return None;
+            }
+            if !self.bringup_may_continue(c"the session and the patch") {
                 return None;
             }
 

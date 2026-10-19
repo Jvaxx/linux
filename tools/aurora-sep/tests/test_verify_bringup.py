@@ -146,6 +146,7 @@ struct Driver {
     templates_restored: AtomicBool,
     device_view_synced: AtomicBool,
     shutting_down: AtomicBool,
+    suspending: AtomicBool,
     capture_epoch: AtomicU64,
     bio_session: SessionLock,
     bringup: AtomicU32,
@@ -159,6 +160,7 @@ impl Driver {
             templates_restored: AtomicBool::new(true),
             device_view_synced: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
+            suspending: AtomicBool::new(false),
             capture_epoch: AtomicU64::new(1),
             bio_session: SessionLock(bio::Session),
             bringup: AtomicU32::new(registration::FRESH),
@@ -289,7 +291,7 @@ class VerifyBringupTest(unittest.TestCase):
         methods = [method(source, name) for name in (
             'run_verify', 'attach_bringup',
             'bring_sensor_online_retrying', 'bring_sensor_online_for_verify',
-            'attach_bring_sensor_online', 'attach_complete',
+            'attach_bring_sensor_online', 'attach_complete', 'bringup_may_continue',
             'verify_wanted')]
         self.assertTrue(all(methods))
         attempts = (item(source, '#[derive(Clone, Copy, PartialEq, Eq)]\nenum Bringup {')

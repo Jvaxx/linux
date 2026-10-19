@@ -56,6 +56,8 @@ mod kernel { pub mod time {
 #[derive(Clone, Copy)] struct PatchLoaded(());
 #[derive(Default)] struct Mock {
  reads: usize, registered: bool, patch: Option<u8>, next: Option<sensor::Status>,
+ /// The system begins to sleep once the serial is registered.
+ suspend: bool,
 }
 thread_local! { static MOCK: RefCell<Mock> = RefCell::new(Mock::default()); }
 mod sensor {
@@ -92,6 +94,9 @@ impl Driver {
  fn register_sensor(&self,_:&sensor::Identifier)->bool {
   MOCK.with(|m| {let mut m=m.borrow_mut();assert_eq!(m.reads,1);m.registered=true;}); true
  }
+ fn bringup_may_continue(&self,_:&std::ffi::CStr)->bool {
+  MOCK.with(|m| !m.borrow().suspend)
+ }
  fn apply_sensor_patch(&self,ack:u8)->Option<PatchLoaded> {
   MOCK.with(|m| {let mut m=m.borrow_mut();m.patch=Some(ack);});
   Some(PatchLoaded(()))
@@ -122,6 +127,14 @@ fn main() {
   let driver = Driver::new();
   assert_eq!(driver.wake_sensor().is_some(),ready);
   MOCK.with(|m| {let m=m.borrow();assert_eq!(m.reads,2);assert!(m.registered);assert_eq!(m.patch,patch);});
+ }
+ // A suspend that begins once the serial is registered stops the attempt
+ // there: no status read, no session and no patch.
+ for nonce_session in [false, true] {
+  MOCK.with(|m| *m.borrow_mut()=Mock{next:Some(sensor::Status{state:0,ack:0,silent:false}),suspend:true,..Mock::default()});
+  let driver = Driver { profile: Profile { nonce_session }, sensor_power_ns: AtomicU64::new(0) };
+  assert!(driver.wake_sensor().is_none());
+  MOCK.with(|m| {let m=m.borrow();assert_eq!(m.reads,1);assert!(m.registered);assert_eq!(m.patch,None);});
  }
 }
 '''
