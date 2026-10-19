@@ -247,6 +247,7 @@ int dptxport_release_display(struct apple_epic_service *service)
 	int ret;
 
 	dptx_180hz_invalidate(service->ep->dcp);
+	dcpavserv_v14_close(service->ep->dcp);
 	dptx->release_calls++;
 	dev_dbg(service->ep->dcp->dev,
 		 "DPTX release_display: call #%u this boot caller=%pS\n",
@@ -264,6 +265,9 @@ int dptxport_set_hpd_timeout(struct apple_epic_service *service, bool hpd,
 	struct dcpdptx_hotplug_cmd cmd, resp;
 	int ret;
 
+	/* The 14.7 external role completes an HPD low only once its AV client closed. */
+	if (!hpd)
+		dcpavserv_v14_close(service->ep->dcp);
 	memset(&cmd, 0, sizeof(cmd));
 
 	if (hpd)
