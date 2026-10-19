@@ -87,16 +87,10 @@ mod m3_active_power;
 mod m3_consistent_perf;
 mod m3_globals_debug;
 mod m3_client;
-mod g15_boot;
-mod g15_initdata;
-mod g15_probe;
 mod t8122_admission;
 mod t8122_hwdata;
 mod t8122_knobs;
 mod t8122_start;
-mod t6031_knobs;
-mod t6031_start;
-mod g15_selftest;
 #[cfg(CONFIG_DEV_COREDUMP)]
 mod agx_fault;
 mod agx_host_progress;

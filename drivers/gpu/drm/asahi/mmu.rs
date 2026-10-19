@@ -130,16 +130,10 @@ pub(crate) const IOVA_USER_TOP: u64 = 1 << 39;
 
 const AGX3_FIRMWARE_HANDOFF_VALIDATED: bool = false;
 
-/// The t6030 G15 14.8.3 firmware completes the AGX2-style Dekker handoff when the GpuManager
-/// builds the UAT before starting it: it publishes `magic_fw` and serves flush requests
-/// (observed on J516S).
-const G15_DEKKER_HANDOFF_OBSERVED: bool = true;
-
 /// How the firmware-shared UAT handoff region behaves for the target SoC.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) enum HandoffMode {
     FirmwareDekker,
-    StoppedFirmwareT6030,
     /// The M3 runtime's RTKit is running before the AP publishes its host mappings (observed
     /// on J514S).
     FirmwareM3,
@@ -200,12 +194,11 @@ impl UatConfig {
         })
     }
 
-    /// Whether an M3 owner holds this UAT: the M3 runtime (reserved tables) on any SoC, or the
-    /// G15 manager backend, which runs on T6030 only. These owners look their reserved regions
-    /// up through `m3_resources`, track faults and VM status, and keep the AP side of the
-    /// handoff themselves.
+    /// Whether the M3 runtime (reserved tables) holds this UAT. That owner looks its reserved
+    /// regions up through `m3_resources`, tracks faults and VM status, and keeps the AP side of
+    /// the handoff itself.
     const fn m3_owner(&self) -> bool {
-        self.reserved_tables || self.chip_id == 0x6030
+        self.reserved_tables
     }
 }
 
@@ -2479,7 +2472,7 @@ impl Handoff {
         self.magic_ap.store(PPL_MAGIC, Ordering::Relaxed);
         self.cur_slot.store(if m3 && mode != HandoffMode::FirmwareDekker { u32::MAX } else { 0 }, Ordering::Relaxed);
         self.unk3.store(0, Ordering::Relaxed);
-        if matches!(mode, HandoffMode::StoppedFirmwareT6030 | HandoffMode::FirmwareG16) {
+        if mode == HandoffMode::FirmwareG16 {
             // This mode is constructed only with ASC stopped. Preserve the
             // firmware magic but initialize the AP producer's lock/flush state.
             self.lock_ap.store(0, Ordering::Relaxed);
@@ -4637,9 +4630,7 @@ impl Uat {
         m3: bool,
         firmware: UatFirmware,
     ) -> Result<Arc<UatInner>> {
-        let cached = !matches!(
-            handoff_mode, HandoffMode::StoppedFirmwareT6030 | HandoffMode::FirmwareM3 | HandoffMode::FirmwareG16
-        );
+        let cached = !matches!(handoff_mode, HandoffMode::FirmwareM3 | HandoffMode::FirmwareG16);
         let handoff_rgn =
             Self::map_region(dev.as_ref(), c_str!("handoff"), HANDOFF_SIZE, cached, m3)?;
         let ttbs_rgn = Self::map_region(dev.as_ref(), c_str!("ttbs"), SLOTS_SIZE, cached, m3)?;
@@ -4749,8 +4740,6 @@ impl Uat {
         map_kernel_to_user: bool,
         handoff_mode: HandoffMode,
     ) -> Result<Self> {
-        // The stopped-firmware mode requires its dedicated ownership contract.
-        if handoff_mode == HandoffMode::StoppedFirmwareT6030 { return Err(EINVAL); }
         Self::new_with_config(
             dev,
             UatConfig::from_hw(cfg),
@@ -4782,14 +4771,8 @@ impl Uat {
             HandoffMode::FirmwareG16 => {
                 if !cfg.reserved_tables || cfg.chip_id != 0x8122 { return Err(ENODEV); }
             }
-            HandoffMode::StoppedFirmwareT6030 => {
-                if !cfg.reserved_tables || cfg.chip_id != 0x6030 { return Err(ENODEV); }
-            }
             HandoffMode::FirmwareDekker => {
-                if cfg.ias != 39
-                    && !AGX3_FIRMWARE_HANDOFF_VALIDATED
-                    && !(cfg.chip_id == 0x6030 && G15_DEKKER_HANDOFF_OBSERVED)
-                {
+                if cfg.ias != 39 && !AGX3_FIRMWARE_HANDOFF_VALIDATED {
                     dev_err!(
                         dev.as_ref(),
                         "MMU: {}-bit UAT geometry is implemented, but the AGX3 firmware Handoff ABI and kernel-VA map are unvalidated\n",

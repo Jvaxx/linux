@@ -395,9 +395,7 @@ impl DrmGpu for LegacyDrmGpu {
             num_clusters_total: dyncfg.id.num_clusters,
             num_cores_per_cluster: dyncfg.id.num_cores,
             core_masks,
-            // The performance cap on G15.
-            max_frequency_khz: crate::initdata::g15_manager_max_frequency_khz(cfg, &dyncfg.pwr)
-                .unwrap_or(dyncfg.pwr.max_frequency_khz()),
+            max_frequency_khz: dyncfg.pwr.max_frequency_khz(),
             usc_generation: dyncfg.id.usc_generation,
             gpu_hal_generation: dyncfg.id.gpu_hal_generation as u32,
             max_commands_per_submission: file::MAX_COMMANDS_PER_SUBMISSION,
