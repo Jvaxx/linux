@@ -209,16 +209,87 @@ out:
 	return ret;
 }
 
+/* The nodes the coldplug enables, in the order its changeset enables them. */
+enum {
+	J613_PMP_REPORT,
+	J613_PMP_DART,
+	J613_PMP_MBOX,
+	J613_PMP,
+	J613_DCP_DART,
+	J613_DISP0_DART,
+	J613_DCP_MBOX,
+	J613_DISPLAY,		/* these three carry the mapping handoff markers */
+	J613_PIODMA,
+	J613_DCP,
+	J613_NR_NODES,
+};
+
+/*
+ * The node named by the single entry of @list in @np, if it is compatible
+ * with @compat and, for a DART (@stream >= 0), is that DART's stream @stream.
+ * Returns NULL otherwise.
+ */
+static struct device_node *j613_target(const struct device_node *np,
+				       const char *list, const char *cells,
+				       int stream, const char *compat)
+{
+	struct of_phandle_args args;
+
+	if (of_count_phandle_with_args(np, list, cells) != 1 ||
+	    of_parse_phandle_with_args(np, list, cells, 0, &args))
+		return NULL;
+	if (args.args_count != (stream < 0 ? 0 : 1) ||
+	    (stream >= 0 && args.args[0] != (u32)stream) ||
+	    !of_device_is_compatible(args.np, compat)) {
+		of_node_put(args.np);
+		return NULL;
+	}
+	return args.np;
+}
+
+/*
+ * Finds the display and PMP nodes from nodes[J613_DCP] through the phandles
+ * that wire them, and the display subsystem through the "disp0" alias, so
+ * that the lookup follows the device tree rather than its node names and
+ * places: the profile reuses Asahi's PMP report and mailbox nodes, and the
+ * display subsystem sits at the root, outside the simple-bus. A node that is
+ * not found stays NULL.
+ */
+static void j613_resolve(struct device_node **nodes)
+{
+	struct device_node *dcp = nodes[J613_DCP], *display, *pmp;
+
+	nodes[J613_DCP_DART] = j613_target(dcp, "iommus", "#iommu-cells", 5,
+					   "apple,t8122-dart");
+	nodes[J613_DCP_MBOX] = j613_target(dcp, "mboxes", "#mbox-cells", -1,
+					   "apple,t8122-asc-mailbox");
+	nodes[J613_PIODMA] = of_get_child_by_name(dcp, "piodma");
+
+	display = of_find_node_by_path("disp0");
+	if (display && !of_device_is_compatible(display, "apple,t8122-display-subsystem")) {
+		of_node_put(display);
+		display = NULL;
+	}
+	nodes[J613_DISPLAY] = display;
+	if (display)
+		nodes[J613_DISP0_DART] = j613_target(display, "iommus", "#iommu-cells",
+						     0, "apple,t8122-dart");
+
+	pmp = j613_target(dcp, "apple,pmp", NULL, -1, "apple,t8122-pmp-v2");
+	nodes[J613_PMP] = pmp;
+	if (!pmp)
+		return;
+	nodes[J613_PMP_REPORT] = j613_target(pmp, "apple,pmp-report", NULL, -1,
+					     "apple,j613-25g83-pmp-report");
+	nodes[J613_PMP_DART] = j613_target(pmp, "iommus", "#iommu-cells", 0,
+					   "apple,t8122-dart");
+	nodes[J613_PMP_MBOX] = j613_target(pmp, "mboxes", "#mbox-cells", -1,
+					   "apple,t8122-asc-mailbox");
+}
+
 int __init apple_j613_25g83_coldplug(void)
 {
-	static const char *const paths[] = {
-		"/soc/pmp-report@2d03c0000", "/soc/iommu@2d0300000",
-		"/soc/mailbox@2d0c08000", "/soc/pmp@2d0500000",
-		"/soc/iommu@28d30c000", "/soc/iommu@28d304000",
-		"/soc/mailbox@28ec08000", "/soc/display-subsystem",
-		"/soc/dcp@28ec00000/piodma", "/soc/dcp@28ec00000",
-	};
-	struct device_node *nodes[ARRAY_SIZE(paths)] = {}, *chosen;
+	struct device_node *nodes[J613_NR_NODES] = {}, *chosen;
 	const char *uuid, *status;
 	void __iomem *cpu;
 	u32 profile, version[3], witness[5], markers[3];
@@ -227,9 +298,17 @@ int __init apple_j613_25g83_coldplug(void)
 
 	if (!of_machine_is_compatible("apple,j613") && !of_machine_is_compatible("apple,j615"))
 		return 0;
-	nodes[9] = of_find_node_by_path(paths[9]);
-	/* Ordinary 14.x J613/J615 boot keeps the existing gate and report driver. */
-	if (!nodes[9] || !of_property_present(nodes[9], "apple,j613-25g83-profile")) {
+	nodes[J613_DCP] = of_find_node_by_path("dcp");
+	if (nodes[J613_DCP] && !of_device_is_compatible(nodes[J613_DCP], "apple,t8122-dcp")) {
+		of_node_put(nodes[J613_DCP]);
+		nodes[J613_DCP] = NULL;
+	}
+	/*
+	 * Only the 25G83 profile is coldplugged here. This tree does not
+	 * carry the T8122 path of the display gate yet, so an ordinary 14.x
+	 * J613/J615 boot leaves the display disabled, on the boot framebuffer.
+	 */
+	if (!nodes[J613_DCP] || !of_property_present(nodes[J613_DCP], "apple,j613-25g83-profile")) {
 		ret = 0;
 		goto out;
 	}
@@ -240,11 +319,11 @@ int __init apple_j613_25g83_coldplug(void)
 		ret = -EPERM;
 		goto out;
 	}
-	if (of_property_count_u32_elems(nodes[9], "apple,j613-25g83-profile") != 1 ||
-	    of_property_read_u32(nodes[9], "apple,j613-25g83-profile", &profile) ||
-	    of_property_count_u32_elems(nodes[9], "apple,firmware-compat") != 3 ||
-	    of_property_read_u32_array(nodes[9], "apple,firmware-compat", version, 3) ||
-	    of_property_read_string(nodes[9], "apple,firmware-uuid", &uuid) ||
+	if (of_property_count_u32_elems(nodes[J613_DCP], "apple,j613-25g83-profile") != 1 ||
+	    of_property_read_u32(nodes[J613_DCP], "apple,j613-25g83-profile", &profile) ||
+	    of_property_count_u32_elems(nodes[J613_DCP], "apple,firmware-compat") != 3 ||
+	    of_property_read_u32_array(nodes[J613_DCP], "apple,firmware-compat", version, 3) ||
+	    of_property_read_string(nodes[J613_DCP], "apple,firmware-uuid", &uuid) ||
 	    !j613_25g83_identity(true, profile, version, 3, uuid))
 		goto out;
 	chosen = of_find_node_by_path("/chosen");
@@ -256,18 +335,28 @@ int __init apple_j613_25g83_coldplug(void)
 		ret = -EINVAL;
 		goto out;
 	}
+	j613_resolve(nodes);
 	for (i = 0; i < ARRAY_SIZE(nodes); i++) {
-		if (!nodes[i])
-			nodes[i] = of_find_node_by_path(paths[i]);
-		if (!nodes[i] || of_property_read_string(nodes[i], "status", &status) ||
+		if (!nodes[i]) {
+			ret = -ENODEV;
+			goto out;
+		}
+		if (of_property_read_string(nodes[i], "status", &status) ||
 		    strcmp(status, "disabled")) {
 			ret = -EBUSY;
 			goto out;
 		}
 	}
+	if (nodes[J613_DCP_DART] == nodes[J613_DISP0_DART]) {
+		ret = -EINVAL;
+		goto out;
+	}
+	/* The display subsystem, the PIODMA node and the DCP, in that order. */
 	for (i = 0; i < 3; i++) {
-		if (of_property_count_u32_elems(nodes[7 + i], J613_25G83_HANDOFF) != 1 ||
-		    of_property_read_u32(nodes[7 + i], J613_25G83_HANDOFF, &markers[i])) {
+		struct device_node *np = nodes[J613_DISPLAY + i];
+
+		if (of_property_count_u32_elems(np, J613_25G83_HANDOFF) != 1 ||
+		    of_property_read_u32(np, J613_25G83_HANDOFF, &markers[i])) {
 			ret = -EINVAL;
 			goto out;
 		}
@@ -279,7 +368,7 @@ int __init apple_j613_25g83_coldplug(void)
 	ret = j613_power_ready();
 	if (ret)
 		goto out;
-	cpu = of_iomap(nodes[9], 0);
+	cpu = of_iomap(nodes[J613_DCP], 0);
 	if (!cpu) {
 		ret = -ENOMEM;
 		goto out;
@@ -289,7 +378,7 @@ int __init apple_j613_25g83_coldplug(void)
 	if (ret)
 		goto out;
 	of_changeset_init(&gate);
-	ret = j613_pmp_values(nodes[3]);
+	ret = j613_pmp_values(nodes[J613_PMP]);
 	for (i = 0; i < ARRAY_SIZE(nodes) && !ret; i++)
 		ret = of_changeset_update_prop_string(&gate, nodes[i], "status", "okay");
 	if (!ret) {
