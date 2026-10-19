@@ -59,8 +59,12 @@ void iomfb_v14_7_unbind(struct apple_dcp *dcp);
 void iomfb_v14_7_remove(struct apple_dcp *dcp);
 /* DCPLink, start signal, first client open and the panel mode. */
 int iomfb_v14_7_start(struct apple_dcp *dcp);
-/* System sleep: no brightness-only present may start once the panel sleeps. */
-void iomfb_v14_7_backlight_suspend(struct apple_dcp *dcp);
+/*
+ * System sleep of the panel: no brightness-only present may start once it
+ * sleeps, and the firmware's messages wait in the mailbox until resume.
+ */
+void iomfb_v14_7_suspend(struct apple_dcp *dcp);
+void iomfb_v14_7_resume(struct apple_dcp *dcp);
 
 int iomfb_v14_7_atomic_check(struct apple_dcp *dcp, struct drm_crtc *crtc,
 			     struct drm_atomic_state *state);

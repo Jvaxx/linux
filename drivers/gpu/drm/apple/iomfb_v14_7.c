@@ -198,6 +198,8 @@ struct apple_dcp_v14 {
 	struct work_struct stopped_work;
 	bool failed;
 	bool started;
+	/* Panel: the mailbox holds the firmware's messages through system sleep. */
+	bool rx_held;
 
 	/*
 	 * An external processor: no panel. Its modes come from the
@@ -2802,12 +2804,38 @@ static void dcp_v14_configure_backlight(struct apple_dcp *dcp)
 		dev_err(dcp->dev, "%s backlight unavailable: %d\n", v14->board->name, ret);
 }
 
-void iomfb_v14_7_backlight_suspend(struct apple_dcp *dcp)
+/*
+ * System sleep of the panel. DRM has blanked it (the background at 0 nits)
+ * before this runs, synchronously under the RPC lock, and no brightness-only
+ * present may start once the mailbox sleeps. The firmware keeps publishing
+ * to the AP while it scans out, and each message would wake a CPU out of
+ * suspend-to-idle: once no call is in flight (calls and notifications run
+ * under the lock), hold its messages in the mailbox until resume.
+ */
+void iomfb_v14_7_suspend(struct apple_dcp *dcp)
 {
 	struct apple_dcp_v14 *v14 = dcp->v14;
 
-	if (v14)
-		cancel_delayed_work_sync(&v14->backlight_work);
+	if (!v14)
+		return;
+	cancel_delayed_work_sync(&v14->backlight_work);
+	if (!v14->rtk || v14->external || !v14->started || READ_ONCE(v14->failed) ||
+	    v14->rx_held)
+		return;
+	mutex_lock(&v14->lock);
+	apple_rtkit_hold_rx(v14->rtk);
+	v14->rx_held = true;
+	mutex_unlock(&v14->lock);
+}
+
+void iomfb_v14_7_resume(struct apple_dcp *dcp)
+{
+	struct apple_dcp_v14 *v14 = dcp->v14;
+
+	if (!v14 || !v14->rx_held)
+		return;
+	v14->rx_held = false;
+	apple_rtkit_resume_rx(v14->rtk);
 }
 
 /*

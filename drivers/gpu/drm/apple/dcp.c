@@ -3320,9 +3320,9 @@ static int dcp_platform_suspend(struct device *dev)
 		return dcp_platform_suspend_h17p(dev);
 	if (READ_ONCE(dcp->ext_dead))
 		return 0;
-	/* The 14.7 panel: no brightness-only present once the mailbox sleeps. */
+	/* The 14.7 panel: its messages wait in the mailbox until resume. */
 	if (dcp_is_v14_7_panel(dcp))
-		iomfb_v14_7_backlight_suspend(dcp);
+		iomfb_v14_7_suspend(dcp);
 
 	/* Serialize PM against explicit bring-up, including queued startup work.
 	 * Before a startup attempt the device remains suspendable. After any
@@ -3383,6 +3383,8 @@ static int dcp_platform_resume(struct device *dev)
 		return dcp_platform_resume_h17p(dev);
 	if (READ_ONCE(dcp->ext_dead))
 		return 0;
+	if (dcp_is_v14_7_panel(dcp))
+		iomfb_v14_7_resume(dcp);
 
 	dcp_enable_typec_work(dcp);
 	/* The HDMI output's PHY and crossbar may have lost their setup in sleep. */
