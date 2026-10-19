@@ -314,20 +314,25 @@ static bool apple_dpxbar_t6030_output_is(struct apple_dpxbar *xbar, unsigned int
 	bool ok;
 
 #define OUT_BIT(reg, bit, set) ((readl(xbar->regs + (reg)) & (bit)) == ((set) ? (bit) : 0))
-	/* The clocks and enables of this output, and their status. */
+	/* The clocks and enables of this output, and the gates' status. */
 	ok = OUT_BIT(T602X_FIFO_WR_DPTX_CLK_EN, u, up) && OUT_BIT(T602X_FIFO_WR_N_CLK_EN, u, !up) &&
 	     OUT_BIT(T602X_FIFO_WR_UNK_EN, u, up) && OUT_BIT(rd, u, up) &&
 	     OUT_BIT(T602X_RD_GATE, u, !up) && OUT_BIT(out, d, up) &&
 	     OUT_BIT(T602X_OUT_GATE, d, !up) && OUT_BIT(T602X_DISPEXT_ENABLE, u, up) &&
 	     OUT_BIT(0x804, u, !up) && OUT_BIT(0x810, u, !up) && OUT_BIT(0x81c, d, !up) &&
-	     OUT_BIT(0x800, u, up) && OUT_BIT(pclk2 ? 0x80c : 0x808, u, up) &&
-	     OUT_BIT(pclk2 ? 0x818 : 0x814, d, up) &&
 	     ((readl(xbar->regs + T602X_RD_SELECT) >> (2 * state)) & 3) == (up ? ps : 0) &&
 	     ((readl(xbar->regs + T602X_OUT_SELECT) >> shift) & 3) == (up ? ps : 0) &&
 	     (readl(xbar->regs + T602X_MUX_SELECT) & sel_mask) == sel;
-	/* The ATC enable is set with the connection and left set after it. */
+	/*
+	 * The clock status bits at +0x800/+0x808/+0x80c/+0x814/+0x818 are
+	 * part of the idle image only: the connection-up image leaves them
+	 * out. The ATC enable is set with the connection and left set after it.
+	 */
 	if (up)
 		ok = ok && OUT_BIT(T602X_ATC_ENABLE, d, true);
+	else
+		ok = ok && OUT_BIT(0x800, u, false) && OUT_BIT(pclk2 ? 0x80c : 0x808, u, false) &&
+		     OUT_BIT(pclk2 ? 0x818 : 0x814, d, false);
 #undef OUT_BIT
 	return ok;
 }
