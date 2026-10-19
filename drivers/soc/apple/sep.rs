@@ -63,8 +63,9 @@ use kernel::{
             Relaxed, //
         },
         barrier::{
-            dma_rmb,
-            dma_wmb, //
+            dma_mb,
+            Read,
+            Write, //
         },
         new_condvar,
         Arc,
@@ -1187,7 +1188,7 @@ impl SepData {
     /// reply's header overwritten by a refill that lands late. dma_wmb() is
     /// what writel() would put there, and what RTKit puts before its sends.
     fn ring(mbox: &Mailbox<SepData>, msg: Message) -> Result<()> {
-        dma_wmb();
+        dma_mb(Write);
         mbox.send(msg, false)
     }
 
@@ -2526,7 +2527,7 @@ impl MailCallback for SepData {
         }
         // The message was read from the mailbox with relaxed MMIO. Read the
         // buffers the enclave wrote before it only after that, as RTKit does.
-        dma_rmb();
+        dma_mb(Read);
         if !data.rx.push(msg) && data.rx.dropped() == 1 {
             dev_err!(
                 data.dev,
