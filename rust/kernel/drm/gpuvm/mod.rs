@@ -264,35 +264,39 @@ impl<T: DriverGpuVm> GpuVm<T> {
         // Do not try to lock the object if it is internal (since it is already locked).
         let is_ext = obj.map(|a| self.is_extobj(a)).unwrap_or(false);
 
-        let mut guard = ManuallyDrop::new(GpuVmExec {
-            // vm_exec needs to be pinned, so stick it in a Box.
-            vm_exec: KBox::init(
-                init!(bindings::drm_gpuvm_exec {
-                    vm: self.as_raw(),
-                    flags: if interruptible {
-                        bindings::DRM_EXEC_INTERRUPTIBLE_WAIT
-                    } else {
-                        0
+        // vm_exec needs to be pinned, so stick it in a Box.
+        let mut vm_exec = KBox::init(
+            init!(bindings::drm_gpuvm_exec {
+                vm: self.as_raw(),
+                flags: if interruptible {
+                    bindings::DRM_EXEC_INTERRUPTIBLE_WAIT
+                } else {
+                    0
+                },
+                exec: Default::default(),
+                extra: match (is_ext, obj) {
+                    (true, Some(obj)) => bindings::drm_gpuvm_exec__bindgen_ty_1 {
+                        fn_: Some(exec_lock_gem_object),
+                        priv_: obj.as_raw() as *mut _,
                     },
-                    exec: Default::default(),
-                    extra: match (is_ext, obj) {
-                        (true, Some(obj)) => bindings::drm_gpuvm_exec__bindgen_ty_1 {
-                            fn_: Some(exec_lock_gem_object),
-                            priv_: obj.as_raw() as *mut _,
-                        },
-                        _ => Default::default(),
-                    },
-                    num_fences: 0,
-                }),
-                GFP_KERNEL,
-            )?,
+                    _ => Default::default(),
+                },
+                num_fences: 0,
+            }),
+            GFP_KERNEL,
+        )?;
+
+        // SAFETY: The object is valid and was initialized above. On failure,
+        // `drm_gpuvm_exec_lock()` has already finalized the exec context, so the box only needs to
+        // be freed, which dropping it does.
+        to_result(unsafe { bindings::drm_gpuvm_exec_lock(&mut *vm_exec) })?;
+
+        // Build the guard, and take its VM reference, only once the locks are held: its `Drop`
+        // unlocks them.
+        Ok(GpuVmExec {
+            vm_exec,
             unique_gpuvm: UniqueRefGpuVm(self.into()),
-        });
-
-        // SAFETY: The object is valid and was initialized above
-        to_result(unsafe { bindings::drm_gpuvm_exec_lock(&mut *guard.vm_exec) })?;
-
-        Ok(ManuallyDrop::into_inner(guard))
+        })
     }
 
     /// Free this GPUVM.
