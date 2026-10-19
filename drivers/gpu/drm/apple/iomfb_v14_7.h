@@ -51,6 +51,8 @@ bool iomfb_v14_7_external_showing(struct apple_dcp *dcp,
  * connected through a withdrawal, and is not described again, gone.
  */
 void dcp_v14_external_hotplug(struct apple_dcp *dcp, bool connected);
+/* The firmware reported the attached sink inactive, or active again. */
+void iomfb_v14_7_external_sink_active(struct apple_dcp *dcp, bool active);
 void iomfb_v14_7_external_withdrawn(struct apple_dcp *dcp);
 bool iomfb_v14_7_external_release(struct apple_dcp *dcp);
 /* Component unbind: KMS goes away; the firmware session is kept until reboot. */
