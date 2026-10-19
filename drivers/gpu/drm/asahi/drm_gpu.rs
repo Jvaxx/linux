@@ -106,6 +106,9 @@ pub(crate) trait DrmGpu: Send + Sync {
     fn bind_batch_limit(&self) -> Option<u32> {
         None
     }
+    /// A client's VM handle was destroyed: a generation that keeps per-VM state beyond the
+    /// client's handle may release it now.
+    fn vm_closed(&self) {}
 }
 
 /// Publish an existing manager without allocating another reference-counted adapter.
@@ -243,6 +246,10 @@ impl DrmGpu for g15::Gpu {
 
     fn bind_batch_limit(&self) -> Option<u32> {
         gpu::Gpu::bind_batch_limit(self)
+    }
+
+    fn vm_closed(&self) {
+        g15::vm::closed(self)
     }
 }
 

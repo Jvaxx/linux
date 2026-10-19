@@ -70,7 +70,7 @@ mod regs;
 mod slots;
 mod timestamp;
 mod uat;
-mod vm;
+pub(crate) mod vm;
 
 use core::any::Any;
 use core::ops::Range;
