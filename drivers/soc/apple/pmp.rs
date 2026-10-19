@@ -221,7 +221,7 @@ impl PmpData {
             pio_base += PIO_GRANULARITY;
         }
         let table: Coherent<[IovaTableEntry]> = table.into();
-        let msg = (OPC_GET_IOVA_TABLE | OPC_ACK_MASK) << OPC_SHIFT | table.dma_handle();
+        let msg = (OPC_GET_IOVA_TABLE | OPC_ACK_MASK) << OPC_SHIFT | table.dma_address();
         state.iova_table = Some(table);
         Ok(msg)
     }
@@ -230,7 +230,7 @@ impl PmpData {
         let bound_dev = unsafe { self.dev.as_bound() };
         let iomem = Coherent::<u8>::zeroed_slice(bound_dev, size as usize, GFP_KERNEL)?;
         let mut state = self.state.lock();
-        let addr = iomem.dma_handle();
+        let addr = iomem.dma_address();
         let msg = (OPC_MALLOC | OPC_ACK_MASK) << OPC_SHIFT | addr;
         state.allocs.push(
             PmpAllocation {
@@ -397,7 +397,6 @@ struct PmpDriver(Arc<PmpData>);
 
 kernel::of_device_table!(
     OF_TABLE,
-    MODULE_OF_TABLE,
     (),
     [(of::DeviceId::new(c"apple,t6000-pmp-v2"), ())]
 );
