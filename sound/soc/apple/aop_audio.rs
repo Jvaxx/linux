@@ -859,7 +859,7 @@ impl SndSocAopDriver {
                 data.dev.as_raw(),
                 -1,
                 ptr::null(),
-                THIS_MODULE.as_ptr(),
+                kernel::module::this_module::<crate::LocalModule>().as_ptr(),
                 0,
                 &mut this.0,
             )
@@ -953,7 +953,6 @@ const HW_CFG_T6030: SndSocAopHwConfig = SndSocAopHwConfig {
 
 kernel::of_device_table!(
     OF_TABLE,
-    MODULE_OF_TABLE,
     <SndSocAopDriver as platform::Driver>::IdInfo,
     [
         (of::DeviceId::new(c_str!("apple,aop-audio")), &HW_CFG_T8013),
@@ -986,7 +985,7 @@ impl platform::Driver for SndSocAopDriver {
         let fwnode = parent_fwnode
             .get_child_by_name(c_str!("audio"))
             .ok_or(EIO)?;
-        let audio = *module_parameters::mic_check_123.value() != 0;
+        let audio = module_parameters::mic_check_123.value() != 0;
         if !audio && parent_fwnode.property_present(c_str!("apple,no-beamforming")) {
             return Err(ENODEV);
         }
