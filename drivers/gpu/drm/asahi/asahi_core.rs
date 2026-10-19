@@ -112,7 +112,6 @@ mod agx_status;
 mod agx_uapi;
 mod gem;
 mod g17;
-#[cfg(CONFIG_DRM_ASAHI_G15)]
 mod g15;
 mod gpu;
 mod hw;

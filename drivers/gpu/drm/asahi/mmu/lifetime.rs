@@ -339,7 +339,6 @@ impl Vm {
 
     /// Whether the client's handle of this VM is gone ([`Self::unmap_user_ranges`] closed
     /// admission for good). G15 releases its per-VM state after that.
-    #[cfg(CONFIG_DRM_ASAHI_G15)]
     pub(crate) fn is_closed(&self) -> bool {
         self.lifetime
             .as_ref()

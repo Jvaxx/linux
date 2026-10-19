@@ -24,16 +24,10 @@ fn board_is(compatible: &[u8]) -> bool {
 }
 
 /// Whether this is a board the M3 runtime is validated on (`soc.validated_boards`).
-/// `asahi.m3_expose=auto` registers the render node and `asahi.m3_backend=auto` starts the
-/// runtime only on these.
+/// `asahi.m3_expose=auto` registers the render node and the probe starts the runtime only on
+/// these.
 pub(crate) fn runtime_validated_board(soc: &Soc) -> bool {
     soc.validated_boards.iter().any(|board| board_is(board))
-}
-
-/// Whether this machine is one of `boards` (root compatibles).
-#[cfg(CONFIG_DRM_ASAHI_G15)]
-pub(crate) fn board_is_any(boards: &[&[u8]]) -> bool {
-    boards.iter().any(|board| board_is(board))
 }
 
 /// The number of core slots of `soc` (2 x 10 on T6030, 4 x 10 on T6031).

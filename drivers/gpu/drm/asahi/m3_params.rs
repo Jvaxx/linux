@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
-//! Module parameters of the T6030 (M3) backends.
+//! Module parameters of the M3 runtime backend.
 //!
 //! The `module!` parameter support only parses plain integers. The parameters here are declared
 //! with their own `kernel_param` entries (the same layout the `module!` macro emits), so they can
-//! take symbolic values on the kernel command line, e.g. `asahi.m3_backend=manager`, and hex or
+//! take symbolic values on the kernel command line, e.g. `asahi.m3_thermal=hold`, and hex or
 //! decimal masks.
 
 use core::ffi::{
@@ -300,44 +300,6 @@ pub(crate) fn g15_debug_mask() -> u64 {
     G15_DEBUG.load(Ordering::Relaxed)
 }
 
-/// `asahi.m3_backend` values.
-const BACKEND_AUTO: u64 = 0;
-const BACKEND_RUNTIME: u64 = 1;
-const BACKEND_MANAGER: u64 = 2;
-const BACKEND_OFF: u64 = 3;
-const BACKEND_G15: u64 = 4;
-
-/// Whether the G15 generation (`g15`) is built into this kernel.
-const G15_BUILT: bool = cfg!(CONFIG_DRM_ASAHI_G15);
-
-fn parse_backend(text: &str) -> Option<u64> {
-    match text.trim() {
-        "auto" | "0" => Some(BACKEND_AUTO),
-        "runtime" | "1" => Some(BACKEND_RUNTIME),
-        "manager" | "2" => Some(BACKEND_MANAGER),
-        "off" | "3" => Some(BACKEND_OFF),
-        "g15" | "4" => Some(BACKEND_G15),
-        _ => None,
-    }
-}
-
-/// `asahi.m3_backend=auto|runtime|manager|off|g15`: which T6030 GPU backend probe starts.
-static M3_BACKEND: AtomicU64 = AtomicU64::new(BACKEND_AUTO);
-m3_param!("m3_backend", M3_BACKEND, parse_backend);
-
-/// The T6030 GPU backend to start.
-pub(crate) enum T6030Backend {
-    /// The serialized M3 runtime (m3_drm / m3_runtime).
-    Runtime,
-    /// The G15 GpuManager backend (g15_probe).
-    Manager,
-    /// No backend: the probe stops without touching the GPU.
-    Off,
-    /// The G15 generation (`g15`, CONFIG_DRM_ASAHI_G15): the firmware the boot loader left
-    /// loaded, retained until reboot.
-    G15,
-}
-
 /// `asahi.m3_initdata` values.
 const INITDATA_AUTO: u64 = 0;
 const INITDATA_ADT: u64 = 2;
@@ -566,101 +528,19 @@ pub(crate) fn thermal_hot_param() -> (u64, bool) {
     (clamped, clamped != value)
 }
 
-/// Whether to start the runtime backend on a T8122 (`asahi.m3_backend`), and say why not.
+/// Whether to start the runtime backend on this T8122 board, and say why not.
 ///
-/// The runtime starts only on the boards the T8122 table allows (the M3 MacBook Airs), with
-/// `auto` and `runtime` alike: it has not run on any T8122, so nothing forces it onto another
-/// board. The G15 manager backend is T6030-only.
+/// The runtime starts only on the boards the T8122 table allows (the M3 MacBook Airs): it has
+/// not run on any T8122, so nothing forces it onto another board.
 pub(crate) fn t8122_backend(pdev: &platform::Device<Core>) -> bool {
-    let dev = pdev.as_ref();
-    match M3_BACKEND.load(Ordering::Relaxed) {
-        BACKEND_OFF => {
-            dev_info!(dev, "M3: asahi.m3_backend=off: no GPU backend started\n");
-            false
-        }
-        BACKEND_MANAGER => {
-            dev_info!(
-                dev,
-                "M3: asahi.m3_backend=manager: the G15 manager backend is T6030-only; no GPU backend started\n"
-            );
-            false
-        }
-        BACKEND_G15 => {
-            dev_info!(
-                dev,
-                "M3: asahi.m3_backend=g15: the G15 generation is T6030-only; no GPU backend started\n"
-            );
-            false
-        }
-        _ if crate::m3_board::runtime_validated_board(&crate::m3_soc::T8122) => true,
-        _ => {
-            dev_info!(
-                dev,
-                "M3: no GPU backend on this T8122 board: the runtime backend may start only on the M3 MacBook Airs (J613, J615)\n"
-            );
-            false
-        }
+    if crate::m3_board::runtime_validated_board(&crate::m3_soc::T8122) {
+        return true;
     }
-}
-
-/// Select the T6030 GPU backend from `asahi.m3_backend`, and say which one and why.
-///
-/// `auto` starts the G15 generation when it is built (the Mesa of this tree drives the G15S
-/// through that generation's contract), else the runtime backend, on the boards they are
-/// validated on (the M3 Pro MacBook Pros). On other T6030 boards it starts nothing until a
-/// backend is validated there; `asahi.m3_backend=runtime` or `=g15` starts one anyway.
-pub(crate) fn t6030_backend(pdev: &platform::Device<Core>) -> T6030Backend {
-    let dev = pdev.as_ref();
-    match M3_BACKEND.load(Ordering::Relaxed) {
-        BACKEND_RUNTIME => {
-            dev_info!(dev, "M3: asahi.m3_backend=runtime\n");
-            T6030Backend::Runtime
-        }
-        BACKEND_G15 => {
-            dev_info!(dev, "M3: asahi.m3_backend=g15: starting the G15 generation\n");
-            T6030Backend::G15
-        }
-        _ if G15_BUILT && crate::m3_board::runtime_validated_board(&crate::m3_soc::T6030) => {
-            dev_info!(dev, "M3: asahi.m3_backend=auto: starting the G15 generation\n");
-            T6030Backend::G15
-        }
-        BACKEND_MANAGER => {
-            dev_info!(dev, "M3: asahi.m3_backend=manager: starting the G15 manager backend\n");
-            T6030Backend::Manager
-        }
-        BACKEND_OFF => {
-            dev_info!(dev, "M3: asahi.m3_backend=off: no GPU backend started\n");
-            T6030Backend::Off
-        }
-        _ if crate::m3_board::runtime_validated_board(&crate::m3_soc::T6030) => T6030Backend::Runtime,
-        _ => {
-            dev_info!(
-                dev,
-                "M3: asahi.m3_backend=auto: no GPU backend on this board: no backend is validated here yet (asahi.m3_backend=runtime starts the runtime, =g15 the G15 generation, =manager the G15 manager backend)\n"
-            );
-            T6030Backend::Off
-        }
-    }
-}
-
-/// Whether the G15 generation starts on this T6031: `asahi.m3_backend=g15`, or `auto` on the
-/// J516C (where the generation was qualified, aurora-silicon/linux PR #363). Every other value,
-/// and every other board, keeps the T6031 runtime selection (`asahi.t6031_start`), as does a
-/// kernel without the generation.
-#[cfg(CONFIG_DRM_ASAHI_G15)]
-pub(crate) fn t6031_g15(pdev: &platform::Device<Core>) -> bool {
-    let dev = pdev.as_ref();
-    match M3_BACKEND.load(Ordering::Relaxed) {
-        BACKEND_G15 => {
-            dev_info!(dev, "M3 G15C: asahi.m3_backend=g15: starting the G15 generation\n");
-            true
-        }
-        BACKEND_AUTO if crate::m3_board::board_is_any(&[b"apple,j516c"]) => {
-            dev_info!(dev, "M3 G15C: asahi.m3_backend=auto: starting the G15 generation\n");
-            true
-        }
-        _ => false,
-    }
+    dev_info!(
+        pdev.as_ref(),
+        "M3: no GPU backend on this T8122 board: the runtime backend may start only on the M3 MacBook Airs (J613, J615)\n"
+    );
+    false
 }
 
 fn parse_t8122_number(text: &str) -> Option<u64> {

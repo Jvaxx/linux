@@ -2368,7 +2368,6 @@ struct UatInner {
     firmware_cache_flush_ready: AtomicBool,
     /// Clean page tables to the point of coherency for a walker that does not snoop the CPU
     /// caches. Set only by [`Uat::new_adopted`].
-    #[cfg(CONFIG_DRM_ASAHI_G15)]
     clean_poc: bool,
     #[pin]
     shared: Mutex<UatShared>,
@@ -2744,7 +2743,6 @@ impl Vm {
     /// Attach a status and job lifetime tracking before sharing a newly created user VM with
     /// queues, without the G17 canonical context views, shared-object footprints and idle
     /// residency reclaim of [`Self::with_status`]. Used by G15, whose user objects stay pinned.
-    #[cfg(CONFIG_DRM_ASAHI_G15)]
     pub(crate) fn with_tracked_status(mut self) -> Result<Self> {
         self.status = Some(Arc::pin_init(crate::g17::status::VmStatus::new(), GFP_KERNEL)?);
         self.lifetime = Some(lifetime::VmLifetime::new()?);
@@ -2758,7 +2756,6 @@ impl Vm {
     /// and invalidated to the point of coherency first (never only invalidated: CPU-written lines
     /// may be dirty), so the copy sees what the GPU or a write-combined CPU view stored. The
     /// mappings cannot change during the copy (GPUVM exec lock).
-    #[cfg(CONFIG_DRM_ASAHI_G15)]
     pub(crate) fn read_user(&self, va: u64, buf: &mut [u8]) -> Result {
         let mut inner = self.inner.exec_lock(None, false)?;
         let mut done = 0usize;
@@ -2919,7 +2916,6 @@ impl Vm {
         } else {
             UatPageTable::new_by_geometry(cfg.ias, cfg.oas)?
         };
-        #[cfg(CONFIG_DRM_ASAHI_G15)]
         let page_table = {
             let mut page_table = page_table;
             if uat_inner.clean_poc {
@@ -4077,7 +4073,6 @@ impl Drop for VmInner {
 
 /// Physical regions of a UAT whose handoff the generation has already established itself
 /// ([`Uat::new_adopted`]). None of them needs to be in the kernel linear map.
-#[cfg(CONFIG_DRM_ASAHI_G15)]
 pub(crate) struct AdoptedRegions {
     /// The handoff region (PPL magic, lock and flush requests).
     pub(crate) handoff: Range<PhysicalAddr>,
@@ -4088,7 +4083,6 @@ pub(crate) struct AdoptedRegions {
 }
 
 impl Uat {
-    #[cfg(CONFIG_DRM_ASAHI_G15)]
     /// Map a region given by its physical range, write-combined.
     fn map_physical(range: &Range<PhysicalAddr>, min_size: usize) -> Result<UatRegion> {
         let size: usize = (range.end.checked_sub(range.start).ok_or(EINVAL)?).try_into()?;
@@ -4126,7 +4120,6 @@ impl Uat {
         })
     }
 
-    #[cfg(CONFIG_DRM_ASAHI_G15)]
     /// Creates a `Uat` for a handoff that the caller establishes itself (G15).
     ///
     /// This only maps the handoff and the TTBAT (write-combined); neither is written here. The
@@ -4224,13 +4217,11 @@ impl Uat {
         })
     }
 
-    #[cfg(CONFIG_DRM_ASAHI_G15)]
     /// Root of the kernel lower `Vm`, for TTBAT context 0 of an adopted handoff.
     pub(crate) fn kernel_lower_root(&self) -> PhysicalAddr {
         self.kernel_lower_vm.ttb()
     }
 
-    #[cfg(CONFIG_DRM_ASAHI_G15)]
     /// Root whose driver-window entry names the second-level table of [`Self::kernel_vm`]'s
     /// driver window. With [`Self::new_adopted`] this is the shadow root that no context names.
     pub(crate) fn kernel_window_root(&self) -> PhysicalAddr {
@@ -4673,7 +4664,6 @@ impl Uat {
                 firmware_cache_flush_ready: AtomicBool::new(
                     handoff_mode == HandoffMode::FirmwareDekker
                 ),
-                #[cfg(CONFIG_DRM_ASAHI_G15)]
                 clean_poc: false,
                 handoff_flush <- pin_init::pin_init_array_from_fn(|i| {
                     new_mutex!(HandoffFlush(&handoff.flush[i]), "handoff_flush")

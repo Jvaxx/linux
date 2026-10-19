@@ -100,7 +100,6 @@ pub(crate) fn clean_poc(ptr: *const u8, len: usize) {
 /// Cleans and invalidates the CPU data cache lines covering `len` bytes at `ptr` to the point of
 /// coherency, so that later CPU reads observe what a non-snooping agent wrote. Lines the CPU wrote
 /// are written back first. [`poc_barrier`] completes the maintenance.
-#[cfg(CONFIG_DRM_ASAHI_G15)]
 pub(crate) fn clean_invalidate_poc(ptr: *const u8, len: usize) {
     if len == 0 {
         return;
@@ -322,7 +321,6 @@ impl Prot {
 
     /// The protection bits of a leaf with this protection (no address, table type or non-global
     /// bits), for checking that a firmware leaf word round-trips through [`Self::from_pte`].
-    #[cfg(CONFIG_DRM_ASAHI_G15)]
     pub(crate) const fn leaf_bits(&self) -> u64 {
         self.as_pte()
     }
@@ -829,7 +827,6 @@ impl UatPageTable {
     /// before its parent descriptor names it, and every written table span is cleaned after the
     /// store with a `dsb osh` ([`Self::publish_table`]). Call it before anything is mapped and
     /// before any context names the root.
-    #[cfg(CONFIG_DRM_ASAHI_G15)]
     pub(crate) fn enable_clean_poc(&mut self) -> Result {
         self.noncoherent = true;
         // The zeroed root: published whole through the write path of `with_table`.

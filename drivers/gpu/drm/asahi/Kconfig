@@ -16,37 +16,27 @@ config DRM_ASAHI
 	depends on MMU
 	depends on IOMMU_SUPPORT
 	depends on PAGE_SIZE_16KB
+	depends on APPLE_PMP
 	select APPLE_PMP_REPORT
 	select CRYPTO_LIB_SHA256
 	select RUST_DRM_SCHED
 	select RUST_DRM_GEM_SHMEM_HELPER
 	select RUST_DRM_GPUVM
 	select RUST_APPLE_RTKIT
+	select RUST_FW_LOADER_ABSTRACTIONS
 	select WANT_DEV_COREDUMP
 	help
 	  DRM driver for Apple AGX GPUs (G13x, found in the M1 SoC family)
 
-config DRM_ASAHI_G15
-	bool "Apple M3 Pro/Max (G15S, G15C) support (experimental)"
-	depends on DRM_ASAHI && ARM64
-	depends on APPLE_PMP=y || APPLE_PMP=DRM_ASAHI
-	select CRYPTO_LIB_SHA256
-	select RUST_FW_LOADER_ABSTRACTIONS
-	help
-	  Support for the G15S GPU of the T6030 MacBook Pros (J514S, J516S)
-	  and the G15C GPU of the T6031 MacBook Pros (J514C, J516C), whose
-	  firmware (RTKit 2419) the boot loader leaves loaded. Only the
+	  The same driver carries the G15 generation of the T6030 (M3 Pro:
+	  J514S, J516S) and T6031 (M3 Max: J514C, J516C) MacBook Pros, whose
+	  GPU firmware (RTKit 2419) the boot loader leaves loaded. Only the
 	  qualified firmware builds are admitted. The T6031 board images are
 	  a firmware file (asahi/t6031-j516c-board.bin), to be built in with
-	  CONFIG_EXTRA_FIRMWARE.
-
-	  The asahi driver starts this generation on apple,agx-t6030 and
-	  apple,agx-t6031 when asahi.m3_backend selects it (the default on
-	  the J514S, J516S and J516C; asahi.m3_backend=runtime keeps the M3
-	  runtime). The firmware session is retained until reboot; the module
-	  cannot be unloaded once the GPU has started.
-
-	  Say N unless you are bringing up the M3 Pro or Max.
+	  CONFIG_EXTRA_FIRMWARE. That firmware session is retained until
+	  reboot; the module cannot be unloaded once such a GPU has started.
+	  The AGX power vote goes through the PMP driver, which must be
+	  reachable from this one.
 
 config DRM_ASAHI_DEBUG_ALLOCATOR
 	bool "Use debug allocator"

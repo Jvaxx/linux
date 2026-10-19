@@ -114,7 +114,7 @@ pub(crate) struct Soc {
     /// GPU node compatible.
     pub(crate) gpu: &'static str,
     /// Boards the runtime starts on by default and registers a render node on. On a T8122 it
-    /// starts on no other board, whatever `asahi.m3_backend` says (`m3_params::t8122_backend`).
+    /// starts on no other board (`m3_params::t8122_backend`).
     pub(crate) validated_boards: &'static [&'static [u8]],
     /// GPU clusters, and core slots per cluster.
     pub(crate) clusters: u32,

@@ -14,8 +14,8 @@
 //!
 //! # Plugging into the shared driver
 //!
-//! - The shared platform driver selects this generation for `apple,agx-t6030` through
-//!   `asahi.m3_backend` ([`crate::m3_params::t6030_backend`]) and probes it with
+//! - The shared platform driver binds this generation to `apple,agx-t6030` and
+//!   `apple,agx-t6031` ([`crate::driver::ProbeConfig::G15`]) and probes it with
 //!   [`crate::driver::AsahiDriver::probe_g15`]. A probe that fails once the firmware has been
 //!   touched keeps the device bound and the session retained ([`retained`]).
 //! - [`Gpu`] implements [`crate::gpu::Gpu`]: GET_PARAMS identity, VM creation (`new_vm`),

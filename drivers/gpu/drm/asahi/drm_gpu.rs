@@ -15,7 +15,6 @@ use kernel::{
     uapi,
 };
 
-#[cfg(CONFIG_DRM_ASAHI_G15)]
 use crate::g15;
 use crate::{alloc, file, fw, g17, gem, gpu, mmu, queue};
 
@@ -118,7 +117,6 @@ pub(crate) enum Backend {
     G16(Arc<dyn DrmGpu>),
     G17(Arc<g17::Gpu>),
     /// The G15 generation (T6030, M3 Pro).
-    #[cfg(CONFIG_DRM_ASAHI_G15)]
     G15(Arc<g15::Gpu>),
 }
 
@@ -128,14 +126,12 @@ impl Backend {
             Self::Legacy(manager) => manager,
             Self::M3(runtime) | Self::G16(runtime) => &**runtime,
             Self::G17(runtime) => &**runtime,
-            #[cfg(CONFIG_DRM_ASAHI_G15)]
             Self::G15(gpu) => &**gpu,
         }
     }
 }
 
 /// The G15 generation's `gpu::Gpu` operations, as the file layer sees them.
-#[cfg(CONFIG_DRM_ASAHI_G15)]
 impl DrmGpu for g15::Gpu {
     fn init(&self) -> Result {
         gpu::Gpu::init(self)

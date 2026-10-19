@@ -563,7 +563,6 @@ impl Resources {
     }
     */
 
-    #[cfg(CONFIG_DRM_ASAHI_G15)]
     /// Reads a 32-bit SGX register at a runtime offset (G15 identification, power and fault
     /// windows).
     pub(crate) fn sgx_read32_at(&self, offset: usize) -> Result<u32> {
@@ -571,7 +570,6 @@ impl Resources {
         sgx.try_read32(offset)
     }
 
-    #[cfg(CONFIG_DRM_ASAHI_G15)]
     /// Writes a 32-bit SGX register at a runtime offset (G15).
     pub(crate) fn sgx_write32_at(&self, offset: usize, value: u32) -> Result {
         let sgx = self.sgx.try_access().ok_or(ENODEV)?;

@@ -21,12 +21,11 @@ use kernel::{
     },
 };
 
-#[cfg(CONFIG_DRM_ASAHI_G15)]
-use crate::g15;
 use crate::{
     debug,
     drm_gpu,
     file,
+    g15,
     g15_boot,
     g17,
     gem::AsahiObject,
@@ -92,18 +91,11 @@ impl AsahiData {
     }
 
     /// The G15 generation, if this device runs it.
-    #[cfg(CONFIG_DRM_ASAHI_G15)]
     pub(crate) fn g15(&self) -> Option<&Arc<g15::Gpu>> {
         match self.gpu.as_ref() {
             Some(drm_gpu::Backend::G15(gpu)) => Some(gpu),
             _ => None,
         }
-    }
-
-    /// Without G15 support no device runs that generation.
-    #[cfg(not(CONFIG_DRM_ASAHI_G15))]
-    pub(crate) fn g15(&self) -> Option<&()> {
-        None
     }
 
     /// Runtime construction can use GEM before the GPU backend exists. All
@@ -132,15 +124,12 @@ enum AsahiRuntime {
     Legacy(ARef<drm::Device<AsahiDriver>>),
     M3(crate::m3_drm::Registered),
     G16(crate::g16_drm::Registered),
-    G15(crate::g15_probe::G15Manager),
     G17(ARef<drm::Device<AsahiDriver>>, Arc<g17::Gpu>),
     /// The G15 generation (`g15`): its DRM device and GPU, retained until reboot.
-    #[cfg(CONFIG_DRM_ASAHI_G15)]
-    G15Native(ARef<drm::Device<AsahiDriver>>, Arc<g15::Gpu>),
+    G15(ARef<drm::Device<AsahiDriver>>, Arc<g15::Gpu>),
     /// A G15 probe that failed once the firmware had been touched: the device stays bound
     /// (unbinding would detach and power off the GFX domain under the running firmware), the
     /// firmware session is retained until reboot and no DRM device exists.
-    #[cfg(CONFIG_DRM_ASAHI_G15)]
     G15Retained,
 }
 
@@ -156,6 +145,9 @@ pub(crate) enum ProbeConfig {
     /// topology decode run at probe time, then the probe fails closed before
     /// DMA setup, ASC start, or any MMIO write.
     Agx3Diagnostic(&'static hw::agx3::SocConfig),
+    /// G15 (T6030, T6031): the G15 generation, driving the firmware the boot loader left
+    /// loaded.
+    G15(&'static g15::Config),
     /// G17 (T8140): the G17P firmware runtime.
     G17(&'static g17::Config),
 }
@@ -263,24 +255,23 @@ kernel::of_device_table!(
         ),
         // AGX3 (G15) identification targets. These intentionally select no
         // HwConfig: unproved power/MMIO/firmware-tuning fields must never be
-        // represented by copied or zero-filled legacy values. T6030 starts
-        // the M3 runtime; a handed-over T8122 is admitted by it and refused
-        // while its table is incomplete; T6031 starts that runtime only with
-        // asahi.t6031_start=1 and otherwise fails closed the same way; the
-        // others fail closed before any firmware handoff.
+        // represented by copied or zero-filled legacy values. A handed-over
+        // T8122 is admitted by the M3 runtime and refused while its table is
+        // incomplete; the others fail closed before any firmware handoff.
         // The M4 (G16) and M5 bring-up runtimes are not bound in this kernel.
-        // The A18 Pro (T8140, G17P) runtime is bound below.
+        // The M3 Pro/Max (T6030/T6031, G15) generation and the A18 Pro
+        // (T8140, G17P) runtime are bound below.
         (
             of::DeviceId::new(c_str!("apple,agx-t8122")),
             ProbeConfig::Agx3Diagnostic(&hw::agx3::T8122)
         ),
         (
             of::DeviceId::new(c_str!("apple,agx-t6030")),
-            ProbeConfig::Agx3Diagnostic(&hw::agx3::T6030)
+            ProbeConfig::G15(&g15::hw::t6030::CONFIG)
         ),
         (
             of::DeviceId::new(c_str!("apple,agx-t6031")),
-            ProbeConfig::Agx3Diagnostic(&hw::agx3::T6031)
+            ProbeConfig::G15(&g15::hw::t6031::CONFIG)
         ),
         (
             of::DeviceId::new(c_str!("apple,agx-t6032")),
@@ -317,12 +308,6 @@ fn start_t8122(pdev: &platform::Device<Core>) -> Result<crate::m3_drm::Registere
         return Err(ENODEV);
     }
     crate::m3_drm::Registered::start(pdev, &crate::m3_soc::T8122)
-}
-
-/// Start the M3 runtime on a T6031 (M3 Max, G15C) when `asahi.t6031_start=1`. The caller has
-/// already accepted that parameter. Resource admission still requires the boot loader's handoff.
-fn start_t6031(pdev: &platform::Device<Core>) -> Result<crate::m3_drm::Registered> {
-    crate::m3_drm::Registered::start(pdev, &crate::m3_soc::T6031)
 }
 
 fn refuse_agx3_probe(pdev: &platform::Device<Core>, soc: &'static hw::agx3::SocConfig) -> Error {
@@ -497,30 +482,6 @@ impl platform::Driver for AsahiDriver {
 
         let cfg = match info.ok_or(ENODEV)? {
             ProbeConfig::Supported(cfg) => *cfg,
-            ProbeConfig::Agx3Diagnostic(soc) if soc.chip_id == 0x6030 => {
-                match crate::m3_params::t6030_backend(pdev) {
-                    crate::m3_params::T6030Backend::Manager => {
-                        let manager = crate::g15_probe::probe(pdev)?;
-                        return Ok(Self { runtime: AsahiRuntime::G15(manager) });
-                    }
-                    crate::m3_params::T6030Backend::Off => return Err(ENODEV),
-                    #[cfg(CONFIG_DRM_ASAHI_G15)]
-                    crate::m3_params::T6030Backend::G15 => {
-                        return Self::probe_g15(pdev, &g15::hw::t6030::CONFIG);
-                    }
-                    #[cfg(not(CONFIG_DRM_ASAHI_G15))]
-                    crate::m3_params::T6030Backend::G15 => {
-                        dev_err!(
-                            pdev.as_ref(),
-                            "M3: asahi.m3_backend=g15: the G15 generation is not built (CONFIG_DRM_ASAHI_G15); no GPU backend started\n"
-                        );
-                        return Err(ENODEV);
-                    }
-                    crate::m3_params::T6030Backend::Runtime => {}
-                }
-                let runtime = crate::m3_drm::Registered::start(pdev, &crate::m3_soc::T6030)?;
-                return Ok(Self { runtime: AsahiRuntime::M3(runtime) });
-            }
             ProbeConfig::Agx3Diagnostic(soc) if soc.chip_id == 0x8122 => {
                 if crate::g16_profile::selected(pdev).inspect_err(|error| {
                     dev_err!(pdev.as_ref(), "G16G: firmware/profile admission failed: {:?}\n", error);
@@ -535,35 +496,8 @@ impl platform::Driver for AsahiDriver {
                 let runtime = start_t8122(pdev)?;
                 return Ok(Self { runtime: AsahiRuntime::M3(runtime) });
             }
-            ProbeConfig::Agx3Diagnostic(soc) if soc.chip_id == 0x6031 => {
-                #[cfg(CONFIG_DRM_ASAHI_G15)]
-                if crate::m3_params::t6031_g15(pdev) {
-                    return Self::probe_g15(pdev, &g15::hw::t6031::CONFIG);
-                }
-                match crate::t6031_knobs::start(&crate::m3_params::t6031_params()) {
-                    crate::t6031_knobs::Start::Off => {
-                        if crate::m3_params::t6031_params().values_given() {
-                            dev_info!(
-                                pdev.as_ref(),
-                                "M3 G15C start: asahi.t6031_* values given without asahi.t6031_start=1; ignored\n"
-                            );
-                        }
-                        return Err(refuse_agx3_probe(pdev, soc));
-                    }
-                    crate::t6031_knobs::Start::Invalid => {
-                        dev_err!(
-                            pdev.as_ref(),
-                            "M3 G15C start: refused: asahi.t6031_start has a value it does not accept (0 or 1); GPU startup disabled\n"
-                        );
-                        return Err(ENODEV);
-                    }
-                    crate::t6031_knobs::Start::On => {
-                        let runtime = start_t6031(pdev)?;
-                        return Ok(Self { runtime: AsahiRuntime::M3(runtime) });
-                    }
-                }
-            }
             ProbeConfig::Agx3Diagnostic(soc) => return Err(refuse_agx3_probe(pdev, soc)),
+            ProbeConfig::G15(cfg) => return Self::probe_g15(pdev, cfg),
             ProbeConfig::G17(cfg) => return Self::probe_g17(pdev, cfg),
         };
 
@@ -650,7 +584,6 @@ impl AsahiDriver {
     }
 }
 
-#[cfg(CONFIG_DRM_ASAHI_G15)]
 impl AsahiDriver {
     /// Boots a G15 GPU and registers its DRM device.
     ///
@@ -689,7 +622,7 @@ impl AsahiDriver {
             return retained(error);
         }
         Ok(Self {
-            runtime: AsahiRuntime::G15Native(drm, gpu),
+            runtime: AsahiRuntime::G15(drm, gpu),
         })
     }
 }
