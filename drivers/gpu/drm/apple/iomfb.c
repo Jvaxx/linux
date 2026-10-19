@@ -1357,9 +1357,15 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *handle,
 
 		if (generation != dcp->modes_generation)
 			return -ESTALE;
+		/*
+		 * The T6030 external processor's catalog takes the external SDR
+		 * path: timing colour restrictions, sync polarity, IsPreferred,
+		 * and the fw14 profile the parse context carries.
+		 */
 		ret = replace_modes(handle, &dcp->modes, &dcp->nr_modes,
 				    dcp->width_mm, dcp->height_mm, dcp->notch_height,
-				    dcp->fixed_connector_type == DRM_MODE_CONNECTOR_eDP);
+				    dcp->fixed_connector_type == DRM_MODE_CONNECTOR_eDP,
+				    dcp_is_v14_7_external(dcp));
 		if (!ret) {
 			dcp->modes_admitted = true;
 			dcp->modes_provisional = false;
