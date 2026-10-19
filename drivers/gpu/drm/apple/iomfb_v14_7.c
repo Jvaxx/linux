@@ -42,6 +42,7 @@
 #include "iomfb_v14_7_board.h"
 #include "iomfb_v14_7_link.h"
 #include "iomfb_v14_7_swap.h"
+#include "av.h"
 #include "parser.h"
 
 #define A(n) DCP_V14_TAG('A', n)
@@ -2802,6 +2803,13 @@ bool iomfb_v14_7_external_showing(struct apple_dcp *dcp,
 	return live;
 }
 
+bool iomfb_v14_7_external_powered(struct apple_dcp *dcp)
+{
+	struct apple_dcp_v14 *v14 = dcp->v14;
+
+	return dcp->external && v14 && READ_ONCE(v14->powered) && !READ_ONCE(v14->failed);
+}
+
 /* An external display: power down, set the new mode, power up. */
 static int dcp_v14_external_modeset(struct apple_dcp *dcp, struct drm_crtc_state *crtc_state)
 {
@@ -2811,6 +2819,13 @@ static int dcp_v14_external_modeset(struct apple_dcp *dcp, struct drm_crtc_state
 
 	if (!v14 || READ_ONCE(v14->failed) || !v14->opened)
 		return -EIO;
+	/*
+	 * The sink's audio stops before the display is powered down for the
+	 * mode change (as dcp_poweroff() has it), outside the RPC lock; it is
+	 * connected again once the display is on, below.
+	 */
+	if (READ_ONCE(v14->powered) && dcp->avep)
+		av_service_disconnect(dcp);
 	ret = dcp_v14_external_settle(dcp, v14);
 	if (ret)
 		goto out;
@@ -2831,6 +2846,8 @@ static int dcp_v14_external_modeset(struct apple_dcp *dcp, struct drm_crtc_state
 			 DRM_MODE_ARG(&crtc_state->mode), mode.timing_mode_id, mode.color_mode_id);
 		atomic_set(&dcp->external_retries, 0);
 		dcp_mode_set_valid(&dcp->mode_state, true);
+		if (dcp->avep)
+			av_service_connect(dcp);
 		return 0;
 	}
 	if (v14->powered && dcp_v14_set_power(v14, false))
@@ -2860,6 +2877,9 @@ out:
 	}
 	atomic_set(&dcp->external_retries, 0);
 	dcp_mode_set_valid(&dcp->mode_state, true);
+	/* A472 on: the sink's audio again. */
+	if (dcp->avep)
+		av_service_connect(dcp);
 	return 0;
 }
 
@@ -2918,6 +2938,9 @@ void iomfb_v14_7_poweroff(struct apple_dcp *dcp)
 
 	/* An external display is powered down; the next enable sets its mode again. */
 	if (dcp->external) {
+		/* Audio stops with the display, as dcp_poweroff() has it. */
+		if (dcp->avep)
+			av_service_disconnect(dcp);
 		if (v14 && v14->opened && !READ_ONCE(v14->failed)) {
 			mutex_lock(&v14->lock);
 			if (v14->powered && dcp_v14_set_power(v14, false))
