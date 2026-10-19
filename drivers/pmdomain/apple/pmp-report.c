@@ -5,8 +5,14 @@
  * Copyright The Asahi Linux Contributors
  */
 
+#include <linux/bitfield.h>
+#include <linux/completion.h>
 #include <linux/debugfs.h>
+#include <linux/delay.h>
+#include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/jiffies.h>
+#include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -15,9 +21,17 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/rculist.h>
+#include <linux/regmap.h>
 #include <linux/seq_file.h>
+#include <linux/sizes.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/pmp-report.h>
+#include <linux/string.h>
+#include <linux/unaligned.h>
+#include <linux/uuid.h>
+#include <linux/workqueue.h>
+
+#include "pmp-report-validation.h"
 
 #define PMP_REPORT_READY 0x1
 
@@ -30,6 +44,12 @@
  * @fast_die: 32-bit word holding the fast die-temperature effort of each
  *	CPU cluster, one byte per lane; 0 if the SoC has none
  * @fast_die_lanes: number of lanes at @fast_die, at most 4
+ * @starts_pmp: this driver starts a halted PMP that a display gate hands
+ *	over to the report (see apple_pmp_start_init())
+ * @name: with @starts_pmp, the SoC in messages
+ * @pwrstate: with @starts_pmp, the compatible of the SoC's PMGR power states
+ * @devices_ordered: with @starts_pmp, soc-device record i holds device ID
+ *	i + 1
  */
 struct apple_pmp_report_offsets {
 	u32 tgt_read;
@@ -38,7 +58,13 @@ struct apple_pmp_report_offsets {
 	u32 status;
 	u32 fast_die;
 	u32 fast_die_lanes;
+	bool starts_pmp;
+	const char *name;
+	const char *pwrstate;
+	bool devices_ordered;
 };
+
+struct apple_pmp_start;
 
 struct apple_pmp_report {
 	struct device *dev;
@@ -47,6 +73,8 @@ struct apple_pmp_report {
 	spinlock_t lock;
 	struct list_head list;
 	struct dentry *debugfs;
+	/* Set only for a report whose halted PMP this driver starts. */
+	struct apple_pmp_start *start;
 };
 
 /* Bound report regions, protected by RCU until managed teardown drains readers. */
@@ -177,6 +205,675 @@ int apple_pmp_report_wait_supplier_ready(struct device *supplier, unsigned int t
 }
 EXPORT_SYMBOL_GPL(apple_pmp_report_wait_supplier_ready);
 
+/*
+ * Starting a halted PMP (T8122, T6031)
+ *
+ * On these SoCs iBoot leaves the PMP loaded but halted, and the DCP firmware
+ * of the 14.x system needs it running. A display gate that admits the boot
+ * loader's display handoff completes the device tree's PMP topology before
+ * any device is created: it copies this Mac's PMP values onto the disabled
+ * PMP node (which this report names in apple,pmp), makes the display and
+ * storage requests always on, and marks requests that the PTD indexes by
+ * soc-device record. Only then does this driver take the start over; on any
+ * other boot it behaves exactly as before.
+ *
+ * The start is the source design of the T6030 bring-up, on this driver's
+ * shared T8140 structure:
+ *  1. at probe, the requests are taken from the always-on entries and
+ *     checked against the PMP tunables (request and acknowledge apertures,
+ *     soc-device table);
+ *  2. the first apple_pmp_report_wait_ready() caller queues the start;
+ *  3. the start waits for the entries to have seeded their requests, then
+ *     checks that the display and PMP power states are up, the display CPU
+ *     has its floor, the PMP CPU is halted, its SRAM holds the image the
+ *     tunables name with valid boot arguments, and the PTD holds exactly the
+ *     seeded requests;
+ *  4. it enables the PMP node, and its DART and mailbox if they are disabled;
+ *     the PMP driver then patches the boot arguments and runs the firmware;
+ *  5. it waits for the PMP driver to bind, the PTD to report ready and the
+ *     startup requests to be acknowledged.
+ * From step 4 on the PMP runs, and only a reboot stops it.
+ */
+#define PMP_ASC_CPU_CONTROL		0x44
+#define PMP_ASC_CPU_RUN			BIT(4)
+#define PMP_SRAM_UUID			0x214
+#define PMP_SRAM_BOOTARGS_OFFSET	0x22c
+#define PMP_SRAM_BOOTARGS_SIZE		0x230
+
+#define APPLE_PMGR_PS_MIN		GENMASK(19, 16)
+#define APPLE_PMGR_PS_ACTUAL		GENMASK(7, 4)
+#define APPLE_PMGR_PS_ACTIVE		0xf
+
+#define PMP_START_SEED_TIMEOUT_MS	2000
+#define PMP_START_BIND_TIMEOUT_MS	20000
+#define PMP_START_QUIET_MS		1000
+#define PMP_START_READY_TIMEOUT_MS	3000
+#define PMP_START_ACK_TIMEOUT_MS	1000
+
+struct apple_pmp_start {
+	struct apple_pmp_report *rep;
+	struct list_head list;
+	/* The halted PMP this report starts. */
+	struct device_node *pmp;
+	/* Requests seeded by always-on entries, and those acknowledged. */
+	u64 seed;
+	u64 ack;
+	/* Requests that must be acknowledged before any consumer can proceed. */
+	u64 startup_ack;
+	/* Seeded bits that are soc-device record indices. */
+	u64 record_seed;
+	struct of_changeset pmp_cs;
+	struct work_struct work;
+	bool queued;
+	struct completion started;
+	int result;
+	bool stopping;
+	unsigned int waiters;
+	struct completion waiters_done;
+};
+
+/* Reports that start their PMP; serializes startup requests and waiters. */
+static LIST_HEAD(apple_pmp_starts);
+static DEFINE_MUTEX(apple_pmp_start_mutex);
+
+static const struct {
+	const char *label;
+	/* The minimum state must already be "active". */
+	bool floor;
+} apple_pmp_start_domains[] = {
+	{ "pms_sram", false },
+	{ "pmp", false },
+	/*
+	 * DISP_SYS and DISP_FE only need to be on: their minimum-state field
+	 * does not hold a value (it reads back 0 after "active" is written),
+	 * and the PMP leaves them on once the DCP CPU domain has its floor.
+	 */
+	{ "disp_sys", false },
+	{ "disp_fe", false },
+	/* Without this floor the PMP stops the running DCP CPU when it starts. */
+	{ "disp_cpu", true },
+};
+
+/*
+ * The PTD request/acknowledge bit of a report entry. An entry's reg is its
+ * soc-device ID - 1. An entry marked apple,soc-device-record is requested by
+ * soc-device record instead: on T8122 the PTD request and acknowledge bits
+ * are indexed by soc-device record (apple,tunable-soc-device), and the
+ * records are not in ID order, so the bit is the index of the record that
+ * holds that ID. Only a report that starts its PMP has that table.
+ */
+static int apple_pmp_report_bit(const struct apple_pmp_start *st,
+				struct device_node *entry, u32 *bit, bool *record)
+{
+	const u8 *table;
+	int len = 0, index;
+	u32 reg;
+
+	if (of_property_read_u32(entry, "reg", &reg) || reg > 63)
+		return -EINVAL;
+	*record = of_property_read_bool(entry, "apple,soc-device-record");
+	if (!*record) {
+		*bit = reg;
+		return 0;
+	}
+	if (!st)
+		return -EINVAL;
+	table = of_get_property(st->pmp, "apple,tunable-soc-device", &len);
+	index = apple_pmp_record_of_id(table, len > 0 ? len : 0, reg + 1);
+	if (index < 0 || index > 63)
+		return -ENOENT;
+	*bit = index;
+	return 0;
+}
+
+/* The single PMGR power state of this SoC with @label. */
+static struct device_node *apple_pmp_start_domain(struct apple_pmp_report *rep,
+						  const char *label)
+{
+	struct device_node *np, *found = NULL;
+	const char *name;
+
+	for_each_compatible_node(np, NULL, rep->offsets->pwrstate) {
+		if (of_property_read_string(np, "label", &name) || strcmp(name, label))
+			continue;
+		if (found) {
+			of_node_put(np);
+			of_node_put(found);
+			return NULL;
+		}
+		found = of_node_get(np);
+	}
+
+	return found;
+}
+
+static int apple_pmp_start_check_power(struct apple_pmp_report *rep)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(apple_pmp_start_domains); i++) {
+		const char *label = apple_pmp_start_domains[i].label;
+		struct device_node *np = apple_pmp_start_domain(rep, label);
+		struct regmap *regmap;
+		u32 offset, val;
+		int ret;
+
+		if (!np) {
+			dev_err(rep->dev, "%s PMP not started: no single %s power state\n",
+				rep->offsets->name, label);
+			return -ENODEV;
+		}
+		ret = of_property_read_u32(np, "reg", &offset);
+		regmap = syscon_node_to_regmap(np->parent);
+		of_node_put(np);
+		if (ret)
+			return ret;
+		if (IS_ERR(regmap))
+			return PTR_ERR(regmap);
+		ret = regmap_read(regmap, offset, &val);
+		if (ret)
+			return ret;
+
+		if (FIELD_GET(APPLE_PMGR_PS_ACTUAL, val) != APPLE_PMGR_PS_ACTIVE) {
+			dev_err(rep->dev, "%s PMP not started: %s is not powered (%#x)\n",
+				rep->offsets->name, label, val);
+			return -EIO;
+		}
+		/* The PMGR power state driver applies the floor when it probes. */
+		if (apple_pmp_start_domains[i].floor &&
+		    FIELD_GET(APPLE_PMGR_PS_MIN, val) != APPLE_PMGR_PS_ACTIVE) {
+			dev_err(rep->dev, "%s PMP not started: the %s minimum state is not active (%#x)\n",
+				rep->offsets->name, label, val);
+			return -EIO;
+		}
+	}
+
+	return 0;
+}
+
+static void __iomem *apple_pmp_start_map(struct apple_pmp_start *st, const char *name,
+					 resource_size_t *size)
+{
+	struct resource res;
+	void __iomem *base;
+	int idx;
+
+	idx = of_property_match_string(st->pmp, "reg-names", name);
+	if (idx < 0 || of_address_to_resource(st->pmp, idx, &res))
+		return NULL;
+	/* The PMP driver claims these registers; only read them here. */
+	base = ioremap_np(res.start, resource_size(&res));
+	if (base && size)
+		*size = resource_size(&res);
+	return base;
+}
+
+/* The PMP CPU, which must still be halted. */
+static int apple_pmp_start_check_halted(struct apple_pmp_start *st)
+{
+	void __iomem *asc = apple_pmp_start_map(st, "asc", NULL);
+	u32 control;
+
+	if (!asc)
+		return -ENOMEM;
+	control = readl(asc + PMP_ASC_CPU_CONTROL);
+	iounmap(asc);
+	if (control & PMP_ASC_CPU_RUN) {
+		dev_err(st->rep->dev, "%s PMP not started: its CPU is already running (%#x)\n",
+			st->rep->offsets->name, control);
+		return -EBUSY;
+	}
+	return 0;
+}
+
+/* The SRAM must hold the image named by the node's tunables, and its boot arguments. */
+static int apple_pmp_start_check_sram(struct apple_pmp_start *st, uuid_t *image)
+{
+	void __iomem *sram;
+	resource_size_t sram_size;
+	const char *expected;
+	u32 offset, size, pos;
+	u8 *args;
+	uuid_t want;
+	int ret = 0;
+
+	if (of_property_read_string(st->pmp, "apple,tunable-uuid", &expected) ||
+	    uuid_parse(expected, &want))
+		return -EINVAL;
+	sram = apple_pmp_start_map(st, "pmp", &sram_size);
+	if (!sram)
+		return -ENOMEM;
+	if (sram_size < PMP_SRAM_BOOTARGS_SIZE + 4) {
+		ret = -EINVAL;
+		goto out;
+	}
+	/* Aligned 32-bit reads only: the SRAM is device memory. */
+	for (pos = 0; pos < sizeof(image->b); pos += 4)
+		put_unaligned_le32(readl(sram + PMP_SRAM_UUID + pos), image->b + pos);
+	offset = readl(sram + PMP_SRAM_BOOTARGS_OFFSET);
+	size = readl(sram + PMP_SRAM_BOOTARGS_SIZE);
+	if (!uuid_equal(image, &want) || size < 8 || size > SZ_4K ||
+	    size > sram_size || offset > sram_size - size || offset & 3) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	/* The boot-argument entries are packed: parse a copy. */
+	args = kmalloc(size, GFP_KERNEL);
+	if (!args) {
+		ret = -ENOMEM;
+		goto out;
+	}
+	memcpy_fromio(args, sram + offset, size);
+	if (!apple_pmp_bootargs_valid(args, size))
+		ret = -EINVAL;
+	kfree(args);
+out:
+	iounmap(sram);
+	return ret;
+}
+
+/*
+ * The PMP tunables describe the PTD: the request and acknowledge ranges
+ * must be where the offsets say, and each seeded device must be the one its
+ * index names, acknowledged exactly when the node expects an acknowledgment.
+ */
+static int apple_pmp_start_check_layout(struct apple_pmp_report *rep,
+					struct apple_pmp_start *st)
+{
+	const u8 *table;
+	int len = 0;
+
+	table = of_get_property(st->pmp, "apple,tunable-ptd-range", &len);
+	if (!apple_pmp_ranges_valid(table, len > 0 ? len : 0, rep->offsets->tgt_read,
+				    rep->offsets->tgt_write, rep->offsets->actual))
+		return -EINVAL;
+
+	len = 0;
+	table = of_get_property(st->pmp, "apple,tunable-soc-device", &len);
+	if (!apple_pmp_devices_valid(table, len > 0 ? len : 0, st->seed & ~st->record_seed,
+				     st->ack & ~st->record_seed,
+				     rep->offsets->devices_ordered))
+		return -EINVAL;
+	if (st->record_seed &&
+	    !apple_pmp_records_valid(table, len > 0 ? len : 0, st->record_seed,
+				     st->ack & st->record_seed))
+		return -EINVAL;
+	return 0;
+}
+
+/* The requests this driver seeds, from the report's always-on entries. */
+static int apple_pmp_start_describe(struct apple_pmp_report *rep,
+				    struct apple_pmp_start *st)
+{
+	struct device_node *child;
+	bool record;
+	u32 id;
+	int ret;
+
+	for_each_available_child_of_node(rep->dev->of_node, child) {
+		if (!of_property_read_bool(child, "apple,always-on"))
+			continue;
+		ret = apple_pmp_report_bit(st, child, &id, &record);
+		if (ret == -EINVAL)
+			continue;
+		if (ret || (st->seed & BIT_ULL(id))) {
+			dev_err(rep->dev, "%s PMP not started: no unique request bit for %pOF\n",
+				rep->offsets->name, child);
+			of_node_put(child);
+			return -EINVAL;
+		}
+		if (record)
+			st->record_seed |= BIT_ULL(id);
+		st->seed |= BIT_ULL(id);
+		if (!of_property_read_bool(child, "apple,no-ack")) {
+			st->ack |= BIT_ULL(id);
+			if (!of_property_read_bool(child, "apple,defer-startup-ack"))
+				st->startup_ack |= BIT_ULL(id);
+		}
+	}
+	if (!st->seed || !st->startup_ack) {
+		dev_err(rep->dev, "%s PMP not started: no acknowledged always-on report\n",
+			rep->offsets->name);
+		return -EINVAL;
+	}
+	if (apple_pmp_start_check_layout(rep, st)) {
+		dev_err(rep->dev, "%s PMP not started: its tunables do not describe this PTD layout\n",
+			rep->offsets->name);
+		return -EINVAL;
+	}
+	return 0;
+}
+
+static void apple_pmp_start_finish(struct apple_pmp_start *st, int result)
+{
+	guard(mutex)(&apple_pmp_start_mutex);
+	if (!st->stopping)
+		st->result = result;
+	complete_all(&st->started);
+}
+
+static bool apple_pmp_start_bound(struct apple_pmp_start *st)
+{
+	struct platform_device *pdev = of_find_device_by_node(st->pmp);
+	bool bound = false;
+
+	if (!pdev)
+		return false;
+	/* The device lock is held for a whole probe: never wait on it. */
+	if (device_trylock(&pdev->dev)) {
+		bound = device_is_bound(&pdev->dev);
+		device_unlock(&pdev->dev);
+	}
+	put_device(&pdev->dev);
+	return bound;
+}
+
+/* The PMP, and its DART and mailbox where they are still disabled. */
+static int apple_pmp_start_enable(struct apple_pmp_start *st)
+{
+	struct device_node *nodes[3];
+	unsigned int i;
+	int ret = 0;
+
+	nodes[0] = of_parse_phandle(st->pmp, "iommus", 0);
+	nodes[1] = of_parse_phandle(st->pmp, "mboxes", 0);
+	nodes[2] = of_node_get(st->pmp);
+
+	of_changeset_init(&st->pmp_cs);
+	for (i = 0; i < ARRAY_SIZE(nodes) && !ret; i++) {
+		if (!nodes[i])
+			ret = -EINVAL;
+		else if (!of_device_is_available(nodes[i]))
+			ret = of_changeset_update_prop_string(&st->pmp_cs, nodes[i],
+							      "status", "okay");
+		/* The PMP itself must not have been enabled behind this driver. */
+		else if (nodes[i] == st->pmp)
+			ret = -EBUSY;
+	}
+	/* Platform devices are created, and probed, in this order. */
+	if (!ret)
+		ret = of_changeset_apply(&st->pmp_cs);
+	if (ret)
+		of_changeset_destroy(&st->pmp_cs);
+
+	for (i = 0; i < ARRAY_SIZE(nodes); i++)
+		of_node_put(nodes[i]);
+	return ret;
+}
+
+/* Every always-on entry has set its request, and nothing else is requested. */
+static int apple_pmp_start_wait_seeded(struct apple_pmp_report *rep,
+				       struct apple_pmp_start *st)
+{
+	unsigned long deadline = jiffies + msecs_to_jiffies(PMP_START_SEED_TIMEOUT_MS);
+	u64 request;
+
+	for (;;) {
+		request = readq(rep->base + rep->offsets->tgt_read);
+		if ((request & st->seed) == st->seed)
+			return 0;
+		if (time_after(jiffies, deadline))
+			break;
+		msleep(20);
+	}
+	dev_err(rep->dev, "%s PMP not started: request %#llx, expected %#llx\n",
+		rep->offsets->name, request, st->seed);
+	return -ETIMEDOUT;
+}
+
+static void apple_pmp_start_work(struct work_struct *work)
+{
+	struct apple_pmp_start *st = container_of(work, struct apple_pmp_start, work);
+	struct apple_pmp_report *rep = st->rep;
+	u64 status = 0, request, ack = 0;
+	unsigned long deadline;
+	uuid_t image;
+	int ret;
+
+	/* The always-on entries probe after the report, once their domains do. */
+	ret = apple_pmp_start_wait_seeded(rep, st);
+	if (!ret)
+		ret = apple_pmp_start_check_power(rep);
+	if (!ret)
+		ret = apple_pmp_start_check_halted(st);
+	if (!ret) {
+		ret = apple_pmp_start_check_sram(st, &image);
+		if (ret)
+			dev_err(rep->dev, "%s PMP not started: its SRAM does not hold the described firmware\n",
+				rep->offsets->name);
+	}
+	if (ret) {
+		apple_pmp_start_finish(st, ret);
+		return;
+	}
+	status = readq(rep->base + rep->offsets->status);
+	request = readq(rep->base + rep->offsets->tgt_read);
+	ack = readq(rep->base + rep->offsets->actual);
+	if (status || request != st->seed) {
+		dev_err(rep->dev, "%s PMP not started: PTD status %#llx request %#llx before start, expected request %#llx\n",
+			rep->offsets->name, status, request, st->seed);
+		apple_pmp_start_finish(st, -EBUSY);
+		return;
+	}
+	dev_info(rep->dev, "PMP halted, firmware %pUb; PTD status %#llx request %#llx ack %#llx\n",
+		 &image, status, request, ack);
+	if (st->record_seed)
+		dev_info(rep->dev, "request bits %#llx are soc-device records\n",
+			 st->record_seed);
+
+	/* From here the PMP may run, and only a reboot stops it. */
+	dev_info(rep->dev, "starting the PMP with request %#llx\n", st->seed);
+	ret = apple_pmp_start_enable(st);
+	if (ret) {
+		dev_err(rep->dev, "%s PMP not started: enabling its nodes failed: %d\n",
+			rep->offsets->name, ret);
+		apple_pmp_start_finish(st, ret);
+		return;
+	}
+
+	/* Bound means the firmware and its endpoint are up. */
+	deadline = jiffies + msecs_to_jiffies(PMP_START_BIND_TIMEOUT_MS);
+	while (!apple_pmp_start_bound(st) && time_before(jiffies, deadline))
+		msleep(50);
+	if (!apple_pmp_start_bound(st)) {
+		dev_err(rep->dev, "PMP driver did not bind within %d ms; display power not acknowledged\n",
+			PMP_START_BIND_TIMEOUT_MS);
+		apple_pmp_start_finish(st, -ETIMEDOUT);
+		return;
+	}
+	msleep(PMP_START_QUIET_MS);
+
+	deadline = jiffies + msecs_to_jiffies(PMP_START_READY_TIMEOUT_MS);
+	do {
+		status = readq(rep->base + rep->offsets->status);
+		if (status == PMP_REPORT_READY)
+			break;
+		msleep(50);
+	} while (time_before(jiffies, deadline));
+	if (status == PMP_REPORT_READY) {
+		deadline = jiffies + msecs_to_jiffies(PMP_START_ACK_TIMEOUT_MS);
+		do {
+			ack = readq(rep->base + rep->offsets->actual);
+			if ((ack & st->startup_ack) == st->startup_ack)
+				break;
+			msleep(20);
+		} while (time_before(jiffies, deadline));
+	}
+	request = readq(rep->base + rep->offsets->tgt_read);
+
+	if (status != PMP_REPORT_READY) {
+		dev_err(rep->dev, "PMP started but not ready: PTD status %#llx request %#llx\n",
+			status, request);
+		ret = -ETIMEDOUT;
+	} else if ((ack & st->startup_ack) != st->startup_ack) {
+		dev_err(rep->dev, "PMP ready but did not acknowledge %#llx: request %#llx ack %#llx\n",
+			st->startup_ack, request, ack);
+		ret = -EIO;
+	} else {
+		dev_info(rep->dev, "PMP ready: PTD status %#llx request %#llx ack %#llx\n",
+			 status, request, ack);
+		ret = 0;
+	}
+	apple_pmp_start_finish(st, ret);
+}
+
+/* No work or waiter may use the start state once the report is torn down. */
+static void apple_pmp_start_drain(void *data)
+{
+	struct apple_pmp_start *st = data;
+	unsigned int waiters;
+
+	scoped_guard(mutex, &apple_pmp_start_mutex) {
+		st->stopping = true;
+		list_del(&st->list);
+		st->result = -ENODEV;
+		complete_all(&st->started);
+		waiters = st->waiters;
+	}
+	cancel_work_sync(&st->work);
+	if (waiters)
+		wait_for_completion(&st->waiters_done);
+	/* A started PMP keeps running; its nodes stay enabled. */
+	of_node_put(st->pmp);
+}
+
+/*
+ * A report whose PMP a display gate handed over: apple,pmp names a disabled
+ * PMP node that carries this Mac's values. Any other report is left exactly
+ * as it was.
+ */
+static int apple_pmp_start_init(struct apple_pmp_report *rep)
+{
+	struct device *dev = rep->dev;
+	struct apple_pmp_start *st;
+	struct device_node *pmp;
+	int ret;
+
+	pmp = of_parse_phandle(dev->of_node, "apple,pmp", 0);
+	if (!pmp || !of_device_is_compatible(pmp, "apple,t6000-pmp-v2") ||
+	    of_device_is_available(pmp) || !of_property_present(pmp, "apple,tunable-uuid")) {
+		of_node_put(pmp);
+		return 0;
+	}
+
+	st = devm_kzalloc(dev, sizeof(*st), GFP_KERNEL);
+	if (!st) {
+		of_node_put(pmp);
+		return -ENOMEM;
+	}
+	st->rep = rep;
+	st->pmp = pmp;
+	INIT_WORK(&st->work, apple_pmp_start_work);
+	init_completion(&st->started);
+	init_completion(&st->waiters_done);
+	/* Stay bound if it does not check out, so consumers learn why. */
+	ret = apple_pmp_start_describe(rep, st);
+	if (ret) {
+		st->result = ret;
+		complete_all(&st->started);
+	}
+	scoped_guard(mutex, &apple_pmp_start_mutex)
+		list_add_tail(&st->list, &apple_pmp_starts);
+	ret = devm_add_action_or_reset(dev, apple_pmp_start_drain, st);
+	if (ret)
+		return ret;
+	rep->start = st;
+	if (!st->result)
+		dev_info(dev, "%s PMP handed over: requests %#llx; it starts when a consumer asks for it\n",
+			 rep->offsets->name, st->seed);
+	return 0;
+}
+
+/**
+ * apple_pmp_report_wait_ready() - wait until a PMP report entry is acknowledged
+ * @entry: report entry node whose request must be acknowledged
+ * @timeout: in jiffies
+ *
+ * For a report whose halted PMP this driver starts (see above): the first
+ * call starts it.
+ *
+ * Context: Process context; sleeps.
+ * Return: 0 once the PMP runs and has acknowledged @entry, -EPROBE_DEFER
+ * while the report driver has not probed yet, -ENODEV if no PMP was handed
+ * over to this report, -EINVAL if @entry is not one of its acknowledged
+ * requests, or the reason the PMP was not started or is not ready.
+ */
+int apple_pmp_report_wait_ready(struct device_node *entry, unsigned long timeout)
+{
+	struct device_node *parent = of_get_parent(entry);
+	const struct apple_pmp_report *rep;
+	struct apple_pmp_start *st = NULL, *it;
+	u64 status, ack;
+	bool record, bound = false;
+	u32 id;
+	int ret;
+
+	if (!parent || of_property_read_u32(entry, "reg", &id) || id > 63) {
+		of_node_put(parent);
+		return -EINVAL;
+	}
+
+	scoped_guard(mutex, &apple_pmp_start_mutex) {
+		list_for_each_entry(it, &apple_pmp_starts, list) {
+			if (it->rep->dev->of_node == parent) {
+				st = it;
+				break;
+			}
+		}
+		if (st && !st->stopping &&
+		    !apple_pmp_report_bit(st, entry, &id, &record)) {
+			st->waiters++;
+		} else if (st) {
+			ret = st->stopping ? -ENODEV : -EINVAL;
+			st = NULL;
+			goto out;
+		}
+	}
+	if (!st) {
+		/* A bound report that was handed no PMP will never start one. */
+		rcu_read_lock();
+		list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
+			if (rep->dev->of_node == parent) {
+				bound = true;
+				break;
+			}
+		}
+		rcu_read_unlock();
+		ret = bound ? -ENODEV : -EPROBE_DEFER;
+		goto out;
+	}
+
+	scoped_guard(mutex, &apple_pmp_start_mutex) {
+		if (!st->stopping && !st->result && !st->queued) {
+			st->queued = true;
+			queue_work(system_unbound_wq, &st->work);
+		}
+	}
+	ret = wait_for_completion_timeout(&st->started, timeout) ? 0 : -ETIMEDOUT;
+	scoped_guard(mutex, &apple_pmp_start_mutex) {
+		if (st->stopping) {
+			ret = -ENODEV;
+		} else if (!ret) {
+			if (st->result) {
+				ret = st->result;
+			} else if (!(st->ack & BIT_ULL(id))) {
+				ret = -EINVAL;
+			} else {
+				status = readq(st->rep->base + st->rep->offsets->status);
+				ack = readq(st->rep->base + st->rep->offsets->actual);
+				ret = status == PMP_REPORT_READY && (ack & BIT_ULL(id)) ? 0 : -EIO;
+			}
+		}
+		if (!--st->waiters && st->stopping)
+			complete(&st->waiters_done);
+	}
+out:
+	of_node_put(parent);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_wait_ready);
+
 static int apple_pmp_report_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -200,6 +897,13 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 	ret = devm_add_action_or_reset(dev, apple_pmp_report_release, rep);
 	if (ret)
 		return ret;
+
+	/* Before the entries exist: they request by soc-device record through it. */
+	if (rep->offsets->starts_pmp) {
+		ret = apple_pmp_start_init(rep);
+		if (ret)
+			return ret;
+	}
 
 	mutex_lock(&apple_pmp_reports_lock);
 	list_add_tail_rcu(&rep->list, &apple_pmp_reports);
@@ -246,11 +950,44 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t8112 = {
 	.status = 0x10,
 };
 
+/*
+ * T8122, from its ADT ptd-range: SOC-DEV-PS-REQ at PTD index 0x100 (read
+ * 0x1000, update 0x10000 + 0x800), SOC-DEV-PS-ACK at 0x108 (0x1080),
+ * PMP-STATUS at 0x1 (0x10). Its soc-device records are not in ID order.
+ */
 static const struct apple_pmp_report_offsets apple_pmp_offsets_t8122 = {
 	.tgt_read = 0x1000,
 	.tgt_write = 0x10800,
 	.actual = 0x1080,
 	.status = 0x10,
+	.starts_pmp = true,
+	.name = "T8122",
+	.pwrstate = "apple,t8122-pmgr-pwrstate",
+};
+
+/* The same PTD apertures; its startup belongs to the native PMP supplier. */
+static const struct apple_pmp_report_offsets apple_pmp_offsets_j613_25g83 = {
+	.tgt_read = 0x1000,
+	.tgt_write = 0x10800,
+	.actual = 0x1080,
+	.status = 0x10,
+};
+
+/*
+ * T6031, from the J516C ADT ptd-range: SOC-DEV-PS-REQ at PTD index 0x200
+ * (read 0x2000, update 0x10000 + 0x1000), SOC-DEV-PS-ACK at 0x208 (0x2080),
+ * PMP-STATUS at 0x1 (0x10): the T6020 apertures. Its soc-device records are
+ * in ID order, as on T6030.
+ */
+static const struct apple_pmp_report_offsets apple_pmp_offsets_t6031 = {
+	.tgt_read = 0x2000,
+	.tgt_write = 0x11000,
+	.actual = 0x2080,
+	.status = 0x10,
+	.starts_pmp = true,
+	.name = "T6031",
+	.pwrstate = "apple,t6031-pmgr-pwrstate",
+	.devices_ordered = true,
 };
 
 /* The fast die-temperature report is the low two bytes of entry 0x1c1. */
@@ -264,10 +1001,11 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t8140 = {
 };
 
 static const struct of_device_id apple_pmp_report_of_match[] = {
-	{ .compatible = "apple,j613-25g83-pmp-report", .data = &apple_pmp_offsets_t8122 },
+	{ .compatible = "apple,j613-25g83-pmp-report", .data = &apple_pmp_offsets_j613_25g83 },
 	{ .compatible = "apple,t6000-pmp-v2-report", .data = &apple_pmp_offsets_t600x },
 	{ .compatible = "apple,t6020-pmp-v2-report", .data = &apple_pmp_offsets_t602x },
 	{ .compatible = "apple,t6030-pmp-v2-report", .data = &apple_pmp_offsets_t6030 },
+	{ .compatible = "apple,t6031-pmp-v2-report", .data = &apple_pmp_offsets_t6031 },
 	{ .compatible = "apple,t8112-pmp-v2-report", .data = &apple_pmp_offsets_t8112 },
 	{ .compatible = "apple,t8122-pmp-v2-report", .data = &apple_pmp_offsets_t8122 },
 	{ .compatible = "apple,t8140-pmp-v2-report", .data = &apple_pmp_offsets_t8140 },
@@ -289,6 +1027,8 @@ struct apple_pmp_report_entry {
 	struct device_node *report_node;
 	struct generic_pm_domain genpd;
 	u32 id;
+	/* The PMP does not acknowledge this request (a started PMP only). */
+	bool no_ack;
 	bool removed;
 };
 
@@ -296,7 +1036,7 @@ struct apple_pmp_report_entry {
 	container_of(_genpd, struct apple_pmp_report_entry, genpd)
 
 static int apple_pmp_report_set_state(struct apple_pmp_report *rep, u32 id,
-				      bool enable)
+				      bool enable, bool no_ack)
 {
 	u64 bit_val = BIT_ULL(id);
 	u64 val;
@@ -310,7 +1050,7 @@ static int apple_pmp_report_set_state(struct apple_pmp_report *rep, u32 id,
 	writeq(val, rep->base + rep->offsets->tgt_write);
 	spin_unlock_irqrestore(&rep->lock, flags);
 	val = readq(rep->base + rep->offsets->status);
-	if ((val & PMP_REPORT_READY) == 0)
+	if ((val & PMP_REPORT_READY) == 0 || no_ack)
 		return 0;
 	return readq_poll_timeout_atomic(
 		rep->base + rep->offsets->actual,
@@ -332,7 +1072,7 @@ static int apple_pmp_report_entry_set_state(struct generic_pm_domain *genpd, boo
 	rcu_read_lock();
 	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
 		if (rep->dev->of_node == ent->report_node) {
-			ret = apple_pmp_report_set_state(rep, ent->id, enable);
+			ret = apple_pmp_report_set_state(rep, ent->id, enable, ent->no_ack);
 			break;
 		}
 	}
@@ -377,6 +1117,8 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct device_node *node = dev->of_node;
 	struct apple_pmp_report_entry *ent;
+	const struct apple_pmp_report *rep;
+	struct apple_pmp_start *start;
 	int ret;
 	const char *name;
 	struct of_phandle_iterator it;
@@ -396,6 +1138,19 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 	if (ent->id >= 64) {
 		ret = -EINVAL;
 		goto err_free;
+	}
+	/* Only a report that starts its PMP requests by record, or without ack. */
+	rep = dev->parent ? dev_get_drvdata(dev->parent) : NULL;
+	start = rep ? rep->start : NULL;
+	if (start) {
+		bool record;
+
+		ret = apple_pmp_report_bit(start, node, &ent->id, &record);
+		if (ret) {
+			ret = dev_err_probe(dev, ret, "no request bit (reg, soc-device record)\n");
+			goto err_free;
+		}
+		ent->no_ack = of_property_read_bool(node, "apple,no-ack");
 	}
 
 	ret = of_property_read_string(node, "label", &name);
