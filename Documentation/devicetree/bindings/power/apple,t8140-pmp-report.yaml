@@ -33,6 +33,12 @@ properties:
   '#size-cells':
     const: 0
 
+  apple,pmp:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      The PMP that publishes this report, on SoCs where the host starts the
+      PMP after a display handoff.
+
 patternProperties:
   '^report@[0-9a-f]+$':
     type: object
@@ -63,6 +69,20 @@ patternProperties:
       apple,always-on:
         type: boolean
         description: Report the device as on from probe.
+
+      apple,no-ack:
+        type: boolean
+        description:
+          The PMP does not acknowledge this entry's requests; the host sets
+          and clears the request bit without waiting for an acknowledgement.
+
+      apple,soc-device-record:
+        type: boolean
+        description:
+          The request and acknowledge bits are indexed by the index of the
+          PMP soc-device record (apple,tunable-soc-device on the PMP) that
+          holds this entry's device ID, instead of by reg. Only valid on a
+          report whose PMP the host starts.
 
     required:
       - compatible
