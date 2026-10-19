@@ -21,6 +21,11 @@
 //! 0 on the MacBook Neo, which already holds Linux records from before the
 //! list existed and would otherwise lose write access to them.
 //!
+//! The effective level, whether the list could be loaded and every refused
+//! write are reported in the driver's `diag` attributes, with what they make
+//! of a fingerprint match ([`Matching`]), so that a readiness check can tell
+//! a guard that blocks matching from one that has refused nothing yet.
+//!
 //! The list entry is made durable before the enclave's write reaches the
 //! gigalocker. A crash between the two leaves an entry for a record that was
 //! never written, which is harmless. It can never leave a Linux record that
@@ -79,6 +84,55 @@ pub(crate) fn level(param: i8, platform: u8) -> Option<u8> {
     match level {
         0 => None,
         level => Some(level.min(2)),
+    }
+}
+
+/// Whether a fingerprint match can save the state it writes to xART, as far
+/// as the driver can tell. The values are `SEP_DIAG_MATCHING_*` in `shim.h`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Matching {
+    /// xART writes are enabled and no guard runs.
+    Usable = 1,
+    /// A guard runs and nothing says it refuses a match, but nothing says it
+    /// allows one either.
+    Unverified = 2,
+    /// A match's write is refused, or known to be.
+    Blocked = 3,
+}
+
+/// What [`Matching`] is derived from.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MatchFacts {
+    /// The store opened with writes enabled.
+    pub(crate) xart_writable: bool,
+    /// The platform cold-boots its enclave.
+    pub(crate) cold: bool,
+    /// The guard's effective level and whether its list loaded, or `None`
+    /// when no guard runs.
+    pub(crate) guard: Option<(u8, bool)>,
+    /// The guard's refusals since probe.
+    pub(crate) refusals: u32,
+}
+
+impl MatchFacts {
+    /// A match rewrites session records that existed before it (seen on a
+    /// T6000). It is blocked when xART is read-only, once the guard has
+    /// refused anything, when the guard has no list to allow Linux's records
+    /// by, and on a cold-boot Mac: creating the keybag there needs the guard
+    /// off, so the records a match rewrites were never listed.
+    ///
+    /// Nothing else proves an unguarded setup. An empty list in particular
+    /// does not: a guarded keybag creation on an M2 writes no record, and a
+    /// rollback can empty the list. So a guarded warm-attach Mac is
+    /// unverified until a refusal says otherwise.
+    pub(crate) fn matching(&self) -> Matching {
+        match self.guard {
+            _ if !self.xart_writable || self.refusals != 0 => Matching::Blocked,
+            None => Matching::Usable,
+            Some((_, false)) => Matching::Blocked,
+            Some(_) if self.cold => Matching::Blocked,
+            Some(_) => Matching::Unverified,
+        }
     }
 }
 
@@ -231,6 +285,16 @@ impl<F: ListFile> Guard<F> {
         Ok(())
     }
 
+    /// The level this guard applies.
+    pub(crate) fn effective_level(&self) -> u8 {
+        self.level
+    }
+
+    /// Whether Linux's list was loaded. Without it nothing can be adopted.
+    pub(crate) fn list_loaded(&self) -> bool {
+        self.file.is_some()
+    }
+
     fn adopt(&mut self, key: &Key) -> Result<()> {
         let file = self.file.as_ref().ok_or(ENOENT)?;
         // The file's length, not the number of distinct keys: a torn or
@@ -254,6 +318,7 @@ impl<F: ListFile> Guard<F> {
             Verdict::Allow => Ok(()),
             Verdict::Adopt if !write => Ok(()),
             Verdict::Adopt => self.adopt(key).inspect_err(|e| {
+                crate::diag::xart_guard_refused();
                 pr_warn!(
                     "xART guard: could not list a new kind-{} record as Linux's ({:?}); refusing to write it\n",
                     key.kind,
@@ -261,6 +326,7 @@ impl<F: ListFile> Guard<F> {
                 )
             }),
             Verdict::Refuse => {
+                crate::diag::xart_guard_refused();
                 self.refused += 1;
                 if self.refused <= LOGGED_REFUSALS {
                     let action = if write { "rewrite" } else { "delete" };
@@ -286,10 +352,56 @@ mod tests {
         Key::new(4, [byte; 16])
     }
 
+    fn facts(
+        xart_writable: bool,
+        cold: bool,
+        guard: Option<(u8, bool)>,
+        refusals: u32,
+    ) -> Matching {
+        MatchFacts {
+            xart_writable,
+            cold,
+            guard,
+            refusals,
+        }
+        .matching()
+    }
+
+    #[test]
+    fn matching_without_a_guard_is_usable() {
+        // The Neo (warm, level 0) and an M1 Pro pinned to xart_guard=0 (cold).
+        assert_eq!(facts(true, false, None, 0), Matching::Usable);
+        assert_eq!(facts(true, true, None, 0), Matching::Usable);
+    }
+
+    #[test]
+    fn matching_under_a_listed_warm_guard_is_unverified() {
+        // An M2 set up under the guard. An empty list is still "loaded", and
+        // does not make the setup unguarded.
+        assert_eq!(facts(true, false, Some((1, true)), 0), Matching::Unverified);
+        assert_eq!(facts(true, false, Some((2, true)), 0), Matching::Unverified);
+    }
+
+    #[test]
+    fn matching_is_blocked_where_it_is_known_to_be() {
+        // A cold-boot M1-family Mac under the default level 1.
+        assert_eq!(facts(true, true, Some((1, true)), 0), Matching::Blocked);
+        // No list: nothing that existed at probe is Linux's.
+        assert_eq!(facts(true, false, Some((1, false)), 0), Matching::Blocked);
+        // A refusal seen.
+        assert_eq!(facts(true, false, Some((1, true)), 1), Matching::Blocked);
+        // xART read-only: no guard runs, and no write can land.
+        assert_eq!(facts(false, false, None, 0), Matching::Blocked);
+        assert_eq!(facts(false, true, None, 0), Matching::Blocked);
+    }
+
     #[test]
     fn another_os_record_is_refused() {
         assert_eq!(decide(1, &session(1), true, false), Verdict::Refuse);
-        assert_eq!(decide(2, &Key::new(3, [1; 16]), true, false), Verdict::Refuse);
+        assert_eq!(
+            decide(2, &Key::new(3, [1; 16]), true, false),
+            Verdict::Refuse
+        );
     }
 
     #[test]
@@ -385,6 +497,8 @@ mod tests {
         let bytes = RefCell::new(KVec::new());
         let foreign = session(1);
         let mut guard = Guard::with_file(1, keys(&[foreign])?, Ok(MemFile(&bytes)));
+        assert_eq!(guard.effective_level(), 1);
+        assert!(guard.list_loaded());
         assert_eq!(guard.check(&foreign, true), Err(EPERM));
         assert_eq!(guard.check(&foreign, false), Err(EPERM));
         // A refusal lists nothing.
@@ -526,6 +640,7 @@ mod tests {
     fn without_the_list_nothing_is_adopted() -> Result<()> {
         let foreign = session(1);
         let mut guard = Guard::<MemFile<'_>>::with_file(1, keys(&[foreign])?, Err(ENOENT));
+        assert!(!guard.list_loaded());
         assert_eq!(guard.check(&foreign, true), Err(EPERM));
         assert!(guard.check(&session(6), true).is_err());
         // Deleting a record that does not exist changes nothing.

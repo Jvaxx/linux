@@ -2655,7 +2655,8 @@ impl platform::Driver for SepDriver {
 
         // As soon as the fixed facts are known, so a tool can watch the attach
         // from "pending" on. Diagnostics are not worth failing the probe for.
-        if let Err(e) = diag::register(dev, data.profile, data.xart_writable()) {
+        let guard = data.with_store(|store| store.guard_state()).flatten();
+        if let Err(e) = diag::register(dev, data.profile, data.xart_writable(), guard) {
             dev_warn!(dev, "diag: could not add the sysfs attributes ({:?})\n", e);
         }
 

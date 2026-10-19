@@ -167,6 +167,12 @@ int sep_sensor_irq_wait(unsigned int timeout_ms);
 #define SEP_DIAG_RESTORE_EMPTY		2
 #define SEP_DIAG_RESTORE_UNPROVEN	3
 
+/* Mirrored by xart_guard.rs (Matching). */
+#define SEP_DIAG_MATCHING_UNKNOWN	0
+#define SEP_DIAG_MATCHING_USABLE	1
+#define SEP_DIAG_MATCHING_UNVERIFIED	2
+#define SEP_DIAG_MATCHING_BLOCKED	3
+
 struct device;
 
 int sep_diag_register(struct device *dev, const char *profile,
@@ -182,6 +188,9 @@ void sep_diag_set_bio_published(void);
 void sep_diag_set_touchid(bool started);
 void sep_diag_set_sensor_attach(int state);
 void sep_diag_set_restore(int state);
+void sep_diag_set_xart_guard(unsigned int level, bool list_loaded,
+			     int matching);
+void sep_diag_xart_guard_refused(int matching);
 void sep_diag_bringup_ended(void);
 
 /* -- bio_shim.c --------------------------------------------------------- */
