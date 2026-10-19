@@ -1031,7 +1031,12 @@ int iomfb_v26_6_probe(struct apple_dcp *dcp)
 		return dev_err_probe(dev, -ENODEV,
 				     "%s display not started: DCP firmware %s is not supported\n",
 				     board->name, uuid ?: "(unknown)");
-	display = of_find_node_by_path("/soc/display-subsystem");
+	/* The display subsystem sits at the root, outside the simple-bus. */
+	display = of_find_node_by_path("disp0");
+	if (display && !of_device_is_compatible(display, "apple,t8122-display-subsystem")) {
+		of_node_put(display);
+		display = NULL;
+	}
 	piodma = of_get_child_by_name(np, "piodma");
 	ret = of_property_count_u32_elems(np, board->handoff) == 1 &&
 		!of_property_read_u32(np, board->handoff, &markers[0]) &&
