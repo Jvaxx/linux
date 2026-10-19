@@ -1148,6 +1148,65 @@ out_put:
 }
 EXPORT_SYMBOL_GPL(apple_pmp_report_wait_ready);
 
+/*
+ * apple_pmp_report_check_ready() - whether a PMP report entry is acknowledged now
+ * @entry: report entry node whose request must be acknowledged
+ *
+ * The non-blocking form of apple_pmp_report_wait_ready(): it never starts the
+ * PMP and never waits. Returns 0 once the PMP runs and has acknowledged
+ * @entry, -EAGAIN while it has not (the PMP not started yet, starting, or
+ * the entry not acknowledged yet), -EPROBE_DEFER while the report driver
+ * has not probed, -EINVAL for an entry this report cannot acknowledge, or
+ * the reason the PMP was not started.
+ */
+int apple_pmp_report_check_ready(struct device_node *entry)
+{
+	struct device_node *parent = of_get_parent(entry);
+	struct platform_device *pdev;
+	struct apple_pmp_report *rep;
+	u64 status, ack;
+	bool record;
+	u32 id;
+	int ret;
+
+	if (!parent || of_property_read_u32(entry, "reg", &id) || id > 63) {
+		of_node_put(parent);
+		return -EINVAL;
+	}
+	if (!of_device_is_compatible(parent, "apple,t6030-pmp-v2-report") &&
+	    !of_device_is_compatible(parent, "apple,t8122-pmp-v2-report") &&
+	    !of_device_is_compatible(parent, "apple,t6031-pmp-v2-report")) {
+		of_node_put(parent);
+		return -EINVAL;
+	}
+	pdev = of_find_device_by_node(parent);
+	of_node_put(parent);
+	if (!pdev)
+		return -EPROBE_DEFER;
+
+	scoped_guard(mutex, &apple_pmp_report_mutex) {
+		rep = platform_get_drvdata(pdev);
+		if (!rep) {
+			ret = -EPROBE_DEFER;
+		} else if (rep->stopping) {
+			ret = -ENODEV;
+		} else if (!rep->offsets->starts_pmp ||
+			   apple_pmp_report_bit(rep, entry, &id, &record) ||
+			   !(rep->ack & BIT_ULL(id))) {
+			ret = -EINVAL;
+		} else if (completion_done(&rep->started) && rep->start_result) {
+			ret = rep->start_result;
+		} else {
+			status = readq(rep->base + rep->offsets->status);
+			ack = readq(rep->base + rep->offsets->actual);
+			ret = status == PMP_REPORT_READY && (ack & BIT_ULL(id)) ? 0 : -EAGAIN;
+		}
+	}
+	put_device(&pdev->dev);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_check_ready);
+
 /* Select one available report entry by its reg (soc-device ID - 1). */
 static struct device_node *apple_pmp_report_entry(struct device_node *report, u32 id)
 {
