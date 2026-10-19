@@ -199,6 +199,12 @@ properties:
     $ref: /schemas/types.yaml#/definitions/uint32
     description: Height in pixels reserved for the display notch.
 
+  apple,pmp-report:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description:
+      PMP report entry for this coprocessor's display request. The display
+      firmware runs only once the PMP has acknowledged it.
+
   apple,typec-mux-indices:
     $ref: /schemas/types.yaml#/definitions/uint32-array
     minItems: 1
