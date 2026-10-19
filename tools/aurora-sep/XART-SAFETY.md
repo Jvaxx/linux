@@ -97,9 +97,12 @@ the kernel log names the refused kind. What to do depends on the case:
   until it has been checked there.
 - A warm-attach Mac set up under the guard whose verify is refused: report
   the log line. `xart_guard=0` restores use at the cost of the protection.
-- A list that could not be read or is full (see "The list of Linux's
-  records"): every record that existed at boot is protected and nothing can
-  be adopted, so new records cannot be written either.
+- A list that could not be read: every record that existed at boot is
+  protected and nothing can be adopted, so new records cannot be written
+  either.
+- A full list (see "The list of Linux's records"): new records can't be
+  adopted, so they cannot be written; existing ownership still applies, and
+  the records already on the list stay writable.
 
 Turning the guard back on later does not list the records written while it
 was off.
@@ -135,7 +138,8 @@ record the enclave created under the guard. It is read at probe and
 appended before each new record is written. The driver refuses to open a
 list longer than 4096 entries, counting torn and repeated ones, and stops
 appending at the same length, so it never writes a list it would refuse.
-A full list protects every existing record, and no new one can be written.
+With a full list, new records can't be adopted; existing ownership still
+applies, so the records already on it stay writable.
 
 The list is a host file, so what happens to the root file system happens to
 it:

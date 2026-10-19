@@ -2270,7 +2270,7 @@ impl SepData {
                 dev_warn!(self.dev, "sensor: the enclave did not register the sensor\n");
                 return None;
             }
-            if !self.bringup_may_continue(c"the session and the patch") {
+            if !self.bringup_may_continue(c"the post-registration status read and the patch") {
                 return None;
             }
 

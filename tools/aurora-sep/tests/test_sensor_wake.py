@@ -128,8 +128,12 @@ fn main() {
   assert_eq!(driver.wake_sensor().is_some(),ready);
   MOCK.with(|m| {let m=m.borrow();assert_eq!(m.reads,2);assert!(m.registered);assert_eq!(m.patch,patch);});
  }
- // A suspend that begins once the serial is registered stops the attempt
- // there: no status read, no session and no patch.
+ // A suspend that begins once register_sensor() has returned stops the
+ // attempt at the check after it: no post-registration status read and no
+ // patch. The mock's register_sensor() stands for all of registration; the
+ // real one, on a nonce-session profile, has already authenticated the
+ // sensor and set its session up by then, so this models no stop before
+ // the session.
  for nonce_session in [false, true] {
   MOCK.with(|m| *m.borrow_mut()=Mock{next:Some(sensor::Status{state:0,ack:0,silent:false}),suspend:true,..Mock::default()});
   let driver = Driver { profile: Profile { nonce_session }, sensor_power_ns: AtomicU64::new(0) };
