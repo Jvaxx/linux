@@ -300,6 +300,22 @@ impl<T: drm::Driver, C: DeviceContext> Device<T, C> {
         self.dev.get()
     }
 
+    /// Reports that device execution is unavailable and the recovery method is unknown.
+    ///
+    /// The reference keeps the DRM device alive during event delivery. A device that has
+    /// not yet registered its primary node cannot deliver the event.
+    pub fn report_wedged(&self) -> Result {
+        let raw = self.as_raw();
+        // SAFETY: `raw` is the referenced live DRM device. Checking the node also permits
+        // callers handling probe failures; registered driver paths retain the device/node.
+        if unsafe { (*raw).primary.is_null() || !(*raw).registered } {
+            return Err(ENODEV);
+        }
+        // SAFETY: The device/node are live, 0 asks DRM to report an unknown recovery method,
+        // and a NULL task means no userspace task is attributed as guilty.
+        crate::error::to_result(unsafe { bindings::drm_dev_wedged_event(raw, 0, ptr::null_mut()) })
+    }
+
     /// # Safety
     ///
     /// `ptr` must be a valid pointer to a `struct device` embedded in `Self`.
