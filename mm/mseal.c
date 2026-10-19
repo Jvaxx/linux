@@ -116,6 +116,7 @@ void mseal_mmap_page_zero(void)
  */
 SYSCALL_DEFINE3(mseal, unsigned long, start, size_t, len, unsigned long, flags)
 {
+	struct mm_struct *mm = current->mm;
 	size_t len_aligned;
 	unsigned long end;
 
