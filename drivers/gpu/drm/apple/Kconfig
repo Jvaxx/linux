@@ -48,8 +48,10 @@ config DRM_APPLE_KUNIT_TEST
 	  larger rings, as well as malformed ring size combinations.
 	  This option is intended for developer test kernels.
 	  Also test the Type-C modeset, hotplug and service ownership state,
-	  the system resume of a CRTC whose mode is no longer admissible, and
-	  when an external display is ready to be reported to userspace.
+	  the system resume of a CRTC whose mode is no longer admissible,
+	  when an external display is ready to be reported to userspace, and
+	  which display processors must have started before the boot
+	  framebuffer is taken over.
 	  The AFK service lifetime test uses the display driver and is built
 	  with it. When the driver is a module, these tests can only be
 	  built as modules too. The standalone modeset state test can still

@@ -1320,6 +1320,12 @@ def readiness(root):
     probe = function(dcp, 'static int dcp_platform_probe_pipe(' if 'static int dcp_platform_probe_pipe(' in dcp
                      else 'static int dcp_platform_probe(')
     publish = probe[probe.rindex('\tif (dcp->hw.iomfb_method_profile ==\n\t    DCP_IOMFB_METHODS_H17P_EXTERNAL) {'):]
+    # Which processor must come up before the boot framebuffer is taken over.
+    header = root / 'drivers/gpu/drm/apple/apple_boot_display.h'
+    boot_display = ''
+    if header.exists():
+        text = header.read_text()
+        boot_display = text[text.index('enum apple_boot_display_class {'):text.rindex('#endif')]
     production = '\n'.join((
         function(dcp, 'bool dcp_h17p_external_supported('),
         function(dcp, 'bool dcp_h17p_external_ready('),
@@ -1327,6 +1333,7 @@ def readiness(root):
         apple_function(root, 'dcp_ext_unusable'),
         function(drm, 'static bool apple_dcp_usable('),
         function(drm, 'static int add_dcp_components('),
+        boot_display,
         function(drm, 'static int apple_drm_init_dcp('),
         'static int publish_provider(struct platform_device *pdev, struct apple_dcp *dcp)\n'
         '{\n\tstruct device *dev = &pdev->dev;\n\tint ret;\n'
@@ -1349,6 +1356,12 @@ typedef uint64_t u64;
 #define DL_FLAG_AUTOREMOVE_SUPPLIER 0
 #define DCP_IOMFB_METHODS_H17P_EXTERNAL 2
 #define dev_warn(...) ((void)0)
+#define dev_err(...) ((void)0)
+#define max(a, b) ((a) > (b) ? (a) : (b))
+#define DRM_MODE_CONNECTOR_DisplayPort 10
+#define DRM_MODE_CONNECTOR_HDMIA 11
+#define DRM_MODE_CONNECTOR_eDP 14
+#define DRM_MODE_CONNECTOR_USB 20
 #define msleep(x) ((void)(x))
 #define component_compare_of 0
 #define apple_dcp_id_tbl 0
@@ -1444,9 +1457,14 @@ static int apple_probe_per_dcp(struct device *d, struct drm_device *drm,
 static int apple_probe_typec_ports(struct drm_device *d, struct platform_device **p,
                                   u32 *masks, int count)
 { (void)d; (void)p; (void)masks; (void)count; return 0; }
-static int dcp_start(struct platform_device *p) { (void)p; return 0; }
+/* The internal processor drives the panel; the J700 dcpext is Type-C. */
+static int start_error[2], ready_error[2], starts[2], waits[2];
+static int dcp_get_connector_type(struct platform_device *p)
+{ return p->dev.of_node->external ? DRM_MODE_CONNECTOR_USB : DRM_MODE_CONNECTOR_eDP; }
+static int dcp_start(struct platform_device *p)
+{ starts[p->dev.of_node->index]++; return start_error[p->dev.of_node->index]; }
 static int dcp_wait_ready(struct platform_device *p, u64 timeout)
-{ (void)p; (void)timeout; return 0; }
+{ (void)timeout; waits[p->dev.of_node->index]++; return ready_error[p->dev.of_node->index]; }
 static u64 get_jiffies_64(void) { return 0; }
 static u64 msecs_to_jiffies(unsigned int ms) { return ms; }
 static bool time_after_eq64(u64 a, u64 b) { return a >= b; }
@@ -1480,6 +1498,10 @@ static void initial(bool supported_firmware)
     memset(dcps, 0, sizeof(dcps));
     memset(&matches, 0, sizeof(matches));
     memset(probes, 0, sizeof(probes));
+    memset(start_error, 0, sizeof(start_error));
+    memset(ready_error, 0, sizeof(ready_error));
+    memset(starts, 0, sizeof(starts));
+    memset(waits, 0, sizeof(waits));
     for (unsigned int i = 0; i < 2; i++) {
         nodes[i] = (struct device_node){ .available = true, .external = i == 1, .index = i };
         devices[i].dev = (struct device){ .of_node = &nodes[i], .data = &dcps[i] };
@@ -1576,7 +1598,26 @@ int main(void)
     external_probe_error = -EIO;
     assert(apple_drm_init_dcp(&master) == -EIO);
     assert(probes[1] == 1 && node_puts == 1);
-    puts("PASS: automatic hardware/firmware matching, delayed/preflight-failed providers, synchronous publication, readiness rejection");
+
+    /* The panel's processor must come up before the boot framebuffer goes. */
+    for (unsigned int failure = 0; failure < 2; failure++) {
+        initial(true);
+        dcps[1].external_prepared = true;
+        if (failure) start_error[0] = -EIO; else ready_error[0] = -ETIMEDOUT;
+        assert(apple_drm_init_dcp(&master) == -ENODEV);
+        /* A processor that did not start is not waited for. */
+        assert(starts[0] == 1 && waits[0] == (int)!failure && waits[1] == 1);
+    }
+    /* A failed external processor alone leaves the panel's take-over alone. */
+    initial(true);
+    dcps[1].external_prepared = true;
+    ready_error[1] = -ETIMEDOUT;
+    assert(apple_drm_init_dcp(&master) == 0);
+    initial(true);
+    dcps[1].external_prepared = true;
+    start_error[1] = -EIO;
+    assert(apple_drm_init_dcp(&master) == 0 && waits[1] == 0);
+    puts("PASS: automatic hardware/firmware matching, delayed/preflight-failed providers, synchronous publication, readiness rejection, boot framebuffer kept without the panel processor");
     return 0;
 }
 '''

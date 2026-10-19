@@ -40,6 +40,7 @@
 #include <drm/drm_vblank.h>
 #include <drm/drm_fixed.h>
 
+#include "apple_boot_display.h"
 #include "apple_resume.h"
 #include "dcp.h"
 #include "plane.h"
@@ -847,6 +848,9 @@ static int apple_drm_init_dcp(struct device *dev)
 	struct platform_device *dcp[MAX_COPROCESSORS];
 	struct drm_encoder *encoder[MAX_COPROCESSORS];
 	u32 crtc_mask[MAX_COPROCESSORS] = {};
+	int connector_type[MAX_COPROCESSORS];
+	bool started[MAX_COPROCESSORS] = {};
+	bool ready[MAX_COPROCESSORS] = {};
 	struct device_node *np;
 	u64 timeout;
 	int i, ret, num_dcp = 0;
@@ -907,7 +911,9 @@ static int apple_drm_init_dcp(struct device *dev)
 		return ret;
 
 	for (i = 0; i < num_dcp; i++) {
+		connector_type[i] = dcp_get_connector_type(dcp[i]);
 		ret = dcp_start(dcp[i]);
+		started[i] = !ret;
 		if (ret)
 			dev_warn(dev, "DCP[%d] failed to start: %d\n", i, ret);
 	}
@@ -922,14 +928,31 @@ static int apple_drm_init_dcp(struct device *dev)
 		u64 wait = time_after_eq64(jiffies, timeout) ?
 				   0 :
 				   timeout - jiffies;
+
+		/* A processor that did not start cannot become ready. */
+		if (!started[i])
+			continue;
 		ret = dcp_wait_ready(dcp[i], wait);
-		/* There is nothing we can do if a dcp/dcpext does not boot
-		 * (successfully). Ignoring it should not do any harm now.
-		 * Needs to reevaluated when adding dcpext support.
+		ready[i] = !ret;
+		/*
+		 * Any other processor that does not come up is left out: the
+		 * driver goes on without it.
 		 */
 		if (ret)
 			dev_warn(dev, "DCP[%d] not ready: %d\n", i, ret);
 	}
+
+	/*
+	 * The caller removes the boot framebuffer next. If none of the display
+	 * processors that can be showing it came up, that would leave the
+	 * screen black with nothing to replace it: fail instead, so that the
+	 * boot framebuffer stays.
+	 */
+	if (!apple_boot_display_up(connector_type, ready, num_dcp)) {
+		dev_err(dev, "no display processor that can show the boot framebuffer came up; keeping the boot framebuffer\n");
+		return -ENODEV;
+	}
+
 	/* HACK: Wait for dcp* to settle before a modeset */
 	msleep(100);
 
