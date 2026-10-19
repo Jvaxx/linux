@@ -1351,6 +1351,15 @@ static inline unsigned long vma_user_pages(const struct vm_area_struct *vma)
 	return (vma->vm_end - vma->vm_start) >> PAGE_SHIFT;
 }
 
+/* Locked VM is accounted in MM_ACCOUNT_SHIFT units; native without subpage. */
+#define MM_ACCOUNT_SHIFT PAGE_SHIFT
+
+static inline unsigned long mm_pages_to_account(const struct mm_struct *mm,
+		unsigned long pages)
+{
+	return pages << (mm_page_shift(mm) - MM_ACCOUNT_SHIFT);
+}
+
 #define mm_account_memory(mm, policy_mm, pages) security_vm_enough_memory_mm(policy_mm, pages)
 #define mm_unacct_memory(mm, pages) vm_unacct_memory(pages)
 
