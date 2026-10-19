@@ -561,9 +561,15 @@ static int apple_probe_per_dcp(struct device *dev,
 	bool supports_xrgb2101010;
 	enum drm_plane_type plane_type;
 	bool interchange;
+	bool supports_interchange;
 
 	supports_xrgb2101010 = dcp_data->fw_compat != DCP_FIRMWARE_H17P ||
 		dcp_data->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G;
+	/*
+	 * Interchange scanout has not been qualified with the H17P firmware
+	 * (T8140 and T8122): advertise linear framebuffers only there.
+	 */
+	supports_interchange = dcp_data->fw_compat != DCP_FIRMWARE_H17P;
 	if (bitmap_empty(iomfb_surfaces, DCP_MAX_PLANES))
 		return dev_err_probe(dev, -EINVAL, "No usable display surfaces\n");
 
@@ -591,7 +597,8 @@ static int apple_probe_per_dcp(struct device *dev,
 		if (dcp_fw_compat_is_14_7(dcp))
 			break;
 		plane_type = (zpos == 0) ? DRM_PLANE_TYPE_PRIMARY : DRM_PLANE_TYPE_OVERLAY;
-		interchange = (zpos <= 1 || surf != top_surf);
+		interchange = supports_interchange &&
+			      (zpos <= 1 || surf != top_surf);
 
 		planes[zpos] = apple_plane_init(drm, 1U << num, surf,
 						supports_l10r,

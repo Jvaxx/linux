@@ -666,7 +666,8 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 		}
 		plane = drmm_universal_plane_alloc(dev, struct apple_plane, base, possible_crtcs,
 				       &apple_plane_funcs, fmts, num_fmts,
-				       format_modifiers, type, NULL);
+				       interchange ? format_modifiers : format_modifiers_no_ix,
+				       type, NULL);
 		break;
 	case DRM_PLANE_TYPE_OVERLAY:
 	case DRM_PLANE_TYPE_CURSOR:
