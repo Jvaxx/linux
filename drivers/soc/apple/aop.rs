@@ -1030,7 +1030,7 @@ impl SetupState {
     }
 
     fn arena_iova(&self) -> Result<u64> {
-        Ok(self.arena.as_ref().ok_or(ENXIO)?.dma_handle())
+        Ok(self.arena.as_ref().ok_or(ENXIO)?.dma_address())
     }
 
     /// Returns a pointer to `len` bytes at `off` in the arena after checking
