@@ -8,8 +8,11 @@
  * that cannot take the display over from iBoot keep scanning out through the
  * simple framebuffer, and all of them share one device tree. The boot loader
  * sets apple,t8122-handoff = <1> on the DCP and the display subsystem after
- * it has checked and locked the inherited DART mappings; the display enable
- * gate (drivers/soc/apple/t6030-display-gate.c) then enables these nodes.
+ * it has checked and locked the inherited DART mappings. A kernel display
+ * gate that checks this handoff, and can start the PMP that the DCP firmware
+ * needs, then enables these nodes. A kernel without such a gate leaves them
+ * disabled. The 25G83 profile (t8122-j613-dcp-25g83.dtsi) has its own
+ * handoff, which the display driver checks before it enables these nodes.
  *
  * Register, interrupt and DART addresses are SoC addresses from the J613
  * boot device tree: the DCP block and its iop-vbar come from /arm-io/dcp,
