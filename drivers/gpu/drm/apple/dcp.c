@@ -4234,6 +4234,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	spin_lock_init(&dcp->mode_state.lock);
 	spin_lock_init(&dcp->metadata.lock);
 	mutex_init(&dcp->dcpavserv.lock);
+	INIT_WORK(&dcp->dcpavserv.close_wq, dcpavserv_close_work);
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
 	if (dcp->hw.iomfb_method_profile ==
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL) {
