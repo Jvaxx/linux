@@ -47,6 +47,7 @@
  * @starts_pmp: this driver starts a halted PMP that a display gate hands
  *	over to the report (see apple_pmp_start_init())
  * @name: with @starts_pmp, the SoC in messages
+ * @fallback: with @starts_pmp, how to boot without starting the PMP
  * @pwrstate: with @starts_pmp, the compatible of the SoC's PMGR power states
  * @devices_ordered: with @starts_pmp, soc-device record i holds device ID
  *	i + 1
@@ -60,6 +61,7 @@ struct apple_pmp_report_offsets {
 	u32 fast_die_lanes;
 	bool starts_pmp;
 	const char *name;
+	const char *fallback;
 	const char *pwrstate;
 	bool devices_ordered;
 };
@@ -132,6 +134,8 @@ int apple_pmp_report_fast_die_effort(const struct device_node *np,
 }
 EXPORT_SYMBOL_GPL(apple_pmp_report_fast_die_effort);
 
+static void apple_pmp_start_show(struct seq_file *s, struct apple_pmp_start *st);
+
 /* Read only the documented status and fast-die entries, never the aperture. */
 static int apple_pmp_report_status_show(struct seq_file *s, void *unused)
 {
@@ -142,6 +146,8 @@ static int apple_pmp_report_status_show(struct seq_file *s, void *unused)
 	u32 effort;
 
 	seq_printf(s, "running: %u\n", !!(status & PMP_REPORT_READY));
+	if (rep->start)
+		apple_pmp_start_show(s, rep->start);
 	if (!(status & PMP_REPORT_READY) || !offs->fast_die)
 		return 0;
 
@@ -232,7 +238,14 @@ EXPORT_SYMBOL_GPL(apple_pmp_report_wait_supplier_ready);
  *     the PMP driver then patches the boot arguments and runs the firmware;
  *  5. it waits for the PMP driver to bind, the PTD to report ready and the
  *     startup requests to be acknowledged.
- * From step 4 on the PMP runs, and only a reboot stops it.
+ * From step 4 on the PMP runs, and only a reboot stops it. That stays so
+ * when step 5 fails: nothing stops the PMP, and the display stays on the boot
+ * framebuffer. There is no safe stop to take instead. The PMP driver has no
+ * shutdown handshake for it, a PMP that did not bind or report ready would
+ * not answer one, and one that runs owns the SoC power states: halting its
+ * CPU would freeze whatever it set, with nothing left to manage them. A
+ * reboot is the recovery, and the SoC's fallback option (@fallback) or
+ * nomodeset boots without starting it. See APPLE_PMP_REPORT in Kconfig.
  */
 #define PMP_ASC_CPU_CONTROL		0x44
 #define PMP_ASC_CPU_RUN			BIT(4)
@@ -250,6 +263,35 @@ EXPORT_SYMBOL_GPL(apple_pmp_report_wait_supplier_ready);
 #define PMP_START_READY_TIMEOUT_MS	3000
 #define PMP_START_ACK_TIMEOUT_MS	1000
 
+/*
+ * The steps of the start that reach beyond the report region: the checks
+ * before the PMP may run (step 3), enabling its nodes (step 4) and whether
+ * its driver has bound (step 5). The KUnit tests replace them to inject
+ * faults; the start reads the report region itself.
+ */
+struct apple_pmp_start;
+
+struct apple_pmp_start_ops {
+	int (*check)(struct apple_pmp_start *st, uuid_t *image);
+	int (*enable)(struct apple_pmp_start *st);
+	bool (*bound)(struct apple_pmp_start *st);
+};
+
+/* Step 5's waits, in milliseconds. */
+struct apple_pmp_start_timing {
+	unsigned int bind;
+	unsigned int quiet;
+	unsigned int ready;
+	unsigned int ack;
+};
+
+static const struct apple_pmp_start_timing apple_pmp_start_timing = {
+	.bind = PMP_START_BIND_TIMEOUT_MS,
+	.quiet = PMP_START_QUIET_MS,
+	.ready = PMP_START_READY_TIMEOUT_MS,
+	.ack = PMP_START_ACK_TIMEOUT_MS,
+};
+
 struct apple_pmp_start {
 	struct apple_pmp_report *rep;
 	struct list_head list;
@@ -263,8 +305,12 @@ struct apple_pmp_start {
 	/* Seeded bits that are soc-device record indices. */
 	u64 record_seed;
 	struct of_changeset pmp_cs;
+	const struct apple_pmp_start_ops *ops;
+	const struct apple_pmp_start_timing *timing;
 	struct work_struct work;
 	bool queued;
+	/* The PMP nodes were enabled: the PMP may run, until the next reboot. */
+	bool enabled;
 	struct completion started;
 	int result;
 	bool stopping;
@@ -547,10 +593,21 @@ static int apple_pmp_start_describe(struct apple_pmp_report *rep,
 
 static void apple_pmp_start_finish(struct apple_pmp_start *st, int result)
 {
-	guard(mutex)(&apple_pmp_start_mutex);
-	if (!st->stopping)
-		st->result = result;
-	complete_all(&st->started);
+	scoped_guard(mutex, &apple_pmp_start_mutex) {
+		if (!st->stopping)
+			st->result = result;
+		complete_all(&st->started);
+	}
+	if (result && READ_ONCE(st->enabled))
+		dev_err(st->rep->dev,
+			"%s PMP start failed (%d) after the PMP was enabled: it may keep running until the next reboot. Reboot to stop it; to boot without starting it: %s, or nomodeset\n",
+			st->rep->offsets->name, result, st->rep->offsets->fallback);
+}
+
+/* Teardown has begun: a start still in progress gives up early. */
+static bool apple_pmp_start_stopping(struct apple_pmp_start *st)
+{
+	return READ_ONCE(st->stopping);
 }
 
 static bool apple_pmp_start_bound(struct apple_pmp_start *st)
@@ -622,13 +679,10 @@ static int apple_pmp_start_wait_seeded(struct apple_pmp_report *rep,
 	return -ETIMEDOUT;
 }
 
-static void apple_pmp_start_work(struct work_struct *work)
+/* Step 3: everything that must hold before the PMP may run. */
+static int apple_pmp_start_check(struct apple_pmp_start *st, uuid_t *image)
 {
-	struct apple_pmp_start *st = container_of(work, struct apple_pmp_start, work);
 	struct apple_pmp_report *rep = st->rep;
-	u64 status = 0, request, ack = 0;
-	unsigned long deadline;
-	uuid_t image;
 	int ret;
 
 	/* The always-on entries probe after the report, once their domains do. */
@@ -638,11 +692,31 @@ static void apple_pmp_start_work(struct work_struct *work)
 	if (!ret)
 		ret = apple_pmp_start_check_halted(st);
 	if (!ret) {
-		ret = apple_pmp_start_check_sram(st, &image);
+		ret = apple_pmp_start_check_sram(st, image);
 		if (ret)
 			dev_err(rep->dev, "%s PMP not started: its SRAM does not hold the described firmware\n",
 				rep->offsets->name);
 	}
+	return ret;
+}
+
+static const struct apple_pmp_start_ops apple_pmp_start_hw_ops = {
+	.check = apple_pmp_start_check,
+	.enable = apple_pmp_start_enable,
+	.bound = apple_pmp_start_bound,
+};
+
+static void apple_pmp_start_work(struct work_struct *work)
+{
+	struct apple_pmp_start *st = container_of(work, struct apple_pmp_start, work);
+	const struct apple_pmp_start_timing *timing = st->timing;
+	struct apple_pmp_report *rep = st->rep;
+	u64 status = 0, request, ack = 0;
+	unsigned long deadline;
+	uuid_t image;
+	int ret;
+
+	ret = st->ops->check(st, &image);
 	if (ret) {
 		apple_pmp_start_finish(st, ret);
 		return;
@@ -664,38 +738,41 @@ static void apple_pmp_start_work(struct work_struct *work)
 
 	/* From here the PMP may run, and only a reboot stops it. */
 	dev_info(rep->dev, "starting the PMP with request %#llx\n", st->seed);
-	ret = apple_pmp_start_enable(st);
+	ret = st->ops->enable(st);
 	if (ret) {
 		dev_err(rep->dev, "%s PMP not started: enabling its nodes failed: %d\n",
 			rep->offsets->name, ret);
 		apple_pmp_start_finish(st, ret);
 		return;
 	}
+	WRITE_ONCE(st->enabled, true);
 
 	/* Bound means the firmware and its endpoint are up. */
-	deadline = jiffies + msecs_to_jiffies(PMP_START_BIND_TIMEOUT_MS);
-	while (!apple_pmp_start_bound(st) && time_before(jiffies, deadline))
+	deadline = jiffies + msecs_to_jiffies(timing->bind);
+	while (!st->ops->bound(st) && time_before(jiffies, deadline) &&
+	       !apple_pmp_start_stopping(st))
 		msleep(50);
-	if (!apple_pmp_start_bound(st)) {
-		dev_err(rep->dev, "PMP driver did not bind within %d ms; display power not acknowledged\n",
-			PMP_START_BIND_TIMEOUT_MS);
+	if (!st->ops->bound(st)) {
+		dev_err(rep->dev, "PMP driver did not bind within %u ms; display power not acknowledged\n",
+			timing->bind);
 		apple_pmp_start_finish(st, -ETIMEDOUT);
 		return;
 	}
-	msleep(PMP_START_QUIET_MS);
+	msleep(timing->quiet);
 
-	deadline = jiffies + msecs_to_jiffies(PMP_START_READY_TIMEOUT_MS);
+	deadline = jiffies + msecs_to_jiffies(timing->ready);
 	do {
 		status = readq(rep->base + rep->offsets->status);
-		if (status == PMP_REPORT_READY)
+		if (status == PMP_REPORT_READY || apple_pmp_start_stopping(st))
 			break;
 		msleep(50);
 	} while (time_before(jiffies, deadline));
 	if (status == PMP_REPORT_READY) {
-		deadline = jiffies + msecs_to_jiffies(PMP_START_ACK_TIMEOUT_MS);
+		deadline = jiffies + msecs_to_jiffies(timing->ack);
 		do {
 			ack = readq(rep->base + rep->offsets->actual);
-			if ((ack & st->startup_ack) == st->startup_ack)
+			if ((ack & st->startup_ack) == st->startup_ack ||
+			    apple_pmp_start_stopping(st))
 				break;
 			msleep(20);
 		} while (time_before(jiffies, deadline));
@@ -718,6 +795,32 @@ static void apple_pmp_start_work(struct work_struct *work)
 	apple_pmp_start_finish(st, ret);
 }
 
+/*
+ * For the debugfs status of a report that starts its PMP: "start" is idle
+ * until a consumer asks for the PMP, then starting, ready or failed, and
+ * "enabled" says whether the PMP nodes were enabled (the PMP may then run
+ * until the next reboot, whatever the result).
+ */
+static void apple_pmp_start_show(struct seq_file *s, struct apple_pmp_start *st)
+{
+	const char *state;
+	int result;
+
+	scoped_guard(mutex, &apple_pmp_start_mutex) {
+		result = st->result;
+		if (result)
+			state = "failed";
+		else if (completion_done(&st->started))
+			state = "ready";
+		else if (st->queued)
+			state = "starting";
+		else
+			state = "idle";
+	}
+	seq_printf(s, "start: %s\nstart_result: %d\nenabled: %u\n", state, result,
+		   READ_ONCE(st->enabled));
+}
+
 /* No work or waiter may use the start state once the report is torn down. */
 static void apple_pmp_start_drain(void *data)
 {
@@ -731,10 +834,14 @@ static void apple_pmp_start_drain(void *data)
 		complete_all(&st->started);
 		waiters = st->waiters;
 	}
+	/* A start in progress gives up at its next poll. */
 	cancel_work_sync(&st->work);
 	if (waiters)
 		wait_for_completion(&st->waiters_done);
-	/* A started PMP keeps running; its nodes stay enabled. */
+	/*
+	 * A started PMP keeps running and its nodes stay enabled: there is no
+	 * safe stop (see "Starting a halted PMP" above).
+	 */
 	of_node_put(st->pmp);
 }
 
@@ -764,6 +871,8 @@ static int apple_pmp_start_init(struct apple_pmp_report *rep)
 	}
 	st->rep = rep;
 	st->pmp = pmp;
+	st->ops = &apple_pmp_start_hw_ops;
+	st->timing = &apple_pmp_start_timing;
 	INIT_WORK(&st->work, apple_pmp_start_work);
 	init_completion(&st->started);
 	init_completion(&st->waiters_done);
@@ -785,6 +894,44 @@ static int apple_pmp_start_init(struct apple_pmp_report *rep)
 	return 0;
 }
 
+/*
+ * Starts the PMP if no one has yet, and waits for request bit @id to be
+ * acknowledged. The caller holds a waiter on @st (st->waiters), which this
+ * gives back: teardown waits for it, so @st stays valid until then.
+ */
+static int apple_pmp_start_wait(struct apple_pmp_start *st, u32 id,
+				unsigned long timeout)
+{
+	u64 status, ack;
+	int ret;
+
+	scoped_guard(mutex, &apple_pmp_start_mutex) {
+		if (!st->stopping && !st->result && !st->queued) {
+			st->queued = true;
+			queue_work(system_unbound_wq, &st->work);
+		}
+	}
+	ret = wait_for_completion_timeout(&st->started, timeout) ? 0 : -ETIMEDOUT;
+	scoped_guard(mutex, &apple_pmp_start_mutex) {
+		if (st->stopping) {
+			ret = -ENODEV;
+		} else if (!ret) {
+			if (st->result) {
+				ret = st->result;
+			} else if (!(st->ack & BIT_ULL(id))) {
+				ret = -EINVAL;
+			} else {
+				status = readq(st->rep->base + st->rep->offsets->status);
+				ack = readq(st->rep->base + st->rep->offsets->actual);
+				ret = status == PMP_REPORT_READY && (ack & BIT_ULL(id)) ? 0 : -EIO;
+			}
+		}
+		if (!--st->waiters && st->stopping)
+			complete(&st->waiters_done);
+	}
+	return ret;
+}
+
 /**
  * apple_pmp_report_wait_ready() - wait until a PMP report entry is acknowledged
  * @entry: report entry node whose request must be acknowledged
@@ -804,7 +951,6 @@ int apple_pmp_report_wait_ready(struct device_node *entry, unsigned long timeout
 	struct device_node *parent = of_get_parent(entry);
 	const struct apple_pmp_report *rep;
 	struct apple_pmp_start *st = NULL, *it;
-	u64 status, ack;
 	bool record, bound = false;
 	u32 id;
 	int ret;
@@ -844,30 +990,7 @@ int apple_pmp_report_wait_ready(struct device_node *entry, unsigned long timeout
 		goto out;
 	}
 
-	scoped_guard(mutex, &apple_pmp_start_mutex) {
-		if (!st->stopping && !st->result && !st->queued) {
-			st->queued = true;
-			queue_work(system_unbound_wq, &st->work);
-		}
-	}
-	ret = wait_for_completion_timeout(&st->started, timeout) ? 0 : -ETIMEDOUT;
-	scoped_guard(mutex, &apple_pmp_start_mutex) {
-		if (st->stopping) {
-			ret = -ENODEV;
-		} else if (!ret) {
-			if (st->result) {
-				ret = st->result;
-			} else if (!(st->ack & BIT_ULL(id))) {
-				ret = -EINVAL;
-			} else {
-				status = readq(st->rep->base + st->rep->offsets->status);
-				ack = readq(st->rep->base + st->rep->offsets->actual);
-				ret = status == PMP_REPORT_READY && (ack & BIT_ULL(id)) ? 0 : -EIO;
-			}
-		}
-		if (!--st->waiters && st->stopping)
-			complete(&st->waiters_done);
-	}
+	ret = apple_pmp_start_wait(st, id, timeout);
 out:
 	of_node_put(parent);
 	return ret;
@@ -909,7 +1032,7 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 	list_add_tail_rcu(&rep->list, &apple_pmp_reports);
 	mutex_unlock(&apple_pmp_reports_lock);
 
-	if (rep->offsets->fast_die)
+	if (rep->offsets->fast_die || rep->start)
 		rep->debugfs = debugfs_create_file(dev_name(dev), 0400,
 						   apple_pmp_report_debugfs, rep,
 						   &apple_pmp_report_status_fops);
@@ -962,6 +1085,7 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t8122 = {
 	.status = 0x10,
 	.starts_pmp = true,
 	.name = "T8122",
+	.fallback = "apple_t8122_display.enable=0",
 	.pwrstate = "apple,t8122-pmgr-pwrstate",
 };
 
@@ -986,6 +1110,7 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t6031 = {
 	.status = 0x10,
 	.starts_pmp = true,
 	.name = "T6031",
+	.fallback = "leave out apple_t6031_display.enable=1",
 	.pwrstate = "apple,t6031-pmgr-pwrstate",
 	.devices_ordered = true,
 };
