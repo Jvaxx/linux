@@ -413,8 +413,10 @@ impl File {
         if gpu.supports_scheduled_queues() {
             params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SCHEDULED_QUEUES as u64;
         }
-        // The M3 runtime's optional features are per SoC (`m3_soc::Soc::features`).
-        let m3 = (facts.gpu_hal_generation == hw::GpuHalGeneration::Legacy as u32)
+        // The M3 runtime's optional features are per SoC (`m3_soc::Soc::features`); the G15
+        // generation reports its own feature word on the same chips.
+        let m3 = (facts.gpu_hal_generation == hw::GpuHalGeneration::Legacy as u32
+            && device.g15().is_none())
             .then(|| crate::m3_soc::by_chip(facts.chip_id)).flatten();
         if m3.is_some_and(|soc| soc.features.fragment_dependency)
             && *module_parameters::m3_early_tiling.value()!=0

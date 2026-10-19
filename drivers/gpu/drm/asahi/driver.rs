@@ -21,6 +21,8 @@ use kernel::{
     },
 };
 
+#[cfg(CONFIG_DRM_ASAHI_G15)]
+use crate::g15;
 use crate::{
     debug,
     drm_gpu,
@@ -89,6 +91,21 @@ impl AsahiData {
         }
     }
 
+    /// The G15 generation, if this device runs it.
+    #[cfg(CONFIG_DRM_ASAHI_G15)]
+    pub(crate) fn g15(&self) -> Option<&Arc<g15::Gpu>> {
+        match self.gpu.as_ref() {
+            Some(drm_gpu::Backend::G15(gpu)) => Some(gpu),
+            _ => None,
+        }
+    }
+
+    /// Without G15 support no device runs that generation.
+    #[cfg(not(CONFIG_DRM_ASAHI_G15))]
+    pub(crate) fn g15(&self) -> Option<&()> {
+        None
+    }
+
     /// Runtime construction can use GEM before the GPU backend exists. All
     /// DRM operations fail with ENODEV until probe publishes the backend once.
     pub(crate) fn gpu(&self) -> Result<&dyn drm_gpu::DrmGpu> {
@@ -117,6 +134,14 @@ enum AsahiRuntime {
     G16(crate::g16_drm::Registered),
     G15(crate::g15_probe::G15Manager),
     G17(ARef<drm::Device<AsahiDriver>>, Arc<g17::Gpu>),
+    /// The G15 generation (`g15`): its DRM device and GPU, retained until reboot.
+    #[cfg(CONFIG_DRM_ASAHI_G15)]
+    G15Native(ARef<drm::Device<AsahiDriver>>, Arc<g15::Gpu>),
+    /// A G15 probe that failed once the firmware had been touched: the device stays bound
+    /// (unbinding would detach and power off the GFX domain under the running firmware), the
+    /// firmware session is retained until reboot and no DRM device exists.
+    #[cfg(CONFIG_DRM_ASAHI_G15)]
+    G15Retained,
 }
 
 pub(crate) struct AsahiDriver {
@@ -479,6 +504,18 @@ impl platform::Driver for AsahiDriver {
                         return Ok(Self { runtime: AsahiRuntime::G15(manager) });
                     }
                     crate::m3_params::T6030Backend::Off => return Err(ENODEV),
+                    #[cfg(CONFIG_DRM_ASAHI_G15)]
+                    crate::m3_params::T6030Backend::G15 => {
+                        return Self::probe_g15(pdev, &g15::hw::t6030::CONFIG);
+                    }
+                    #[cfg(not(CONFIG_DRM_ASAHI_G15))]
+                    crate::m3_params::T6030Backend::G15 => {
+                        dev_err!(
+                            pdev.as_ref(),
+                            "M3: asahi.m3_backend=g15: the G15 generation is not built (CONFIG_DRM_ASAHI_G15); no GPU backend started\n"
+                        );
+                        return Err(ENODEV);
+                    }
                     crate::m3_params::T6030Backend::Runtime => {}
                 }
                 let runtime = crate::m3_drm::Registered::start(pdev, &crate::m3_soc::T6030)?;
@@ -605,6 +642,50 @@ impl AsahiDriver {
         }
         Ok(Self {
             runtime: AsahiRuntime::G17(drm, gpu),
+        })
+    }
+}
+
+#[cfg(CONFIG_DRM_ASAHI_G15)]
+impl AsahiDriver {
+    /// Boots a G15 GPU and registers its DRM device.
+    ///
+    /// A G15 firmware session cannot be stopped once started. If the boot or the registration
+    /// fails after the firmware has been touched ([`g15::retained`]), the device stays bound with
+    /// no DRM device and [`g15::Gpu`] retains everything the firmware can reach until reboot.
+    fn probe_g15(pdev: &platform::Device<Core>, cfg: &'static g15::Config) -> Result<Self> {
+        dev_info!(pdev.as_ref(), "G15: probing\n");
+        // SAFETY: The GPU performs DMA through a UAT whose output width is part of the SoC config.
+        unsafe { pdev.dma_set_mask_and_coherent(DmaMask::try_new(cfg.uat_oas)?)? };
+        let res = regs::Resources::new(pdev)?;
+        // No userspace or GPU backend is published before the generation is constructed.
+        let drm: ARef<AsahiDevice> = drm::device::Device::new(
+            pdev.as_ref(),
+            AsahiData::new(pdev, Some(res.clone()), false),
+        )?;
+        let retained = |error: Error| -> Result<Self> {
+            dev_err!(
+                pdev.as_ref(),
+                "G15: probe failed after the firmware start ({:?}); device kept bound, firmware retained until reboot\n",
+                error
+            );
+            Ok(Self {
+                runtime: AsahiRuntime::G15Retained,
+            })
+        };
+        let gpu = match g15::Gpu::new(pdev, &drm, cfg, res) {
+            Ok(gpu) => gpu,
+            Err(error) if g15::retained() => return retained(error),
+            Err(error) => return Err(error),
+        };
+        if !drm.gpu.populate(drm_gpu::Backend::G15(gpu.clone())) {
+            return retained(EBUSY);
+        }
+        if let Err(error) = drm::driver::Registration::new_foreign_owned(&drm, pdev.as_ref(), 0) {
+            return retained(error);
+        }
+        Ok(Self {
+            runtime: AsahiRuntime::G15Native(drm, gpu),
         })
     }
 }
