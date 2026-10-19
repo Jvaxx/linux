@@ -18,6 +18,7 @@ void asahi_g15_sha256(const u8 *data, size_t len, u8 *out);
 bool asahi_g15_board(void);
 bool asahi_g15_machine(const char *compatible);
 void asahi_g15_hold_power(struct device *dev);
+void asahi_g15_release_power(struct device *dev);
 void asahi_g15_module_get(void);
 int asahi_g15_adt_phram(u64 *start, u64 *size);
 bool asahi_g15_ram_disjoint(u64 start, u64 size);
@@ -53,6 +54,17 @@ void asahi_g15_hold_power(struct device *dev)
 	pm_runtime_get_noresume(dev);
 	pm_runtime_set_active(dev);
 	pm_runtime_enable(dev);
+}
+
+/*
+ * Give the hold of asahi_g15_hold_power() back: the start failed before
+ * anything firmware-visible was written, so the session is not retained.
+ */
+void asahi_g15_release_power(struct device *dev)
+{
+	pm_runtime_put_noidle(dev);
+	pm_runtime_disable(dev);
+	pm_runtime_set_suspended(dev);
 }
 
 /* Pin this module until reboot. */
