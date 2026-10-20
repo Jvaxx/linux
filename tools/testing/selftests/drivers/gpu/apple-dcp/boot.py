@@ -84,3 +84,99 @@ int main(void)
     return 0;
 }
 '''
+
+
+def syslog(root):
+    source = (root / 'drivers/soc/apple/rtkit.c').read_text()
+    dcp = (root / 'drivers/gpu/drm/apple/dcp.c').read_text()
+    header = (root / 'drivers/gpu/drm/apple/dcp-syslog.h').read_text()
+    helper = header[header.index('static inline bool'):header.index('\n#endif')]
+    # The policy belongs only to the external H17P transport. Other RTKit
+    # clients, including the panel and older DCP firmware, keep info logging.
+    assert '.syslog_is_debug' not in block(dcp, 'static struct apple_rtkit_ops rtkit_ops =')
+    assert '.syslog_is_debug = dcp_rtk_syslog_is_debug' in block(dcp, 'static const struct apple_rtkit_ops external_h17p_rtkit_ops =')
+    return r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+typedef uint8_t u8;
+typedef uint64_t u64;
+#define APPLE_RTKIT_EP_SYSLOG 2
+struct buffer { size_t size; unsigned char *buffer; bool iomem; };
+struct apple_rtkit_ops {
+    bool (*syslog_is_debug)(void *, const char *, const char *);
+};
+struct apple_rtkit {
+    void *dev, *cookie;
+    struct apple_rtkit_ops *ops;
+    bool syslog_inherited;
+    char *syslog_msg_buffer;
+    size_t syslog_msg_size, syslog_n_entries;
+    struct buffer syslog_buffer;
+};
+static unsigned infos, debugs, warnings, copies, acks, calls;
+#define dev_info(...) (++infos)
+#define dev_dbg(...) (++debugs)
+#define dev_warn_ratelimited(...) (++warnings)
+static void apple_rtkit_memcpy(struct apple_rtkit *rtk, void *out,
+                              struct buffer *b, size_t off, size_t len)
+{ (void)rtk; assert(off + len <= b->size); copies++; memcpy(out, b->buffer+off, len); }
+static int apple_rtkit_send_message(struct apple_rtkit *rtk, u8 ep, u64 msg, void *c, bool atomic)
+{ (void)rtk; assert(ep==2 && msg==0 && c==NULL && !atomic); acks++; return 0; }
+''' + helper + '\n' + block(dcp, 'static bool dcp_rtk_syslog_is_debug(') + r'''
+static bool policy(void *cookie, const char *context, const char *message)
+{ calls++; return dcp_rtk_syslog_is_debug(cookie, context, message); }
+''' + block(source, 'static bool should_crop_syslog_char(') + '\n' + block(source, 'static void apple_rtkit_syslog_rx_log(') + r'''
+static void reset(void) { infos=debugs=warnings=copies=acks=calls=0; }
+static void record(struct apple_rtkit *rtk, const char *context, const char *message)
+{
+    memset(rtk->syslog_buffer.buffer,0,rtk->syslog_buffer.size);
+    memcpy(rtk->syslog_buffer.buffer+8,context,strlen(context));
+    memcpy(rtk->syslog_buffer.buffer+32,message,strlen(message));
+}
+int main(void)
+{
+    unsigned char ring[288]; char decoded[256];
+    struct apple_rtkit_ops ops={.syslog_is_debug=policy};
+    struct apple_rtkit rtk={.ops=&ops, .syslog_msg_buffer=decoded,
+        .syslog_msg_size=256, .syslog_n_entries=1,
+        .syslog_buffer={.size=sizeof(ring),.buffer=ring}};
+    const char *messages[]={
+        "set_run_mode_safe: deferring: 4 -> 1",
+        "set_run_mode_safe: deferring: 2 -> 4",
+        "ready_for_run_mode_change: initiating deferred run mode change: 4 -> 1",
+        "ready_for_run_mode_change: initiating deferred run mode change: 2 -> 4"
+    };
+    for (unsigned i=0;i<4;i++) {
+        const char *ctx=i<2?"UPPipeDCP_H17P.cpp:2096":"UPPipeDCP_H17P.cpp:2014";
+        record(&rtk,ctx,messages[i]); reset(); apple_rtkit_syslog_rx_log(&rtk,0);
+        assert(debugs==1 && !infos && !warnings && acks==1 && copies==2 && calls==1);
+        char fault[192]; snprintf(fault,sizeof(fault),"%s: timeout",messages[i]);
+        record(&rtk,ctx,fault); reset(); apple_rtkit_syslog_rx_log(&rtk,0);
+        assert(infos==1 && !debugs && acks==1);
+        record(&rtk,"other.cpp:2096",messages[i]); reset(); apple_rtkit_syslog_rx_log(&rtk,0);
+        assert(infos==1 && !debugs && acks==1);
+    }
+    puts("PASS complete transition records use debug; faults and foreign contexts use info; all ACK");
+    record(&rtk,"UPPipeDCP_H17P.cpp:2096","set_run_mode_safe: deferring: 4 -> 1\r\n ");
+    reset(); apple_rtkit_syslog_rx_log(&rtk,0);
+    assert(debugs==1 && acks==1); /* Existing trimming precedes policy. */
+    ops.syslog_is_debug=NULL;
+    reset(); apple_rtkit_syslog_rx_log(&rtk,0);
+    assert(infos==1 && !debugs && !calls && acks==1);
+    ops.syslog_is_debug=policy;
+    record(&rtk,"UPPipeDCP_H17P.cpp:2096","set_run_mode_safe: error -110");
+    reset(); apple_rtkit_syslog_rx_log(&rtk,0);
+    assert(infos==1 && !debugs && acks==1);
+    rtk.syslog_inherited=true;
+    reset(); apple_rtkit_syslog_rx_log(&rtk,0);
+    assert(!calls && !copies && !infos && !debugs && acks==1);
+    rtk.syslog_inherited=false; rtk.syslog_n_entries=0;
+    reset(); apple_rtkit_syslog_rx_log(&rtk,0);
+    assert(warnings==1 && !calls && !copies && acks==1);
+    puts("PASS default info, trimming, inherited and invalid records retain transport behavior");
+    return 0;
+}
+'''

@@ -49,6 +49,7 @@
 #include "dcp-fabric-effects.h"
 #include "dcp-fabric.h"
 #include "dcp-hdmi.h"
+#include "dcp-syslog.h"
 #include "dcpext_scanout.h"
 #include "dcp-internal.h"
 #include "dcp-external-bw.h"
@@ -882,8 +883,14 @@ static struct apple_rtkit_ops rtkit_ops = {
 	.shmem_destroy = dcp_rtk_shmem_destroy,
 };
 
+static bool dcp_rtk_syslog_is_debug(void *cookie, const char *context, const char *message)
+{
+	return dcp_h17p_syslog_is_debug(context, message);
+}
+
 static const struct apple_rtkit_ops external_h17p_rtkit_ops = {
 	.flags = APPLE_RTKIT_COPROC_PLACES_BUFFERS,
+	.syslog_is_debug = dcp_rtk_syslog_is_debug,
 	.crashed = dcp_rtk_crashed,
 	.recv_message = dcp_recv_msg,
 	.shmem_setup = dcp_rtk_shmem_setup,
