@@ -35,19 +35,21 @@ static int dwc3_core_init(struct dwc3 *d)
 		assert(phy_init(d->usb3_generic_phy[i]) == 0);
 	return dwc3_phy_power_on(d);
 }
-static int dwc3_apple_core_probe(struct dwc3_apple *a)
+static int dwc3_apple_core_probe(struct dwc3_apple *a, enum dwc3_apple_state s)
 {
+	(void)s;
 	int ret = dwc3_core_init(&a->dwc);
 	if (!ret)
 		a->state = DWC3_APPLE_NO_CABLE;
 	return ret;
 }
-static void dwc3_apple_set_role(struct dwc3_apple *a, enum dwc3_apple_state s)
+static int dwc3_apple_set_role(struct dwc3_apple *a, enum dwc3_apple_state s)
 {
 	assert(atcphy_usb3_set_mode(a->usb3_phy,
 				    s == DWC3_APPLE_HOST ? PHY_MODE_USB_HOST :
 							   PHY_MODE_USB_DEVICE,
 				    0) == 0);
+	return 0;
 }
 struct fixture {
 	struct apple_atcphy atc;
