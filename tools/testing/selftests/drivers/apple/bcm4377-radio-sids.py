@@ -103,7 +103,8 @@ struct apple_dart {
     u16 managed_sids, version;
     bool locked, managed_failed, managed_lock, retained, retained_mtp, supports_bypass;
     bool four_level, per_stream, tunneled, fw_mirror, fw_handoff;
-    bool pending;
+    bool pending, preserve_display;
+    void *dcp, *frontend[2];
     struct { bool ready; } iommu;
     void *dev;
     unsigned pgsize;
@@ -199,6 +200,8 @@ static int apple_dart_hw_sync_locked(struct io_pgtable_cfg *c, struct apple_dart
 { (void)c; (void)m; (void)b; abort(); }
 static int apple_dart_fw_invalidate(struct apple_dart_stream_map *m, u64 a, u64 b)
 { (void)m; (void)a; (void)b; abort(); }
+static int apple_dart_dcp_domain_flush(struct apple_dart_domain *d)
+{ (void)d; abort(); }
 #define DART_T8110_TLB_CMD_OP_FLUSH_SID 1
 #define for_each_stream_map(i,base,m) for ((i)=0,(m)=&(base)->stream_maps[0]; \
     (i)<MAX_DARTS_PER_DEVICE && (m)->dart; (m)=&(base)->stream_maps[++(i)])
@@ -259,6 +262,8 @@ static u32 apple_pcie_port_readl(struct apple_pcie_port *p, unsigned o)
     assert(o<16); return p->entries[o];
 }
 '''
+    display = (root / 'drivers/iommu/apple-dart-dcp.h').read_text()
+    code += definition(display, 'static bool apple_dart_has_borrowed(') + '\n'
     for name in ('static int apple_pcie_managed_sid_mask(',
                  'static int apple_pcie_managed_word(',
                  'static int apple_pcie_managed_admit('):
@@ -437,6 +442,9 @@ int main(void)
     active_cfg=&cfg;
     assert(apple_dart_def_domain_type(&dev)==IOMMU_DOMAIN_DMA);
     d.managed_sids=0;
+    d.frontend[0]=&d;
+    assert(apple_dart_def_domain_type(&dev)==IOMMU_DOMAIN_DMA);
+    d.frontend[0]=NULL;
     assert(apple_dart_def_domain_type(&dev)==IOMMU_DOMAIN_IDENTITY); /* legacy J713 */
     board_j713=false;
     assert(apple_dart_def_domain_type(&dev)==0); /* other machines retain default */
@@ -590,7 +598,7 @@ int main(void)
                 assert tested.count(enable) == 1
                 tested = tested.replace(enable, enable + "\n" + block)
             elif control == "missing-failure-quarantine":
-                block = "\tif (dart->retained && !READ_ONCE(dart->managed_failed))\n\t\tapple_dart_managed_quarantine(dart);\n"
+                block = "\tif (dart->managed_sids && dart->retained && !READ_ONCE(dart->managed_failed))\n\t\tapple_dart_managed_quarantine(dart);\n"
                 assert tested.count(block) == 1
                 tested = tested.replace(block, '')
             c.write_text(tested)
