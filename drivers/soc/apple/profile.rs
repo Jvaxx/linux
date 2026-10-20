@@ -51,7 +51,8 @@ pub(crate) enum IdentitySource {
     /// and the boot chain forwards. A malformed or absent property is refused;
     /// the identity is never invented.
     Chosen,
-    /// A UUID provisioned in the Linux host-state store on first bring-up.
+    /// Reserved declaration; the current selector does not implement this policy.
+    /// Wiring it up on an enrolled install would change its anti-replay lane.
     HostPersisted,
 }
 
@@ -616,6 +617,12 @@ mod tests {
         ] {
             assert!(!t6020_uses_sepos13(Some(raw)));
         }
+    }
+
+    #[test]
+    fn neo_keeps_its_existing_chosen_identity_policy() {
+        // A host-persisted default would strand existing chosen-lane enrolments.
+        assert!(T8140.identity == IdentitySource::Chosen);
     }
 
     #[test]

@@ -20,6 +20,7 @@ mod hwrng;
 mod image;
 mod keybag;
 mod keybag_identity;
+mod os_identity;
 mod pm;
 mod profile;
 mod proto;
@@ -1538,26 +1539,21 @@ impl SepData {
     fn prepare_os_uuid(&self) {
         let hi = module_parameters::os_uuid_hi.value();
         let lo = module_parameters::os_uuid_lo.value();
-        if hi != 0 || lo != 0 {
-            let mut uuid = [0u8; 16];
-            uuid[..8].copy_from_slice(&hi.to_be_bytes());
-            uuid[8..].copy_from_slice(&lo.to_be_bytes());
-            self.xarm.lock().os_uuid = Some(uuid);
-            dev_info!(
-                self.dev,
-                "xART: using explicit OS UUID {:016x}-{:016x}\n",
-                hi,
-                lo
-            );
-            return;
-        }
-
-        if let Some(uuid) = dt::preboot_uuid() {
-            self.xarm.lock().os_uuid = Some(uuid);
-            dev_info!(self.dev, "xART: using /chosen/apfs-preboot-uuid\n");
-        } else {
-            self.xarm.lock().os_uuid = None;
-            dev_warn!(self.dev, "xART: /chosen/apfs-preboot-uuid is unavailable\n");
+        // Keep the existing lane on installed systems. The tested selector
+        // never invents an identity or lets a profile override explicit params.
+        match os_identity::select(hi, lo, dt::preboot_uuid) {
+            os_identity::Selection::Explicit(uuid) => {
+                self.xarm.lock().os_uuid = Some(uuid);
+                dev_info!(self.dev, "xART: using explicit OS identity\n");
+            }
+            os_identity::Selection::Chosen(uuid) => {
+                self.xarm.lock().os_uuid = Some(uuid);
+                dev_info!(self.dev, "xART: using /chosen/apfs-preboot-uuid\n");
+            }
+            os_identity::Selection::Unavailable => {
+                self.xarm.lock().os_uuid = None;
+                dev_warn!(self.dev, "xART: /chosen/apfs-preboot-uuid is unavailable\n");
+            }
         }
     }
 
