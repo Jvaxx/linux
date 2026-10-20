@@ -7,11 +7,13 @@
  * Copyright (C) 2012 ARM Ltd.
  */
 #include <linux/compat.h>
+#include <linux/binfmts.h>
 #include <linux/efi.h>
 #include <linux/elf.h>
 #include <linux/export.h>
 #include <linux/sched.h>
 #include <linux/sched/debug.h>
+#include <linux/sched/mm.h>
 #include <linux/sched/task.h>
 #include <linux/sched/task_stack.h>
 #include <linux/kernel.h>
@@ -884,6 +886,37 @@ unsigned long arch_align_stack(unsigned long sp)
 	return sp & ~0xf;
 }
 
+#ifdef CONFIG_ARM64_USER4K_EXPERIMENTAL
+int arm64_bprm_prepare_mm(struct linux_binprm *bprm, bool compat)
+{
+	/* Without user4k=on every image, AArch32 included, stays native. */
+	bool enabled = user4k_enabled();
+	bool has_4k = enabled && cpus_have_final_cap(ARM64_HAS_USER4K_GRANULE);
+	unsigned int requested = 0, shift;
+
+	if (enabled)
+		requested = current->exec_page_shift ?:
+			    current->default_exec_page_shift;
+	shift = arm64_exec_page_shift(compat, has_4k, PAGE_SHIFT, requested);
+
+	/* begin_new_exec() falls back to this if the exec gains privilege. */
+	bprm->secure_page_shift = arm64_exec_page_shift(compat, has_4k,
+							PAGE_SHIFT, 0);
+	return bprm_set_page_shift(bprm, shift);
+}
+
+/*
+ * Return zero for the native default, or a validated alternative shift.
+ * Every alternative is refused with -EINVAL unless booted with user4k=on.
+ */
+int arch_exec_page_size_shift(unsigned long size)
+{
+	return arm64_exec_page_size_request(size, user4k_enabled(),
+			cpus_have_final_cap(ARM64_HAS_USER4K_GRANULE),
+			cpus_have_final_cap(ARM64_HAS_USER16K_GRANULE));
+}
+#endif
+
 #ifdef CONFIG_COMPAT
 int compat_elf_check_arch(const struct elf32_hdr *hdr)
 {
@@ -911,10 +944,10 @@ int compat_elf_check_arch(const struct elf32_hdr *hdr)
  */
 void arch_setup_new_exec(void)
 {
-	unsigned long mmflags = 0;
+	unsigned long mmflags = current->mm->context.flags & MMCF_USER_GRANULE;
 
 	if (is_compat_task()) {
-		mmflags = MMCF_AARCH32;
+		mmflags |= MMCF_AARCH32;
 
 		/*
 		 * Restrict the CPU affinity mask for a 32-bit task so that

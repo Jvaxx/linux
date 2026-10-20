@@ -105,6 +105,10 @@ struct vma_merge_struct {
 	unsigned long end;
 	pgoff_t pgoff;
 	pgoff_t anon_pgoff;
+#ifdef CONFIG_MM_SUBPAGE
+	/* Byte offset within pgoff; the anonymous page offset shares it. */
+	unsigned int subpage_offset;
+#endif
 
 	union {
 		/* Temporary while VMA flags are being converted. */
@@ -250,9 +254,37 @@ static inline pgoff_t vmg_start_pgoff(const struct vma_merge_struct *vmg)
 	return vmg->pgoff;
 }
 
+static inline struct vm_page_offset vmg_page_offset(const struct vma_merge_struct *vmg)
+{
+	return (struct vm_page_offset) {
+		.index = vmg->pgoff,
+#ifdef CONFIG_MM_SUBPAGE
+		.offset = vmg->subpage_offset,
+#endif
+	};
+}
+
+static inline void vmg_set_page_offset(struct vma_merge_struct *vmg, struct vm_page_offset pos)
+{
+	vmg->pgoff = pos.index;
+#ifdef CONFIG_MM_SUBPAGE
+	vmg->subpage_offset = pos.offset;
+#endif
+}
+
+/* Position of the byte following the proposed range. */
+static inline struct vm_page_offset vmg_end_page_offset(const struct vma_merge_struct *vmg)
+{
+	return vm_page_offset_add(vmg_page_offset(vmg), vmg->end - vmg->start);
+}
+
 static inline pgoff_t vmg_end_pgoff(const struct vma_merge_struct *vmg)
 {
+#ifdef CONFIG_MM_SUBPAGE
+	return vmg_end_page_offset(vmg).index;
+#else
 	return vmg_start_pgoff(vmg) + vmg_pages(vmg);
+#endif
 }
 
 static inline void assert_sane_pgoff(struct vm_area_struct *vma, pgoff_t pgoff)
@@ -284,6 +316,19 @@ static inline void vma_set_pgoff(struct vm_area_struct *vma, pgoff_t pgoff)
 	vma->vm_pgoff = pgoff;
 }
 
+/*
+ * The byte offset within the native page at vm_pgoff. The anonymous page
+ * offset of a MAP_PRIVATE file-backed VMA uses the same byte offset, so both
+ * page offsets advance together when the VMA start moves.
+ */
+static inline void vma_set_subpage_offset(struct vm_area_struct *vma,
+					  unsigned int offset)
+{
+#ifdef CONFIG_MM_SUBPAGE
+	vma->vm_subpage_offset = offset;
+#endif
+}
+
 static inline pgoff_t vmg_start_anon_pgoff(const struct vma_merge_struct *vmg)
 {
 	return vmg->anon_pgoff;
@@ -291,7 +336,11 @@ static inline pgoff_t vmg_start_anon_pgoff(const struct vma_merge_struct *vmg)
 
 static inline pgoff_t vmg_end_anon_pgoff(const struct vma_merge_struct *vmg)
 {
+#ifdef CONFIG_MM_SUBPAGE
+	return vmg_start_anon_pgoff(vmg) + (vmg_end_pgoff(vmg) - vmg_start_pgoff(vmg));
+#else
 	return vmg_start_anon_pgoff(vmg) + vmg_pages(vmg);
+#endif
 }
 
 static inline void __vma_set_anon_pgoff(struct vm_area_struct *vma, pgoff_t pgoff)
@@ -322,6 +371,30 @@ static inline void vma_sub_pgoff(struct vm_area_struct *vma, pgoff_t delta)
 	vma_set_anon_pgoff(vma, vma_start_anon_pgoff(vma) - delta);
 }
 
+/* Position of the byte following @vma, i.e. a contiguous successor's start. */
+static inline struct vm_page_offset vma_end_page_offset(const struct vm_area_struct *vma)
+{
+	return vma_page_offset_at(vma, vma->vm_end);
+}
+
+/* Anonymous page offset of the byte following @vma. */
+static inline pgoff_t vma_next_anon_pgoff(const struct vm_area_struct *vma)
+{
+#ifdef CONFIG_MM_SUBPAGE
+	return vma_start_anon_pgoff(vma) +
+		(vma_end_page_offset(vma).index - vma_start_pgoff(vma));
+#else
+	return vma_end_anon_pgoff(vma);
+#endif
+}
+
+#ifdef CONFIG_MM_SUBPAGE
+#define VMG_SUBPAGE_STATE(vma, start) \
+	.subpage_offset = vma_page_offset_at(vma, start).offset,
+#else
+#define VMG_SUBPAGE_STATE(vma, start)
+#endif
+
 #define VMG_STATE(name, mm_, vmi_, start_, end_, vma_flags_, pgoff_, anon_pgoff_) \
 	struct vma_merge_struct name = {					  \
 		.mm = mm_,							  \
@@ -346,6 +419,7 @@ static inline void vma_sub_pgoff(struct vm_area_struct *vma, pgoff_t delta)
 		.vm_flags = vma_->vm_flags,				\
 		.pgoff = linear_page_index(vma_, start_),		\
 		.anon_pgoff = __linear_anon_page_index(vma_, start_),	\
+		VMG_SUBPAGE_STATE(vma_, start_)				\
 		.file = vma_->vm_file,					\
 		.anon_vma = vma_->anon_vma,				\
 		.policy = vma_policy(vma_),				\
@@ -397,6 +471,9 @@ static inline void compat_set_vma_from_desc(struct vm_area_struct *vma,
 
 	/* Mutable fields. Populated with initial state. */
 	vma_set_pgoff(vma, desc->pgoff);
+#ifdef CONFIG_MM_SUBPAGE
+	vma->vm_subpage_offset = desc->subpage_offset;
+#endif
 	if (desc->vm_file != vma->vm_file)
 		vma_set_file(vma, desc->vm_file);
 	vma->flags = desc->vma_flags;
@@ -534,7 +611,7 @@ void unlink_file_vma_batch_add(struct unlink_vma_file_batch *vb,
 			       struct vm_area_struct *vma);
 
 struct vm_area_struct *copy_vma(struct vm_area_struct **vmap,
-	unsigned long addr, unsigned long len, pgoff_t pgoff,
+	unsigned long addr, unsigned long len, struct vm_page_offset pos,
 	pgoff_t anon_pgoff, bool *need_rmap_locks, bool keep_source);
 
 struct anon_vma *find_mergeable_anon_vma(struct vm_area_struct *vma);
@@ -546,7 +623,7 @@ int mm_take_all_locks(struct mm_struct *mm);
 void mm_drop_all_locks(struct mm_struct *mm);
 
 unsigned long mmap_region(struct file *file, unsigned long addr,
-		unsigned long len, vma_flags_t vma_flags, unsigned long pgoff,
+		unsigned long len, vma_flags_t vma_flags, struct vm_page_offset pos,
 		struct list_head *uf);
 
 int do_brk_flags(struct vma_iterator *vmi, struct vm_area_struct *brkvma,

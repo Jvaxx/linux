@@ -26,6 +26,7 @@
 #include <linux/delayacct.h>
 #include <linux/zswap.h>
 #include <linux/swap_ops.h>
+#include <linux/mutex.h>
 #include "swap.h"
 #include "swap_table.h"
 
@@ -367,6 +368,77 @@ static void swap_add_folio(struct swap_io_ctx *ctx, struct folio *folio, int rw)
 	}
 }
 
+#ifdef CONFIG_MM_SUBPAGE
+static DEFINE_MUTEX(swap_extent_io_mutex);
+static struct bio_set swap_extent_bioset;
+
+int swap_extent_io_init(void)
+{
+	int ret = 0;
+
+	/* Swapon prepares the reserve before any reclaim can use this file. */
+	mutex_lock(&swap_extent_io_mutex);
+	if (!bioset_initialized(&swap_extent_bioset))
+		ret = bioset_init(&swap_extent_bioset, SWAP_CLUSTER_MAX, 0,
+				 BIOSET_NEED_RESCUER);
+	mutex_unlock(&swap_extent_io_mutex);
+	return ret;
+}
+
+/*
+ * A mandatory large base page cannot split to fit a swap-file extent. Chain
+ * each physical run to the original bio: its folio completion must wait for
+ * every run, including on partial I/O or allocation failure.
+ * swap_bdev_can_merge() keeps such a folio alone in its bio.
+ */
+static void swap_submit_bio(struct bio *bio, void *private)
+{
+	struct folio *folio = private;
+	struct swap_info_struct *sis = __swap_entry_to_info(folio->swap);
+	swp_entry_t entry = folio->swap;
+
+	if (!(READ_ONCE(sis->flags) & SWP_BLKDEV) && folio_test_large(folio)) {
+		while (true) {
+			unsigned long nr = bio->bi_iter.bi_size >> PAGE_SHIFT;
+			unsigned int bytes;
+			struct bio *split;
+
+			bio->bi_iter.bi_sector = swap_extent_sector(entry, &nr);
+			bytes = nr << PAGE_SHIFT;
+			if (bytes == bio->bi_iter.bi_size)
+				break;
+			/* The unsubmitted parent may own a bio from fs_bio_set. */
+			split = bio_split(bio, bytes >> 9, GFP_NOIO, &swap_extent_bioset);
+			if (IS_ERR(split)) {
+				bio->bi_status = BLK_STS_RESOURCE;
+				bio_endio(bio);
+				return;
+			}
+			bio_chain(split, bio);
+			submit_bio(split);
+			entry.val += nr;
+		}
+	}
+	submit_bio(bio);
+}
+
+static void swap_submit_bio_wait(struct bio *bio, struct folio *folio)
+{
+	bio_await(bio, folio, swap_submit_bio);
+}
+#else
+/* Without subpage support, large folios never reach a swap file. */
+static inline void swap_submit_bio(struct bio *bio, void *private)
+{
+	submit_bio(bio);
+}
+
+static inline void swap_submit_bio_wait(struct bio *bio, struct folio *folio)
+{
+	submit_bio_wait(bio);
+}
+#endif
+
 void __swap_writepage(struct swap_io_ctx *ctx, struct folio *folio)
 {
 	VM_BUG_ON_FOLIO(!folio_test_swapcache(folio), folio);
@@ -599,11 +671,11 @@ static void swap_bdev_submit_write(struct swap_io_ctx *ctx)
 	bio_associate_blkg_from_page(bio, bio_first_folio_all(bio));
 
 	if (ctx->sis->flags & SWP_SYNCHRONOUS_IO) {
-		submit_bio_wait(bio);
+		swap_submit_bio_wait(bio, bio_first_folio_all(bio));
 		end_swap_bio_write(bio);
 	} else {
 		bio->bi_end_io = end_swap_bio_write;
-		submit_bio(bio);
+		swap_submit_bio(bio, bio_first_folio_all(bio));
 	}
 }
 
@@ -624,18 +696,24 @@ static void swap_bdev_submit_read(struct swap_io_ctx *ctx)
 		 * time check.
 		 */
 		get_task_struct(current);
-		submit_bio_wait(bio);
+		swap_submit_bio_wait(bio, bio_first_folio_all(bio));
 		swap_bio_read_end_io(bio);
 		put_task_struct(current);
 	} else {
 		bio->bi_end_io = swap_bio_read_end_io;
-		submit_bio(bio);
+		swap_submit_bio(bio, bio_first_folio_all(bio));
 	}
 }
 
 static bool swap_bdev_can_merge(struct folio *folio, struct folio *prev_folio,
 		size_t prev_folio_size, int rw)
 {
+	struct swap_info_struct *sis = __swap_entry_to_info(folio->swap);
+
+	/* swap_submit_bio() splits a large folio at swap-file extent ends. */
+	if (IS_ENABLED(CONFIG_MM_SUBPAGE) && !(READ_ONCE(sis->flags) & SWP_BLKDEV) &&
+	    (folio_test_large(folio) || folio_test_large(prev_folio)))
+		return false;
 	if (swap_folio_sector(folio) !=
 	    swap_folio_sector(prev_folio) + (prev_folio_size >> SECTOR_SHIFT))
 		return false;

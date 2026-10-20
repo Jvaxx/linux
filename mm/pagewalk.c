@@ -4,6 +4,7 @@
 #include <linux/sched.h>
 #include <linux/hugetlb.h>
 #include <linux/mmu_context.h>
+#include <linux/overflow.h>
 #include <linux/swap.h>
 
 #include <asm/tlbflush.h>
@@ -30,13 +31,14 @@ static int walk_pte_range_inner(pte_t *pte, unsigned long addr,
 				unsigned long end, struct mm_walk *walk)
 {
 	const struct mm_walk_ops *ops = walk->ops;
+	const unsigned long page_size = mm_page_size(walk->mm);
 	int err = 0;
 
 	for (;;) {
 		if (ops->install_pte && pte_none(ptep_get(pte))) {
 			pte_t new_pte;
 
-			err = ops->install_pte(addr, addr + PAGE_SIZE, &new_pte,
+			err = ops->install_pte(addr, addr + page_size, &new_pte,
 					       walk);
 			if (err)
 				break;
@@ -46,13 +48,13 @@ static int walk_pte_range_inner(pte_t *pte, unsigned long addr,
 			if (!WARN_ON_ONCE(walk->no_vma))
 				update_mmu_cache(walk->vma, addr, pte);
 		} else {
-			err = ops->pte_entry(pte, addr, addr + PAGE_SIZE, walk);
+			err = ops->pte_entry(pte, addr, addr + page_size, walk);
 			if (err)
 				break;
 		}
-		if (addr >= end - PAGE_SIZE)
+		if (addr >= end - page_size)
 			break;
-		addr += PAGE_SIZE;
+		addr += page_size;
 		pte++;
 	}
 	return err;
@@ -67,15 +69,15 @@ static int walk_pte_range(pmd_t *pmd, unsigned long addr, unsigned long end,
 
 	if (walk->no_vma) {
 		/*
-		 * pte_offset_map() might apply user-specific validation.
+		 * pte_offset_map_mm() might apply user-specific validation.
 		 * Indeed, on x86_64 the pmd entries set up by init_espfix_ap()
 		 * fit its pmd_bad() check (_PAGE_NX set and _PAGE_RW clear),
 		 * and CONFIG_EFI_PGT_DUMP efi_mm goes so far as to walk them.
 		 */
 		if (walk->mm == &init_mm || addr >= TASK_SIZE)
-			pte = pte_offset_kernel(pmd, addr);
+			pte = pte_offset_kernel_mm(walk->mm, pmd, addr);
 		else
-			pte = pte_offset_map(pmd, addr);
+			pte = pte_offset_map_mm(walk->mm, pmd, addr);
 		if (pte) {
 			err = walk_pte_range_inner(pte, addr, end, walk);
 			if (walk->mm != &init_mm && addr < TASK_SIZE)
@@ -123,11 +125,11 @@ static int walk_pmd_range(pud_t *pud, unsigned long addr, unsigned long end,
 		return 0;
 	}
 
-	pmd = pmd_offset(pud, addr);
+	pmd = pmd_offset_mm(walk->mm, pud, addr);
 	do {
 again:
 		walk->action = ACTION_SUBTREE;
-		next = pmd_addr_end(addr, end);
+		next = pmd_addr_end_mm(walk->mm, addr, end);
 		if (pmd_none(*pmd)) {
 			if (has_install)
 				err = __pte_alloc(walk->mm, pmd);
@@ -192,11 +194,11 @@ static int walk_pud_range(p4d_t *p4d, unsigned long addr, unsigned long end,
 	int err = 0;
 	int depth = real_depth(2);
 
-	pud = pud_offset(p4d, addr);
+	pud = pud_offset_mm(walk->mm, p4d, addr);
 	do {
  again:
 		walk->action = ACTION_SUBTREE;
-		next = pud_addr_end(addr, end);
+		next = pud_addr_end_mm(walk->mm, addr, end);
 		if (pud_none(*pud)) {
 			if (has_install)
 				err = __pmd_alloc(walk->mm, pud, addr);
@@ -256,10 +258,10 @@ static int walk_p4d_range(pgd_t *pgd, unsigned long addr, unsigned long end,
 	int err = 0;
 	int depth = real_depth(1);
 
-	p4d = p4d_offset(pgd, addr);
+	p4d = p4d_offset_mm(walk->mm, pgd, addr);
 	do {
-		next = p4d_addr_end(addr, end);
-		if (p4d_none_or_clear_bad(p4d)) {
+		next = p4d_addr_end_mm(walk->mm, addr, end);
+		if (p4d_none_or_clear_bad_mm(walk->mm, p4d)) {
 			if (has_install)
 				err = __pud_alloc(walk->mm, p4d, addr);
 			else if (ops->pte_hole)
@@ -295,11 +297,11 @@ static int walk_pgd_range(unsigned long addr, unsigned long end,
 	int err = 0;
 
 	if (walk->pgd)
-		pgd = walk->pgd + pgd_index(addr);
+		pgd = pgd_offset_pgd_mm(walk->mm, walk->pgd, addr);
 	else
 		pgd = pgd_offset(walk->mm, addr);
 	do {
-		next = pgd_addr_end(addr, end);
+		next = pgd_addr_end_mm(walk->mm, addr, end);
 		if (pgd_none_or_clear_bad(pgd)) {
 			if (has_install)
 				err = __p4d_alloc(walk->mm, pgd, addr);
@@ -767,6 +769,36 @@ int walk_page_vma(struct vm_area_struct *vma, const struct mm_walk_ops *ops,
 	return __walk_page_range(vma->vm_start, vma->vm_end, &walk);
 }
 
+#ifdef CONFIG_MM_SUBPAGE
+/* Clip native file indices to the VMA's exact byte interval. */
+static bool walk_mapping_clip(struct vm_area_struct *vma, pgoff_t first_index,
+			      pgoff_t last_index, unsigned long *start_addr,
+			      unsigned long *end_addr)
+{
+	*start_addr = first_index <= vma_start_pgoff(vma) ? vma->vm_start :
+		vma_address_at_offset(vma, (struct vm_page_offset) { first_index, 0 });
+	*end_addr = last_index >= vma_last_pgoff(vma) ? vma->vm_end :
+		vma_address_at_offset(vma, (struct vm_page_offset) { last_index + 1, 0 });
+	return !IS_ERR_VALUE(*start_addr) && !IS_ERR_VALUE(*end_addr) &&
+	       *start_addr < *end_addr;
+}
+#else
+/* Clip to the vma */
+static bool walk_mapping_clip(struct vm_area_struct *vma, pgoff_t first_index,
+			      pgoff_t last_index, unsigned long *start_addr,
+			      unsigned long *end_addr)
+{
+	pgoff_t vba = vma_start_pgoff(vma);
+	pgoff_t vea = vba + vma_pages(vma);
+	pgoff_t cba = max(first_index, vba);
+	pgoff_t cea = min(last_index + 1, vea);
+
+	*start_addr = ((cba - vba) << PAGE_SHIFT) + vma->vm_start;
+	*end_addr = ((cea - vba) << PAGE_SHIFT) + vma->vm_start;
+	return *start_addr < *end_addr;
+}
+#endif
+
 /**
  * walk_page_mapping - walk all memory areas mapped into a struct address_space.
  * @mapping: Pointer to the struct address_space
@@ -806,27 +838,25 @@ int walk_page_mapping(struct address_space *mapping, pgoff_t first_index,
 		.private	= private,
 	};
 	struct vm_area_struct *vma;
-	pgoff_t vba, vea, cba, cea;
+	pgoff_t last_index;
 	unsigned long start_addr, end_addr;
 	int err = 0;
 
 	if (!check_ops_safe(ops))
 		return -EINVAL;
+	if (IS_ENABLED(CONFIG_MM_SUBPAGE)) {
+		if (!nr)
+			return 0;
+		if (check_add_overflow(first_index, nr - 1, &last_index))
+			return -EINVAL;
+	} else {
+		last_index = first_index + nr - 1;
+	}
 
 	lockdep_assert_held(&mapping->i_mmap_rwsem);
-	mapping_rmap_tree_foreach(vma, mapping, first_index,
-				  first_index + nr - 1) {
-		/* Clip to the vma */
-		vba = vma_start_pgoff(vma);
-		vea = vba + vma_pages(vma);
-		cba = first_index;
-		cba = max(cba, vba);
-		cea = first_index + nr;
-		cea = min(cea, vea);
-
-		start_addr = ((cba - vba) << PAGE_SHIFT) + vma->vm_start;
-		end_addr = ((cea - vba) << PAGE_SHIFT) + vma->vm_start;
-		if (start_addr >= end_addr)
+	mapping_rmap_tree_foreach(vma, mapping, first_index, last_index) {
+		if (!walk_mapping_clip(vma, first_index, last_index,
+				       &start_addr, &end_addr))
 			continue;
 
 		walk.vma = vma;
@@ -922,11 +952,11 @@ struct folio *folio_walk_start(struct folio_walk *fw,
 	if (pgd_none_or_clear_bad(pgdp))
 		goto not_found;
 
-	p4dp = p4d_offset(pgdp, addr);
-	if (p4d_none_or_clear_bad(p4dp))
+	p4dp = p4d_offset_mm(vma->vm_mm, pgdp, addr);
+	if (p4d_none_or_clear_bad_mm(vma->vm_mm, p4dp))
 		goto not_found;
 
-	pudp = pud_offset(p4dp, addr);
+	pudp = pud_offset_mm(vma->vm_mm, p4dp, addr);
 	pud = pudp_get(pudp);
 	if (pud_none(pud))
 		goto not_found;
@@ -935,7 +965,7 @@ struct folio *folio_walk_start(struct folio_walk *fw,
 		ptl = pud_lock(vma->vm_mm, pudp);
 		pud = pudp_get(pudp);
 
-		entry_size = PUD_SIZE;
+		entry_size = pud_size_mm(vma->vm_mm);
 		fw->level = FW_LEVEL_PUD;
 		fw->pudp = pudp;
 		fw->pud = pud;
@@ -957,7 +987,7 @@ struct folio *folio_walk_start(struct folio_walk *fw,
 
 pmd_table:
 	VM_WARN_ON_ONCE(!pud_present(pud) || pud_leaf(pud));
-	pmdp = pmd_offset(pudp, addr);
+	pmdp = pmd_offset_mm(vma->vm_mm, pudp, addr);
 	pmd = pmdp_get_lockless(pmdp);
 	if (pmd_none(pmd))
 		goto not_found;
@@ -966,7 +996,7 @@ pmd_table:
 		ptl = pmd_lock(vma->vm_mm, pmdp);
 		pmd = pmdp_get(pmdp);
 
-		entry_size = PMD_SIZE;
+		entry_size = pmd_size_mm(vma->vm_mm);
 		fw->level = FW_LEVEL_PMD;
 		fw->pmdp = pmdp;
 		fw->pmd = pmd;
@@ -999,7 +1029,7 @@ pte_table:
 		goto not_found;
 	pte = ptep_get(ptep);
 
-	entry_size = PAGE_SIZE;
+	entry_size = mm_page_size(vma->vm_mm);
 	fw->level = FW_LEVEL_PTE;
 	fw->ptep = ptep;
 	fw->pte = pte;
@@ -1026,5 +1056,5 @@ found:
 	else
 		fw->page = NULL;
 	fw->ptl = ptl;
-	return page_folio(page);
+	return page_folio(zeropage ? page : fw->page);
 }

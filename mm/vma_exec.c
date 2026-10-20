@@ -46,6 +46,8 @@ int relocate_vma_down(struct vm_area_struct *vma, unsigned long shift)
 	struct mmu_gather tlb;
 	PAGETABLE_MOVE(pmc, vma, vma, old_start, new_start, length);
 
+	vmg_set_page_offset(&vmg, vma_page_offset_at(vma, old_start));
+
 	BUG_ON(new_start > new_end);
 
 	/*
@@ -146,7 +148,7 @@ int create_init_stack_vma(struct mm_struct *mm, struct vm_area_struct **vmap,
 	 * configured yet.
 	 */
 	vma->vm_end = STACK_TOP_MAX;
-	vma->vm_start = vma->vm_end - PAGE_SIZE;
+	vma->vm_start = vma->vm_end - mm_page_size(mm);
 	if (pgtable_supports_soft_dirty())
 		vma_flags_set(&flags, VMA_SOFTDIRTY_BIT);
 	vma->flags = flags;

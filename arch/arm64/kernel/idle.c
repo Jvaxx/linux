@@ -4,11 +4,16 @@
  */
 
 #include <linux/cpu.h>
+#include <linux/init.h>
 #include <linux/irqflags.h>
+#include <linux/jump_label.h>
 
+#include <asm/apple-idle.h>
 #include <asm/barrier.h>
 #include <asm/cpuidle.h>
 #include <asm/cpufeature.h>
+#include <asm/cputype.h>
+#include <asm/fpsimd.h>
 #include <asm/sysreg.h>
 
 enum {
@@ -34,6 +39,35 @@ static int __init setup_idle(char *arg)
 }
 early_param("idle", setup_idle);
 
+#ifdef CONFIG_ARCH_APPLE
+/*
+ * Preserve general-purpose and FP/SIMD state across WFI on M4 and later
+ * Apple cores. The key is enabled once at boot; elsewhere the check is a
+ * patched-out branch.
+ */
+static DEFINE_STATIC_KEY_FALSE(apple_wfi_loses_regs);
+
+static int __init apple_wfi_quirk_init(void)
+{
+	if (midr_is_apple_m4_or_later(read_cpuid_id())) {
+		static_branch_enable(&apple_wfi_loses_regs);
+		pr_info("Apple: preserving registers across WFI\n");
+	}
+	return 0;
+}
+early_initcall(apple_wfi_quirk_init);
+
+static __always_inline bool apple_wfi_needs_save(void)
+{
+	return static_branch_unlikely(&apple_wfi_loses_regs);
+}
+#else
+static __always_inline bool apple_wfi_needs_save(void)
+{
+	return false;
+}
+#endif
+
 /*
  *	cpu_do_idle()
  *
@@ -50,8 +84,18 @@ void __cpuidle cpu_do_idle(void)
 	arm_cpuidle_save_irq_context(&context);
 
 	if (likely(idle == ARM64_IDLE_WFI)) {
-		dsb(sy);
-		wfi();
+		if (apple_wfi_needs_save()) {
+			/*
+			 * The FP/SIMD registers do not survive either: drop the
+			 * lazy ownership so the next return to userspace reloads
+			 * them, even when the same task resumes on this CPU.
+			 */
+			fpsimd_save_and_flush_cpu_state();
+			apple_cpu_wfi();
+		} else {
+			dsb(sy);
+			wfi();
+		}
 	} else if (idle == ARM64_IDLE_YIELD) {
 		dsb(sy);
 		asm volatile("yield" ::: "memory");

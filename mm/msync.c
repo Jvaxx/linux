@@ -42,12 +42,12 @@ SYSCALL_DEFINE3(msync, unsigned long, start, size_t, len, int, flags)
 
 	if (flags & ~(MS_ASYNC | MS_INVALIDATE | MS_SYNC))
 		goto out;
-	if (offset_in_page(start))
+	if (start & ~mm_page_mask(mm))
 		goto out;
 	if ((flags & MS_ASYNC) && (flags & MS_SYNC))
 		goto out;
 	error = -ENOMEM;
-	len = (len + ~PAGE_MASK) & PAGE_MASK;
+	len = mm_page_align(mm, len);
 	end = start + len;
 	if (end < start)
 		goto out;
@@ -86,7 +86,8 @@ SYSCALL_DEFINE3(msync, unsigned long, start, size_t, len, int, flags)
 			goto out_unlock;
 		}
 		file = vma->vm_file;
-		fstart = (loff_t)linear_page_index(vma, start) << PAGE_SHIFT;
+		fstart = ((loff_t)linear_page_index(vma, start) << PAGE_SHIFT) +
+			 vma_page_offset_at(vma, start).offset;
 		fend = fstart + (min(end, vma->vm_end) - start) - 1;
 		start = vma->vm_end;
 		if ((flags & MS_SYNC) && file &&

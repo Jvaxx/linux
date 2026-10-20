@@ -797,7 +797,14 @@ static vm_fault_t try_insert_pfn(struct vm_fault *vmf, unsigned int order,
 	vm_fault_t ret = VM_FAULT_FALLBACK;
 
 	if (!order) {
+#ifdef CONFIG_MM_SUBPAGE
+		struct vm_page_offset pos = vma_page_offset_at(vmf->vma, vmf->address);
+
+		ret = vmf_insert_pfn_prot_mkwrite_offset(vmf->vma, vmf->address,
+			pfn, pos.offset, vmf->vma->vm_page_prot, write);
+#else
 		ret = vmf_insert_pfn_mkwrite(vmf->vma, vmf->address, pfn, write);
+#endif
 #ifdef CONFIG_ARCH_SUPPORTS_PMD_PFNMAP
 	} else if (order == PMD_ORDER) {
 		unsigned long paddr = pfn << PAGE_SHIFT;
@@ -834,7 +841,7 @@ static vm_fault_t drm_gem_shmem_any_fault(struct vm_fault *vmf, unsigned int ord
 	struct folio *folio;
 	unsigned long pfn;
 
-	if (order && order != PMD_ORDER)
+	if (order && (order != PMD_ORDER || mm_page_size(vma->vm_mm) != PAGE_SIZE))
 		return VM_FAULT_FALLBACK;
 
 	dma_resv_lock(obj->resv, NULL);
@@ -989,6 +996,19 @@ int drm_gem_shmem_mmap(struct drm_gem_shmem_object *shmem, struct vm_area_struct
 
 	if (vma_is_cow_mapping(vma))
 		return -EINVAL;
+
+#ifdef CONFIG_MM_SUBPAGE
+	/* Validate bytes, including a partial native-page offset from PRIME. */
+	{
+		pgoff_t index = drm_gem_shmem_object_offset(obj, vma->vm_pgoff);
+		unsigned long offset, length = vma->vm_end - vma->vm_start;
+
+		if (check_mul_overflow(index, PAGE_SIZE, &offset) ||
+		    check_add_overflow(offset, (unsigned long)vma_subpage_offset(vma), &offset) ||
+		    offset > obj->size || length > obj->size - offset)
+			return -EINVAL;
+	}
+#endif
 
 	/* Revocation zaps the device anon mapping only. */
 	if (shmem->reclaimable_cpu_mappings &&

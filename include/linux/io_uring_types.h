@@ -552,6 +552,9 @@ struct io_ring_ctx {
 	struct io_mapped_region		param_region;
 
 	struct kcov_common_handle_id	kcov_handle;
+#ifdef CONFIG_MM_SUBPAGE
+	struct io_fragment_account	*fragment_account;
+#endif
 };
 
 /*

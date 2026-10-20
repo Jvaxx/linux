@@ -7,6 +7,7 @@
  */
 
 #include <linux/mman.h>
+#include <linux/mm_subpage.h>
 #include <linux/pagemap.h>
 #include <linux/syscalls.h>
 #include <linux/mempolicy.h>
@@ -202,7 +203,7 @@ static int swapin_walk_pmd_entry(pmd_t *pmd, unsigned long start,
 	spinlock_t *ptl;
 	unsigned long addr;
 
-	for (addr = start; addr < end; addr += PAGE_SIZE) {
+	for (addr = start; addr < end; addr += mm_page_size(vma->vm_mm)) {
 		pte_t pte;
 		softleaf_t entry;
 		struct folio *folio;
@@ -245,7 +246,7 @@ static void shmem_swapin_range(struct vm_area_struct *vma,
 		struct address_space *mapping)
 {
 	XA_STATE(xas, &mapping->i_pages, linear_page_index(vma, start));
-	pgoff_t end_index = linear_page_index(vma, end) - 1;
+	pgoff_t end_index = linear_page_index(vma, end - 1);
 	struct folio *folio;
 	struct swap_io_ctx ctx = {};
 
@@ -261,8 +262,11 @@ static void shmem_swapin_range(struct vm_area_struct *vma,
 		if (!softleaf_is_swap(entry))
 			continue;
 
-		addr = vma->vm_start +
-			((xas.xa_index - vma_start_pgoff(vma)) << PAGE_SHIFT);
+		/* The first cache page may start before this VMA's byte offset. */
+		addr = xas.xa_index == linear_page_index(vma, start) ? start :
+			vma_address_at_offset(vma, (struct vm_page_offset) {
+				.index = xas.xa_index,
+			});
 		xas_pause(&xas);
 		rcu_read_unlock();
 
@@ -327,7 +331,7 @@ static long madvise_willneed(struct madvise_behavior *madv_behavior)
 	mark_mmap_lock_dropped(madv_behavior);
 	get_file(file);
 	offset = (loff_t)(start - vma->vm_start)
-			+ ((loff_t)vma_start_pgoff(vma) << PAGE_SHIFT);
+			+ ((loff_t)vma_start_pgoff(vma) << PAGE_SHIFT) + vma_subpage_offset(vma);
 	mmap_read_unlock(mm);
 	vfs_fadvise(file, offset, end - start, POSIX_FADV_WILLNEED);
 	fput(file);
@@ -349,12 +353,18 @@ static inline bool can_do_file_pageout(struct vm_area_struct *vma)
 	       file_permission(vma->vm_file, MAY_WRITE) == 0;
 }
 
-static inline int madvise_folio_pte_batch(unsigned long addr, unsigned long end,
+static inline int madvise_folio_pte_batch(struct vm_area_struct *vma,
+					  unsigned long addr, unsigned long end,
 					  struct folio *folio, pte_t *ptep,
 					  pte_t *ptentp)
 {
-	int max_nr = (end - addr) / PAGE_SIZE;
+	int max_nr = (end - addr) >> mm_page_shift(vma->vm_mm);
 
+#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(vma->vm_mm) != PAGE_SIZE)
+		return folio_subpage_pte_batch_flags(vma, folio, ptep, ptentp,
+						    max_nr, FPB_MERGE_YOUNG_DIRTY);
+#endif
 	return folio_pte_batch_flags(folio, NULL, ptep, ptentp, max_nr,
 				     FPB_MERGE_YOUNG_DIRTY);
 }
@@ -385,7 +395,7 @@ static int madvise_cold_or_pageout_pte_range(pmd_t *pmd,
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
 	if (pmd_trans_huge(*pmd)) {
 		pmd_t orig_pmd;
-		unsigned long next = pmd_addr_end(addr, end);
+		unsigned long next = pmd_addr_end_mm(mm, addr, end);
 
 		tlb_change_page_size(tlb, HPAGE_PMD_SIZE);
 		ptl = pmd_trans_huge_lock(pmd, vma);
@@ -455,14 +465,14 @@ huge_unlock:
 
 regular_folio:
 #endif
-	tlb_change_page_size(tlb, PAGE_SIZE);
+	tlb_change_page_size(tlb, mm_page_size(mm));
 restart:
 	start_pte = pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
 	if (!start_pte)
 		return 0;
 	flush_tlb_batched_pending(mm);
 	lazy_mmu_mode_enable();
-	for (; addr < end; pte += nr, addr += nr * PAGE_SIZE) {
+	for (; addr < end; pte += nr, addr += nr * mm_page_size(mm)) {
 		nr = 1;
 		ptent = ptep_get(pte);
 
@@ -493,9 +503,10 @@ restart:
 		 * fail to split a folio, leave it in place and advance to the
 		 * next pte in the range.
 		 */
-		if (folio_test_large(folio)) {
-			nr = madvise_folio_pte_batch(addr, end, folio, pte, &ptent);
-			if (nr < folio_nr_pages(folio)) {
+		if (folio_test_large(folio) || mm_page_size(mm) != PAGE_SIZE) {
+			nr = madvise_folio_pte_batch(vma, addr, end, folio, pte, &ptent);
+			if (folio_test_large(folio) &&
+			    nr < (folio_size(folio) >> mm_page_shift(mm))) {
 				int err;
 
 				if (folio_maybe_mapped_shared(folio))
@@ -530,7 +541,8 @@ restart:
 		 * number of pages, it must be exclusive.
 		 */
 		if (!folio_test_lru(folio) ||
-		    folio_mapcount(folio) != folio_nr_pages(folio))
+		    folio_mapcount(folio) !=
+		    (mm_page_size(mm) != PAGE_SIZE ? nr : folio_nr_pages(folio)))
 			continue;
 
 		if (pageout_anon_only_filter && !folio_test_anon(folio))
@@ -658,6 +670,75 @@ static long madvise_pageout(struct madvise_behavior *madv_behavior)
 	return 0;
 }
 
+#ifdef CONFIG_MM_SUBPAGE
+static int madvise_free_subpage_range(pmd_t *pmd, unsigned long addr,
+				     unsigned long end, struct mm_walk *walk)
+{
+	struct vm_area_struct *vma = walk->vma;
+	struct mm_struct *mm = vma->vm_mm;
+	struct mmu_gather *tlb = walk->private;
+	spinlock_t *ptl;
+	pte_t *base, *ptep;
+	long swapped = 0;
+
+	base = ptep = pte_offset_map_lock(mm, pmd, addr, &ptl);
+	if (!base)
+		return 0;
+	flush_tlb_batched_pending(mm);
+	for (; addr < end; addr += mm_page_size(mm), ptep++) {
+		pte_t pte = ptep_get(ptep);
+		struct mm_subpage *slot;
+		struct folio *folio;
+		struct page *page;
+
+		if (!pte_present(pte)) {
+			softleaf_t entry = softleaf_from_pte(pte);
+
+			if (softleaf_is_swap(entry)) {
+				swap_subpage_put(entry,
+						 pte_swp_subpage_offset(pte), true);
+				pte_clear(mm, addr, ptep);
+				swapped--;
+			} else if (softleaf_is_hwpoison(entry) ||
+				   softleaf_is_poison_marker(entry)) {
+				pte_clear(mm, addr, ptep);
+			}
+			continue;
+		}
+		page = vm_normal_page(vma, addr, pte);
+		if (!page)
+			continue;
+		folio = page_folio(page);
+		if (!folio_test_anon(folio) || !folio_trylock(folio))
+			continue;
+		slot = mm_subpage_get_from_phys(pte_phys_mm(mm, pte));
+		if (!slot)
+			goto unlock;
+		if (folio_test_swapcache(folio) && !folio_free_swap(folio))
+			goto put;
+		if (!mm_subpage_mark_lazyfree(slot))
+			goto put;
+		clear_young_dirty_ptes(vma, addr, ptep, 1,
+				      CYDP_CLEAR_YOUNG | CYDP_CLEAR_DIRTY);
+		tlb_remove_tlb_entry(tlb, ptep, addr);
+		/* Partial hints must never clear a neighbor's dirty state. */
+		if (mm_subpage_all_lazyfree(slot)) {
+			folio_clear_dirty(folio);
+			folio_mark_lazyfree(folio);
+		}
+put:
+		mm_subpage_put(slot);
+unlock:
+		folio_unlock(folio);
+	}
+	if (swapped)
+		add_mm_counter(mm, MM_SWAPENTS, swapped);
+	pte_unmap_unlock(base, ptl);
+	cond_resched();
+	return 0;
+}
+#endif
+
 static int madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
 				unsigned long end, struct mm_walk *walk)
 
@@ -673,6 +754,10 @@ static int madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
 	unsigned long next;
 	int nr, max_nr;
 
+	#ifdef CONFIG_MM_SUBPAGE
+	if (mm_page_size(mm) != PAGE_SIZE)
+		return madvise_free_subpage_range(pmd, addr, end, walk);
+#endif
 	next = pmd_addr_end(addr, end);
 	if (pmd_trans_huge(*pmd))
 		if (madvise_free_huge_pmd(tlb, vma, pmd, addr, next))
@@ -723,7 +808,7 @@ static int madvise_free_pte_range(pmd_t *pmd, unsigned long addr,
 		 * next pte in the range.
 		 */
 		if (folio_test_large(folio)) {
-			nr = madvise_folio_pte_batch(addr, end, folio, pte, &ptent);
+			nr = madvise_folio_pte_batch(vma, addr, end, folio, pte, &ptent);
 			if (nr < folio_nr_pages(folio)) {
 				int err;
 
@@ -997,7 +1082,7 @@ static long madvise_populate(struct madvise_behavior *madv_behavior)
 				return -ENOMEM;
 			}
 		}
-		start += pages * PAGE_SIZE;
+		start += pages * mm_page_size(mm);
 	}
 	return 0;
 }
@@ -1031,7 +1116,7 @@ static long madvise_remove(struct madvise_behavior *madv_behavior)
 		return -EACCES;
 
 	offset = (loff_t)(start - vma->vm_start)
-			+ ((loff_t)vma_start_pgoff(vma) << PAGE_SHIFT);
+			+ ((loff_t)vma_start_pgoff(vma) << PAGE_SHIFT) + vma_subpage_offset(vma);
 
 	/*
 	 * Filesystem's fallocate may need to take i_rwsem.  We need to
@@ -1191,7 +1276,7 @@ static long madvise_guard_install(struct madvise_behavior *madv_behavior)
 
 		if (err == 0) {
 			unsigned long nr_expected_pages =
-				PHYS_PFN(range->end - range->start);
+				(range->end - range->start) >> mm_page_shift(vma->vm_mm);
 
 			VM_WARN_ON(nr_pages != nr_expected_pages);
 			return 0;
@@ -1844,18 +1929,21 @@ static void madvise_finish_tlb(struct madvise_behavior *madv_behavior)
 
 /**
  * check_input_range() - Check if the requested range is valid.
+ * @mm:		Target mm; its user page size sets the alignment.
  * @start:	Start address of madvise-requested address range.
  * @len_in:	Length of madvise-requested address range.
+ * @behavior:	Requested madvise behavior.
  *
  * Returns: 0 if the input range is valid, otherwise an error code.
  */
-static int check_input_range(unsigned long start, size_t len_in)
+static int check_input_range(struct mm_struct *mm, unsigned long start,
+			     size_t len_in, int behavior)
 {
 	size_t len;
 
-	if (!PAGE_ALIGNED(start))
+	if (!IS_ALIGNED(start, mm_page_size(mm)))
 		return -EINVAL;
-	len = PAGE_ALIGN(len_in);
+	len = mm_page_align(mm, len_in);
 
 	/* Check to see whether len was rounded up from small -ve to zero */
 	if (len_in && !len)
@@ -1864,6 +1952,20 @@ static int check_input_range(unsigned long start, size_t len_in)
 	if (start + len < start)
 		return -EINVAL;
 
+#ifdef CONFIG_MM_SUBPAGE
+	/* These engines still assume whole native folios/tables. */
+	if (mm_page_size(mm) != PAGE_SIZE) {
+		switch (behavior) {
+		case MADV_MERGEABLE:
+		case MADV_UNMERGEABLE:
+		case MADV_HUGEPAGE:
+		case MADV_COLLAPSE:
+		case MADV_HWPOISON:
+		case MADV_SOFT_OFFLINE:
+			return -EOPNOTSUPP;
+		}
+	}
+#endif
 	return 0;
 }
 
@@ -1907,7 +2009,7 @@ static int madvise_do_behavior(unsigned long start, size_t len_in,
 	}
 
 	range->start = get_untagged_addr(madv_behavior->mm, start);
-	range->end = range->start + PAGE_ALIGN(len_in);
+	range->end = range->start + mm_page_align(madv_behavior->mm, len_in);
 
 	blk_start_plug(&plug);
 	if (is_madvise_populate(madv_behavior))
@@ -2003,7 +2105,7 @@ int do_madvise(struct mm_struct *mm, unsigned long start, size_t len_in, int beh
 	if (!madvise_behavior_valid(behavior))
 		return -EINVAL;
 
-	error = check_input_range(start, len_in);
+	error = check_input_range(mm, start, len_in, behavior);
 	if (error || !len_in)
 		return error;
 
@@ -2048,7 +2150,7 @@ static ssize_t vector_madvise(struct mm_struct *mm, struct iov_iter *iter,
 		size_t len_in = iter_iov_len(iter);
 		int error;
 
-		error = check_input_range(start, len_in);
+		error = check_input_range(mm, start, len_in, behavior);
 		if (error || !len_in)
 			ret = error;
 		else
@@ -2184,9 +2286,9 @@ static int madvise_set_anon_name(struct mm_struct *mm, unsigned long start,
 		.anon_name = anon_name,
 	};
 
-	if (start & ~PAGE_MASK)
+	if (start & ~mm_page_mask(mm))
 		return -EINVAL;
-	len = (len_in + ~PAGE_MASK) & PAGE_MASK;
+	len = mm_page_align(mm, len_in);
 
 	/* Check to see whether len was rounded up from small -ve to zero */
 	if (len_in && !len)

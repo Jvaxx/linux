@@ -92,7 +92,7 @@ void mseal_mmap_page_zero(void)
 	if (WARN_ON_ONCE(!(current->personality & MMAP_PAGE_ZERO)))
 		return;
 
-	err = mseal_range(0, PAGE_SIZE);
+	err = mseal_range(0, mm_page_size(current->mm));
 	if (err)
 		pr_warn_ratelimited("pid=%d, couldn't seal address 0, ret=%d.\n",
 				    task_pid_nr(current), err);
@@ -116,6 +116,7 @@ void mseal_mmap_page_zero(void)
  */
 SYSCALL_DEFINE3(mseal, unsigned long, start, size_t, len, unsigned long, flags)
 {
+	struct mm_struct *mm = current->mm;
 	size_t len_aligned;
 	unsigned long end;
 
@@ -124,10 +125,10 @@ SYSCALL_DEFINE3(mseal, unsigned long, start, size_t, len, unsigned long, flags)
 		return -EINVAL;
 
 	start = untagged_addr(start);
-	if (!PAGE_ALIGNED(start))
+	if (start & ~mm_page_mask(mm))
 		return -EINVAL;
 
-	len_aligned = PAGE_ALIGN(len);
+	len_aligned = mm_page_align(mm, len);
 	/* Check to see whether len was rounded up from small -ve to zero. */
 	if (len && !len_aligned)
 		return -EINVAL;
