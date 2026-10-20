@@ -408,9 +408,9 @@ pub unsafe extern "C" fn apple_pmp_send_power_command(
     // SAFETY: The C bridge serializes calls against unregister in Drop.
     let data = unsafe { &*data.cast::<PmpData>() };
     let message = PM_COMMAND_MARKER
-        | ((command as u64) << PM_COMMAND_SHIFT)
-        | ((device_id as u64) << 40)
-        | ((enabled as u64) << 32);
+        | (u64::from(command) << PM_COMMAND_SHIFT)
+        | (u64::from(device_id) << 40)
+        | (u64::from(enabled) << 32);
     {
         let mut state = data.power_command.lock();
         if !state.begin(command) {

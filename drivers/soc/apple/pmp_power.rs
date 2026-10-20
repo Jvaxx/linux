@@ -18,7 +18,7 @@ impl Command {
         if *self != Self::Idle || !matches!(command, 0x0e | 0x0f) {
             return false;
         }
-        *self = Self::Pending(MARKER | ((command as u64 + 1) << SHIFT));
+        *self = Self::Pending(MARKER | ((u64::from(command) + 1) << SHIFT));
         true
     }
 
