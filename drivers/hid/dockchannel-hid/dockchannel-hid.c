@@ -1267,6 +1267,7 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct dockchannel_hid *dchid;
 	struct device_node *child, *helper;
+	struct fwnode_handle *stm;
 	struct platform_device *helper_pdev;
 	struct property *prop;
 	int ret;
@@ -1281,6 +1282,9 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	}
 
 	dchid->dev = dev;
+	stm = device_get_named_child_node(dev, "stm");
+	dchid->id_ready = !stm || !fwnode_device_is_available(stm);
+	fwnode_handle_put(stm);
 
 	/*
 	 * The STM interface reports the machine's vendor and product IDs,
@@ -1394,8 +1398,7 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 	if (ret)
 		dev_warn(dev, "Failed to set up wakeup: %d\n", ret);
 
-	dchid->new_iface_wq = alloc_workqueue("dchid-new",
-					      WQ_UNBOUND | WQ_MEM_RECLAIM, 0);
+	dchid->new_iface_wq = alloc_ordered_workqueue("dchid-new", 0);
 	if (!dchid->new_iface_wq)
 		return -ENOMEM;
 

@@ -2359,10 +2359,8 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 
 	ret = devm_request_irq(anv->dev, anv->irq, apple_nvme_irq, 0,
 			       "nvme-apple", anv);
-	if (ret) {
-		dev_err_probe(dev, ret, "Failed to request IRQ");
+	if (ret)
 		goto out_detach_genpd;
-	}
 
 	/*
 	 * A post-M4 boot stage may leave RTKit fully running.  Prime the known

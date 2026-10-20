@@ -597,7 +597,7 @@ impl AFKEndpoint {
         // this callback runs.
         let bound_dev = unsafe { dev.as_bound() };
         let iomem = Coherent::<u8>::zeroed_slice(bound_dev, size, GFP_KERNEL)?;
-        let iova = iomem.dma_handle();
+        let iova = iomem.dma_address();
         // Own the buffer before its address leaves the host: should the
         // doorbell fail after the firmware has seen the message, the buffer
         // must not go back to the allocator while the firmware uses it.
@@ -1030,7 +1030,7 @@ impl SetupState {
     }
 
     fn arena_iova(&self) -> Result<u64> {
-        Ok(self.arena.as_ref().ok_or(ENXIO)?.dma_handle())
+        Ok(self.arena.as_ref().ok_or(ENXIO)?.dma_address())
     }
 
     /// Returns a pointer to `len` bytes at `off` in the arena after checking
@@ -2311,7 +2311,6 @@ const HW_CFG_T8140: AopHwConfig = AopHwConfig {
 
 kernel::of_device_table!(
     OF_TABLE,
-    MODULE_OF_TABLE,
     <AopDriver as platform::Driver>::IdInfo,
     [
         (of::DeviceId::new(c_str!("apple,t8103-aop")), &HW_CFG_T8103),

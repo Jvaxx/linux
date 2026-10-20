@@ -1261,9 +1261,7 @@ struct bnxt_irq {
 	irq_handler_t	handler;
 	unsigned int	vector;
 	u8		requested:1;
-	u8		have_cpumask:1;
 	char		name[IFNAMSIZ + BNXT_IRQ_NAME_EXTRA];
-	cpumask_var_t	cpu_mask;
 
 	struct bnxt	*bp;
 	int		msix_nr;
@@ -2470,7 +2468,6 @@ struct bnxt {
 #define BNXT_STATE_ABORT_ERR	5
 #define BNXT_STATE_FW_FATAL_COND	6
 #define BNXT_STATE_DRV_REGISTERED	7
-#define BNXT_STATE_PCI_CHANNEL_IO_FROZEN	8
 #define BNXT_STATE_NAPI_DISABLED	9
 #define BNXT_STATE_FW_ACTIVATE		11
 #define BNXT_STATE_RECOVER		12
@@ -2483,6 +2480,15 @@ struct bnxt {
 	 pci_channel_offline((bp)->pdev))
 
 	struct bnxt_irq	*irq_tbl;
+	/* IRQ affinity, indexed by completion ring. Kept across IRQ
+	 * reallocation, the MSI-X vector index is not stable.
+	 */
+	cpumask_var_t		*ring_cpu_mask;
+	/* Rings for which the mask above was configured from the outside,
+	 * rather than being our own default placement.
+	 */
+	unsigned long		*ring_affinity_set;
+	int			max_irqs;
 	int			total_irqs;
 	int			ulp_num_msix_want;
 	u8			mac_addr[ETH_ALEN];

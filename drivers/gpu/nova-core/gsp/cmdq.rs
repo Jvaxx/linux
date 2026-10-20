@@ -243,7 +243,7 @@ impl DmaGspMem {
         gsp_mem.cpuq.rx = MsgqRxHeader::new();
 
         let gsp_mem: Coherent<_> = gsp_mem.into();
-        PteArray::init(io_project!(gsp_mem, .ptes), gsp_mem.dma_handle())?;
+        PteArray::init(io_project!(gsp_mem, .ptes), gsp_mem.dma_address())?;
 
         Ok(Self(gsp_mem))
     }
@@ -487,8 +487,8 @@ pub(crate) struct Cmdq {
     /// Inner mutex-protected state.
     #[pin]
     inner: Mutex<CmdqInner>,
-    /// DMA handle of the command queue's shared memory region.
-    pub(super) dma_handle: DmaAddress,
+    /// DMA address of the command queue's shared memory region.
+    pub(super) dma_addr: DmaAddress,
 }
 
 impl Cmdq {
@@ -517,7 +517,7 @@ impl Cmdq {
             let gsp_mem = DmaGspMem::new(dev)?;
 
             Ok(try_pin_init!(Self {
-                dma_handle: gsp_mem.0.dma_handle(),
+                dma_addr: gsp_mem.0.dma_address(),
                 inner <- new_mutex!(CmdqInner {
                     dev: dev.into(),
                     gsp_mem,
@@ -654,8 +654,8 @@ impl CmdqInner {
         // SAFETY: `msg_header` and `cmd` are valid references, and not touched if the initializer
         // fails.
         unsafe {
-            msg_element.__init(core::ptr::from_mut(dst.header))?;
-            command.init().__init(core::ptr::from_mut(cmd))?;
+            pin_init::raw_try_init(core::ptr::from_mut(dst.header), msg_element)?;
+            pin_init::raw_try_init(core::ptr::from_mut(cmd), command.init())?;
         }
 
         // Fill the variable-length payload, which may be empty.

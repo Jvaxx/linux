@@ -159,9 +159,13 @@
 #define TPS_SYSTEM_POWER_STATE_S4	0x04
 #define TPS_SYSTEM_POWER_STATE_S5	0x05
 
-/* TPS_REG_POWER_STATUS bits */
-#define TPS_POWER_STATUS_CONNECTION(x)  TPS_FIELD_GET(BIT(0), (x))
-#define TPS_POWER_STATUS_SOURCESINK(x)	TPS_FIELD_GET(BIT(1), (x))
+/* TPS_REG_POWER_STATUS bits (masks shared by TPS_FIELD_GET accessors and FIELD_PREP) */
+#define TPS_POWER_STATUS_CONNECTION_MASK	BIT(0)
+#define TPS_POWER_STATUS_SOURCESINK_MASK	BIT(1)
+#define TPS_POWER_STATUS_CONNECTION(x) \
+	TPS_FIELD_GET(TPS_POWER_STATUS_CONNECTION_MASK, (x))
+#define TPS_POWER_STATUS_SOURCESINK(x) \
+	TPS_FIELD_GET(TPS_POWER_STATUS_SOURCESINK_MASK, (x))
 #define TPS_POWER_STATUS_BC12_DET(x)	TPS_FIELD_GET(BIT(2), (x))
 
 #define TPS_POWER_STATUS_TYPEC_CURRENT_MASK GENMASK(3, 2)
@@ -303,6 +307,7 @@ enum tipd_hw_variant {
 	TIPD_VARIANT_TPS6598X,
 	TIPD_VARIANT_TPS25750,
 	TIPD_VARIANT_SN201202X,
+	TIPD_VARIANT_TPS66993,
 	TIPD_VARIANT_MAX,
 };
 
@@ -323,6 +328,7 @@ struct tipd_data {
 	int (*init)(struct tps6598x *tps);
 	int (*switch_power_state)(struct tps6598x *tps, u8 target_state);
 	bool (*read_data_status)(struct tps6598x *tps);
+	bool (*read_power_status)(struct tps6598x *tps);
 	int (*reset)(struct tps6598x *tps);
 	int (*connect)(struct tps6598x *tps, u32 status);
 	void (*prepare)(struct tps6598x *tps);

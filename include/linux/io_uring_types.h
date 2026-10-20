@@ -1,11 +1,12 @@
 #ifndef IO_URING_TYPES_H
 #define IO_URING_TYPES_H
 
-#include <linux/blkdev.h>
+#include <linux/blk_plug.h>
 #include <linux/hashtable.h>
 #include <linux/task_work.h>
 #include <linux/bitmap.h>
 #include <linux/llist.h>
+#include <linux/uio.h>
 #include <uapi/linux/io_uring.h>
 
 struct iou_loop_params;
@@ -50,6 +51,11 @@ enum io_uring_cmd_flags {
 	/* set when uring wants to cancel a previously issued command */
 	IO_URING_F_CANCEL		= (1 << 11),
 	IO_URING_F_COMPAT		= (1 << 12),
+};
+
+enum {
+	IO_BUF_DEST	= 1 << ITER_DEST,
+	IO_BUF_SOURCE	= 1 << ITER_SOURCE,
 };
 
 struct iou_loop_params;
@@ -316,6 +322,8 @@ enum {
 	IO_RING_F_DRAIN_DISABLED	= BIT(10),
 	IO_RING_F_COMPAT		= BIT(11),
 	IO_RING_F_IOWQ_LIMITS_SET	= BIT(12),
+	/* restrictions were inherited from the task that created the ring */
+	IO_RING_F_RESTRICT_INHERITED	= BIT(13),
 };
 
 struct iou_ctx {};
@@ -542,6 +550,8 @@ struct io_ring_ctx {
 	struct io_mapped_region		ring_region;
 	/* used for optimised request parameter and wait argument passing  */
 	struct io_mapped_region		param_region;
+
+	struct kcov_common_handle_id	kcov_handle;
 #ifdef CONFIG_MM_SUBPAGE
 	struct io_fragment_account	*fragment_account;
 #endif

@@ -666,7 +666,7 @@ impl WorkQueue::ver {
             let _ = cfg;
             false
         };
-        let preempt = match *module_parameters::compute_preempt.value() {
+        let preempt = match module_parameters::compute_preempt.value() {
             -1 => preempt_auto || debug_enabled(DebugFlags::Debug0),
             value => value != 0,
         };

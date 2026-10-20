@@ -386,6 +386,7 @@ unsigned long page_mapped_in_vma(const struct page *page,
 		struct vm_area_struct *vma)
 {
 	const struct folio *folio = page_folio(page);
+	const pgoff_t pgoff = page_pgoff(folio, page);
 	unsigned long address;
 	struct page_vma_mapped_walk pvmw = {
 		.pfn = page_to_pfn(page),
@@ -393,9 +394,13 @@ unsigned long page_mapped_in_vma(const struct page *page,
 		.nr_pages = 1,
 		.vma = vma,
 		.flags = PVMW_SYNC,
+		.pgoff_is_anon = folio_test_anon(folio),
 	};
 
-	address = vma_address(vma, pvmw.pgoff, 1);
+	if (folio_test_anon(folio))
+		address = vma_anon_address(vma, pgoff, 1);
+	else
+		address = vma_filebacked_address(vma, pgoff, 1);
 	pvmw.address = address;
 	if (pvmw.address == -EFAULT)
 		goto out;

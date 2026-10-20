@@ -177,6 +177,25 @@ static const struct thermal_cooling_device_ops mt7915_thermal_ops = {
 	.set_cur_state = mt7915_thermal_set_cur_throttle_state,
 };
 
+static int mt7915_thermal_get_temp(struct thermal_zone_device *tz, int *temp)
+{
+	struct mt7915_phy *phy = thermal_zone_device_priv(tz);
+	int val;
+
+	mutex_lock(&phy->dev->mt76.mutex);
+	val = mt7915_mcu_get_temperature(phy);
+	mutex_unlock(&phy->dev->mt76.mutex);
+	if (val < 0)
+		return val;
+
+	*temp = val * 1000;
+	return 0;
+}
+
+static const struct thermal_zone_device_ops mt7915_tz_ops = {
+	.get_temp = mt7915_thermal_get_temp,
+};
+
 static void mt7915_unregister_thermal(struct mt7915_phy *phy)
 {
 	struct wiphy *wiphy = phy->mt76->hw->wiphy;
@@ -212,6 +231,17 @@ static int mt7915_thermal_init(struct mt7915_phy *phy)
 	/* initialize critical/maximum high temperature */
 	phy->throttle_temp[MT7915_CRIT_TEMP_IDX] = MT7915_CRIT_TEMP;
 	phy->throttle_temp[MT7915_MAX_TEMP_IDX] = MT7915_MAX_TEMP;
+
+	phy->tzone = devm_thermal_of_zone_register(phy->dev->mt76.dev,
+						   phy->mt76->band_idx, phy,
+						   &mt7915_tz_ops);
+	if (IS_ERR(phy->tzone)) {
+		if (PTR_ERR(phy->tzone) != -ENODEV)
+			dev_warn(phy->dev->mt76.dev,
+				 "failed to register thermal zone: %ld\n",
+				 PTR_ERR(phy->tzone));
+		phy->tzone = NULL;
+	}
 
 	if (!IS_REACHABLE(CONFIG_HWMON))
 		return 0;
@@ -1208,6 +1238,12 @@ static void mt7915_unregister_ext_phy(struct mt7915_dev *dev)
 
 static void mt7915_stop_hardware(struct mt7915_dev *dev)
 {
+	int i;
+
+	mt76_for_each_q_rx(&dev->mt76, i) {
+		if (!mt76_queue_is_wed_rro(&dev->mt76.q_rx[i]))
+			napi_disable(&dev->mt76.napi[i]);
+	}
 	mt7915_mcu_exit(dev);
 	mt76_connac2_tx_token_put(&dev->mt76);
 	mt7915_dma_cleanup(dev);

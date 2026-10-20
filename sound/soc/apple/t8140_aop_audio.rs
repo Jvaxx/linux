@@ -2946,7 +2946,7 @@ impl SndSocT8140AopDriver {
                 data.dev.as_raw(),
                 -1,
                 ptr::null(),
-                THIS_MODULE.as_ptr(),
+                kernel::module::this_module::<crate::LocalModule>().as_ptr(),
                 0,
                 &mut this.card,
             )
@@ -3021,7 +3021,7 @@ impl SndSocT8140AopDriver {
         // SAFETY: the descriptor, the DAI table and the controls are heap
         // allocations owned by `this.asoc`, which outlives the component.
         let ret = unsafe {
-            bindings::snd_soc_register_component(
+            bindings::snd_soc_register_component_d(
                 data.dev.as_raw(),
                 &this.asoc.component,
                 this.asoc.dais.get().cast(),
@@ -3197,7 +3197,6 @@ unsafe extern "C" fn hpai_pcm_hw_params(
 
 kernel::of_device_table!(
     OF_TABLE,
-    MODULE_OF_TABLE,
     <SndSocT8140AopDriver as platform::Driver>::IdInfo,
     [(of::DeviceId::new(c_str!("apple,t8140-aop-audio")), ())]
 );

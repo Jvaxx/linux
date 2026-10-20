@@ -40,7 +40,7 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 mod shim { pub fn boottime_ns()->u64 {0} }
 mod module_parameters {
  pub struct Param(u8);
- impl Param { pub fn value(&self)->&u8 {&self.0} }
+ impl Param { pub fn value(&self)->u8 {self.0} }
  #[allow(non_upper_case_globals)] pub static sensor_trace: Param = Param(0);
 }
 struct Profile { nonce_session: bool }

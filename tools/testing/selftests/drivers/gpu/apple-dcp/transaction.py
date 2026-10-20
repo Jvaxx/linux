@@ -316,8 +316,8 @@ def probe(root):
     core = (root / 'drivers/usb/typec/tipd/core.c').read_text()
     unit = quiesce.make_unit(root)
     unit = unit.replace(block(unit, 'int main('), block(unit, 'int main(').replace('int main(', 'int __attribute__((unused)) prior_main(', 1), 1)
-    unit = unit.replace('struct tipd_data {', 'struct fwnode_handle;\nstruct tipd_data { unsigned irq_mask1; int (*init)(struct tps6598x *); int (*switch_power_state)(struct tps6598x *, int); int (*register_port)(struct tps6598x *, struct fwnode_handle *); bool (*read_data_status)(struct tps6598x *); int (*connect)(struct tps6598x *,u32); void (*ready)(struct tps6598x *); void *irq_handler;')
-    unit = unit.replace('struct tps6598x {', 'struct tps6598x { bool dbma_at_probe,wakeup;')
+    unit = unit.replace('struct tipd_data {', 'struct fwnode_handle;\nstruct tipd_data { unsigned irq_mask1; int (*init)(struct tps6598x *); int (*switch_power_state)(struct tps6598x *, int); int (*register_port)(struct tps6598x *, struct fwnode_handle *); bool (*read_data_status)(struct tps6598x *); bool (*read_power_status)(struct tps6598x *); int (*connect)(struct tps6598x *,u32); void (*ready)(struct tps6598x *); void *irq_handler;')
+    unit = unit.replace('struct tps6598x {', 'struct tps6598x { bool dbma_at_probe,wakeup; u32 status;')
     helpers = r"""
 #undef dev_err
 #define dev_err(...) ((void)0)
@@ -373,7 +373,7 @@ static int connect(struct tps6598x *t,u32 status) { (void)t;(void)status;return 
     helpers += block(core, 'static bool cd321x_uses_dp_sid(') + '\n' + block(core, 'static u64 cd321x_irq_mask(') + '\n'
     unit += helpers + block(core, 'int tipd_init(') + r"""
 static void probe_initial(struct cd321x *c) {
- initial(c);ordinary_port=true;phy_provider.safe_after_role=true;c->tps.irq=1;data.register_port=register_port;data.read_data_status=read_data_status;data.connect=connect;
+ initial(c);ordinary_port=true;phy_provider.safe_after_role=true;c->tps.irq=1;data.register_port=register_port;data.read_data_status=read_data_status;data.read_power_status=tps6598x_read_power_status;data.connect=connect;
  connect_error=irq_error=register_error=node_puts=mux_get_error=0;
  /* tipd_init() resets only a controller it patched (stable a2b95607926d, mainline c5df31f10880) */
  controller_mode=TPS_MODE_PTCH;data.init=apply_patch;
