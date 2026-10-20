@@ -218,15 +218,15 @@ static __always_inline void commit_anon_folio_batch(struct vm_area_struct *vma,
 	if (mm_page_size(vma->vm_mm) < PAGE_SIZE) {
 		while (nr_ptes) {
 			expected_anon_exclusive = subpage_pte_exclusive(vma,
-				pte_advance_pfn_mm(vma->vm_mm, oldpte, sub_batch_idx));
+				pte_advance_pfn_mm(vma->vm_mm, oldpte, batch_idx));
 			for (len = 1; len < nr_ptes; len++)
 				if (subpage_pte_exclusive(vma,
-				    pte_advance_pfn_mm(vma->vm_mm, oldpte, sub_batch_idx + len)) !=
+				    pte_advance_pfn_mm(vma->vm_mm, oldpte, batch_idx + len)) !=
 				    expected_anon_exclusive)
 					break;
 			prot_commit_flush_ptes(vma, addr, ptep, oldpte, ptent, len,
-					       sub_batch_idx, expected_anon_exclusive, tlb);
-			sub_batch_idx += len;
+					       batch_idx, expected_anon_exclusive, tlb);
+			batch_idx += len;
 			nr_ptes -= len;
 		}
 		return;
