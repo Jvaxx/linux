@@ -3524,7 +3524,7 @@ static int follow_subpage_fragment(struct vm_area_struct *vma, unsigned long add
 			if ((flags & FOLL_WRITE) && !pte_write(pte))
 				goto out;
 			/* Private non-anonymous read pins must first acquire COW ownership. */
-			if ((flags & FOLL_PIN) && is_cow_mapping(vma->vm_flags)) {
+			if ((flags & FOLL_PIN) && vma_is_cow_mapping(vma)) {
 				ret = -EMLINK;
 				goto out;
 			}
