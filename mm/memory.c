@@ -48,6 +48,7 @@
 #include <linux/hugetlb.h>
 #include <linux/mman.h>
 #include <linux/swap.h>
+#include <linux/swap_ops.h>
 #include <linux/highmem.h>
 #include <linux/pagemap.h>
 #include <linux/memremap.h>
@@ -6031,8 +6032,12 @@ vm_fault_t do_swap_coarse_page(struct vm_fault *vmf)
 		next.val += covered;
 		folio = swap_cache_get_folio(next);
 		if (!folio) {
-			folio = read_swap_cache_async(next, GFP_HIGHUSER_MOVABLE, vma,
-						     vmf->address + covered * PAGE_SIZE, NULL);
+			struct swap_io_ctx ctx = {};
+
+			folio = read_swap_cache_async(&ctx, next, GFP_HIGHUSER_MOVABLE, vma,
+						     vmf->address + covered * PAGE_SIZE);
+			/* Submit now: the folio lock below waits for this read. */
+			swap_read_submit(&ctx);
 			if (!(ret & VM_FAULT_MAJOR)) {
 				ret |= VM_FAULT_MAJOR;
 				count_vm_event(PGMAJFAULT);
