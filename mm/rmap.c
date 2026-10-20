@@ -1852,11 +1852,11 @@ int mm_subpage_dup_anon_rmap(struct mm_subpage *subpage,
 	    address < dst->vm_start || address >= dst->vm_end ||
 	    address < src->vm_start || address >= src->vm_end)
 		return -EINVAL;
-	pos = vma_page_offset_at(dst, address);
+	pos = vma_anon_page_offset_at(dst, address);
 	/* Both mmap locks and the source PTE stabilize this slot's identity. */
 	if (!mm_subpage_match_rmap(subpage, dst, address) ||
 	    src->anon_vma->root != dst->anon_vma->root ||
-	    !vm_page_offset_equal(pos, vma_page_offset_at(src, address)))
+	    !vm_page_offset_equal(pos, vma_anon_page_offset_at(src, address)))
 		return -EINVAL;
 	/* A pin in a neighboring physical slot does not share this slot. */
 	if (!mm_subpage_try_share(subpage))
@@ -3412,7 +3412,7 @@ noinline bool rmap_walk_subpages(struct folio *folio,
 		anon_rmap_tree_foreach(avc, map->root,
 					      map->pos.index, map->pos.index) {
 			struct vm_area_struct *vma = avc->vma;
-			unsigned long address = vma_address_at_offset(vma, map->pos);
+			unsigned long address = vma_address_at_anon_offset(vma, map->pos);
 			struct rmap_walk_range range = {
 				.address = address,
 				.subpage = true,

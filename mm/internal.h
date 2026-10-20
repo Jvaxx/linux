@@ -1131,6 +1131,31 @@ static inline unsigned long vma_anon_address(const struct vm_area_struct *vma,
 	return __vma_address(vma, pgoff_anon, vma_start_anon_pgoff(vma), nr_pages);
 }
 
+#ifdef CONFIG_MM_SUBPAGE
+/*
+ * Anonymous folios are indexed by anonymous page offset (see
+ * linear_anon_page_index()), so subpage anonymous reverse-map positions use
+ * that offset space too. It shares the VMA's offset within a native page.
+ */
+static inline struct vm_page_offset
+vma_anon_page_offset_at(const struct vm_area_struct *vma, unsigned long address)
+{
+	struct vm_page_offset pos = vma_page_offset_at(vma, address);
+
+	pos.index += vma_start_anon_pgoff(vma) - vma_start_pgoff(vma);
+	return pos;
+}
+
+/* Inverse of vma_anon_page_offset_at(); -EFAULT outside the VMA. */
+static inline unsigned long
+vma_address_at_anon_offset(const struct vm_area_struct *vma,
+			   struct vm_page_offset pos)
+{
+	pos.index += vma_start_pgoff(vma) - vma_start_anon_pgoff(vma);
+	return vma_address_at_offset(vma, pos);
+}
+#endif
+
 /*
  * At what user virtual address will none of the range be found in vma?
  * Assumes that vma_address() already returned a good starting address.
