@@ -1068,7 +1068,7 @@ static struct io_rsrc_node *io_register_fragment_buffer(struct io_ring_ctx *ctx,
 	imu->release = io_release_fragment_buffer;
 	imu->priv = buffer;
 	imu->flags = 0;
-	imu->dir = IO_IMU_DEST | IO_IMU_SOURCE;
+	imu->dir = IO_BUF_DEST | IO_BUF_SOURCE;
 	refcount_set(&imu->refs, 1);
 	node->buf = imu;
 	return node;
