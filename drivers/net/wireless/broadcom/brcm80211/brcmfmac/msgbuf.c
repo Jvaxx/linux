@@ -10,9 +10,11 @@
 
 #include <linux/types.h>
 #include <linux/netdevice.h>
+#include <linux/pci.h>
 #include <linux/etherdevice.h>
 #include <linux/ratelimit.h>
 
+#include <brcm_hw_ids.h>
 #include <brcmu_utils.h>
 #include <brcmu_wifi.h>
 
@@ -331,6 +333,30 @@ struct brcmf_msgbuf_pktids {
 
 static void brcmf_msgbuf_rxbuf_ioctlresp_post(struct brcmf_msgbuf *msgbuf);
 
+
+/*
+ * BCM4387 firmware can read buffers posted for receive. Since the packet-ID
+ * direction is now honored, DMA_FROM_DEVICE makes those buffers write-only
+ * on permission-enforcing IOMMUs. Keep RX data, event and ioctl-response
+ * buffers readable, with the same direction used for mapping and unmapping.
+ */
+static enum dma_data_direction
+brcmf_msgbuf_rx_dma_direction(struct device *dev)
+{
+	struct pci_dev *pdev;
+
+	if (!dev_is_pci(dev))
+		return DMA_FROM_DEVICE;
+
+	pdev = to_pci_dev(dev);
+	if (pdev->vendor == PCI_VENDOR_ID_BROADCOM &&
+	    pdev->device == BRCM_PCIE_4387_DEVICE_ID) {
+		dev_info(dev, "BCM4387: using bidirectional receive DMA\n");
+		return DMA_BIDIRECTIONAL;
+	}
+
+	return DMA_FROM_DEVICE;
+}
 
 static struct brcmf_msgbuf_pktids *
 brcmf_msgbuf_init_pktids(u32 nr_array_entries,
@@ -1830,7 +1856,7 @@ int brcmf_proto_msgbuf_attach(struct brcmf_pub *drvr)
 	if (!msgbuf->tx_pktids)
 		goto fail;
 	msgbuf->rx_pktids = brcmf_msgbuf_init_pktids(NR_RX_PKTIDS,
-						     DMA_FROM_DEVICE);
+			brcmf_msgbuf_rx_dma_direction(drvr->bus_if->dev));
 	if (!msgbuf->rx_pktids)
 		goto fail;
 
