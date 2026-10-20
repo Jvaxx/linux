@@ -994,6 +994,12 @@ void apple_rtkit_resume_rx(struct apple_rtkit *rtk)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_resume_rx);
 
+void apple_rtkit_flush_rx(struct apple_rtkit *rtk)
+{
+	flush_workqueue(rtk->wq);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_flush_rx);
+
 bool apple_rtkit_has_endpoint(struct apple_rtkit *rtk, u8 ep)
 {
 	return test_bit(ep, rtk->endpoints);

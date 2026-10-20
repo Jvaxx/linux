@@ -5,6 +5,7 @@
 
 #include "plane.h"
 
+#include "dcp-internal.h"
 #include "iomfb_internal.h"
 
 #include "iomfb_plane.h"
@@ -14,6 +15,7 @@
 #include <drm/drm_fb_dma_helper.h>
 #include <drm/drm_framebuffer.h>
 #include <drm/drm_gem.h>
+#include <drm/drm_gem_atomic_helper.h>
 #include <drm/drm_gem_dma_helper.h>
 #include <drm/drm_plane.h>
 
@@ -417,13 +419,56 @@ static void apple_plane_atomic_update(struct drm_plane *plane,
 		new_state->iova = obj->dma_addr + base->fb->offsets[0];
 }
 
+static void apple_plane_cleanup_fb(struct drm_plane *plane,
+				   struct drm_plane_state *state)
+{
+	struct apple_plane_state *apple_state = to_apple_plane_state(state);
+	struct dcp_fb_reference *entry = apple_state->retirement;
+
+	if (!entry)
+		return;
+
+	apple_state->retirement = NULL;
+	drm_framebuffer_put(entry->fb);
+	kfree(entry);
+}
+
+static int apple_plane_prepare_fb(struct drm_plane *plane,
+				  struct drm_plane_state *state)
+{
+	struct drm_plane_state *old;
+	struct dcp_fb_reference *entry;
+	int ret;
+
+	ret = drm_gem_plane_helper_prepare_fb(plane, state);
+	if (ret)
+		return ret;
+
+	old = drm_atomic_get_old_plane_state(state->state, plane);
+	if (!old || !old->crtc || !old->fb || old->fb == state->fb)
+		return 0;
+
+	entry = kzalloc_obj(*entry);
+	if (!entry)
+		return -ENOMEM;
+
+	drm_framebuffer_get(old->fb);
+	entry->fb = old->fb;
+	to_apple_plane_state(state)->retirement = entry;
+	return 0;
+}
+
 static const struct drm_plane_helper_funcs apple_primary_plane_helper_funcs = {
+	.prepare_fb	= apple_plane_prepare_fb,
+	.cleanup_fb	= apple_plane_cleanup_fb,
 	.atomic_check	= apple_plane_atomic_check,
 	.atomic_update	= apple_plane_atomic_update,
 	.get_scanout_buffer = drm_fb_dma_get_scanout_buffer,
 };
 
 static const struct drm_plane_helper_funcs apple_plane_helper_funcs = {
+	.prepare_fb	= apple_plane_prepare_fb,
+	.cleanup_fb	= apple_plane_cleanup_fb,
 	.atomic_check	= apple_plane_atomic_check,
 	.atomic_update	= apple_plane_atomic_update,
 };
@@ -432,8 +477,10 @@ static const struct drm_plane_helper_funcs apple_plane_helper_funcs = {
 static void apple_plane_reset(struct drm_plane *plane)
 {
         struct apple_plane_state *state = to_apple_plane_state(plane->state);
-	if (state)
+	if (state) {
+		apple_plane_cleanup_fb(plane, &state->base);
 		__drm_atomic_helper_plane_destroy_state(&state->base);
+	}
 
 	kfree(state);
 	plane->state = NULL;
@@ -458,23 +505,26 @@ apple_plane_duplicate_state(struct drm_plane *plane)
         __drm_atomic_helper_plane_duplicate_state(plane, &apple_plane_state->base);
 
 	apple_plane_state->surf = old_apple_plane_state->surf;
+	apple_plane_state->src_rect = old_apple_plane_state->src_rect;
+	apple_plane_state->dst_rect = old_apple_plane_state->dst_rect;
+	apple_plane_state->iova = old_apple_plane_state->iova;
 
 	return &apple_plane_state->base;
 }
 
-// void apple_plane_destroy_state(struct drm_plane *plane,
-//                                      struct drm_plane_state *state)
-// {
-// 	drm_atomic_helper_plane_destroy_state(plane, state);
-// }
+static void apple_plane_destroy_state(struct drm_plane *plane,
+				      struct drm_plane_state *state)
+{
+	apple_plane_cleanup_fb(plane, state);
+	drm_atomic_helper_plane_destroy_state(plane, state);
+}
 
 static const struct drm_plane_funcs apple_plane_funcs = {
 	.update_plane		= drm_atomic_helper_update_plane,
 	.disable_plane		= drm_atomic_helper_disable_plane,
 	.reset			= apple_plane_reset,
 	.atomic_duplicate_state = apple_plane_duplicate_state,
-	// .atomic_destroy_state	= apple_plane_destroy_state,
-	.atomic_destroy_state	= drm_atomic_helper_plane_destroy_state,
+	.atomic_destroy_state	= apple_plane_destroy_state,
 };
 
 /*
@@ -508,6 +558,23 @@ static const u32 dcp_primary_formats[] = {
 	DRM_FORMAT_P230,
 #if defined(DRM_FORMAT_P430)
 	DRM_FORMAT_P430,
+#endif
+};
+
+/* The H17P alpha semantics of 10-bit XRGB are unknown. */
+static const u32 dcp_primary_formats_h17p[] = {
+	DRM_FORMAT_ARGB2101010,
+	DRM_FORMAT_XRGB8888,
+	DRM_FORMAT_ARGB8888,
+	DRM_FORMAT_XBGR8888,
+	DRM_FORMAT_ABGR8888,
+	DRM_FORMAT_NV12,
+	DRM_FORMAT_NV16,
+	DRM_FORMAT_NV24,
+	DRM_FORMAT_P010,
+	DRM_FORMAT_P210,
+#if defined(DRM_FORMAT_P410)
+	DRM_FORMAT_P410,
 #endif
 };
 
@@ -577,6 +644,7 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 				   unsigned long possible_crtcs,
 				   u32 iomfb_surf,
 				   bool supports_l10r,
+				   bool supports_xrgb2101010,
 				   enum drm_plane_type type,
 				   bool interchange)
 {
@@ -586,16 +654,20 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 
 	switch (type) {
 	case DRM_PLANE_TYPE_PRIMARY:
-		if (supports_l10r) {
+		if (supports_l10r && supports_xrgb2101010) {
 			fmts = dcp_primary_formats;
 			num_fmts = ARRAY_SIZE(dcp_primary_formats);
+		} else if (supports_l10r) {
+			fmts = dcp_primary_formats_h17p;
+			num_fmts = ARRAY_SIZE(dcp_primary_formats_h17p);
 		} else {
 			fmts = dcp_primary_formats_12_x;
 			num_fmts = ARRAY_SIZE(dcp_primary_formats_12_x);
 		}
 		plane = drmm_universal_plane_alloc(dev, struct apple_plane, base, possible_crtcs,
 				       &apple_plane_funcs, fmts, num_fmts,
-				       format_modifiers, type, NULL);
+				       interchange ? format_modifiers : format_modifiers_no_ix,
+				       type, NULL);
 		break;
 	case DRM_PLANE_TYPE_OVERLAY:
 	case DRM_PLANE_TYPE_CURSOR:
@@ -629,6 +701,35 @@ struct drm_plane *apple_plane_init(struct drm_device *dev,
 	else
 		drm_plane_helper_add(&plane->base, &apple_plane_helper_funcs);
 
+	plane->iomfb_surf = iomfb_surf;
+
+	return &plane->base;
+}
+
+/* The formats the T6030 (14.x firmware) scanout was qualified with. */
+static const u32 dcp_primary_formats_14_7[] = {
+	DRM_FORMAT_XRGB8888,
+	DRM_FORMAT_ARGB8888,
+};
+
+struct drm_plane *apple_plane_init_v14_7(struct drm_device *dev,
+					 unsigned long possible_crtcs,
+					 u32 iomfb_surf,
+					 enum drm_plane_type type)
+{
+	struct apple_plane *plane;
+
+	if (type != DRM_PLANE_TYPE_PRIMARY)
+		return ERR_PTR(-EINVAL);
+
+	plane = drmm_universal_plane_alloc(dev, struct apple_plane, base, possible_crtcs,
+					   &apple_plane_funcs, dcp_primary_formats_14_7,
+					   ARRAY_SIZE(dcp_primary_formats_14_7),
+					   format_modifiers_no_ix, type, NULL);
+	if (IS_ERR(plane))
+		return ERR_CAST(plane);
+
+	drm_plane_helper_add(&plane->base, &apple_primary_plane_helper_funcs);
 	plane->iomfb_surf = iomfb_surf;
 
 	return &plane->base;

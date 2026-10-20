@@ -4,7 +4,8 @@
 /* Include all per-version headers before defining DCP_FW ourself. */
 #include "iomfb_v12_3.h"
 #include "iomfb_v13_3.h"
-#include "iomfb_v14_7.h"
+#include "iomfb_v14_7_tpl.h"
+#include "iomfb_h17p.h"
 #include "version_utils.h"
 
 static const struct dcp_method_entry dcp_methods[dcpep_num_methods] = {
