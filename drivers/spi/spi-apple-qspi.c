@@ -125,7 +125,7 @@ static const struct kernel_param_ops apple_qspi_read_only_ops = {
 	.get = apple_qspi_get_read_only,
 };
 module_param_cb(read_only, &apple_qspi_read_only_ops, &read_only, 0644);
-MODULE_PARM_DESC(read_only, "Default true; root runtime opt-in for bounded J613 NVRAM writes (T8122/T8132 only)");
+MODULE_PARM_DESC(read_only, "Default true; root runtime opt-in for bounded J613/J713 NVRAM writes");
 
 static bool apple_qspi_opcode_is_read(u8 opcode)
 {
@@ -149,7 +149,7 @@ static bool apple_qspi_opcode_is_read(u8 opcode)
 }
 
 struct apple_qspi {
-	/* T8122/T8132 use the serialized J613 policy. */
+	/* T8122/T8132 use the serialized, verified NVRAM policy. */
 	bool nvram_policy;
 	/* T8140 admits programs and erases only inside nvram. */
 	bool nvram_window;
@@ -843,7 +843,20 @@ static const struct spi_controller_mem_ops apple_qspi_mem_ops = {
 	.exec_op = apple_qspi_mem_exec_op,
 };
 
-/* Require the pinned partition, aperture and single physical chip select. */
+/* Keep write qualification tied to the board and its controller aperture. */
+static bool apple_qspi_nvram_write_board(struct device_node *node,
+					 resource_size_t base)
+{
+	if (of_device_is_compatible(node, "apple,t8122-qspi"))
+		return of_machine_is_compatible("apple,j613") &&
+			base == 0x2a1118000ULL;
+	if (of_device_is_compatible(node, "apple,t8132-qspi"))
+		return of_machine_is_compatible("apple,j713") &&
+			base == 0x3ad118000ULL;
+	return false;
+}
+
+/* Require the pinned partition and single physical chip select. */
 static bool apple_qspi_nvram_layout(struct device_node *node)
 {
 	struct device_node *flash, *parts, *part;
@@ -953,8 +966,8 @@ static int apple_qspi_probe(struct platform_device *pdev)
 		apple_qspi_nvram_window(dev, qspi);
 	qspi->nvram_policy = of_device_is_compatible(dev->of_node, "apple,t8122-qspi") ||
 			     of_device_is_compatible(dev->of_node, "apple,t8132-qspi");
-	qspi->nvram_write_candidate = of_device_is_compatible(dev->of_node, "apple,t8122-qspi");
-	if (qspi->nvram_write_candidate && !of_machine_is_compatible("apple,j613"))
+	if (of_device_is_compatible(dev->of_node, "apple,t8122-qspi") &&
+	    !of_machine_is_compatible("apple,j613"))
 		return -ENODEV;
 	init_completion(&qspi->done);
 	spin_lock_init(&qspi->lock);
@@ -964,7 +977,8 @@ static int apple_qspi_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, -EINVAL,
 				     "QSPIMC aperture is too small\n");
 
-	qspi->nvram_write_candidate &= res->start == 0x2a1118000ULL &&
+	qspi->nvram_write_candidate = apple_qspi_nvram_write_board(dev->of_node,
+								   res->start) &&
 		apple_qspi_nvram_layout(dev->of_node);
 	qspi->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(qspi->base))
