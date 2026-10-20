@@ -2005,6 +2005,8 @@ static struct anon_slot_fixture *anon_slot_fixture_create_from(struct kunit *tes
 		mmap_write_lock(parent->mm);
 		mmap_write_lock_nested(f->mm, SINGLE_DEPTH_NESTING);
 		vma_set_page_offset(vma, vma_page_offset_at(parent->vma, TEST_VA));
+		/* As vm_area_init_from(): forked anon folios keep their index. */
+		__vma_set_anon_pgoff(vma, vma_start_anon_pgoff(parent->vma));
 		ret = anon_vma_fork(vma, parent->vma);
 	} else {
 		mmap_write_lock(f->mm);
@@ -5835,6 +5837,8 @@ static void user4k_remap_pfn_range_test(struct kunit *test)
 			KUNIT_ASSERT_NOT_ERR_OR_NULL(test, vma);
 			vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
 			mmap_write_lock(mm);
+			/* The mmap_prepare compat path modifies an attached VMA. */
+			vma_start_write(vma);
 			if (shape >= 2) {
 				phys_addr_t base = PFN_PHYS(folio_pfn(folio)) + physical_offset;
 				unsigned long available = folio_size(folio) - physical_offset;
