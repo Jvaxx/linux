@@ -1,5 +1,11 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+/* This fixture selects the original controller layout, not T8132. */
+#define of_device_is_compatible(...) false
 struct apple_atcphy {
+    /* T8132-only paths are covered by drivers/apple/atc-t8132-usb3.py. */
+    bool t8132_ss, t8132_common_owned, t8132_failed;
+    struct { void *usb3_dp; } tunables;
+
 	const struct atcphy_hw *hw;
 	struct {
 		unsigned char *core, *lpdptx, *pipehandler, *usb2phy;
@@ -66,7 +72,7 @@ struct dwc3 {
 	struct phy *usb2_generic_phy[3], *usb3_generic_phy[3];
 	int num_usb2_ports, num_usb3_ports, usb2_phy, usb3_phy;
 	struct reset_controller_dev *reset;
-	int dev, usb_psy, vbus_draw_work;
+	int dev, usb_psy, vbus_draw_work, dr_mode;
 };
 struct dwc3_apple {
 	struct dwc3 dwc;
@@ -75,7 +81,7 @@ struct dwc3_apple {
 	int lock;
 	void *dev;
 	struct phy *usb2_phy, *usb3_phy;
-	bool fixed_hub, core_active, core_exit_pending, reset_pending;
+	bool fixed_hub, core_active, core_exit_pending, reset_pending, shutting_down;
 	unsigned long usb2_power_off_pending, usb3_power_off_pending;
 };
 static unsigned int polls, fail_poll, reset_calls, reset_writes, core_writes;
@@ -188,6 +194,13 @@ static void atcphy_restore_after_pd_off(struct apple_atcphy *p);
 static int atcphy_power_off(struct apple_atcphy *p);
 static int atcphy_configure(struct apple_atcphy *p, enum atcphy_mode mode);
 
+/* These units exercise older PHY generations. Never accept a T8132 dispatch. */
+static int __attribute__((unused)) atcphy_configure_t8132(struct apple_atcphy *p, enum atcphy_mode mode)
+{ (void)p; (void)mode; assert(false); return -EOPNOTSUPP; }
+static int __attribute__((unused)) atcphy_configure_pipehandler_usb3_host_t8132(struct apple_atcphy *p)
+{ (void)p; assert(false); return -EOPNOTSUPP; }
+
+
 /* USB2 power-on is outside this teardown/recovery control. */
 static void atcphy_usb2_power_on(struct apple_atcphy *p)
 {
@@ -284,7 +297,7 @@ static int phy_set_mode(struct phy *p, int m)
 	(void)m;
 	return 0;
 }
-static int dwc3_apple_core_probe(struct dwc3_apple *a);
+static int dwc3_apple_core_probe(struct dwc3_apple *a, enum dwc3_apple_state s);
 static int dwc3_core_init(struct dwc3 *d);
 static void dwc3_apple_setup_cio(struct dwc3_apple *a)
 {
@@ -299,7 +312,7 @@ static int dwc3_apple_usb2_mode_before_reset(enum dwc3_apple_state s,
 	*m = s == DWC3_APPLE_HOST ? PHY_MODE_INVALID : PHY_MODE_USB_DEVICE;
 	return 0;
 }
-static void dwc3_apple_set_role(struct dwc3_apple *a, enum dwc3_apple_state s);
+static int dwc3_apple_set_role(struct dwc3_apple *a, enum dwc3_apple_state s);
 static int dwc3_host_init(struct dwc3 *d)
 {
 	(void)d;
@@ -341,3 +354,8 @@ static void dwc3_free_event_buffers(struct dwc3 *d)
 	(void)d;
 	free_buffers++;
 }
+
+/* J713 host-before-init is exercised by the dedicated initial-role test. */
+enum { USB_DR_MODE_HOST = 1, DWC3_GCTL_PRTCAP_HOST = 1 };
+static void dwc3_apple_set_ptrcap(struct dwc3_apple *a, u32 mode)
+{ (void)a; (void)mode; assert(!"J713 pre-init path entered a legacy fixture"); }
