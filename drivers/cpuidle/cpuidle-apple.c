@@ -124,12 +124,28 @@ static struct cpuidle_driver apple_idle_driver = {
 
 static int apple_cpuidle_probe(struct platform_device *pdev)
 {
+	/*
+	 * CPU PD writes CYC_OVRD, which is an undefined instruction on
+	 * T8140. Its WFI already lets the hardware power-gate idle
+	 * secondary cores, so both entries must use WFI. Keep index 1:
+	 * the generic s2idle selector skips fallback index 0, otherwise
+	 * tick_freeze() and timekeeping suspension are never reached.
+	 */
+	if (of_machine_is_compatible("apple,t8140"))
+		apple_idle_driver.states[STATE_PWRDOWN] = apple_idle_driver.states[STATE_WFI];
+
 	return cpuidle_register(&apple_idle_driver, NULL);
 }
+
+static const struct of_device_id apple_cpuidle_of_match[] = {
+	{ .compatible = "apple,t8140-cpuidle" },
+	{ }
+};
 
 static struct platform_driver apple_cpuidle_driver = {
 	.driver = {
 		.name = "cpuidle-apple",
+		.of_match_table = apple_cpuidle_of_match,
 	},
 	.probe = apple_cpuidle_probe,
 };
@@ -137,11 +153,19 @@ static struct platform_driver apple_cpuidle_driver = {
 static int __init apple_cpuidle_init(void)
 {
 	struct platform_device *pdev;
+	struct device_node *np;
 	int ret;
 
 	ret = platform_driver_register(&apple_cpuidle_driver);
 	if (ret)
 		return ret;
+
+	/* DT-described systems are populated by the OF platform code. */
+	np = of_find_matching_node(NULL, apple_cpuidle_of_match);
+	if (np) {
+		of_node_put(np);
+		return 0;
+	}
 
 	if (!of_machine_is_compatible("apple,arm-platform"))
 		return 0;
@@ -158,7 +182,8 @@ static int __init apple_cpuidle_init(void)
 	      of_machine_is_compatible("apple,t6030") ||
 	      of_machine_is_compatible("apple,t6031") ||
 	      of_machine_is_compatible("apple,t6032") ||
-	      of_machine_is_compatible("apple,t6034")))
+	      of_machine_is_compatible("apple,t6034") ||
+	      of_machine_is_compatible("apple,t8140")))
 		return 0;
 
 	pdev = platform_device_register_simple("cpuidle-apple", -1, NULL, 0);

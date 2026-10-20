@@ -7,6 +7,10 @@
 
 use core::mem;
 
+mod pmp_bootargs;
+mod pmp_power;
+use pmp_power::Command;
+
 use kernel::{
     bindings,
     device::{
@@ -15,10 +19,11 @@ use kernel::{
     },
     dma::{
         Coherent,
-        CoherentBox, //
+        CoherentBox,
+        Device as _,
+        DmaMask, //
     },
     io::{
-        io_project,
         Io,
         IoBase,
         IoSysMap,
@@ -27,7 +32,7 @@ use kernel::{
     },
     kvec,
     module_platform_driver,
-    new_mutex,
+    new_condvar, new_mutex,
     of,
     platform,
     prelude::*,
@@ -39,6 +44,7 @@ use kernel::{
     sync::{
         aref::ARef,
         Arc,
+        CondVar, CondVarTimeoutResult,
         Mutex, //
     },
     transmute::{
@@ -48,17 +54,21 @@ use kernel::{
     types::ForeignOwnable, //
 };
 
-const PMP_MMIO_SIZE: usize = 0x80000;
+const PMP_MIN_MMIO_SIZE: usize = 0x80000;
 const ASC_MMIO_SIZE: usize = 0x4000;
 const BOOTARGS_OFFSET: usize = 0x22c;
 const BOOTARGS_SIZE: usize = 0x230;
 const PMP_ENDPOINT: u8 = 0x20;
+const PM_COMMAND_MARKER: u64 = pmp_power::MARKER;
+const PM_COMMAND_SHIFT: u32 = pmp_power::SHIFT;
 const OPC_GET_IOVA_TABLE: u64 = 0x10;
 const OPC_MALLOC: u64 = 0x12;
 const OPC_FREE: u64 = 0x14;
 const OPC_SET_BUF: u64 = 0x30;
 const OPC_REGISTER_IOREG: u64 = 0x32;
 const OPC_SET_IOREG: u64 = 0x34;
+const OPC_UPDATE_IOREG: u64 = 0x36;
+const OPC_CONFIRM_IOREG: u64 = 0x37;
 const OPC_ACK_MASK: u64 = 0x1;
 const OPC_SHIFT: u32 = 48;
 const MALLOC_SIZE_MASK: u64 = 0xFFFFFF;
@@ -126,6 +136,10 @@ struct PmpData {
     rtkit: Mutex<Option<rtkit::RtKit<PmpData>>>,
     #[pin]
     state: Mutex<PmpState>,
+    #[pin]
+    power_command: Mutex<Command>,
+    #[pin]
+    power_reply: CondVar,
 }
 
 impl PmpData {
@@ -135,7 +149,9 @@ impl PmpData {
                 PmpData {
                     dev: dev.as_ref().into(),
                     rtkit <- new_mutex!(None),
-                    state <- new_mutex!(PmpState::new()?)
+                    state <- new_mutex!(PmpState::new()?),
+                    power_command <- new_mutex!(Command::Idle),
+                    power_reply <- new_condvar!(),
                 }
             ),
             GFP_KERNEL,
@@ -149,31 +165,25 @@ impl PmpData {
     }
     fn patch_bootargs(
         &self,
-        pmp_mmio: &Mmio<'_, Region<PMP_MMIO_SIZE>>,
+        pmp_mmio: &Mmio<'_, Region<PMP_MIN_MMIO_SIZE>>,
         patches: &[(u32, u32)],
     ) -> Result<()> {
         let io = pmp_mmio.as_view().relaxed();
         let offset = io.read32(BOOTARGS_OFFSET) as usize;
         let size = io.read32(BOOTARGS_SIZE) as usize;
-        let mut arg_bytes = kvec![0u8; size]?;
-        let pmp_io_array: Mmio<'_, [u8; PMP_MMIO_SIZE]> = pmp_mmio.try_cast()?;
-        let bootargs = io_project!(pmp_io_array, [try: offset .. offset+size]);
-        bootargs.copy_to_slice(&mut arg_bytes);
-        let mut idx = 0;
-        while idx < size {
-            let key = u32::from_le_bytes(arg_bytes[idx..idx + 4].try_into().unwrap());
-            let size = u32::from_le_bytes(arg_bytes[idx + 4..idx + 8].try_into().unwrap()) as usize;
-            idx += 8;
-            for (k, v) in patches.iter() {
-                if *k != key {
-                    continue;
-                }
-                arg_bytes[idx..idx + size].copy_from_slice(&(*v as u64).to_le_bytes()[..size]);
-                break;
-            }
-            idx += size;
+        if !pmp_bootargs::region_valid(offset, size, io.size()) {
+            return Err(EINVAL);
         }
-        bootargs.copy_from_slice(&arg_bytes);
+        let mut arg_bytes = kvec![0u8; size]?;
+        for (idx, byte) in arg_bytes.iter_mut().enumerate() {
+            *byte = io.try_read8(offset + idx)?;
+        }
+        if !pmp_bootargs::patch(&mut arg_bytes, patches) {
+            return Err(EINVAL);
+        }
+        for (idx, byte) in arg_bytes.iter().enumerate() {
+            io.try_write8(*byte, offset + idx)?;
+        }
         Ok(())
     }
     fn get_iova_table(&self) -> Result<u64> {
@@ -318,12 +328,17 @@ impl PmpData {
                 let data = node
                     .property_read_array_vec::<u8>(&name_str, len)?
                     .required_by(&self.dev)?;
+                if len > val_buf.len() {
+                    return Err(EINVAL);
+                }
                 unsafe {
                     val_buf.as_mut()[0..len].copy_from_slice(&data);
                 }
                 size = len as u32;
             } else {
-                dev_info!(self.dev, "unknown property {:?}", name_str);
+                // Not every boot loader provides every tunable the firmware
+                // asks for, and the firmware starts without them.
+                dev_dbg!(self.dev, "unknown property {:?}", name_str);
             }
         }
         state.ioreg_entries.push(size, GFP_KERNEL)?;
@@ -342,6 +357,16 @@ impl PmpData {
         Ok(msg)
     }
     fn recv_message(&self, msg: u64) -> Result<()> {
+        let pm_command = (msg >> PM_COMMAND_SHIFT) & 0xff;
+        if msg & PM_COMMAND_MARKER != 0 && (pm_command == 0x0f || pm_command == 0x10) {
+            let mut state = self.power_command.lock();
+            state.reply(msg);
+            if *state == Command::Failed {
+                dev_err!(self.dev, "Unexpected PMP device-state reply {:#018x}; power commands disabled", msg);
+            }
+            self.power_reply.notify_all();
+            return Ok(());
+        }
         let opc = (msg >> OPC_SHIFT) & 0xFF;
         let reply = match opc {
             OPC_GET_IOVA_TABLE => self.get_iova_table()?,
@@ -350,6 +375,9 @@ impl PmpData {
             OPC_SET_BUF => self.set_buf(msg & MSG_IOVA_MASK)?,
             OPC_REGISTER_IOREG => self.register_ioreg(msg & MSG_IOVA_MASK)?,
             OPC_SET_IOREG => self.set_ioreg(msg & SET_IOREG_INDEX_MASK)?,
+            // Firmware waits for this confirmation before publishing reports.
+            // Do not echo the registry index/payload or add a generic ACK bit.
+            OPC_UPDATE_IOREG => OPC_CONFIRM_IOREG << OPC_SHIFT,
             _ => {
                 dev_err!(self.dev, "Got unknown message {}", msg);
                 return Err(EIO);
@@ -364,6 +392,66 @@ impl PmpData {
 
 unsafe impl Send for PmpData {}
 unsafe impl Sync for PmpData {}
+
+/// Send a power request while the C bridge serializes the untagged reply stream.
+/// A lost reply disables further requests until the PMP session is recreated.
+///
+/// # Safety
+/// `data` must point to the live PmpData registered by PmpDriver.
+#[export]
+pub unsafe extern "C" fn apple_pmp_send_power_command(
+    data: *const core::ffi::c_void,
+    command: u8,
+    device_id: u16,
+    enabled: u32,
+) -> i32 {
+    // SAFETY: The C bridge serializes calls against unregister in Drop.
+    let data = unsafe { &*data.cast::<PmpData>() };
+    let message = PM_COMMAND_MARKER
+        | ((command as u64) << PM_COMMAND_SHIFT)
+        | ((device_id as u64) << 40)
+        | ((enabled as u64) << 32);
+    {
+        let mut state = data.power_command.lock();
+        if !state.begin(command) {
+            return EIO.to_errno();
+        }
+    }
+    let sent = {
+        let mut guard = data.rtkit.lock();
+        match guard.as_mut().as_pin_mut() {
+            Some(rtk) => rtk.send_message(PMP_ENDPOINT, message),
+            None => Err(ENODEV),
+        }
+    };
+    let mut state = data.power_command.lock();
+    if let Err(error) = sent {
+        *state = Command::Failed;
+        return error.to_errno();
+    }
+    let mut remaining = kernel::time::msecs_to_jiffies(1000);
+    while matches!(*state, Command::Pending(_)) {
+        match data.power_reply.wait_interruptible_timeout(&mut state, remaining) {
+            CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
+            CondVarTimeoutResult::Timeout | CondVarTimeoutResult::Signal { .. } => {
+                // A reply may have arrived while the waiter reacquired its
+                // mutex. Consume it if complete; otherwise never reuse the
+                // untagged stream after an ambiguous wait.
+                if *state != Command::Complete {
+                    *state = Command::Failed;
+                    dev_err!(data.dev, "PMP device-power request {:#018x} did not complete", message);
+                    return ETIMEDOUT.to_errno();
+                }
+            }
+        }
+    }
+    if *state != Command::Complete {
+        return EIO.to_errno();
+    }
+    *state = Command::Idle;
+    dev_dbg!(data.dev, "PMP device={} enabled={} acknowledged", device_id, enabled);
+    0
+}
 
 struct NoBuffer;
 impl rtkit::Buffer for NoBuffer {
@@ -388,6 +476,8 @@ impl rtkit::Operations for PmpData {
     }
 
     fn crashed(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, _crashlog: Option<&[u8]>) {
+        *data.power_command.lock() = Command::Failed;
+        data.power_reply.notify_all();
         dev_err!(data.dev, "PMP firmware crashed");
     }
 }
@@ -395,25 +485,55 @@ impl rtkit::Operations for PmpData {
 #[allow(dead_code)]
 struct PmpDriver(Arc<PmpData>);
 
+/// Per-SoC configuration.
+struct PmpHwConfig {
+    /// DMA mask to set before the firmware allocates anything, or `None` to
+    /// keep the default.
+    dma_mask: Option<DmaMask>,
+}
+
+const HW_CFG_DEFAULT: PmpHwConfig = PmpHwConfig { dma_mask: None };
+
+/// T8140: the DART translates 42 bits and its DMA window starts at 1 TiB.
+const HW_CFG_T8140: PmpHwConfig = PmpHwConfig {
+    dma_mask: Some(DmaMask::new::<42>()),
+};
+
+impl Drop for PmpDriver {
+    fn drop(&mut self) {
+        // SAFETY: The Arc remains live until unregister has joined any caller.
+        unsafe { bindings::apple_pmp_unregister(Arc::as_ptr(&self.0).cast()) };
+    }
+}
+
 kernel::of_device_table!(
     OF_TABLE,
-    (),
-    [(of::DeviceId::new(c"apple,t6000-pmp-v2"), ())]
+    <PmpDriver as platform::Driver>::IdInfo,
+    [
+        (of::DeviceId::new(c"apple,t8140-pmp-v2"), &HW_CFG_T8140),
+        (of::DeviceId::new(c"apple,t6000-pmp-v2"), &HW_CFG_DEFAULT),
+    ]
 );
 
 impl platform::Driver for PmpDriver {
-    type IdInfo = ();
+    type IdInfo = &'static PmpHwConfig;
     type Data<'bound> = PmpDriver;
 
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
 
     fn probe<'bound>(
         pdev: &'bound platform::Device<Core<'_>>,
-        _info: Option<&'bound Self::IdInfo>,
+        info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let dev: ARef<device::Device> = pdev.as_ref().into();
+        let cfg = info.ok_or(ENODEV)?;
+        if let Some(mask) = cfg.dma_mask {
+            // SAFETY: No DMA allocations or mappings exist for this device
+            // yet.
+            unsafe { pdev.dma_set_mask_and_coherent(mask)? };
+        }
         let pmp_req = pdev.io_request_by_name(c"pmp").ok_or(EINVAL)?;
-        let pmp_mmio = pmp_req.iomap_sized::<PMP_MMIO_SIZE>()?;
+        let pmp_mmio = pmp_req.iomap_sized::<PMP_MIN_MMIO_SIZE>()?;
         let pmp_mmio = pmp_mmio.as_view();
         let asc_req = pdev.io_request_by_name(c"asc").ok_or(EINVAL)?;
         let asc_mmio = asc_req.iomap_sized::<ASC_MMIO_SIZE>()?;
@@ -442,6 +562,12 @@ impl platform::Driver for PmpDriver {
         data.rtkit.lock().as_mut().set(Some(rtkit));
         asc_mmio.update(ASC_CPU_CONTROL, |r| r.with_const_cpu_run::<1>());
         data.start()?;
+        dev_info!(dev, "PMP firmware and endpoint ready");
+        // SAFETY: PmpDriver retains this Arc and unregisters it before dropping it.
+        let ret = unsafe { bindings::apple_pmp_register(dev.as_raw(), Arc::as_ptr(&data).cast()) };
+        if ret != 0 {
+            return Err(Error::from_errno(ret));
+        }
         Ok(PmpDriver(data))
     }
 }
