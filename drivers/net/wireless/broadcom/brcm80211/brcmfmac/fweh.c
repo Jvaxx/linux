@@ -183,6 +183,13 @@ static void brcmf_fweh_handle_if_event(struct brcmf_pub *drvr,
 	brcmf_fweh_call_event_handler(drvr, ifp, emsg->event_code, emsg,
 				      data);
 
+	/* The handler above establishes the vif <-> ifp linkage. Only then can
+	 * the AWDL netdev be registered, and only from here: this worker holds
+	 * no locks, unlike the vendor command that requested the interface.
+	 */
+	if (ifp && ifevent->action == BRCMF_E_IF_ADD)
+		brcmf_cfg80211_awdl_attach_pending(ifp);
+
 	if (ifp && ifevent->action == BRCMF_E_IF_DEL) {
 		bool armed = brcmf_cfg80211_vif_event_armed(drvr->config);
 
@@ -378,8 +385,13 @@ void brcmf_fweh_detach(struct brcmf_pub *drvr)
 	if (!fweh)
 		return;
 
-	/* cancel the worker if initialized */
+	/* Stop the worker if initialized. brcmf_detach() calls this with the
+	 * event producers stopped, before its interfaces go away, so first run
+	 * the events still queued: a worker that was queued but had not started
+	 * would otherwise be cancelled with its events left on the queue.
+	 */
 	if (fweh->event_work.func) {
+		flush_work(&fweh->event_work);
 		cancel_work_sync(&fweh->event_work);
 		WARN_ON(!list_empty(&fweh->event_q));
 	}

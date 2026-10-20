@@ -37,6 +37,7 @@
 #include "xtlv.h"
 #include "ratespec.h"
 #include "interface_create.h"
+#include "scan_timeout.h"
 
 #define BRCMF_SCAN_IE_LEN_MAX		2048
 
@@ -84,7 +85,6 @@
 
 #define BRCMF_SCAN_CHANNEL_TIME		40
 #define BRCMF_SCAN_UNASSOC_TIME		40
-#define BRCMF_SCAN_PASSIVE_TIME		120
 
 #define BRCMF_ND_INFO_TIMEOUT		msecs_to_jiffies(2000)
 
@@ -605,6 +605,267 @@ brcmf_cfg80211_update_proto_addr_mode(struct wireless_dev *wdev)
  *
  * Return: pointer to new vif on success, ERR_PTR(-errno) if not
  */
+static void brcmf_awdl_cleanup_locked(struct brcmf_cfg80211_info *cfg)
+{
+	struct brcmf_cfg80211_vif *vif;
+	struct brcmf_if *ifp;
+
+	spin_lock(&cfg->vif_event.vif_event_lock);
+	ifp = cfg->awdl_failed_ifp;
+	vif = cfg->awdl_vif;
+	cfg->awdl_failed_ifp = NULL;
+	cfg->awdl_vif = NULL;
+	WRITE_ONCE(cfg->awdl_pending, false);
+	cfg->awdl_attaching = false;
+	if (cfg->vif_event.vif == vif) {
+		cfg->vif_event.vif = NULL;
+		cfg->vif_event.action = 0;
+	}
+	spin_unlock(&cfg->vif_event.vif_event_lock);
+
+	if (ifp) {
+		brcmf_fil_iovar_data_set(ifp, "interface_remove", NULL, 0);
+		brcmf_proto_del_if(cfg->pub, ifp);
+		ifp->vif = NULL;
+	}
+	if (vif)
+		brcmf_free_vif(vif);
+	if (ifp) {
+		if (ifp->ndev) {
+			ifp->ndev->ieee80211_ptr = NULL;
+			free_netdev(ifp->ndev);
+		} else {
+			kfree(ifp);
+		}
+	}
+}
+
+static void brcmf_awdl_cleanup(struct wiphy *wiphy, struct wiphy_work *work)
+{
+	struct brcmf_cfg80211_info *cfg =
+		container_of(work, struct brcmf_cfg80211_info, awdl_cleanup);
+
+	brcmf_awdl_cleanup_locked(cfg);
+}
+
+void brcmf_cfg80211_awdl_stop(struct brcmf_cfg80211_info *cfg)
+{
+	wiphy_lock(cfg->wiphy);
+	wiphy_delayed_work_cancel(cfg->wiphy, &cfg->awdl_timeout);
+	wiphy_work_cancel(cfg->wiphy, &cfg->awdl_cleanup);
+	brcmf_awdl_cleanup_locked(cfg);
+	wiphy_unlock(cfg->wiphy);
+}
+
+static void brcmf_awdl_timeout(struct wiphy *wiphy, struct wiphy_work *work)
+{
+	struct brcmf_cfg80211_info *cfg =
+		container_of(work, struct brcmf_cfg80211_info, awdl_timeout.work);
+	struct brcmf_cfg80211_vif *vif;
+
+	spin_lock(&cfg->vif_event.vif_event_lock);
+	vif = cfg->awdl_vif;
+	/* IF_ADD has already claimed the vif; its worker owns completion. */
+	if (!cfg->awdl_pending || cfg->awdl_attaching ||
+	    (vif && vif->ifp)) {
+		spin_unlock(&cfg->vif_event.vif_event_lock);
+		return;
+	}
+	cfg->awdl_vif = NULL;
+	WRITE_ONCE(cfg->awdl_pending, false);
+	if (cfg->vif_event.vif == vif) {
+		cfg->vif_event.vif = NULL;
+		cfg->vif_event.action = 0;
+	}
+	spin_unlock(&cfg->vif_event.vif_event_lock);
+
+	brcmf_err("AWDL interface creation timed out\n");
+	if (vif)
+		brcmf_free_vif(vif);
+}
+
+/**
+ * brcmf_awdl_add_vif() - create an AWDL interface and give it a netdev.
+ *
+ * @wiphy: wiphy device of the new interface.
+ * @name: name of the new interface.
+ *
+ * AWDL is Apple Wireless Direct Link, the link layer AirDrop and AirPlay run
+ * over. BCM4387 firmware implements it and accepts BRCMF_INTERFACE_TYPE_AWDL
+ * through interface_create, but there is no nl80211 interface type for it, so
+ * this cannot go through add_virtual_intf(). It is driven from the vendor
+ * command instead.
+ *
+ * The vif is allocated as NL80211_IFTYPE_STATION because cfg80211 needs some
+ * valid type for its bookkeeping; the firmware side is what actually decides
+ * the interface behaviour, from the iftype passed to interface_create.
+ *
+ * Return: 0 when requested, or a negative error code.
+ */
+int brcmf_awdl_add_vif(struct wiphy *wiphy, const char *name)
+{
+	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
+	struct brcmf_if *ifp = netdev_priv(cfg_to_ndev(cfg));
+	struct brcmf_cfg80211_vif *vif;
+	int err;
+
+	if (cfg->pub->bus_if->state != BRCMF_BUS_UP)
+		return -ENODEV;
+	if (brcmf_cfg80211_vif_event_armed(cfg) ||
+	    READ_ONCE(cfg->awdl_pending))
+		return -EBUSY;
+
+	vif = brcmf_alloc_vif(cfg, NL80211_IFTYPE_STATION);
+	if (IS_ERR(vif))
+		return PTR_ERR(vif);
+
+	/* Arm before asking firmware: the BRCMF_E_IF event is what links the
+	 * brcmf_if to this vif (brcmf_notify_vif_event() bails with -EBADF if
+	 * nothing is armed, leaving ndev->ieee80211_ptr unset).
+	 */
+	brcmf_cfg80211_arm_vif_event(cfg, vif);
+
+	/* Pass NULL rather than a derived address. Supplying a MAC address
+	 * at interface_create time kills the firmware control channel about
+	 * two seconds after create, so the address is set afterwards via
+	 * cur_etheraddr instead.
+	 *
+	 */
+	strscpy(cfg->awdl_ifname, name, sizeof(cfg->awdl_ifname));
+	spin_lock(&cfg->vif_event.vif_event_lock);
+	cfg->awdl_vif = vif;
+	WRITE_ONCE(cfg->awdl_pending, true);
+	spin_unlock(&cfg->vif_event.vif_event_lock);
+	wiphy_delayed_work_queue(wiphy, &cfg->awdl_timeout,
+				 BRCMF_VIF_EVENT_TIMEOUT);
+
+	err = brcmf_cfg80211_request_awdl_if(ifp, NULL);
+	if (err) {
+		/* An IF_ADD may already be in flight: retire under the same lock. */
+		wiphy_delayed_work_queue(wiphy, &cfg->awdl_timeout, 0);
+		return err;
+	}
+
+	/* Deliberately do NOT wait for the interface here, and do NOT attach
+	 * the netdev. nl80211 calls vendor commands holding the wiphy mutex
+	 * (NL80211_CMD_VENDOR sets NEED_WIPHY without NO_WIPHY_MTX), and
+	 * register_netdev() re-enters that mutex via the netdev notifier
+	 * chain -> cfg80211_netdev_notifier_call(). Doing it here self-
+	 * deadlocks and wedges the RTNL for the whole system. The attach is
+	 * done from brcmf_cfg80211_awdl_attach_pending(), which the fweh
+	 * event worker calls while holding no locks at all.
+	 */
+	return 0;
+}
+
+/**
+ * brcmf_cfg80211_awdl_attach_pending() - finish AWDL interface creation.
+ *
+ * @ifp: interface the firmware just reported via BRCMF_E_IF_ADD.
+ *
+ * Called from the fweh event worker (brcmf_fweh_handle_if_event()), which
+ * runs on the system workqueue holding neither the RTNL nor the wiphy mutex.
+ * That is the only context in which register_netdev() is safe for an
+ * interface created outside cfg80211's own add_virtual_intf() path.
+ */
+void brcmf_cfg80211_awdl_attach_pending(struct brcmf_if *ifp)
+{
+	struct brcmf_cfg80211_info *cfg = ifp->drvr->config;
+	struct brcmf_cfg80211_vif *vif;
+	int err;
+
+	if (!cfg)
+		return;
+	spin_lock(&cfg->vif_event.vif_event_lock);
+	vif = cfg->awdl_vif;
+	if (!cfg->awdl_pending || cfg->awdl_attaching || !vif ||
+	    ifp->vif != vif) {
+		spin_unlock(&cfg->vif_event.vif_event_lock);
+		return;
+	}
+	cfg->awdl_attaching = true;
+	spin_unlock(&cfg->vif_event.vif_event_lock);
+
+	if (!ifp->ndev) {
+		bphy_err(ifp->drvr, "AWDL if event without netdev\n");
+		goto fail;
+	}
+
+	ifp->is_awdl = true;
+	strscpy(ifp->ndev->name, cfg->awdl_ifname, sizeof(ifp->ndev->name));
+	err = brcmf_net_attach(ifp, false);
+	if (err) {
+		bphy_err(ifp->drvr, "registering AWDL netdevice failed\n");
+		goto fail;
+	}
+
+	spin_lock(&cfg->vif_event.vif_event_lock);
+	cfg->awdl_vif = NULL;
+	WRITE_ONCE(cfg->awdl_pending, false);
+	cfg->awdl_attaching = false;
+	if (cfg->vif_event.vif == vif) {
+		cfg->vif_event.vif = NULL;
+		cfg->vif_event.action = 0;
+	}
+	spin_unlock(&cfg->vif_event.vif_event_lock);
+	brcmf_info("AWDL interface %s created (bsscfgidx %d)\n",
+		   ifp->ndev->name, ifp->bsscfgidx);
+	return;
+
+fail:
+	/* Do not free a vif while an event or wiphy operation can still see it. */
+	spin_lock(&cfg->vif_event.vif_event_lock);
+	if (cfg->pub->iflist[ifp->bsscfgidx] == ifp)
+		cfg->pub->iflist[ifp->bsscfgidx] = NULL;
+	cfg->awdl_failed_ifp = ifp;
+	cfg->vif_event.vif = NULL;
+	cfg->vif_event.action = 0;
+	spin_unlock(&cfg->vif_event.vif_event_lock);
+	wiphy_work_queue(cfg->wiphy, &cfg->awdl_cleanup);
+}
+
+/**
+ * brcmf_awdl_del_vif() - tear down an interface made by brcmf_awdl_add_vif().
+ *
+ * @wiphy: wiphy device of the interface.
+ * @wdev: wireless device to remove.
+ *
+ * Return: 0 on success, negative errno on failure.
+ */
+int brcmf_awdl_del_vif(struct wiphy *wiphy, struct wireless_dev *wdev)
+{
+	struct brcmf_cfg80211_vif *vif = container_of(wdev,
+						      struct brcmf_cfg80211_vif,
+						      wdev);
+	struct brcmf_if *ifp = vif->ifp;
+	int err;
+
+	if (wdev->wiphy != wiphy || !ifp || !ifp->is_awdl)
+		return -ENODEV;
+
+	/* Asymmetric with the rest of brcmfmac on purpose, for the same reason
+	 * brcmf_awdl_add_vif() does not call brcmf_net_attach(): nl80211 calls
+	 * vendor commands holding the wiphy mutex and NOT the RTNL
+	 * (NL80211_CMD_VENDOR sets NEED_WIPHY without NO_WIPHY_MTX). Tearing
+	 * the netdev down here reaches cfg80211_close_dependents(), which
+	 * asserts the RTNL, and then deadlocks the whole netdev layer against
+	 * any concurrent RTNL holder. Do NOT call brcmf_remove_interface() or
+	 * arm the vif event from this context.
+	 *
+	 * Just ask the firmware to drop the BSS and return. The BRCMF_E_IF_DEL
+	 * event lands in brcmf_fweh_event_worker(), which is a plain work item
+	 * holding neither lock, and brcmf_fweh_handle_if_event() removes the
+	 * interface from there.
+	 */
+	err = brcmf_fil_iovar_data_set(ifp, "interface_remove", NULL, 0);
+	if (err)
+		err = brcmf_fil_bsscfg_data_set(ifp, "interface_remove", NULL, 0);
+	if (err)
+		bphy_err(ifp->drvr, "interface_remove failed %d\n", err);
+
+	return err;
+}
+
 static
 struct wireless_dev *brcmf_apsta_add_vif(struct wiphy *wiphy, const char *name,
 					 struct vif_params *params,
@@ -1180,6 +1441,7 @@ brcmf_cfg80211_scan(struct wiphy *wiphy, struct cfg80211_scan_request *request)
 	struct brcmf_cfg80211_info *cfg = wiphy_to_cfg(wiphy);
 	struct brcmf_pub *drvr = cfg->pub;
 	struct brcmf_cfg80211_vif *vif;
+	unsigned int timeout;
 	s32 err = 0;
 
 	brcmf_dbg(TRACE, "Enter\n");
@@ -1226,13 +1488,19 @@ brcmf_cfg80211_scan(struct wiphy *wiphy, struct cfg80211_scan_request *request)
 	if (vif == cfg->p2p.bss_idx[P2PAPI_BSSCFG_DEVICE].vif)
 		vif = cfg->p2p.bss_idx[P2PAPI_BSSCFG_PRIMARY].vif;
 
+	/* P2P supplies its own dwell policy; retain its existing timeout. */
+	timeout = cfg->escan_info.run == brcmf_run_escan ?
+		brcmf_scan_timeout_ms(wiphy, request) : BRCMF_ESCAN_TIMER_INTERVAL_MS;
+	brcmf_dbg(SCAN, "scan timeout %u ms for %u channels\n",
+		  timeout, request->n_channels);
+
 	err = brcmf_do_escan(vif->ifp, request);
 	if (err)
 		goto scan_out;
 
 	/* Arm scan timeout timer */
 	mod_timer(&cfg->escan_timeout,
-		  jiffies + msecs_to_jiffies(BRCMF_ESCAN_TIMER_INTERVAL_MS));
+		  jiffies + msecs_to_jiffies(timeout));
 
 	return 0;
 
@@ -3217,8 +3485,47 @@ done:
 	return err;
 }
 
+static bool brcmf_bss_info_version_supported(u32 version)
+{
+	return (version >= BRCMF_BSS_INFO_MIN_VERSION &&
+		version <= BRCMF_BSS_INFO_MAX_VERSION) ||
+		version == BRCMF_BSS_INFO_VERSION_116;
+}
+
+static bool brcmf_bss_info_valid(const struct brcmf_bss_info_le *bi,
+			       size_t available)
+{
+	u32 version, length, ie_length;
+	u16 ie_offset;
+	size_t fixed_size = offsetof(struct brcmf_bss_info_le, SNR);
+
+	/* All scan consumers use the common prefix through ie_length. */
+	if (available < fixed_size)
+		return false;
+
+	version = le32_to_cpu(bi->version);
+	if (!brcmf_bss_info_version_supported(version))
+		return false;
+
+	/* Version 116 has two five-byte EHT maps and an MLD address.
+	 * Its common prefix has the same offsets; the tail stays opaque.
+	 */
+	if (version == BRCMF_BSS_INFO_VERSION_116)
+		fixed_size = BRCMF_BSS_INFO_V116_FIXED_SIZE;
+
+	length = le32_to_cpu(bi->length);
+	ie_offset = le16_to_cpu(bi->ie_offset);
+	ie_length = le32_to_cpu(bi->ie_length);
+	return length >= fixed_size && length <= available &&
+		bi->SSID_len <= sizeof(bi->SSID) &&
+		le32_to_cpu(bi->rateset.count) <= sizeof(bi->rateset.rates) &&
+		ie_offset >= fixed_size && ie_offset <= length &&
+		ie_length <= length - ie_offset;
+}
+
 static s32 brcmf_inform_single_bss(struct brcmf_cfg80211_info *cfg,
-				   struct brcmf_bss_info_le *bi)
+				   struct brcmf_bss_info_le *bi,
+				   size_t available)
 {
 	struct wiphy *wiphy = cfg_to_wiphy(cfg);
 	struct brcmf_pub *drvr = cfg->pub;
@@ -3234,8 +3541,9 @@ static s32 brcmf_inform_single_bss(struct brcmf_cfg80211_info *cfg,
 	size_t notify_ielen;
 	struct cfg80211_inform_bss bss_data = {};
 
-	if (le32_to_cpu(bi->length) > WL_BSS_INFO_MAX) {
-		bphy_err(drvr, "Bss info is larger than buffer. Discarding\n");
+	if (!brcmf_bss_info_valid(bi, available) ||
+	    le32_to_cpu(bi->length) > WL_BSS_INFO_MAX) {
+		bphy_err(drvr, "Invalid Bss info record. Discarding\n");
 		return -EINVAL;
 	}
 
@@ -3318,20 +3626,30 @@ static s32 brcmf_inform_bss(struct brcmf_cfg80211_info *cfg)
 	struct brcmf_scan_results *bss_list;
 	struct brcmf_bss_info_le *bi = NULL;	/* must be initialized */
 	s32 err = 0;
-	int i;
+	u32 i;
+	size_t remaining;
 
 	bss_list = (struct brcmf_scan_results *)cfg->escan_info.escan_buf;
 	if (bss_list->count != 0 &&
-	    (bss_list->version < BRCMF_BSS_INFO_MIN_VERSION ||
-	    bss_list->version > BRCMF_BSS_INFO_MAX_VERSION)) {
+	    !brcmf_bss_info_version_supported(bss_list->version)) {
 		bphy_err(drvr, "BSS info version %d unsupported\n",
 			 bss_list->version);
 		return -EOPNOTSUPP;
 	}
+	if (bss_list->buflen < sizeof(*bss_list) ||
+	    bss_list->buflen > BRCMF_ESCAN_BUF_SIZE)
+		return -EINVAL;
+	remaining = bss_list->buflen - sizeof(*bss_list);
+	if (bss_list->count > remaining /
+	    offsetof(struct brcmf_bss_info_le, SNR))
+		return -EINVAL;
 	brcmf_dbg(SCAN, "scanned AP count (%d)\n", bss_list->count);
 	for (i = 0; i < bss_list->count; i++) {
 		bi = next_bss_le(bss_list, bi);
-		err = brcmf_inform_single_bss(cfg, bi);
+		if (!brcmf_bss_info_valid(bi, remaining))
+			return -EINVAL;
+		err = brcmf_inform_single_bss(cfg, bi, remaining);
+		remaining -= le32_to_cpu(bi->length);
 		if (err)
 			break;
 	}
@@ -3375,6 +3693,10 @@ static s32 brcmf_inform_ibss(struct brcmf_cfg80211_info *cfg,
 	}
 
 	bi = (struct brcmf_bss_info_le *)(buf + 4);
+	if (!brcmf_bss_info_valid(bi, WL_BSS_INFO_MAX - 4)) {
+		err = -EINVAL;
+		goto cleanup;
+	}
 
 	ch.chspec = le16_to_cpu(bi->chanspec);
 	cfg->d11inf.decchspec(&ch);
@@ -3448,7 +3770,7 @@ static s32 brcmf_update_bss_info(struct brcmf_cfg80211_info *cfg,
 		goto update_bss_info_out;
 	}
 	bi = (struct brcmf_bss_info_le *)(cfg->extra_buf + 4);
-	err = brcmf_inform_single_bss(cfg, bi);
+	err = brcmf_inform_single_bss(cfg, bi, WL_EXTRA_BUF_MAX - 4);
 
 update_bss_info_out:
 	brcmf_dbg(TRACE, "Exit");
@@ -3558,7 +3880,8 @@ brcmf_cfg80211_escan_handler(struct brcmf_if *ifp,
 
 	if (status == BRCMF_E_STATUS_PARTIAL) {
 		brcmf_dbg(SCAN, "ESCAN Partial result\n");
-		if (e->datalen < sizeof(*escan_result_le)) {
+		if (e->datalen < WL_ESCAN_RESULTS_FIXED_SIZE +
+		    offsetof(struct brcmf_bss_info_le, SNR)) {
 			bphy_err(drvr, "invalid event data length\n");
 			goto exit;
 		}
@@ -3570,7 +3893,8 @@ brcmf_cfg80211_escan_handler(struct brcmf_if *ifp,
 		escan_buflen = le32_to_cpu(escan_result_le->buflen);
 		if (escan_buflen > BRCMF_ESCAN_BUF_SIZE ||
 		    escan_buflen > e->datalen ||
-		    escan_buflen < sizeof(*escan_result_le)) {
+		    escan_buflen < WL_ESCAN_RESULTS_FIXED_SIZE +
+		    offsetof(struct brcmf_bss_info_le, SNR)) {
 			bphy_err(drvr, "Invalid escan buffer length: %d\n",
 				 escan_buflen);
 			goto exit;
@@ -3581,19 +3905,18 @@ brcmf_cfg80211_escan_handler(struct brcmf_if *ifp,
 			goto exit;
 		}
 		bss_info_le = &escan_result_le->bss_info_le;
+		bi_length = escan_buflen - WL_ESCAN_RESULTS_FIXED_SIZE;
+		if (!brcmf_bss_info_valid(bss_info_le, bi_length) ||
+		    le32_to_cpu(bss_info_le->length) != bi_length) {
+			bphy_err(drvr, "Ignoring invalid bss_info record\n");
+			goto exit;
+		}
 
 		if (brcmf_p2p_scan_finding_common_channel(cfg, bss_info_le))
 			goto exit;
 
 		if (!cfg->int_escan_map && !cfg->scan_request) {
 			brcmf_dbg(SCAN, "result without cfg80211 request\n");
-			goto exit;
-		}
-
-		bi_length = le32_to_cpu(bss_info_le->length);
-		if (bi_length != escan_buflen -	WL_ESCAN_RESULTS_FIXED_SIZE) {
-			bphy_err(drvr, "Ignoring invalid bss_info length: %d\n",
-				 bi_length);
 			goto exit;
 		}
 
@@ -3608,7 +3931,9 @@ brcmf_cfg80211_escan_handler(struct brcmf_if *ifp,
 
 		list = (struct brcmf_scan_results *)
 				cfg->escan_info.escan_buf;
-		if (bi_length > BRCMF_ESCAN_BUF_SIZE - list->buflen) {
+		if (list->buflen < sizeof(*list) ||
+		    list->buflen > BRCMF_ESCAN_BUF_SIZE ||
+		    bi_length > BRCMF_ESCAN_BUF_SIZE - list->buflen) {
 			bphy_err(drvr, "Buffer is too small: ignoring\n");
 			goto exit;
 		}
@@ -6239,80 +6564,103 @@ static s32 brcmf_get_assoc_ies(struct brcmf_cfg80211_info *cfg,
 			       struct brcmf_if *ifp)
 {
 	struct brcmf_pub *drvr = cfg->pub;
-	struct brcmf_cfg80211_assoc_ielen_le *assoc_info;
+	struct brcmf_cfg80211_assoc_ielen_le assoc_info = {};
 	struct brcmf_cfg80211_connect_info *conn_info = cfg_to_conn(cfg);
 	struct brcmf_cfg80211_edcf_acparam edcf_acparam_info[EDCF_AC_COUNT];
-	u32 req_len;
-	u32 resp_len;
-	s32 err = 0;
+	u8 *buffer = NULL, *req_ie = NULL, *resp_ie = NULL;
+	u32 req_len, resp_len, received;
+	s32 err;
 
 	brcmf_clear_assoc_ies(cfg);
-
-	err = brcmf_fil_iovar_data_get(ifp, "assoc_info",
-				       cfg->extra_buf, WL_ASSOC_INFO_MAX);
+	err = brcmf_fil_iovar_data_get_len(ifp, "assoc_info", &assoc_info,
+					   sizeof(assoc_info), &received);
 	if (err) {
 		bphy_err(drvr, "could not get assoc info (%d)\n", err);
 		return err;
 	}
-	assoc_info =
-		(struct brcmf_cfg80211_assoc_ielen_le *)cfg->extra_buf;
-	req_len = le32_to_cpu(assoc_info->req_len);
-	resp_len = le32_to_cpu(assoc_info->resp_len);
+	if (received < sizeof(assoc_info)) {
+		bphy_err(drvr, "short assoc info: received %u required %zu\n",
+			 received, sizeof(assoc_info));
+		return -EBADMSG;
+	}
+	req_len = le32_to_cpu(assoc_info.req_len);
+	resp_len = le32_to_cpu(assoc_info.resp_len);
 	if (req_len > WL_EXTRA_BUF_MAX || resp_len > WL_EXTRA_BUF_MAX) {
 		bphy_err(drvr, "invalid lengths in assoc info: req %u resp %u\n",
 			 req_len, resp_len);
 		return -EINVAL;
 	}
+	if (req_len || resp_len) {
+		buffer = kzalloc(WL_EXTRA_BUF_MAX, GFP_KERNEL);
+		if (!buffer)
+			return -ENOMEM;
+	}
 	if (req_len) {
-		err = brcmf_fil_iovar_data_get(ifp, "assoc_req_ies",
-					       cfg->extra_buf,
-					       WL_ASSOC_INFO_MAX);
+		err = brcmf_fil_iovar_data_get_len(ifp, "assoc_req_ies", buffer,
+						   max_t(u32, req_len, WL_ASSOC_INFO_MAX),
+						   &received);
 		if (err) {
 			bphy_err(drvr, "could not get assoc req (%d)\n", err);
-			return err;
+			goto done;
 		}
-		conn_info->req_ie_len = req_len;
-		conn_info->req_ie =
-		    kmemdup(cfg->extra_buf, conn_info->req_ie_len,
-			    GFP_KERNEL);
-		if (!conn_info->req_ie)
-			conn_info->req_ie_len = 0;
-	} else {
-		conn_info->req_ie_len = 0;
-		conn_info->req_ie = NULL;
+		if (received < req_len) {
+			bphy_err(drvr, "short assoc req: received %u required %u\n",
+				 received, req_len);
+			err = -EBADMSG;
+			goto done;
+		}
+		req_ie = kmemdup(buffer, req_len, GFP_KERNEL);
+		if (!req_ie) {
+			err = -ENOMEM;
+			goto done;
+		}
 	}
 	if (resp_len) {
-		err = brcmf_fil_iovar_data_get(ifp, "assoc_resp_ies",
-					       cfg->extra_buf,
-					       WL_ASSOC_INFO_MAX);
+		memset(buffer, 0, WL_EXTRA_BUF_MAX);
+		err = brcmf_fil_iovar_data_get_len(ifp, "assoc_resp_ies", buffer,
+						   max_t(u32, resp_len, WL_ASSOC_INFO_MAX),
+						   &received);
 		if (err) {
 			bphy_err(drvr, "could not get assoc resp (%d)\n", err);
-			return err;
+			goto done;
 		}
-		conn_info->resp_ie_len = resp_len;
-		conn_info->resp_ie =
-		    kmemdup(cfg->extra_buf, conn_info->resp_ie_len,
-			    GFP_KERNEL);
-		if (!conn_info->resp_ie)
-			conn_info->resp_ie_len = 0;
-
+		if (received < resp_len) {
+			bphy_err(drvr, "short assoc resp: received %u required %u\n",
+				 received, resp_len);
+			err = -EBADMSG;
+			goto done;
+		}
+		resp_ie = kmemdup(buffer, resp_len, GFP_KERNEL);
+		if (!resp_ie) {
+			err = -ENOMEM;
+			goto done;
+		}
+	}
+	/* Publish both IE buffers only after both firmware replies succeed. */
+	conn_info->req_ie = req_ie;
+	conn_info->req_ie_len = req_len;
+	conn_info->resp_ie = resp_ie;
+	conn_info->resp_ie_len = resp_len;
+	req_ie = NULL;
+	resp_ie = NULL;
+	err = 0;
+	if (resp_len) {
 		err = brcmf_fil_iovar_data_get(ifp, "wme_ac_sta",
 					       edcf_acparam_info,
 					       sizeof(edcf_acparam_info));
 		if (err) {
 			brcmf_err("could not get wme_ac_sta (%d)\n", err);
-			return err;
+			goto done;
 		}
-
 		brcmf_wifi_prioritize_acparams(edcf_acparam_info,
 					       cfg->ac_priority);
-	} else {
-		conn_info->resp_ie_len = 0;
-		conn_info->resp_ie = NULL;
 	}
+done:
 	brcmf_dbg(CONN, "req len (%d) resp len (%d)\n",
 		  conn_info->req_ie_len, conn_info->resp_ie_len);
-
+	kfree(buffer);
+	kfree(req_ie);
+	kfree(resp_ie);
 	return err;
 }
 
@@ -6395,6 +6743,10 @@ brcmf_bss_roaming_done(struct brcmf_cfg80211_info *cfg,
 		goto done;
 
 	bi = (struct brcmf_bss_info_le *)(buf + 4);
+	if (!brcmf_bss_info_valid(bi, WL_BSS_INFO_MAX - 4)) {
+		err = -EINVAL;
+		goto done;
+	}
 	ch.chspec = le16_to_cpu(bi->chanspec);
 	cfg->d11inf.decchspec(&ch);
 
@@ -6460,12 +6812,6 @@ brcmf_bss_connect_done(struct brcmf_cfg80211_info *cfg,
 		if (completed) {
 			brcmf_get_assoc_ies(cfg, ifp);
 			brcmf_update_bss_info(cfg, ifp);
-			if ((profile->use_fwsup == BRCMF_PROFILE_FWSUP_SAE) ||
-			    (profile->use_fwsup == BRCMF_PROFILE_FWSUP_PSK)) {
-				cfg80211_port_authorized(ndev, profile->bssid,
-							 NULL, 0, GFP_KERNEL);
-				brcmf_dbg(CONN, "Report port authorized\n");
-			}
 			set_bit(BRCMF_VIF_STATUS_CONNECTED,
 				&ifp->vif->sme_state);
 			conn_params.status = WLAN_STATUS_SUCCESS;
@@ -7933,9 +8279,11 @@ static int brcmf_setup_wiphy(struct wiphy *wiphy, struct brcmf_if *ifp)
 		gscan = brcmf_feat_is_enabled(ifp, BRCMF_FEAT_GSCAN);
 		brcmf_pno_wiphy_params(wiphy, gscan);
 	}
-	/* vendor commands/events support */
+	/* vendor commands/events support; awdl=0 leaves out the AWDL command */
 	wiphy->vendor_commands = brcmf_vendor_cmds;
-	wiphy->n_vendor_commands = BRCMF_VNDR_CMDS_LAST - 1;
+	wiphy->n_vendor_commands = ifp->drvr->settings->awdl_enable ?
+				   BRCMF_VNDR_CMDS_LAST - 1 :
+				   BRCMF_VNDR_CMDS_AWDL - 1;
 
 	if (brcmf_feat_is_enabled(ifp, BRCMF_FEAT_WOWL))
 		brcmf_wiphy_wowl_params(wiphy, ifp);
@@ -8577,6 +8925,8 @@ struct brcmf_cfg80211_info *brcmf_cfg80211_attach(struct brcmf_pub *drvr,
 	cfg->wiphy = wiphy;
 	cfg->pub = drvr;
 	init_vif_event(&cfg->vif_event);
+	wiphy_delayed_work_init(&cfg->awdl_timeout, brcmf_awdl_timeout);
+	wiphy_work_init(&cfg->awdl_cleanup, brcmf_awdl_cleanup);
 	INIT_LIST_HEAD(&cfg->vif_list);
 	cfg->force_band_setup = true;
 

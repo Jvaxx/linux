@@ -7,6 +7,7 @@
 
 #include <linux/kernel.h>
 #include <linux/etherdevice.h>
+#include <linux/hex.h>
 #include <linux/module.h>
 #include <linux/vmalloc.h>
 #include <net/cfg80211.h>
@@ -21,6 +22,18 @@
 #include "bus.h"
 #include "common.h"
 #include "interface_create.h"
+
+/* Creating a usable AWDL interface requires interface_create flags
+ * MAC_USE | IF_INDEX_USE | BSSID_USE together with an explicit BSSID and
+ * an interface index (BRCMF_AWDL_CREATE_FLAGS, BRCMF_AWDL_IF_INDEX);
+ * brcmfmac otherwise sends MAC_USE alone, which the firmware accepts but
+ * leaves the AWDL iovars unusable. The default BSSID is the fixed one that
+ * every AWDL node uses, so peers accept the interface's frames; awdl_bssid
+ * can override it at module load only.
+ */
+static char *brcmf_awdl_bssid = "00:25:00:ff:94:73";
+module_param_named(awdl_bssid, brcmf_awdl_bssid, charp, 0444);
+MODULE_PARM_DESC(awdl_bssid, "interface_create BSSID for AWDL (default: the fixed AWDL BSSID)");
 
 #define BRCMF_INTERFACE_CREATE_VER_1 1
 #define BRCMF_INTERFACE_CREATE_VER_2 2
@@ -45,6 +58,12 @@
 #define BRCMF_INTERFACE_BSSID_DONT_USE (0 << 4)
 #define BRCMF_INTERFACE_BSSID_USE (1 << 4)
 
+/* interface_create flags and interface index of an AWDL interface */
+#define BRCMF_AWDL_CREATE_FLAGS (BRCMF_INTERFACE_MAC_USE | \
+				 BRCMF_INTERFACE_IF_INDEX_USE | \
+				 BRCMF_INTERFACE_BSSID_USE)
+#define BRCMF_AWDL_IF_INDEX 2
+
 /*
  * From revision >= 2 Bit 0 of flags field will not be used  for STA or AP interface creation.
  * "iftype" field shall be used for identifying the interface type.
@@ -52,7 +71,7 @@
 enum brcmf_interface_type {
 	BRCMF_INTERFACE_TYPE_STA = 0,
 	BRCMF_INTERFACE_TYPE_AP = 1,
-	/* The missing number here is deliberate */
+	BRCMF_INTERFACE_TYPE_AWDL = 2,
 	BRCMF_INTERFACE_TYPE_NAN = 3,
 	BRCMF_INTERFACE_TYPE_P2P_GO = 4,
 	BRCMF_INTERFACE_TYPE_P2P_GC = 5,
@@ -130,6 +149,8 @@ static int brcmf_cfg80211_request_if_internal(struct brcmf_if *ifp, u32 version,
 					      enum brcmf_interface_type if_type,
 					      u8 *macaddr)
 {
+	bool awdl = if_type == BRCMF_INTERFACE_TYPE_AWDL;
+
 	switch (version) {
 	case BRCMF_INTERFACE_CREATE_VER_1: {
 		struct brcmf_interface_create_v1 iface_v1 = {};
@@ -182,6 +203,26 @@ static int brcmf_cfg80211_request_if_internal(struct brcmf_if *ifp, u32 version,
 				brcmf_set_vif_sta_macaddr(ifp,
 							  iface_v3.mac_addr);
 		}
+		if (awdl) {
+			flags = BRCMF_AWDL_CREATE_FLAGS;
+			/* brcmf_awdl_add_vif() passes NULL, so derive a MAC
+			 * here rather than send MAC_USE with an all-zero
+			 * address.
+			 */
+			if (is_zero_ether_addr(iface_v3.mac_addr))
+				brcmf_set_vif_sta_macaddr(ifp,
+							  iface_v3.mac_addr);
+			iface_v3.if_index = BRCMF_AWDL_IF_INDEX;
+			if (mac_pton(brcmf_awdl_bssid, iface_v3.bssid)) {
+				brcmf_info("awdl interface_create: flags 0x%x, if_index %u, bssid %pM, mac %pM\n",
+					   flags, iface_v3.if_index,
+					   iface_v3.bssid, iface_v3.mac_addr);
+			} else {
+				bphy_err(ifp->drvr, "bad awdl_bssid \"%s\"\n",
+					 brcmf_awdl_bssid);
+				return -EINVAL;
+			}
+		}
 		iface_v3.flags = cpu_to_le32(flags);
 		return brcmf_fil_iovar_data_get(ifp, "interface_create",
 						&iface_v3, sizeof(iface_v3));
@@ -203,6 +244,17 @@ static int brcmf_cfg80211_request_if(struct brcmf_if *ifp,
 	iface_create_ver = 0;
 	err = brcmf_fil_bsscfg_int_query(ifp, "interface_create",
 					 &iface_create_ver);
+	/* Only the version 3 request can describe an AWDL interface. Refuse it
+	 * on older firmware, including firmware too old to report a version,
+	 * rather than send a request that does not say what is asked for.
+	 */
+	if (if_type == BRCMF_INTERFACE_TYPE_AWDL &&
+	    (err || iface_create_ver != BRCMF_INTERFACE_CREATE_VER_3)) {
+		bphy_err(ifp->drvr,
+			 "AWDL needs interface_create version 3 (firmware: %d)\n",
+			 err ? -1 : (int)iface_create_ver);
+		return -EOPNOTSUPP;
+	}
 	if (!err) {
 		err = brcmf_cfg80211_request_if_internal(ifp, iface_create_ver,
 							 if_type, macaddr);
@@ -237,6 +289,12 @@ static int brcmf_cfg80211_request_if(struct brcmf_if *ifp,
 int brcmf_cfg80211_request_sta_if(struct brcmf_if *ifp, u8 *macaddr)
 {
 	return brcmf_cfg80211_request_if(ifp, BRCMF_INTERFACE_TYPE_STA,
+					 macaddr);
+}
+
+int brcmf_cfg80211_request_awdl_if(struct brcmf_if *ifp, u8 *macaddr)
+{
+	return brcmf_cfg80211_request_if(ifp, BRCMF_INTERFACE_TYPE_AWDL,
 					 macaddr);
 }
 
