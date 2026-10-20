@@ -4071,7 +4071,7 @@ asmlinkage long __arm64_sys_mremap(const struct pt_regs *regs);
 static unsigned long test_mremap(unsigned long old, unsigned long old_len,
 		unsigned long new_len, unsigned long flags, unsigned long new)
 {
-	struct pt_regs regs = { .regs = { old, old_len, new_len, flags, new } };
+	struct pt_regs regs = { .regs = { old, old_len, new_len, flags, new }, .orig_x0 = old };
 
 	return __arm64_sys_mremap(&regs);
 }
@@ -5188,7 +5188,7 @@ static void user4k_msync_offsets_test(struct kunit *test)
 	const struct file_operations *original_ops;
 	void *original_private;
 	struct test_fsync_record records[3] = {}, record = {};
-	struct pt_regs regs = { .regs = { TEST_VA + SZ_4K, 1, MS_SYNC } };
+	struct pt_regs regs = { .regs = { TEST_VA + SZ_4K, 1, MS_SYNC }, .orig_x0 = TEST_VA + SZ_4K };
 	long result[3];
 	unsigned int i;
 
@@ -5210,6 +5210,7 @@ static void user4k_msync_offsets_test(struct kunit *test)
 	kthread_use_mm(vma->vm_mm);
 	for (i = 0; i < ARRAY_SIZE(result); i++) {
 		regs.regs[0] = vma->vm_start + i * SZ_4K;
+		regs.orig_x0 = regs.regs[0];
 		result[i] = __arm64_sys_msync(&regs);
 		records[i] = record;
 	}
@@ -9109,7 +9110,7 @@ asmlinkage long __arm64_sys_mprotect(const struct pt_regs *regs);
 
 static long test_mprotect(unsigned long start, unsigned long len, unsigned long prot)
 {
-	struct pt_regs regs = { .regs = { start, len, prot } };
+	struct pt_regs regs = { .regs = { start, len, prot }, .orig_x0 = start };
 
 	return __arm64_sys_mprotect(&regs);
 }
@@ -9575,7 +9576,7 @@ asmlinkage long __arm64_sys_madvise(const struct pt_regs *regs);
 
 static long test_madvise(unsigned long addr, unsigned long size, unsigned long behavior)
 {
-	struct pt_regs regs = { .regs = { addr, size, behavior } };
+	struct pt_regs regs = { .regs = { addr, size, behavior }, .orig_x0 = addr };
 
 	return __arm64_sys_madvise(&regs);
 }
@@ -13805,7 +13806,7 @@ asmlinkage long __arm64_sys_prctl(const struct pt_regs *regs);
 
 static long test_prctl(unsigned long option, unsigned long arg2)
 {
-	struct pt_regs regs = { .regs = { option, arg2 } };
+	struct pt_regs regs = { .regs = { option, arg2 }, .orig_x0 = option };
 
 	return __arm64_sys_prctl(&regs);
 }
