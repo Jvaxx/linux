@@ -6,6 +6,7 @@
 #include <kunit/device.h>
 #include <kunit/test.h>
 #include <linux/ctype.h>
+#include <linux/device.h>
 #include <linux/module.h>
 #include <linux/power_supply.h>
 #include <linux/property.h>
@@ -206,6 +207,13 @@ static const struct power_supply_desc cd321x_mux_test_psy_desc = {
 
 static void cd321x_mux_test_unregister_nodes(void *unused)
 {
+	/*
+	 * Software nodes take part in fw_devlink, so the port is a consumer
+	 * of the PHY. The port is released only when that device link is,
+	 * from device_link_wq, and the release drops the port's references
+	 * to the nodes. Let it happen before the nodes go.
+	 */
+	device_link_wait_removal();
 	software_node_unregister_node_group(cd321x_mux_test_nodes);
 }
 
