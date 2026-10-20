@@ -8,6 +8,8 @@
 
 #define pr_fmt(fmt) "Power allocator: " fmt
 
+#include <linux/limits.h>
+#include <linux/math64.h>
 #include <linux/slab.h>
 #include <linux/thermal.h>
 
@@ -174,7 +176,16 @@ static void estimate_pid_constants(struct thermal_zone_device *tz,
 	tz->tzp->k_pu = int_to_frac(2 * sustainable_power) /
 		temperature_threshold;
 
-	k_i = tz->tzp->k_pu / 10;
+	if (tz->tzp->integral_time_constant_ms && tz->passive_delay_jiffies) {
+		u64 gain = (u64)tz->tzp->k_pu *
+			   jiffies_to_msecs(tz->passive_delay_jiffies);
+
+		gain = div_u64(gain, tz->tzp->integral_time_constant_ms);
+		k_i = min_t(u64, gain, S32_MAX);
+	} else {
+		/* Preserve the existing estimate unless a time is supplied. */
+		k_i = tz->tzp->k_pu / 10;
+	}
 	tz->tzp->k_i = k_i > 0 ? k_i : 1;
 
 	/*

@@ -177,6 +177,16 @@ stops at zero: the cutoff still prevents positive wind-up.  This lets the
 power budget recover after a temperature overshoot without requiring the
 zone to cool below its switch on temperature and reset the controller.
 
+The default estimate of `k_i` is `k_pu` divided by ten per iteration.  For
+polled zones, `integral-time-constant-ms` may instead specify the integral
+time relative to `k_pu`.  The estimate then scales with the passive polling
+period: `k_i = k_pu * passive_delay_ms / integral_time_constant_ms`, rounded
+down and bounded to the supported positive gain range.  For example, a
+5000 ms integral time retains the nominal gain per second when changing
+from 500 ms to 250 ms passive polling.  Zones without this property retain
+the existing estimate.  A sysfs override of `k_i` remains a per-iteration
+gain.
+
 k_d
 ---
 

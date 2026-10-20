@@ -180,8 +180,8 @@ config THERMAL_GOV_POWER_ALLOCATOR_KUNIT_TEST
 	default KUNIT_ALL_TESTS
 	help
 	  Test integral recovery after a temperature overshoot, the configured
-	  integral cutoff and the integral power bound. The tests exercise the
-	  PID controller with synthetic thermal zones and do not need hardware.
+	  integral cutoff, power bounds and polling-period gain calibration.
+	  The tests use synthetic thermal zones and do not need hardware.
 	  Only useful for kernel developers; say N unless testing the governor.
 
 config CPU_THERMAL

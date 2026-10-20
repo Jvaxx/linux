@@ -123,6 +123,54 @@ static void power_allocator_test_integral_bound(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, ctx->params.err_integral, 0LL);
 }
 
+static void power_allocator_test_legacy_gain(struct kunit *test)
+{
+	struct power_allocator_test_ctx *ctx = test->priv;
+	struct thermal_trip switch_on = { .temperature = 58000 };
+
+	/* Without an explicit time constant the per-poll estimate is unchanged. */
+	ctx->tz.passive_delay_jiffies = msecs_to_jiffies(500);
+	estimate_pid_constants(&ctx->tz, 1500, &switch_on, 95000);
+	KUNIT_EXPECT_EQ(test, ctx->tzp.k_i, 8);
+	ctx->tz.passive_delay_jiffies = msecs_to_jiffies(250);
+	estimate_pid_constants(&ctx->tz, 1500, &switch_on, 95000);
+	KUNIT_EXPECT_EQ(test, ctx->tzp.k_i, 8);
+}
+
+static void power_allocator_test_timed_gain(struct kunit *test)
+{
+	struct power_allocator_test_ctx *ctx = test->priv;
+	struct thermal_trip switch_on = { .temperature = 58000 };
+	u32 slow_budget;
+
+	ctx->tzp.integral_time_constant_ms = 5000;
+	ctx->tz.passive_delay_jiffies = msecs_to_jiffies(500);
+	estimate_pid_constants(&ctx->tz, 1500, &switch_on, 95000);
+	KUNIT_ASSERT_EQ(test, ctx->tzp.k_i, 8);
+	slow_budget = power_allocator_test_sample(test, 96000);
+
+	reset_pid_controller(&ctx->params);
+	ctx->tz.passive_delay_jiffies = msecs_to_jiffies(250);
+	estimate_pid_constants(&ctx->tz, 1500, &switch_on, 95000);
+	KUNIT_EXPECT_EQ(test, ctx->tzp.k_po, 41);
+	KUNIT_EXPECT_EQ(test, ctx->tzp.k_pu, 83);
+	KUNIT_ASSERT_EQ(test, ctx->tzp.k_i, 4);
+	/* Two fast samples integrate the same error as one slow sample. */
+	power_allocator_test_sample(test, 96000);
+	KUNIT_EXPECT_EQ(test, power_allocator_test_sample(test, 96000), slow_budget);
+}
+
+static void power_allocator_test_timed_gain_bound(struct kunit *test)
+{
+	struct power_allocator_test_ctx *ctx = test->priv;
+	struct thermal_trip switch_on = { .temperature = 58000 };
+
+	ctx->tzp.integral_time_constant_ms = 1;
+	ctx->tz.passive_delay_jiffies = msecs_to_jiffies(30000000);
+	estimate_pid_constants(&ctx->tz, 1500, &switch_on, 95000);
+	KUNIT_EXPECT_EQ(test, ctx->tzp.k_i, S32_MAX);
+}
+
 static struct kunit_case power_allocator_test_cases[] = {
 	KUNIT_CASE(power_allocator_test_no_positive_windup),
 	KUNIT_CASE(power_allocator_test_hot_integrates),
@@ -131,6 +179,9 @@ static struct kunit_case power_allocator_test_cases[] = {
 	KUNIT_CASE(power_allocator_test_positive_cutoff),
 	KUNIT_CASE(power_allocator_test_negative_cutoff),
 	KUNIT_CASE(power_allocator_test_integral_bound),
+	KUNIT_CASE(power_allocator_test_legacy_gain),
+	KUNIT_CASE(power_allocator_test_timed_gain),
+	KUNIT_CASE(power_allocator_test_timed_gain_bound),
 	{}
 };
 
