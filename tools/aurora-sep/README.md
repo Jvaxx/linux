@@ -29,7 +29,7 @@ reboot-persistent enrollment fixes, reference-key recovery caveats and current
 validation boundaries. The historical bring-up results below describe the
 individual builds at the time they were tested.
 
-For Neo OS-identity continuity and the unexecuted hardware plan, read
+For Neo OS-identity continuity, read
 [OS-IDENTITY.md](OS-IDENTITY.md) before changing boot parameters or identity
 sources. Existing chosen-lane enrolments require no migration.
 

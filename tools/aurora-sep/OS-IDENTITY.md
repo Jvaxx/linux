@@ -1,137 +1,81 @@
 <!-- SPDX-License-Identifier: GPL-2.0-only OR MIT -->
 # Keep the SEP OS identity stable
 
-The original T2587 premise was wrong: on a normally installed Neo (T8140),
-`/chosen/apfs-preboot-uuid` identifies the booted volume group, so Linux has
-its own anti-replay lane. It is not automatically the macOS identity. The
-operator's 2026-10-11 hardware check established that distinction; the
-September collision was caused by explicitly pinning macOS's identity.
-The source review below supports the forwarding and selection mechanism;
-it does not repeat that hardware check.
+The SEP OS identity selects the anti-replay lane that the enclave puts an OS
+in. Two operating systems that present the same identity share a lane, and
+enrolling in one of them invalidates the other's material. Changing the
+identity of an installed system orphans everything enrolled under the old
+one.
 
-## Selection contract
+On a normally installed Neo (T8140), m1n1 forwards `/chosen/apfs-preboot-uuid`
+from the Apple device tree. It names the booted volume group, so a Linux
+install that boots from its own volume group already has its own lane. It is
+not macOS's identity unless a boot entry pins macOS's value explicitly, which
+is what caused enrolments to collide in the past.
 
-The driver must preserve the identity used by an existing install:
+## Selection order
 
-1. If either `apple_sep.os_uuid_hi` or `apple_sep.os_uuid_lo` is nonzero, use
-   both explicit halves, in big-endian order. One zero half is valid. Both
-   zero halves mean there is no override.
-2. Otherwise use the parsed, nonzero `/chosen/apfs-preboot-uuid`.
-3. If the property is missing, malformed or zero, leave the identity
-   unavailable. Do not generate an identity or silently choose another lane.
+The driver picks the identity in this order and never invents one:
 
-`sep.rs::prepare_os_uuid` uses `os_identity::select`; KUnit guards explicit
-precedence, zero halves, byte order, repeatable chosen selection and absence.
-The T8140 profile remains `IdentitySource::Chosen`, with a regression test.
-This is a software regression guard, not a new persisted runtime binding.
-No host-state format, identity-source policy or enrolment state changes.
-The explicit-selection log reports only its source, never identity bytes.
+1. If `apple_sep.os_uuid_hi` or `apple_sep.os_uuid_lo` is nonzero, use both
+   halves in big-endian order. One zero half is valid. Both halves zero
+   means there is no override.
+2. Otherwise use `/chosen/apfs-preboot-uuid`, if it is present, well formed
+   and nonzero.
+3. Otherwise leave the identity unavailable.
 
-At the reviewed SEP topic base, the profile's `identity` field was not read
-by selection. In particular, T6020's `HostPersisted` declaration was not an
-implemented persistence policy. Changing T8140's enum and wiring it into
-selection would change the effective identity on existing machines.
+`os_identity::select()` implements this order and has KUnit coverage for
+explicit precedence, zero halves, byte order, repeated chosen selection and
+a missing property. The T8140 profile keeps `IdentitySource::Chosen`, with a
+regression test. The `HostPersisted` source declared for other profiles is
+not implemented by the selector. Wiring it up would move existing installs
+to a new lane, so do not do that without a migration plan. The kernel log
+names the source it used and never prints the identity.
 
-## Boot-chain evidence
+## Existing installs
 
-The reviewed kernel is `omacom/linux-aurora` commit
-`d75387d811a1a400a3fdbf9e69bb3b38c7bbba90` (the SEP topic base).
-Its original `sep.rs:1537-1561` implements params, then chosen, then none.
-`dt.rs::preboot_uuid` reads that exact property and rejects malformed and
-all-zero values. The supplied older reference `44d5afc79da7` has the same
-selection order.
+A Fedora Neo with explicit `apple_sep.os_uuid_*` parameters keeps them and
+keeps its lane. Carry them unchanged across kernel updates, recovery entries
+and boot loader changes. Do not remove them because chosen forwarding exists.
 
-The MIT-licensed m1n1 SEP handoff at commit
-`851c795061e1ce9f1823b52a3217ce1fd14885a9`, `src/kboot.c`, calls
-`dt_forward_chosen_str` for `apfs-preboot-uuid` and `boot-uuid` from the ADT's
-`/chosen` node. That helper copies the bytes verbatim to the FDT; it does
-not search APFS for macOS or substitute a macOS identity. The comment about
-what macOS's driver reads describes the property, not ownership of its value.
-The reviewed `v1.6.3-m3air.stage1` commit
-`328a7ee2593b83da8e34eaec9d666e086e6a389b` instead formats a binary property
-or copies a string, with `boot-uuid` as fallback, into `apfs-preboot-uuid`.
-Neither implementation establishes that a particular installed boot chain
-contains that code. Older branches may lack forwarding; an absent property
-must remain an unavailable identity rather than justify inventing one.
+An Omarchy Neo that uses chosen keeps that identity and its enrolments. No
+migration or re-enrolment is needed.
 
-## Existing installs and alternatives
+A system that is actually pinned to macOS's identity is a separate recovery
+case. Stop automatic SEP consumers and plan the recovery with the owner. Do
+not change the lane or delete either OS's enrolments automatically.
 
-An existing Fedora Neo with explicit parameters keeps those exact parameters
-and its lane. Preserve them across updates, recovery entries and boot-loader
-changes. Do not replace them with a generated value or remove them merely
-because chosen forwarding exists. No re-enrolment is needed for this change.
+Installers and boot hooks may preserve an explicit identity, but must never
+add, remove or rotate one on an enrolled install. Switching an entry between
+explicit and chosen is safe only when both resolve to the same bytes.
+Recreating the volume group, restoring boot configuration or reinstalling
+can change chosen and needs the same care.
 
-An existing normal Omarchy Neo using chosen keeps that identity and its
-existing enrolments. No migration refusal or re-enrolment is appropriate.
-A system actually pinned to macOS's identity is a separate recovery case:
-stop automatic SEP consumers and obtain an owner-approved recovery plan.
-Do not automatically change the lane or delete either OS's enrolments.
-Previously invalidated credentials are not repaired by this patch.
+The host state does not record which identity an enrolment was made under.
+`aurora-sep-ready` therefore cannot tell whether a migration is needed, and
+does not try to.
 
-The proposed host-persisted source switch was withdrawn. The unpublished
-`ac14bdc7c654` experiment must not be promoted: it would switch fresh chosen
-installs to another lane and refuse existing chosen-lane state as a migration.
+## Testing changes to identity selection
 
-An installer or boot hook can preserve an explicitly configured identity,
-but must never add, remove or rotate one on an enrolled install unattended.
-A new random per-install value is unnecessary for a normal chosen install.
-Switching boot entries between explicit and chosen is safe only when their
-effective bytes are known to be equal; a source-label change alone does not
-prove a lane change. Recreating a volume group, restoring boot configuration
-or reinstalling can change chosen and needs the same continuity review.
+Never test identity changes on a machine with enrolments or SEP-protected
+keys that matter. SEP and xART state is device-wide, so a spare Linux volume
+on the same machine does not isolate it. Do not record identities, SEP
+payloads, MAC addresses or calibration data in test logs, and do not keep raw
+console logs from older kernels or m1n1 builds that print identities.
 
-There is no recorded enrolment-to-OS-identity provenance in the current
-host-state format. Source labels, the presence of keybag files and generic
-SEP errors cannot establish which lane contains an enrolment. Consequently
-`aurora-sep-ready` must not infer "migration required" from these facts.
-No runtime provenance warning is added. A future opt-in continuity marker
-would need a trusted baseline, compare effective identities rather than
-labels, preserve old installs on first adoption, and never expose identities
-or read SEP payloads merely to generate a warning.
+On a disposable machine:
 
-## Hardware plan — not executed
-
-All steps require a new controller request naming the exact device, explicit
-policy approval, session/source/resource/ownership gates and owner consent.
-This document does not authorize or request a hardware session.
-
-To avoid orphaning existing enrolments, do not boot this candidate or invoke
-SEP on any device with valuable enrolments or SEP-protected keys. A spare
-Linux volume on such a device is insufficient: SEP and xART are device-wide.
-Existing Fedora and Omarchy continuity checks are offline boot-configuration
-comparisons only, performed by the authorized owner without printing values.
-Preserve original entries and report only equal/different and source labels.
-
-Use only an owner-approved disposable Neo with no valuable credentials in
-any OS for runtime qualification. Before any boot, disable automatic SEP
-loaders and consumers in every test entry, arrange password/recovery access,
-and record the approved source commit and unchanged boot-chain build.
-Do not extract, print or attach UUIDs, SEP payloads, MACs or calibration data.
-Do not collect raw console logs: older kernel and m1n1 builds print identities.
-
-1. Establish disposable Linux and macOS test enrolments using the known-good
-   kernel and normal, unchanged chosen boot entry. Verify both and record
-   boolean results only. All test credentials are disposable from the outset.
-2. Boot the candidate using the same volume group and boot arguments. First
-   confirm the effective identity equals the baseline through a private
-   in-memory comparison that emits only equality and source. If it differs,
-   stop before loading the driver; return to the unchanged original entry.
-3. Only after that comparison, allow the normal loader on the disposable
-   device. Verify the existing Linux credential without re-enrolling, reboot
-   and verify again, then verify the disposable macOS credential. Matches
-   write anti-replay state, so these are not read-only checks.
-4. Separately qualify explicit-parameter continuity on a disposable test
-   setup: enrol under a known-good explicit entry, preserve both halves
-   verbatim, then repeat candidate/reboot verification. Do not change sources
-   beneath an already-enrolled setup. The synthetic KUnit cases cover zero
-   halves and missing chosen without touching hardware.
-5. Roll back only the kernel/boot entry while retaining the current matching
-   identity and host state. Never restore stale host-state or xART snapshots
-   after SEP writes: file rollback does not roll back enclave anti-replay
-   counters. On any mismatch or failed verification, stop consumers and
-   preserve failure evidence; do not reset, delete, rotate or re-enrol to make
-   the test pass. Retire only disposable test credentials under a separate
-   owner-approved cleanup procedure.
-
-No real enrolment migration, lane-switch experiment or destructive recovery
-is part of this plan. Report source/equality and pass/fail counts only.
+1. Enrol a disposable Linux and macOS fingerprint using the known-good kernel
+   and its unchanged boot entry, and verify both.
+2. Boot the candidate with the same volume group and boot arguments. Before
+   loading the driver, compare the effective identity with the baseline and
+   record only whether they match. Stop if they differ.
+3. Verify the existing Linux fingerprint without re-enrolling, reboot and
+   verify again, then verify the macOS fingerprint. These checks write
+   anti-replay state, so they are not read-only.
+4. Repeat with an explicit-parameter entry that was used for the enrolment,
+   copying both halves verbatim.
+5. Roll back only the kernel and boot entry. Never restore older host-state
+   or xART files after the SEP has written, because file rollback does not
+   roll back the enclave's counters. On a mismatch or failed verification,
+   stop and keep the evidence instead of resetting or re-enrolling.
