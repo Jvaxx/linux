@@ -192,6 +192,28 @@ config APPLE_PMP
 
 	  Say 'y' here if you have an Apple SoC.
 
+config APPLE_T8132_PLATFORM_HANDOFF
+	bool "Apple T8132 legacy platform description compatibility"
+	depends on ARCH_APPLE || COMPILE_TEST
+	depends on OF_DYNAMIC && OF_FLATTREE
+	default y if APPLE_PMP
+	help
+	  Supply missing cache and PMC descriptions, and the J713 board's PMGR
+	  availability/ownership policy, for the original loader tree before devices
+	  are populated. Native memory-controller descriptions take precedence.
+	  Required for that legacy tree to keep inaccessible PMGR domains from
+	  probing; kernels using the complete J713 DT do not require this adapter.
+
+config APPLE_T8132_PLATFORM_KUNIT_TEST
+	bool "KUnit tests for T8132 platform descriptions" if !KUNIT_ALL_TESTS
+	depends on KUNIT && APPLE_T8132_PLATFORM_HANDOFF
+	default KUNIT_ALL_TESTS
+	help
+	  Check live OF descriptions after the compatibility initcall runs.
+	  Tests require a J713 description; a QEMU fixture can supply a legacy
+	  tree without enabling any Apple hardware drivers. These tests only
+	  read metadata and never access the described MMIO resources.
+
 config APPLE_CLPC
 	tristate "Apple host performance controller floors"
 	depends on ARCH_APPLE || COMPILE_TEST
