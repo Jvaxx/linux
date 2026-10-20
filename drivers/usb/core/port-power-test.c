@@ -802,6 +802,20 @@ static void port_graph_test_cleanup(void *data)
 		of_node_put(g->nodes[--g->count]);
 }
 
+/*
+ * The highest phandle in the live tree, walked with the exported child
+ * iterator: the test can be a module, and for_each_of_allnodes() is not.
+ */
+static u32 port_graph_test_max_phandle(struct device_node *np)
+{
+	struct device_node *child;
+	u32 max = np->phandle;
+
+	for_each_child_of_node(np, child)
+		max = max_t(u32, max, port_graph_test_max_phandle(child));
+	return max;
+}
+
 static void port_power_test_connector_graph_model(struct kunit *test, bool legacy)
 {
 	static const struct {
@@ -836,12 +850,10 @@ static void port_power_test_connector_graph_model(struct kunit *test, bool legac
 	struct port_power_test *t = test->priv;
 	struct port_graph_test *g;
 	struct usb_device *fixed;
-	struct device_node *node;
-	u32 phandle = 0;
+	u32 phandle;
 
 	KUNIT_ASSERT_NOT_NULL(test, root);
-	for_each_of_allnodes(node)
-		phandle = max(phandle, node->phandle);
+	phandle = port_graph_test_max_phandle(root);
 	KUNIT_ASSERT_LT(test, phandle, (u32)(U32_MAX - PG_COUNT));
 	phandle++;
 	g = kunit_kzalloc(test, sizeof(*g), GFP_KERNEL);
