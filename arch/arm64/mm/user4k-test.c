@@ -24,6 +24,7 @@
 #include <linux/falloc.h>
 #include <linux/shmem_fs.h>
 #include <linux/seq_file.h>
+#include <linux/swap_ops.h>
 #include <linux/kthread.h>
 #include <linux/khugepaged.h>
 #include <linux/mm.h>
@@ -1635,18 +1636,20 @@ static void user4k_vma_offsets_test(struct kunit *test)
 static void user4k_vma_intervals_test(struct kunit *test)
 {
 	struct vm_area_struct *vmas = kunit_kcalloc(test, 3, sizeof(*vmas), GFP_KERNEL);
-	struct rb_root_cached root = RB_ROOT_CACHED;
+	struct address_space *mapping = kunit_kzalloc(test, sizeof(*mapping), GFP_KERNEL);
 	struct vm_area_struct *vma;
 	unsigned int i, count = 0;
 
 	KUNIT_ASSERT_NOT_NULL(test, vmas);
+	KUNIT_ASSERT_NOT_NULL(test, mapping);
+	mapping->i_mmap = RB_ROOT_CACHED;
 	for (i = 0; i < 3; i++) {
 		vmas[i].vm_start = TEST_VA + i * SZ_8K;
 		vmas[i].vm_end = vmas[i].vm_start + SZ_4K;
 		vma_set_page_offset(&vmas[i], (struct vm_page_offset) { 77, i * SZ_4K });
-		vma_interval_tree_insert(&vmas[i], &root);
+		mapping_rmap_tree_insert(&vmas[i], mapping);
 	}
-	vma_interval_tree_foreach(vma, &root, 77, 77) {
+	mapping_rmap_tree_foreach(vma, mapping, 77, 77) {
 		unsigned long address = vma_address_at_offset(vma,
 						(struct vm_page_offset) { 77, SZ_4K });
 
@@ -1655,11 +1658,11 @@ static void user4k_vma_intervals_test(struct kunit *test)
 		count++;
 	}
 	KUNIT_EXPECT_EQ(test, count, 3U);
-	KUNIT_EXPECT_PTR_EQ(test, vma_interval_tree_iter_first(&root, 76, 76), NULL);
-	KUNIT_EXPECT_PTR_EQ(test, vma_interval_tree_iter_first(&root, 78, 78), NULL);
+	KUNIT_EXPECT_PTR_EQ(test, mapping_rmap_tree_iter_first(mapping, 76, 76), NULL);
+	KUNIT_EXPECT_PTR_EQ(test, mapping_rmap_tree_iter_first(mapping, 78, 78), NULL);
 	for (i = 0; i < 3; i++)
-		vma_interval_tree_remove(&vmas[i], &root);
-	KUNIT_EXPECT_TRUE(test, RB_EMPTY_ROOT(&root.rb_root));
+		mapping_rmap_tree_remove(&vmas[i], mapping);
+	KUNIT_EXPECT_TRUE(test, RB_EMPTY_ROOT(&mapping->i_mmap.rb_root));
 }
 
 static void user4k_vma_mm_free(void *arg)
@@ -1885,7 +1888,10 @@ static void user4k_vma_copy_shrink_test(struct kunit *test)
 		struct vm_page_offset pos = vm_page_offset_add(initial, i == 2 ? 0 : (i + 1) * SZ_4K);
 
 		mmap_write_lock(mm);
-		dest = copy_vma(&source, addr, SZ_4K, pos, &need_locks);
+		pgoff_t anon_pgoff = __linear_anon_page_index(source,
+					start + (i == 2 ? 0 : (i + 1) * SZ_4K));
+
+		dest = copy_vma(&source, addr, SZ_4K, pos, anon_pgoff, &need_locks, false);
 		mmap_write_unlock(mm);
 		KUNIT_ASSERT_NOT_NULL(test, dest);
 		KUNIT_EXPECT_EQ(test, mm->map_count, 2);
@@ -1899,17 +1905,17 @@ static void user4k_vma_copy_shrink_test(struct kunit *test)
 	mmap_write_lock(mm);
 	{
 		VMA_ITERATOR(vmi, mm, dest->vm_start);
-		struct vm_page_offset pos = vma_page_offset_at(dest, target);
 
+		/* Since Linux 7.3 vma_shrink() only moves the end of a VMA. */
 		vma_iter_load(&vmi);
-		ret = vma_shrink(&vmi, dest, target, dest->vm_end, pos);
+		ret = vma_shrink(&vmi, dest, target + SZ_4K);
 	}
 	mmap_write_unlock(mm);
 	KUNIT_ASSERT_EQ(test, ret, 0);
-	KUNIT_EXPECT_EQ(test, dest->vm_start, target);
-	KUNIT_EXPECT_EQ(test, dest->vm_end, target + 2 * SZ_4K);
-	KUNIT_EXPECT_EQ(test, dest->vm_pgoff, 77UL + 4 / TEST_SLOTS);
-	KUNIT_EXPECT_EQ(test, vma_subpage_offset(dest), (4 % TEST_SLOTS) * SZ_4K);
+	KUNIT_EXPECT_EQ(test, dest->vm_start, target - SZ_4K);
+	KUNIT_EXPECT_EQ(test, dest->vm_end, target + SZ_4K);
+	KUNIT_EXPECT_EQ(test, dest->vm_pgoff, 77UL + 3 / TEST_SLOTS);
+	KUNIT_EXPECT_EQ(test, vma_subpage_offset(dest), (3 % TEST_SLOTS) * SZ_4K);
 }
 
 struct anon_slot_fixture {
@@ -2038,7 +2044,7 @@ static void user4k_anon_rmap_test(struct kunit *test)
 	struct anon_slot_fixture *f = anon_slot_fixture_create(test);
 	struct folio *folio = NULL;
 	unsigned int i;
-	vm_flags_t flags;
+	vma_flags_t flags;
 	int ret, bad_offset = 0, bad_index = 0;
 
 	KUNIT_ASSERT_NOT_NULL(test, f);
@@ -2151,7 +2157,7 @@ static void user4k_anon_fork_rmap_test(struct kunit *test)
 	struct anon_slot_fixture *child;
 	struct mm_subpage *slot;
 	struct folio *folio;
-	vm_flags_t flags;
+	vma_flags_t flags;
 	int ret;
 	unsigned int i;
 
@@ -2194,7 +2200,7 @@ static void user4k_nonlinear_rmap_reuse_test(struct kunit *test)
 	struct folio *folio;
 	struct anon_vma_chain *avc;
 	phys_addr_t phys;
-	vm_flags_t flags;
+	vma_flags_t flags;
 	int ret;
 
 	KUNIT_ASSERT_NOT_NULL(test, a);
@@ -2240,10 +2246,12 @@ static void user4k_nonlinear_rmap_reuse_test(struct kunit *test)
 	mmap_write_lock(c->mm);
 	anon_vma_lock_write(c->vma->anon_vma);
 	list_for_each_entry(avc, &c->vma->anon_vma_chain, same_vma)
-		anon_vma_interval_tree_remove(avc, &avc->anon_vma->rb_root);
+		anon_rmap_tree_remove(avc, avc->anon_vma);
+	/* Linux 7.3 keys the anon_vma tree by the anonymous page offset. */
 	c->vma->vm_pgoff += 9;
+	c->vma->__vm_anon_pgoff_lo += 9;
 	list_for_each_entry(avc, &c->vma->anon_vma_chain, same_vma)
-		anon_vma_interval_tree_insert(avc, &avc->anon_vma->rb_root);
+		anon_rmap_tree_insert(avc, avc->anon_vma);
 	anon_vma_unlock_write(c->vma->anon_vma);
 	mmap_write_unlock(c->mm);
 #ifdef CONFIG_FAILSLAB
@@ -2866,7 +2874,7 @@ static void user64k_anon_zap_batch_test(struct kunit *test)
 
 	/* The reference walker must consume logical PTEs and native mapcounts. */
 	{
-		vm_flags_t flags;
+		vma_flags_t flags;
 		bool young;
 
 		folio_lock(f->folio);
@@ -3081,7 +3089,7 @@ static void user4k_swap_encoding_test(struct kunit *test)
 					if (flags & 1)
 						pte = pte_swp_mkexclusive(pte);
 					if (flags & 2)
-						pte = pte_swp_mkuffd_wp(pte);
+						pte = pte_swp_mkuffd(pte);
 					KUNIT_EXPECT_FALSE(test, pte_present(pte));
 					KUNIT_EXPECT_EQ(test, softleaf_from_pte(pte).val, entry.val);
 					KUNIT_EXPECT_EQ(test, pte_swp_subpage_offset(pte), slot * (unsigned int)SZ_4K);
@@ -3234,14 +3242,14 @@ static void user4k_mmap_region_offsets_test(struct kunit *test)
 	/* Only the full native-sized lengths are used before accounting conversion. */
 	kthread_use_mm(mm);
 	mmap_write_lock(mm);
-	result[0] = mmap_region(file, start + PAGE_SIZE, PAGE_SIZE, flags,
+	result[0] = mmap_region(file, start + PAGE_SIZE, PAGE_SIZE, legacy_to_vma_flags(flags),
 			       (struct vm_page_offset) { 1, SZ_4K }, NULL);
-	result[1] = mmap_region(file, start + 2 * PAGE_SIZE, PAGE_SIZE, flags,
+	result[1] = mmap_region(file, start + 2 * PAGE_SIZE, PAGE_SIZE, legacy_to_vma_flags(flags),
 			       (struct vm_page_offset) { 2, SZ_4K }, NULL);
-	result[2] = mmap_region(file, start, PAGE_SIZE, flags,
+	result[2] = mmap_region(file, start, PAGE_SIZE, legacy_to_vma_flags(flags),
 			       (struct vm_page_offset) { 0, SZ_4K }, NULL);
 	/* Adjacent virtual bytes with a different file offset must not merge. */
-	result[3] = mmap_region(file, start + 3 * PAGE_SIZE, PAGE_SIZE, flags,
+	result[3] = mmap_region(file, start + 3 * PAGE_SIZE, PAGE_SIZE, legacy_to_vma_flags(flags),
 			       (struct vm_page_offset) { 3, 2 * SZ_4K }, NULL);
 	mmap_write_unlock(mm);
 	kthread_unuse_mm(mm);
@@ -3710,7 +3718,7 @@ static void user4k_mmap_accounting_test(struct kunit *test)
 	before = test_commit_baseline(test);
 	kthread_use_mm(mm);
 	mmap_write_lock(mm);
-	mapped = mmap_region(NULL, start, 3 * SZ_4K, flags,
+	mapped = mmap_region(NULL, start, 3 * SZ_4K, legacy_to_vma_flags(flags),
 			     (struct vm_page_offset) { start >> PAGE_SHIFT, SZ_4K }, NULL);
 	mmap_write_unlock(mm);
 	if (!IS_ERR_VALUE(mapped)) {
@@ -3984,7 +3992,7 @@ static void user4k_mlock_repair_test(struct kunit *test)
 			struct file *file = test_cache_file(test, PAGE_SIZE, true);
 			struct folio *folio;
 			unsigned long addr, offset;
-			vm_flags_t flags = 0;
+			vma_flags_t flags = EMPTY_VMA_FLAGS;
 			int maps, ret;
 
 			KUNIT_ASSERT_NOT_NULL(test, mm);
@@ -4033,7 +4041,7 @@ static void user4k_mlock_repair_test(struct kunit *test)
 			lru_add_drain_all();
 			if (walker) {
 				KUNIT_EXPECT_GE(test, ret, 0);
-				KUNIT_EXPECT_TRUE(test, flags & VM_LOCKED);
+				KUNIT_EXPECT_TRUE(test, vma_flags_test(&flags, VMA_LOCKED_BIT));
 			}
 			KUNIT_EXPECT_TRUE(test, folio_test_mlocked(folio));
 			KUNIT_EXPECT_EQ(test, folio_mapcount(folio), maps);
@@ -9964,7 +9972,7 @@ static void user4k_nonlinear_rmap_test(struct kunit *test)
 	struct mm_subpage *slot;
 	struct folio *folio, *dst;
 	phys_addr_t phys;
-	vm_flags_t flags;
+	vma_flags_t flags;
 	unsigned int succeeded = 0, side;
 	int ret, unmapped = -1;
 	bool isolated;
@@ -12253,7 +12261,7 @@ static void user4k_swap_suite_exit(struct kunit_suite *suite)
 static void test_shmem_uffd_swap(struct kunit *test, unsigned int mode)
 {
 	const unsigned long missing = GENMASK(PAGE_SIZE / SZ_4K - 1, mode == 3 ? 2 : 1);
-	struct swap_iocb *plug = NULL;
+	struct swap_io_ctx ctx = {};
 	struct file *file;
 	struct folio *folio;
 	void *entry;
@@ -12283,9 +12291,8 @@ static void test_shmem_uffd_swap(struct kunit *test, unsigned int mode)
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, folio);
 	/* Match pageout(): submitted data is clean unless writeout redirties it. */
 	KUNIT_EXPECT_TRUE(test, folio_clear_dirty_for_io(folio));
-	ret = shmem_writeout(folio, &plug, &folios);
-	if (plug)
-		swap_write_unplug(plug);
+	ret = shmem_writeout(&ctx, folio, &folios);
+	swap_write_submit(&ctx);
 	if (ret == AOP_WRITEPAGE_ACTIVATE)
 		folio_unlock(folio);
 	folio_wait_writeback(folio);
@@ -12365,7 +12372,7 @@ static void user4k_shmem_uffd_swap_alloc_fail_test(struct kunit *test)
 		pgoff_t index = attempt == 1 ? 1 : 64;
 		const unsigned long missing = GENMASK(PAGE_SIZE / SZ_4K - 1, 1);
 		struct file *file = test_cache_file(test, (index + 1) * PAGE_SIZE, false);
-		struct swap_iocb *plug = NULL;
+		struct swap_io_ctx ctx = {};
 		struct folio *folio;
 		unsigned int pending;
 		unsigned long pfn;
@@ -12390,15 +12397,14 @@ static void user4k_shmem_uffd_swap_alloc_fail_test(struct kunit *test)
 		/* Fail this task's selected allocation and its allocator retries. */
 		WRITE_ONCE(current->make_it_fail, 1);
 		WRITE_ONCE(current->fail_nth, attempt);
-		ret = shmem_writeout(folio, &plug, &folios);
+		ret = shmem_writeout(&ctx, folio, &folios);
 		pending = READ_ONCE(current->fail_nth);
 		WRITE_ONCE(current->fail_nth, 0);
 		WRITE_ONCE(current->make_it_fail, 0);
 		KUNIT_EXPECT_EQ(test, pending, 0U);
 		KUNIT_EXPECT_EQ(test, ret, AOP_WRITEPAGE_ACTIVATE);
 		if (ret != AOP_WRITEPAGE_ACTIVATE) {
-			if (plug)
-				swap_write_unplug(plug);
+			swap_write_submit(&ctx);
 			folio_wait_writeback(folio);
 			folio_put(folio);
 			return;
@@ -12415,16 +12421,15 @@ static void user4k_shmem_uffd_swap_alloc_fail_test(struct kunit *test)
 			KUNIT_EXPECT_PTR_EQ(test, xa_find(&SHMEM_I(file_inode(file))->uffd_missing,
 					&cursor, ULONG_MAX, XA_PRESENT), NULL);
 		}
-		KUNIT_EXPECT_PTR_EQ(test, plug, NULL);
+		KUNIT_EXPECT_PTR_EQ(test, ctx.sio, NULL);
 		KUNIT_EXPECT_TRUE(test, list_empty(&folios));
 		KUNIT_EXPECT_PTR_EQ(test, memchr_inv(folio_address(folio), 0xb6, SZ_4K), NULL);
 		KUNIT_EXPECT_PTR_EQ(test, memchr_inv(folio_address(folio) + SZ_4K, 0, PAGE_SIZE - SZ_4K), NULL);
 		/* No restart or cache repair: retry exactly the retained folio. */
 		KUNIT_EXPECT_EQ(test, folio_pfn(folio), pfn);
 		KUNIT_EXPECT_TRUE(test, folio_clear_dirty_for_io(folio));
-		ret = shmem_writeout(folio, &plug, &folios);
-		if (plug)
-			swap_write_unplug(plug);
+		ret = shmem_writeout(&ctx, folio, &folios);
+		swap_write_submit(&ctx);
 		if (ret == AOP_WRITEPAGE_ACTIVATE)
 			folio_unlock(folio);
 		folio_wait_writeback(folio);
@@ -12466,7 +12471,7 @@ static void user4k_shmem_uffd_swap_charge_test(struct kunit *test)
 	struct mem_cgroup *memcg, *saved;
 	struct file *file;
 	struct folio *folio;
-	struct swap_iocb *plug = NULL;
+	struct swap_io_ctx ctx = {};
 	void *entry;
 	const unsigned long missing = GENMASK(PAGE_SIZE / SZ_4K - 1, 1);
 	int ret;
@@ -12505,10 +12510,9 @@ static void user4k_shmem_uffd_swap_charge_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, folio_clear_dirty_for_io(folio));
 	/* Reclaim from the root charge domain, not the folio's cgroup. */
 	saved = set_active_memcg(root_mem_cgroup);
-	ret = shmem_writeout(folio, &plug, &folios);
+	ret = shmem_writeout(&ctx, folio, &folios);
 	set_active_memcg(saved);
-	if (plug)
-		swap_write_unplug(plug);
+	swap_write_submit(&ctx);
 	if (ret == AOP_WRITEPAGE_ACTIVATE)
 		folio_unlock(folio);
 	folio_wait_writeback(folio);
@@ -13233,8 +13237,13 @@ static void user64k_anon_swap_race_test(struct kunit *test)
 		}
 		part = entry;
 		part.val += nr - 1;
-		blocker = read_swap_cache_async(part, GFP_KERNEL, vma,
-						TEST_VA + SZ_64K - PAGE_SIZE, NULL);
+		{
+			struct swap_io_ctx ctx = {};
+
+			blocker = read_swap_cache_async(&ctx, part, GFP_KERNEL, vma,
+							TEST_VA + SZ_64K - PAGE_SIZE);
+			swap_read_submit(&ctx);
+		}
 		KUNIT_ASSERT_NOT_NULL(test, blocker);
 		KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, test_folio_put, blocker), 0);
 		KUNIT_EXPECT_EQ(test, folio_size(blocker), cold ? PAGE_SIZE : (unsigned long)SZ_64K);
@@ -13567,7 +13576,7 @@ static void user64k_anon_swap_extent_test(struct kunit *test)
 		saved->synchronous = saved->si->flags & SWP_SYNCHRONOUS_IO;
 		KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, test_coarse_restore_io_mode, saved), 0);
 		file = !(saved->si->flags & SWP_BLKDEV);
-		KUNIT_ASSERT_FALSE(test, saved->si->flags & SWP_FS_OPS);
+		KUNIT_ASSERT_PTR_EQ(test, saved->si->ops, &swap_bdev_ops);
 		first = swap_extent_sector(entry, &run);
 		if (file) {
 			unsigned long remaining;
@@ -13590,14 +13599,24 @@ static void user64k_anon_swap_extent_test(struct kunit *test)
 		spin_unlock(&saved->si->lock);
 		folio_lock(folio);
 		folio_clear_dirty_for_io(folio);
-		__swap_writepage(folio, NULL);
+		{
+			struct swap_io_ctx ctx = {};
+
+			__swap_writepage(&ctx, folio);
+			swap_write_submit(&ctx);
+		}
 		folio_wait_writeback(folio);
 		folio_lock(folio);
 		KUNIT_EXPECT_FALSE(test, folio_test_dirty(folio));
 		/* A full-folio read must reconstruct all physical runs, not warm cache. */
 		memset(folio_address(folio), 0, SZ_64K);
 		folio_clear_uptodate(folio);
-		swap_read_folio(folio, NULL);
+		{
+			struct swap_io_ctx ctx = {};
+
+			swap_read_folio(&ctx, folio);
+			swap_read_submit(&ctx);
+		}
 		folio_lock(folio);
 		KUNIT_EXPECT_TRUE(test, folio_test_uptodate(folio));
 		for (i = 0; i < SZ_64K / SZ_4K; i++)
