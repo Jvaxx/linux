@@ -575,7 +575,8 @@ int tb_port_add_nfc_credits(struct tb_port *port, int credits)
 	 * USB4 restricts programming NFC buffers to lane adapters only
 	 * so skip other ports.
 	 */
-	if (tb_switch_is_usb4(port->sw) && !tb_port_is_null(port))
+	if (tb_switch_is_usb4(port->sw) && !tb_port_is_null(port) &&
+	    !tb_port_needs_host_dp_credits(port))
 		return 0;
 
 	nfc_credits = port->config.nfc_credits & ADP_CS_4_NFC_BUFFERS_MASK;
@@ -2496,6 +2497,9 @@ struct tb_switch *tb_switch_alloc(struct tb *tb, struct device *parent,
 	if (ret)
 		goto err_free_sw_ports;
 
+	if (route)
+		atomic64_inc(&tb->remote_activity);
+
 	sw->generation = tb_switch_get_generation(sw);
 
 	tb_dbg(tb, "current switch config:\n");
@@ -3568,6 +3572,8 @@ int tb_switch_resume(struct tb_switch *sw, bool runtime)
 			return err;
 		}
 
+		atomic64_inc(&sw->tb->remote_activity);
+
 		/* We don't have any way to confirm this was the same device */
 		if (!sw->uid)
 			return -ENODEV;
@@ -3691,6 +3697,10 @@ void tb_switch_suspend(struct tb_switch *sw, bool runtime)
 		flags |= TB_WAKE_ON_CONNECT | TB_WAKE_ON_DISCONNECT;
 		flags |= TB_WAKE_ON_USB4 | TB_WAKE_ON_USB3 | TB_WAKE_ON_PCIE;
 	}
+
+	/* The link stays up; a sleeping router would drop it by itself. */
+	if (!runtime && (sw->tb->nhi->quirks & QUIRK_NO_SYSTEM_SLEEP))
+		return;
 
 	tb_switch_set_wake(sw, flags, runtime);
 

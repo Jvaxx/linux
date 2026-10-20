@@ -13,6 +13,8 @@
 #include <linux/mutex.h>
 #include <linux/property.h>
 #include <linux/slab.h>
+#include <linux/srcu.h>
+#include <linux/sched.h>
 
 #include "class.h"
 #include "mux.h"
@@ -261,10 +263,102 @@ EXPORT_SYMBOL_GPL(typec_switch_get_drvdata);
 
 /* ------------------------------------------------------------------------- */
 
+/* Class, altmode and controller handles for one connector share this domain. */
+struct typec_mux_context {
+	struct list_head list;
+	struct fwnode_handle *fwnode;
+	struct mutex lock;
+	unsigned int users;
+};
+
+static LIST_HEAD(typec_mux_contexts);
+static DEFINE_MUTEX(typec_mux_contexts_lock);
+DEFINE_STATIC_SRCU(typec_mux_srcu);
+
 struct typec_mux {
 	struct typec_mux_dev *mux_devs[TYPEC_MUX_MAX_DEVS];
 	unsigned int num_mux_devs;
+	struct typec_mux_context *context;
+	struct typec_mux_state transaction;
+	struct task_struct *owner;
+	int srcu_index;
+	unsigned int prepared;
+	bool applied;
+	/* The last request timed out in a provider with transient timeouts. */
+	bool timeout_transient;
 };
+
+static struct typec_mux_context *typec_mux_context_get(struct fwnode_handle *fwnode)
+{
+	struct typec_mux_context *context;
+
+	guard(mutex)(&typec_mux_contexts_lock);
+	list_for_each_entry(context, &typec_mux_contexts, list) {
+		if (context->fwnode == fwnode) {
+			context->users++;
+			return context;
+		}
+	}
+	context = kzalloc_obj(*context);
+	if (!context)
+		return ERR_PTR(-ENOMEM);
+	context->fwnode = fwnode_handle_get(fwnode);
+	context->users = 1;
+	mutex_init(&context->lock);
+	list_add_tail(&context->list, &typec_mux_contexts);
+	return context;
+}
+
+static void typec_mux_context_put(struct typec_mux_context *context)
+{
+	guard(mutex)(&typec_mux_contexts_lock);
+	if (--context->users)
+		return;
+	list_del(&context->list);
+	fwnode_handle_put(context->fwnode);
+	kfree(context);
+}
+
+/* Immutable provider policy; the handle pins each provider until put. */
+bool typec_mux_safe_after_role(struct typec_mux *mux)
+{
+	unsigned int i;
+
+	if (IS_ERR_OR_NULL(mux))
+		return false;
+
+	for (i = 0; i < mux->num_mux_devs; i++) {
+		if (mux->mux_devs[i]->safe_after_role)
+			return true;
+	}
+
+	return false;
+}
+EXPORT_SYMBOL_GPL(typec_mux_safe_after_role);
+
+/**
+ * typec_mux_timeout_transient - Check whether a mux request timed out for now
+ * @mux: Mux handle
+ *
+ * For use after a request on @mux, by typec_mux_set() or by typec_mux_begin()
+ * and the calls that follow it, failed with -ETIMEDOUT. A handle can hold more
+ * than one provider, and only the one that timed out is asked: whether it
+ * declared its timeouts transient (&typec_mux_desc.transient_timeouts). Its
+ * hardware then only held the change up, and the same state can be applied
+ * again later. A timeout of any other provider can be permanent.
+ *
+ * The answer describes the last request on @mux that failed with -ETIMEDOUT,
+ * so ask before any other request on the same handle runs. One that fails
+ * before it owns the providers, such as with -EBUSY, leaves the answer as it
+ * was; any other request changes it.
+ *
+ * Return: true if the provider that timed out declared its timeouts transient.
+ */
+bool typec_mux_timeout_transient(struct typec_mux *mux)
+{
+	return !IS_ERR_OR_NULL(mux) && mux->timeout_transient;
+}
+EXPORT_SYMBOL_GPL(typec_mux_timeout_transient);
 
 static int mux_fwnode_match(struct device *dev, const void *fwnode)
 {
@@ -272,6 +366,26 @@ static int mux_fwnode_match(struct device *dev, const void *fwnode)
 		return 0;
 
 	return device_match_fwnode(dev, fwnode);
+}
+
+/*
+ * The connection lookup checks that a mux's own node is available, but the
+ * device that registers a mux can sit further up: a display processor
+ * registers its Type-C routes, which are child nodes of its own. Under a
+ * node that is not available, such as one the boot loader left disabled,
+ * nothing ever registers the mux.
+ */
+static bool typec_mux_ancestors_available(const struct fwnode_handle *fwnode)
+{
+	struct fwnode_handle *parent;
+
+	fwnode_for_each_parent_node(fwnode, parent) {
+		if (!fwnode_device_is_available(parent)) {
+			fwnode_handle_put(parent);
+			return false;
+		}
+	}
+	return true;
 }
 
 static void *typec_mux_match(const struct fwnode_handle *fwnode,
@@ -295,7 +409,7 @@ static void *typec_mux_match(const struct fwnode_handle *fwnode,
 	dev = class_find_device(&typec_mux_class, NULL, fwnode,
 				mux_fwnode_match);
 	if (!dev)
-		return ERR_PTR(-EPROBE_DEFER);
+		return typec_mux_ancestors_available(fwnode) ? ERR_PTR(-EPROBE_DEFER) : NULL;
 
 	/* Skip duplicates */
 	for (i = 0; i < TYPEC_MUX_MAX_DEVS; i++)
@@ -324,17 +438,21 @@ struct typec_mux *fwnode_typec_mux_get(struct fwnode_handle *fwnode)
 	int count;
 	int err;
 	int i;
+	int index;
 
 	mux = kzalloc_obj(*mux);
 	if (!mux)
 		return ERR_PTR(-ENOMEM);
 
+	/* Unregister must drain lookup and module-reference conversion too. */
+	index = srcu_read_lock(&typec_mux_srcu);
 	count = fwnode_connection_find_matches(fwnode, "mode-switch",
 					       (void **)mux_devs,
 					       typec_mux_match,
 					       (void **)mux_devs,
 					       ARRAY_SIZE(mux_devs));
 	if (count <= 0) {
+		srcu_read_unlock(&typec_mux_srcu, index);
 		kfree(mux);
 		return NULL;
 	}
@@ -347,12 +465,26 @@ struct typec_mux *fwnode_typec_mux_get(struct fwnode_handle *fwnode)
 	}
 
 	for (i = 0; i < count; i++) {
-		WARN_ON(!try_module_get(mux_devs[i]->dev.parent->driver->owner));
+		if (READ_ONCE(mux_devs[i]->removed) ||
+		    !try_module_get(mux_devs[i]->owner)) {
+			err = -ENODEV;
+			while (i--)
+				module_put(mux_devs[i]->owner);
+			goto put_mux_devs;
+		}
 		mux->mux_devs[i] = mux_devs[i];
 	}
 
 	mux->num_mux_devs = count;
+	mux->context = typec_mux_context_get(fwnode);
+	if (IS_ERR(mux->context)) {
+		err = PTR_ERR(mux->context);
+		for (i = 0; i < count; i++)
+			module_put(mux_devs[i]->owner);
+		goto put_mux_devs;
+	}
 
+	srcu_read_unlock(&typec_mux_srcu, index);
 	return mux;
 
 put_mux_devs:
@@ -361,6 +493,7 @@ put_mux_devs:
 			put_device(&mux_devs[i]->dev);
 	}
 
+	srcu_read_unlock(&typec_mux_srcu, index);
 	kfree(mux);
 
 	return ERR_PTR(err);
@@ -383,31 +516,166 @@ void typec_mux_put(struct typec_mux *mux)
 
 	for (i = 0; i < mux->num_mux_devs; i++) {
 		mux_dev = mux->mux_devs[i];
-		module_put(mux_dev->dev.parent->driver->owner);
+		module_put(mux_dev->owner);
 		put_device(&mux_dev->dev);
 	}
+	typec_mux_context_put(mux->context);
 	kfree(mux);
 }
 EXPORT_SYMBOL_GPL(typec_mux_put);
 
-int typec_mux_set(struct typec_mux *mux, struct typec_mux_state *state)
+static void typec_mux_unlock(struct typec_mux *mux)
 {
-	struct typec_mux_dev *mux_dev;
+	int index = mux->srcu_index;
+
+	mux->prepared = 0;
+	mux->applied = false;
+	mux->owner = NULL;
+	mutex_unlock(&mux->context->lock);
+	srcu_read_unlock(&typec_mux_srcu, index);
+}
+
+void typec_mux_abort(struct typec_mux *mux)
+{
+	unsigned int i;
+
+	if (IS_ERR_OR_NULL(mux))
+		return;
+	if (WARN_ON_ONCE(mux->owner != current))
+		return;
+	for (i = mux->prepared; i > 0; i--) {
+		struct typec_mux_dev *dev = mux->mux_devs[i - 1];
+
+		if (dev->abort)
+			dev->abort(dev, &mux->transaction);
+	}
+	typec_mux_unlock(mux);
+}
+EXPORT_SYMBOL_GPL(typec_mux_abort);
+
+int typec_mux_begin(struct typec_mux *mux, struct typec_mux_state *state)
+{
+	unsigned int i;
+	int index, ret;
+
+	if (IS_ERR_OR_NULL(mux))
+		return 0;
+	index = srcu_read_lock(&typec_mux_srcu);
+	/* Nonblocking acquisition also rejects same-domain forwarding recursion. */
+	if (!mutex_trylock(&mux->context->lock)) {
+		srcu_read_unlock(&typec_mux_srcu, index);
+		return -EBUSY;
+	}
+	mux->srcu_index = index;
+	mux->owner = current;
+	mux->transaction = *state;
+	mux->timeout_transient = false;
+	for (i = 0; i < mux->num_mux_devs; i++) {
+		struct typec_mux_dev *dev = mux->mux_devs[i];
+
+		if (READ_ONCE(dev->removed)) {
+			typec_mux_unlock(mux);
+			return -ENODEV;
+		}
+	}
+	for (i = 0; i < mux->num_mux_devs; i++) {
+		struct typec_mux_dev *dev = mux->mux_devs[i];
+
+		mux->prepared = i + 1;
+		if (!dev->prepare)
+			continue;
+		ret = dev->prepare(dev, &mux->transaction);
+		if (ret)
+			goto abort;
+	}
+	return 0;
+abort:
+	typec_mux_abort(mux);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(typec_mux_begin);
+
+int typec_mux_apply(struct typec_mux *mux)
+{
 	unsigned int i;
 	int ret;
 
 	if (IS_ERR_OR_NULL(mux))
 		return 0;
-
+	if (WARN_ON_ONCE(mux->owner != current))
+		return -EINVAL;
+	if (mux->applied)
+		return 0;
 	for (i = 0; i < mux->num_mux_devs; i++) {
-		mux_dev = mux->mux_devs[i];
+		struct typec_mux_dev *dev = mux->mux_devs[i];
 
-		ret = mux_dev->set(mux_dev, state);
-		if (ret && ret != -EOPNOTSUPP)
+		ret = dev->set(dev, &mux->transaction);
+		if (ret && ret != -EOPNOTSUPP) {
+			/* Only the provider that failed knows what its timeout means. */
+			mux->timeout_transient = ret == -ETIMEDOUT &&
+						 dev->transient_timeouts;
+			typec_mux_abort(mux);
 			return ret;
+		}
 	}
-
+	mux->applied = true;
 	return 0;
+}
+EXPORT_SYMBOL_GPL(typec_mux_apply);
+
+int typec_mux_end(struct typec_mux *mux)
+{
+	unsigned int i;
+	int ret;
+
+	if (IS_ERR_OR_NULL(mux))
+		return 0;
+	ret = typec_mux_apply(mux);
+	if (ret)
+		return ret;
+	/* Finalizers can fail, but must not release their software reservation. */
+	for (i = 0; i < mux->num_mux_devs; i++) {
+		struct typec_mux_dev *dev = mux->mux_devs[i];
+
+		if (!dev->finish)
+			continue;
+		ret = dev->finish(dev, &mux->transaction);
+		if (ret)
+			goto abort;
+	}
+	/* Only this no-fail publication phase may release owner reservations. */
+	for (i = 0; i < mux->num_mux_devs; i++) {
+		struct typec_mux_dev *dev = mux->mux_devs[i];
+
+		if (dev->commit)
+			dev->commit(dev, &mux->transaction);
+	}
+	typec_mux_unlock(mux);
+	return 0;
+abort:
+	typec_mux_abort(mux);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(typec_mux_end);
+
+/* Preparation-only callers leave recovery ownership pending, never committed. */
+int typec_mux_prepare(struct typec_mux *mux, struct typec_mux_state *state)
+{
+	int ret = typec_mux_begin(mux, state);
+
+	if (!ret)
+		typec_mux_abort(mux);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(typec_mux_prepare);
+
+int typec_mux_set(struct typec_mux *mux, struct typec_mux_state *state)
+{
+	int ret = typec_mux_begin(mux, state);
+
+	if (ret)
+		return ret;
+	return typec_mux_end(mux);
 }
 EXPORT_SYMBOL_GPL(typec_mux_set);
 
@@ -444,7 +712,14 @@ typec_mux_register(struct device *parent, const struct typec_mux_desc *desc)
 	if (!mux_dev)
 		return ERR_PTR(-ENOMEM);
 
+	mux_dev->owner = parent->driver ? parent->driver->owner : NULL;
 	mux_dev->set = desc->set;
+	mux_dev->prepare = desc->prepare;
+	mux_dev->finish = desc->finish;
+	mux_dev->commit = desc->commit;
+	mux_dev->abort = desc->abort;
+	mux_dev->safe_after_role = desc->safe_after_role;
+	mux_dev->transient_timeouts = desc->transient_timeouts;
 
 	device_initialize(&mux_dev->dev);
 	mux_dev->dev.parent = parent;
@@ -477,8 +752,12 @@ EXPORT_SYMBOL_GPL(typec_mux_register);
  */
 void typec_mux_unregister(struct typec_mux_dev *mux_dev)
 {
-	if (!IS_ERR_OR_NULL(mux_dev))
+	if (!IS_ERR_OR_NULL(mux_dev)) {
+		WRITE_ONCE(mux_dev->removed, true);
+		/* Callbacks may nest through forwarders; SRCU permits that nesting. */
+		synchronize_srcu(&typec_mux_srcu);
 		device_unregister(&mux_dev->dev);
+	}
 }
 EXPORT_SYMBOL_GPL(typec_mux_unregister);
 
@@ -539,6 +818,7 @@ fwnode_typec_thunderbolt_switch_get(struct fwnode_handle *fwnode)
 	struct typec_thunderbolt_switch_dev *sw_dev;
 	struct typec_thunderbolt_switch *sw;
 	void *match;
+	int ret = 0;
 
 	match = fwnode_connection_find_match(fwnode, "thunderbolt-switch", NULL,
 					     typec_thunderbolt_switch_match);
@@ -555,7 +835,15 @@ fwnode_typec_thunderbolt_switch_get(struct fwnode_handle *fwnode)
 	}
 
 	sw->sw_dev = sw_dev;
-	WARN_ON(!try_module_get(sw_dev->dev.parent->driver->owner));
+	scoped_guard(rwsem_read, &sw_dev->set_lock) {
+		if (!sw_dev->set || !try_module_get(sw_dev->owner))
+			ret = -ENODEV;
+	}
+	if (ret) {
+		put_device(&sw_dev->dev);
+		kfree(sw);
+		return ERR_PTR(ret);
+	}
 
 	return sw;
 }
@@ -572,7 +860,7 @@ void typec_thunderbolt_switch_put(struct typec_thunderbolt_switch *sw)
 	if (IS_ERR_OR_NULL(sw))
 		return;
 
-	module_put(sw->sw_dev->dev.parent->driver->owner);
+	module_put(sw->sw_dev->owner);
 	put_device(&sw->sw_dev->dev);
 	kfree(sw);
 }
@@ -593,9 +881,89 @@ int typec_thunderbolt_switch_set(struct typec_thunderbolt_switch *sw,
 	if (IS_ERR_OR_NULL(sw))
 		return 0;
 
+	guard(rwsem_read)(&sw->sw_dev->set_lock);
+	if (!sw->sw_dev->set)
+		return -ENODEV;
 	return sw->sw_dev->set(sw->sw_dev, data);
 }
 EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_set);
+
+/**
+ * typec_thunderbolt_switch_register_notifier - Watch provider health changes
+ * @sw: USB4/Thunderbolt switch held by the consumer
+ * @nb: Atomic notifier, which must not sleep or call the switch's set method
+ *
+ * Notifications request fresh state validation in consumer work context.
+ * Unregister the notifier before releasing @sw or its callback data.
+ */
+int typec_thunderbolt_switch_register_notifier(struct typec_thunderbolt_switch *sw,
+					       struct notifier_block *nb)
+{
+	if (IS_ERR_OR_NULL(sw))
+		return 0;
+
+	return atomic_notifier_chain_register(&sw->sw_dev->notifiers, nb);
+}
+EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_register_notifier);
+
+/**
+ * typec_thunderbolt_switch_unregister_notifier - Stop provider notifications
+ * @sw: USB4/Thunderbolt switch held by the consumer
+ * @nb: Previously registered notifier
+ *
+ * Drains callbacks. Call in process context, outside callback/worker locks,
+ * before cancelling work queued by the callback.
+ */
+void typec_thunderbolt_switch_unregister_notifier(struct typec_thunderbolt_switch *sw,
+						  struct notifier_block *nb)
+{
+	if (!IS_ERR_OR_NULL(sw))
+		atomic_notifier_chain_unregister(&sw->sw_dev->notifiers, nb);
+}
+EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_unregister_notifier);
+
+/**
+ * typec_thunderbolt_switch_notify - Request consumer revalidation
+ * @sw: Registered provider switch
+ *
+ * May be called from interrupt context. No connection state is passed: a
+ * delayed notification must validate the current connection, not reset it
+ * using details from an earlier session. Stop notifications before unregister.
+ */
+void typec_thunderbolt_switch_notify(struct typec_thunderbolt_switch_dev *sw)
+{
+	atomic_notifier_call_chain(&sw->notifiers,
+				   TYPEC_THUNDERBOLT_SWITCH_REVALIDATE, NULL);
+}
+EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_notify);
+
+/**
+ * typec_thunderbolt_switch_notify_ready - Report completed activation
+ * @sw: Registered provider switch
+ *
+ * Wake consumers waiting on a busy provider without requesting fault recovery.
+ * As with revalidation notifications, drain producers before unregistering.
+ */
+void typec_thunderbolt_switch_notify_ready(struct typec_thunderbolt_switch_dev *sw)
+{
+	atomic_notifier_call_chain(&sw->notifiers,
+				   TYPEC_THUNDERBOLT_SWITCH_READY, NULL);
+}
+EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_notify_ready);
+
+/**
+ * typec_thunderbolt_switch_notify_restore - Request a cable read after sleep
+ * @sw: Registered provider switch
+ *
+ * The provider powered itself down for system sleep and needs the current
+ * cable state reapplied. Unlike a revalidation this reports no link fault.
+ */
+void typec_thunderbolt_switch_notify_restore(struct typec_thunderbolt_switch_dev *sw)
+{
+	atomic_notifier_call_chain(&sw->notifiers,
+				   TYPEC_THUNDERBOLT_SWITCH_RESTORE, NULL);
+}
+EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_notify_restore);
 
 static void typec_thunderbolt_switch_release(struct device *dev)
 {
@@ -630,6 +998,8 @@ typec_thunderbolt_switch_register(struct device *parent,
 	if (!sw_dev)
 		return ERR_PTR(-ENOMEM);
 
+	init_rwsem(&sw_dev->set_lock);
+	sw_dev->owner = parent->driver ? parent->driver->owner : NULL;
 	sw_dev->set = desc->set;
 
 	device_initialize(&sw_dev->dev);
@@ -637,6 +1007,7 @@ typec_thunderbolt_switch_register(struct device *parent,
 	sw_dev->dev.fwnode = desc->fwnode;
 	sw_dev->dev.class = &typec_mux_class;
 	sw_dev->dev.type = &typec_thunderbolt_switch_dev_type;
+	ATOMIC_INIT_NOTIFIER_HEAD(&sw_dev->notifiers);
 	sw_dev->dev.driver_data = desc->drvdata;
 	ret = dev_set_name(&sw_dev->dev, "%s-thunderbolt-switch",
 			   desc->name ? desc->name : dev_name(parent));
@@ -665,8 +1036,13 @@ EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_register);
  */
 void typec_thunderbolt_switch_unregister(struct typec_thunderbolt_switch_dev *sw_dev)
 {
-	if (!IS_ERR_OR_NULL(sw_dev))
-		device_unregister(&sw_dev->dev);
+	if (IS_ERR_OR_NULL(sw_dev))
+		return;
+
+	/* Drain callbacks before the parent releases its private data. */
+	scoped_guard(rwsem_write, &sw_dev->set_lock)
+		sw_dev->set = NULL;
+	device_unregister(&sw_dev->dev);
 }
 EXPORT_SYMBOL_GPL(typec_thunderbolt_switch_unregister);
 

@@ -2697,6 +2697,7 @@ F:	drivers/nvme/host/apple.c
 F:	drivers/nvmem/apple-efuses.c
 F:	drivers/nvmem/apple-spmi-nvmem.c
 F:	drivers/phy/apple/
+F:	drivers/phy/apple/.kunitconfig.apple-atc
 F:	drivers/pinctrl/pinctrl-apple-gpio.c
 F:	drivers/pmdomain/apple/
 F:	drivers/power/reset/macsmc-reboot.c
@@ -2709,6 +2710,8 @@ F:	drivers/soc/apple/*
 F:	tools/asahi/pmp-bootargs-tests.rs
 F:	drivers/spi/spi-apple.c
 F:	drivers/spmi/spmi-apple-controller.c
+F:	drivers/thunderbolt/.kunitconfig.apple-dpin
+F:	drivers/thunderbolt/apple-dpin*
 F:	drivers/thunderbolt/apple.c
 F:	drivers/usb/dwc3/dwc3-apple.c
 F:	drivers/usb/typec/tipd/spmi.c

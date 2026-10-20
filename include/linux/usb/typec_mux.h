@@ -15,6 +15,7 @@ struct typec_switch;
 struct typec_switch_dev;
 struct typec_altmode;
 struct fwnode_handle;
+struct notifier_block;
 
 typedef int (*typec_switch_set_fn_t)(struct typec_switch_dev *sw,
 				     enum typec_orientation orientation);
@@ -85,6 +86,9 @@ struct typec_mux_state {
 	void *data;
 };
 
+typedef void (*typec_mux_notify_fn_t)(struct typec_mux_dev *mux,
+				     struct typec_mux_state *state);
+
 typedef int (*typec_mux_set_fn_t)(struct typec_mux_dev *mux,
 				  struct typec_mux_state *state);
 
@@ -93,12 +97,37 @@ struct typec_mux_desc {
 	typec_mux_set_fn_t set;
 	const char *name;
 	void *drvdata;
+	/* Quiesce consumers before any provider changes the shared route. */
+	typec_mux_set_fn_t prepare;
+	/* Fallible finalization retains ownership; commit cannot fail. */
+	typec_mux_set_fn_t finish;
+	typec_mux_notify_fn_t commit;
+	typec_mux_notify_fn_t abort;
+	/* SAFE needs the USB role consumer to stop the shared PHY first. */
+	bool safe_after_role;
+	/*
+	 * -ETIMEDOUT from @set only means that the hardware held the change up
+	 * for now: the same state can be applied again later, and is worth
+	 * applying again for longer than after other failures. Consumers learn
+	 * it from typec_mux_timeout_transient().
+	 */
+	bool transient_timeouts;
 };
 
 #if IS_ENABLED(CONFIG_TYPEC)
 
 struct typec_mux *fwnode_typec_mux_get(struct fwnode_handle *fwnode);
 void typec_mux_put(struct typec_mux *mux);
+/* begin/end must run in the same task; failure retains provider recovery state. */
+/* Same-task begin/end; retain the handle and state pointees until end/abort. */
+int typec_mux_begin(struct typec_mux *mux, struct typec_mux_state *state);
+/* Apply the providers while retaining the transaction and ownership. */
+int typec_mux_apply(struct typec_mux *mux);
+bool typec_mux_safe_after_role(struct typec_mux *mux);
+bool typec_mux_timeout_transient(struct typec_mux *mux);
+int typec_mux_end(struct typec_mux *mux);
+void typec_mux_abort(struct typec_mux *mux);
+int typec_mux_prepare(struct typec_mux *mux, struct typec_mux_state *state);
 int typec_mux_set(struct typec_mux *mux, struct typec_mux_state *state);
 
 struct typec_mux_dev *
@@ -116,6 +145,31 @@ static inline struct typec_mux *fwnode_typec_mux_get(struct fwnode_handle *fwnod
 }
 
 static inline void typec_mux_put(struct typec_mux *mux) {}
+
+static inline int typec_mux_begin(struct typec_mux *mux, struct typec_mux_state *state)
+{
+	return 0;
+}
+
+static inline int typec_mux_apply(struct typec_mux *mux) { return 0; }
+
+static inline bool typec_mux_safe_after_role(struct typec_mux *mux)
+{
+	return false;
+}
+
+static inline bool typec_mux_timeout_transient(struct typec_mux *mux)
+{
+	return false;
+}
+
+static inline int typec_mux_end(struct typec_mux *mux) { return 0; }
+static inline void typec_mux_abort(struct typec_mux *mux) {}
+
+static inline int typec_mux_prepare(struct typec_mux *mux, struct typec_mux_state *state)
+{
+	return 0;
+}
 
 static inline int typec_mux_set(struct typec_mux *mux, struct typec_mux_state *state)
 {
@@ -144,6 +198,13 @@ static inline struct typec_mux *typec_mux_get(struct device *dev)
 
 struct typec_thunderbolt_switch;
 struct typec_thunderbolt_switch_dev;
+
+/* Recheck fresh cable data and provider health; not a request to reset. */
+#define TYPEC_THUNDERBOLT_SWITCH_REVALIDATE 1
+/* A deferred activation completed; this is not a link-failure event. */
+#define TYPEC_THUNDERBOLT_SWITCH_READY 2
+/* The consumer powered down for system sleep and needs a fresh cable read. */
+#define TYPEC_THUNDERBOLT_SWITCH_RESTORE 3
 
 enum typec_thunderbolt_switch_state {
 	TYPEC_THUNDERBOLT_SWITCH_OFF,
@@ -192,6 +253,13 @@ fwnode_typec_thunderbolt_switch_get(struct fwnode_handle *fwnode);
 void typec_thunderbolt_switch_put(struct typec_thunderbolt_switch *sw);
 int typec_thunderbolt_switch_set(struct typec_thunderbolt_switch *sw,
 				 const struct typec_thunderbolt_switch_data *data);
+int typec_thunderbolt_switch_register_notifier(struct typec_thunderbolt_switch *sw,
+					       struct notifier_block *nb);
+void typec_thunderbolt_switch_unregister_notifier(struct typec_thunderbolt_switch *sw,
+						  struct notifier_block *nb);
+void typec_thunderbolt_switch_notify(struct typec_thunderbolt_switch_dev *sw);
+void typec_thunderbolt_switch_notify_ready(struct typec_thunderbolt_switch_dev *sw);
+void typec_thunderbolt_switch_notify_restore(struct typec_thunderbolt_switch_dev *sw);
 
 struct typec_thunderbolt_switch_dev *
 typec_thunderbolt_switch_register(struct device *parent,
@@ -228,6 +296,34 @@ typec_thunderbolt_switch_register(struct device *parent,
 				  const struct typec_thunderbolt_switch_desc *desc)
 {
 	return ERR_PTR(-EOPNOTSUPP);
+}
+
+static inline int
+typec_thunderbolt_switch_register_notifier(struct typec_thunderbolt_switch *sw,
+					   struct notifier_block *nb)
+{
+	return 0;
+}
+
+static inline void
+typec_thunderbolt_switch_unregister_notifier(struct typec_thunderbolt_switch *sw,
+					     struct notifier_block *nb)
+{
+}
+
+static inline void
+typec_thunderbolt_switch_notify(struct typec_thunderbolt_switch_dev *sw)
+{
+}
+
+static inline void
+typec_thunderbolt_switch_notify_ready(struct typec_thunderbolt_switch_dev *sw)
+{
+}
+
+static inline void
+typec_thunderbolt_switch_notify_restore(struct typec_thunderbolt_switch_dev *sw)
+{
 }
 
 static inline void
