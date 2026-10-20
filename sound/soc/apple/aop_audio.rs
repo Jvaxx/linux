@@ -975,12 +975,19 @@ impl platform::Driver for SndSocAopDriver {
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let info = info.ok_or(ENODEV)?;
         let dev = ARef::<device::Device>::from(pdev.as_ref());
-        let parent = pdev.as_ref().parent().unwrap();
-        // SAFETY: our parent is AOP, and AopDriver is repr(transparent) for Arc<dyn Aop>
-        let adata_ptr = unsafe { Pin::<KBox<Arc<dyn AOP>>>::borrow(parent.get_drvdata()) };
-        let adata = (&*adata_ptr).clone();
-        // SAFETY: AOP sets the platform data correctly
-        let svc = unsafe { *((*dev.as_raw()).platform_data as *const EPICService) };
+        let parent = pdev.as_ref().parent().ok_or(ENODEV)?;
+        // SAFETY: this is a service device the AOP core registered, being
+        // probed here; the lookup defers the probe until the core has
+        // published its driver data.
+        let adata = unsafe { <dyn AOP>::from_child(pdev.as_ref()) }?;
+        // SAFETY: the AOP core sets this child's platform data to the EPIC
+        // service it created the child for; it lives as long as the child.
+        let service = unsafe { (*dev.as_raw()).platform_data as *const EPICService };
+        if service.is_null() {
+            return Err(ENODEV);
+        }
+        // SAFETY: the pointer was checked above and stays valid with the child.
+        let svc = unsafe { *service };
         let parent_fwnode = parent.fwnode().ok_or(ENOENT)?;
         let fwnode = parent_fwnode
             .get_child_by_name(c_str!("audio"))
