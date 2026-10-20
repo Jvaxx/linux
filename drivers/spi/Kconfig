@@ -129,6 +129,16 @@ config SPI_APPLE
 	  to a single device like spi-nor (nvram), input device controller
 	  or fingerprint sensor.
 
+config SPI_APPLE_KUNIT_TEST
+	bool "KUnit tests for the Apple SPI interrupt handler" if !KUNIT_ALL_TESTS
+	depends on SPI_APPLE && (KUNIT=y || KUNIT=SPI_APPLE)
+	default KUNIT_ALL_TESTS
+	help
+	  Tests that the Apple SPI controller driver refills and drains the
+	  FIFOs of an interrupt-driven transfer from its interrupt handler,
+	  and wakes the transferring thread only once the transfer is over.
+	  No hardware is accessed.
+
 config SPI_APPLE_QSPI
 	tristate "Apple SoC QSPIMC controller"
 	depends on ARCH_APPLE || COMPILE_TEST

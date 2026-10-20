@@ -2767,6 +2767,7 @@ F:	drivers/reset/reset-apple-cio.c
 F:	drivers/rtc/rtc-macsmc.c
 F:	drivers/soc/apple/*
 F:	tools/asahi/pmp-bootargs-tests.rs
+F:	drivers/spi/spi-apple-test.c
 F:	drivers/spi/spi-apple.c
 F:	drivers/spmi/spmi-apple-controller.c
 F:	drivers/thunderbolt/.kunitconfig.apple-dpin

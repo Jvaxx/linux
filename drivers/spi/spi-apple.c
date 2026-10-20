@@ -712,6 +712,10 @@ static struct platform_driver apple_spi_driver = {
 };
 module_platform_driver(apple_spi_driver);
 
+#if IS_ENABLED(CONFIG_SPI_APPLE_KUNIT_TEST)
+#include "spi-apple-test.c"
+#endif
+
 MODULE_AUTHOR("Hector Martin <marcan@marcan.st>");
 MODULE_DESCRIPTION("Apple SoC SPI driver");
 MODULE_LICENSE("GPL");
