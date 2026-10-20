@@ -262,6 +262,7 @@ class M3FlowBase(unittest.TestCase):
                            ("pacman-conf", '#!/bin/sh\n[ -z "$FAKE_FAIL_CONFIG" ] || exit 1\nprintf "%s\\n" "$FAKE_HOLDS"\n'),
                            ("id", ID), ("getent", GETENT), ("gpasswd", GPASSWD),
                            ("findmnt", "#!/bin/sh\ncase \"$*\" in *PARTUUID*) echo fake-uuid ;; *) echo vfat ;; esac\n"),
+                           ("sync", "#!/bin/sh\nexit 0\n"),
                            ("systemctl", "#!/bin/sh\nexit 0\n")):
             (self.tmp / "bin" / name).write_text(body)
             (self.tmp / "bin" / name).chmod(0o755)
