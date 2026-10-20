@@ -107,6 +107,7 @@ config RUST_APPLE_RTKIT
 	depends on PM
 	depends on RUST
 	select APPLE_RTKIT
+	select RUST_APPLE_MAILBOX
 
 config APPLE_AOP
 	tristate "Apple \"Always-on\" Processor"
@@ -122,18 +123,63 @@ config APPLE_AOP
 
 	  Say 'y' here if you have an Apple laptop.
 
+config APPLE_SEP_FV_INTERFACE
+	bool
+
 config APPLE_SEP
-	tristate "Apple Secure Element Processor"
-	depends on ARCH_APPLE || COMPILE_TEST
+	tristate "Apple SEP (Secure Enclave Processor)"
+	default m if ARCH_APPLE
+	depends on ARCH_APPLE
 	depends on PM
 	depends on RUST
-	select RUST_APPLE_RTKIT
-	select RUST_APPLE_MAILBOX
+	depends on DMA_SHARED_BUFFER
+	depends on OF_DYNAMIC
+	depends on SPI
+	depends on RUST_APPLE_MAILBOX
+	depends on HW_RANDOM
+	depends on TRUSTED_KEYS
+	depends on CRYPTO
+	depends on MFD_MACSMC || !MFD_MACSMC
+	select CRYPTO_HMAC
+	select CRYPTO_SHA256
+	select CRYPTO_AES
+	select CRYPTO_GCM
+	select CRYPTO_ECDH
+	select APPLE_SEP_FV_INTERFACE
+	select RUST_FW_LOADER_ABSTRACTIONS
 	help
-	  A security co-processor persent on Apple SoCs, controlling transparent
-	  disk encryption, secure boot, HDCP, biometric auth and probably more.
+	  Driver for the Apple SEP (Secure Enclave Processor) on Apple silicon.
+	  It drives the Touch ID fingerprint sensor over a /dev/sep-bio character
+	  device (enrol and match), exposes the SEP hardware RNG, and registers a
+	  SEP-backed trusted key source so keyctl can seal keys to the enclave.
 
-	  Say 'y' here if you have an Apple SoC.
+	  The driver reads the existing machine-wide xART gigalocker directly from
+	  the iBoot system container, locating its .gl extent through read-only,
+	  checksum-validated APFS metadata. It validates the complete store and
+	  both root records before registering with SEP.
+	  xART writes are enabled by default, but accepted only when the driver
+	  validates the physical extent ownership invariants. Unsupported APFS
+	  layouts fail closed. A Linux identity keybag is created automatically
+	  when none exists; existing identities and reference keys are retained.
+	  Set xart_writes=0 provision_keybag=0 for read-only operation.
+	  With writes off the driver still attaches, but refuses Touch ID enrol
+	  and verify: the enclave saves anti-replay state after every match.
+
+	  Say Y here if you have an Apple silicon Mac.
+
+config APPLE_SEP_KUNIT_TEST
+	bool "KUnit tests for the Apple SEP driver" if !KUNIT_ALL_TESTS
+	depends on APPLE_SEP && KUNIT
+	default KUNIT_ALL_TESTS
+	help
+	  Build KUnit tests for the pure logic of the Apple SEP driver: the
+	  mailbox message encoding and decoding, the shared-memory registration
+	  limits, the rules that keep a keybag's lookup identity apart from
+	  the identity the enclave reports, the format and validation of the
+	  Linux host-state store, and the xART guard's decisions and its list
+	  of Linux's records. The tests touch no hardware.
+
+	  If unsure, say N.
 
 config APPLE_PMP
 	tristate "Apple Power Management Processor"
