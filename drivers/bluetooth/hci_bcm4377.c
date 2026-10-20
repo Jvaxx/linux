@@ -2654,10 +2654,6 @@ static int bcm4377_probe_of(struct bcm4377_data *bcm4377)
 	bcm4377->taurus_beamforming_cal_blob =
 		of_get_property(np, "brcm,taurus-bf-cal-blob",
 				&bcm4377->taurus_beamforming_cal_size);
-	if (bcm4377->hw->id == 0x4388) {
-		/* BCM4388 never uses the non-beamforming calibration. */
-		return bcm4377->taurus_beamforming_cal_blob ? 0 : -ENOENT;
-	}
 	if (!bcm4377->taurus_beamforming_cal_blob) {
 		dev_err(&bcm4377->pdev->dev,
 			"no brcm,taurus-bf-cal-blob property\n");
@@ -2665,7 +2661,8 @@ static int bcm4377_probe_of(struct bcm4377_data *bcm4377)
 	}
 	bcm4377->taurus_cal_blob = of_get_property(np, "brcm,taurus-cal-blob",
 						   &bcm4377->taurus_cal_size);
-	if (!bcm4377->taurus_cal_blob) {
+	/* BCM4388 never uses the non-beamforming calibration. */
+	if (!bcm4377->taurus_cal_blob && bcm4377->hw->id != 0x4388) {
 		dev_err(&bcm4377->pdev->dev,
 			"no brcm,taurus-cal-blob property\n");
 		return -ENOENT;
