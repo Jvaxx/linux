@@ -8,7 +8,7 @@
 
 Name:           aurora-sep
 Version:        1
-Release:        7%{?dist}
+Release:        8%{?dist}
 Summary:        Loader and desktop integration for the Apple SEP fingerprint driver
 
 License:        GPL-2.0-only
@@ -26,6 +26,7 @@ Source9:        aurora-sep-greeter-fingerprint
 Source10:       aurora-sep-greeter-fingerprint.service
 Source11:       aurora_sep.te
 Source12:       aurora_sep.fc
+Source13:       OS-IDENTITY.md
 
 BuildArch:      noarch
 BuildRequires:  systemd-rpm-macros
@@ -64,7 +65,7 @@ fprintd may not open, so fprintd lists no fingerprint reader.
 
 %prep
 %setup -q -c -T
-cp -p %{SOURCE3} %{SOURCE4} %{SOURCE11} %{SOURCE12} .
+cp -p %{SOURCE3} %{SOURCE4} %{SOURCE11} %{SOURCE12} %{SOURCE13} .
 
 %build
 make -f %{_datadir}/selinux/devel/Makefile %{modulename}.pp
@@ -126,7 +127,7 @@ if selinuxenabled 2>/dev/null && [ -c /dev/sep-bio ]; then
 fi
 
 %files
-%doc README.md XART-SAFETY.md
+%doc README.md XART-SAFETY.md OS-IDENTITY.md
 %{_libexecdir}/aurora-sep-load
 %{_libexecdir}/aurora-sep-ready
 %{_libexecdir}/aurora-sep-greeter-fingerprint
