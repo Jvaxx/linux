@@ -18,6 +18,10 @@
 	compatible = "apple,j615", "apple,t8122", "apple,arm-platform";
 	model = "Apple MacBook Air (15-inch, M3, 2024)";
 
+	aliases {
+		sep = &sep;
+	};
+
 	led-controller {
 		compatible = "pwm-leds";
 		led-0 {
@@ -29,6 +33,22 @@
 			default-state = "keep";
 		};
 	};
+};
+
+&dcp {
+	panel: panel {
+		compatible = "apple,panel-j615", "apple,panel";
+		/* 2880x1864 at 224 ppi; 64 notch rows above the desktop. */
+		width-mm = <327>;
+		height-mm = <211>;
+		adj-height-mm = <204>;
+		apple,max-brightness = <500>;
+	};
+};
+
+&framebuffer0 {
+	panel = <&panel>;
+	post-init-providers = <&panel>;
 };
 
 &aop_mbox {
@@ -221,6 +241,24 @@
 &isp {
 	apple,platform-id = <18>;
 	apple,temporal-filter = <1>;
+};
+
+/*
+ * Mesa fingerprint sensor on spi2 (J615 ADT /arm-io/spi2/mesa): power on
+ * NUB GPIO 29, active high. The data-ready line (AP GPIO 199) is left out,
+ * so the driver polls until its trigger is confirmed. Native chip select only.
+ */
+&spi2 {
+	status = "okay";
+};
+
+&mesa {
+	status = "okay";
+	enable-gpios = <&pinctrl_nub 29 GPIO_ACTIVE_HIGH>;
+	spi-cs-setup-delay-ns = <20>;
+	spi-cs-hold-delay-ns = <20>;
+	/* Per-device factory data from this Mac's own iBoot system container. */
+	firmware-name = "apple/mesacal-j615.bin";
 };
 
 #include "hwmon-laptop.dtsi"

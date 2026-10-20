@@ -886,6 +886,28 @@
 			status = "disabled";
 		};
 
+		spi2: spi@235108000 {
+			compatible = "apple,t8112-spi", "apple,spi";
+			reg = <0x2 0x35108000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 750 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&clkref>;
+			pinctrl-0 = <&spi2_pins>;
+			pinctrl-names = "default";
+			power-domains = <&ps_spi2>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+
+			mesa: fingerprint@0 {
+				compatible = "apple,mesa-fingerprint";
+				reg = <0>;
+				spi-max-frequency = <8000000>;
+				spi-cpha;
+				status = "disabled";
+			};
+		};
+
 		spi3: spi@23510c000 {
 			compatible = "apple,t8112-spi", "apple,spi";
 			reg = <0x2 0x3510c000 0x0 0x4000>;
@@ -1295,6 +1317,13 @@
 					<APPLE_PINMUX(49, 1)>;
 			};
 
+			spi2_pins: spi2-pins {
+				/* Three signal pads; SPI2 uses the controller's native chip select. */
+				pinmux = <APPLE_PINMUX(64, 1)>,
+					<APPLE_PINMUX(65, 1)>,
+					<APPLE_PINMUX(66, 1)>;
+			};
+
 			spi3_pins: spi3-pins {
 				pinmux = <APPLE_PINMUX(93, 1)>,
 					<APPLE_PINMUX(94, 1)>,
@@ -1647,12 +1676,20 @@
 
 		};
 
+		/*
+		 * iBoot hands over a running SEP. Keep Linux off its DART at boot;
+		 * apple_sep enables it at module initialization. This DART has a
+		 * 32-bit input aperture and does not use a high DMA alias.
+		 */
 		sep_dart: iommu@25d2c0000 {
 			compatible = "apple,t8112-dart", "apple,t8110-dart";
 			reg = <0x2 0x5d2c0000 0x0 0x4000>;
 			#iommu-cells = <1>;
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 282 IRQ_TYPE_LEVEL_HIGH>;
+			apple,dma-offset = <0x0 0x0>;
+			apple,dma-range = <0x0 0x4000 0x0 0xffff0000>;
+			status = "disabled";
 		};
 
 		sep: sep@25e400000 {
@@ -1703,6 +1740,64 @@
 			interrupt-parent = <&aic>;
 			interrupts = <AIC_IRQ 674 IRQ_TYPE_LEVEL_HIGH>;
 			power-domains = <&ps_avd_sys>;
+		};
+
+		ane_mbox: mailbox@26b408000 {
+			compatible = "apple,t8112-ane-mailbox", "apple,asc-mailbox-v4";
+			reg = <0x2 0x6b408000 0x0 0x4000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 520 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "recv-not-empty";
+			#mbox-cells = <0>;
+			status = "disabled";
+		};
+
+		ane_dart0: iommu@26b800000 {
+			compatible = "apple,t8112-dart", "apple,t8110-dart";
+			reg = <0x2 0x6b800000 0x0 0x4000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 521 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_ane_sys>;
+			status = "disabled";
+		};
+
+		ane_dart1: iommu@26b810000 {
+			compatible = "apple,t8112-dart", "apple,t8110-dart";
+			reg = <0x2 0x6b810000 0x0 0x4000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 521 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_ane_sys>;
+			status = "disabled";
+		};
+
+		ane_dart2: iommu@26b820000 {
+			compatible = "apple,t8112-dart", "apple,t8110-dart";
+			reg = <0x2 0x6b820000 0x0 0x4000>;
+			#iommu-cells = <1>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 521 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_ane_sys>;
+			status = "disabled";
+		};
+
+		ane: ane@26a000000 {
+			compatible = "apple,t8112-ane";
+			reg = <0x2 0x6a000000 0x0 0x2000000>,
+				<0x2 0x3b700000 0x0 0x18000>,
+				<0x2 0x3b724000 0x0 0x4000>,
+				<0x2 0x3d2c8060 0x0 0x8>;
+			reg-names = "engine", "pmgr", "set", "fuse";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 520 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "ane";
+			iommus = <&ane_dart0 0>, <&ane_dart1 0>, <&ane_dart2 0>;
+			power-domains = <&ps_ane_sys_cpu>, <&ps_ane_td>,
+				<&ps_ane_base>, <&ps_ane_set1>, <&ps_ane_set2>,
+				<&ps_ane_set3>, <&ps_ane_set4>;
+			mboxes = <&ane_mbox>;
+			status = "disabled";
 		};
 
 		dispext0_dart: iommu@271304000 {
@@ -1845,9 +1940,11 @@
 
 			power-domains = <&ps_atc0_cio>,
 					<&ps_atc0_cio_pcie>,
-					<&ps_atc0_cio_usb>;
+					<&ps_atc0_cio_usb>,
+					<&ps_atc0_pcie>;
 
 			thunderbolt-switch;
+			apple,pcie-tunnel = <&usb4_0_pcie_tunnel>;
 
 			pinctrl-0 = <&acio0_pins>;
 			pinctrl-names = "default";
@@ -1908,6 +2005,74 @@
 				iommus = <&usb4_0_dart 1>;
 				/* To be filled by the loader */
 				apple,thunderbolt-drom = [00];
+			};
+		};
+
+		usb4_0_pcie_tunnel: usb4-pcie-tunnel-0 {
+			#address-cells = <2>;
+			#size-cells = <2>;
+			ranges;
+
+			apciec0_dart: iommu@3a1008000 {
+				compatible = "apple,t8110-dart";
+				reg = <0x3 0xa1008000 0x0 0x4000>;
+				interrupt-parent = <&aic>;
+				interrupts = <AIC_IRQ 1025 IRQ_TYPE_LEVEL_HIGH>;
+				#iommu-cells = <1>;
+			};
+
+			apciec0: pcie@3b0000000 {
+				compatible = "apple,t8112-pciec", "apple,t8103-pciec";
+				device_type = "pci";
+
+				reg = <0x3 0xb0000000 0x0 0x10000000>,
+					<0x3 0xa0000000 0x0 0x4000>,
+					<0x3 0xa1000000 0x0 0x8000>,
+					<0x3 0xa0004000 0x0 0x4000>,
+					<0x3 0xa0200000 0x0 0x4000>,
+					<0x3 0xa1010000 0x0 0x4000>,
+					<0x3 0xa100c000 0x0 0x4000>;
+				reg-names = "config", "rc", "port0", "fabric",
+					    "debug", "ltssm", "intr2axi";
+
+				interrupt-parent = <&aic>;
+				interrupts = <AIC_IRQ 1024 IRQ_TYPE_LEVEL_HIGH>;
+				power-domains = <&ps_atc0_pcie>;
+
+				msi-controller;
+				msi-parent = <&apciec0>;
+				msi-ranges = <&aic AIC_IRQ 992 IRQ_TYPE_EDGE_RISING 32>;
+
+				iommu-map = <0x0 &apciec0_dart 0x0 0x40>;
+				iommu-map-mask = <0x3f>;
+
+				bus-range = <0x0 0x7f>;
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges = <0x43000000 0x4 0x0
+					  0x4 0x0 0x0 0x80000000>,
+					 <0x02000000 0x0 0x80000000
+					  0x4 0x80000000 0x0 0x40000000>,
+					 <0x42000000 0x0 0xc0000000
+					  0x4 0xc0000000 0x0 0x40000000>;
+
+				apciec0_port: pci@0,0 {
+					device_type = "pci";
+					reg = <0x0 0x0 0x0 0x0 0x0>;
+					external-facing;
+
+					#address-cells = <3>;
+					#size-cells = <2>;
+					ranges;
+
+					interrupt-controller;
+					#interrupt-cells = <1>;
+					interrupt-map-mask = <0 0 0 7>;
+					interrupt-map = <0 0 0 1 &apciec0_port 0 0 0 0>,
+							<0 0 0 2 &apciec0_port 0 0 0 1>,
+							<0 0 0 3 &apciec0_port 0 0 0 2>,
+							<0 0 0 4 &apciec0_port 0 0 0 3>;
+				};
 			};
 		};
 
@@ -1995,9 +2160,11 @@
 
 			power-domains = <&ps_atc1_cio>,
 					<&ps_atc1_cio_pcie>,
-					<&ps_atc1_cio_usb>;
+					<&ps_atc1_cio_usb>,
+					<&ps_atc1_pcie>;
 
 			thunderbolt-switch;
+			apple,pcie-tunnel = <&usb4_1_pcie_tunnel>;
 
 			pinctrl-0 = <&acio1_pins>;
 			pinctrl-names = "default";
@@ -2058,6 +2225,74 @@
 				iommus = <&usb4_1_dart 1>;
 				/* To be filled by the loader */
 				apple,thunderbolt-drom = [00];
+			};
+		};
+
+		usb4_1_pcie_tunnel: usb4-pcie-tunnel-1 {
+			#address-cells = <2>;
+			#size-cells = <2>;
+			ranges;
+
+			apciec1_dart: iommu@521008000 {
+				compatible = "apple,t8110-dart";
+				reg = <0x5 0x21008000 0x0 0x4000>;
+				interrupt-parent = <&aic>;
+				interrupts = <AIC_IRQ 1025 IRQ_TYPE_LEVEL_HIGH>;
+				#iommu-cells = <1>;
+			};
+
+			apciec1: pcie@530000000 {
+				compatible = "apple,t8112-pciec", "apple,t8103-pciec";
+				device_type = "pci";
+
+				reg = <0x5 0x30000000 0x0 0x10000000>,
+					<0x5 0x20000000 0x0 0x4000>,
+					<0x5 0x21000000 0x0 0x8000>,
+					<0x5 0x20004000 0x0 0x4000>,
+					<0x5 0x20200000 0x0 0x4000>,
+					<0x5 0x21010000 0x0 0x4000>,
+					<0x5 0x2100c000 0x0 0x4000>;
+				reg-names = "config", "rc", "port0", "fabric",
+					    "debug", "ltssm", "intr2axi";
+
+				interrupt-parent = <&aic>;
+				interrupts = <AIC_IRQ 1105 IRQ_TYPE_LEVEL_HIGH>;
+				power-domains = <&ps_atc1_pcie>;
+
+				msi-controller;
+				msi-parent = <&apciec1>;
+				msi-ranges = <&aic AIC_IRQ 1073 IRQ_TYPE_EDGE_RISING 32>;
+
+				iommu-map = <0x0 &apciec1_dart 0x0 0x40>;
+				iommu-map-mask = <0x3f>;
+
+				bus-range = <0x0 0x7f>;
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges = <0x43000000 0x5 0x80000000
+					  0x5 0x80000000 0x0 0x80000000>,
+					 <0x02000000 0x0 0x00100000
+					  0x6 0x00100000 0x0 0x3ff00000>,
+					 <0x42000000 0x0 0x40000000
+					  0x6 0x40000000 0x0 0x40000000>;
+
+				apciec1_port: pci@0,0 {
+					device_type = "pci";
+					reg = <0x0 0x0 0x0 0x0 0x0>;
+					external-facing;
+
+					#address-cells = <3>;
+					#size-cells = <2>;
+					ranges;
+
+					interrupt-controller;
+					#interrupt-cells = <1>;
+					interrupt-map-mask = <0 0 0 7>;
+					interrupt-map = <0 0 0 1 &apciec1_port 0 0 0 0>,
+							<0 0 0 2 &apciec1_port 0 0 0 1>,
+							<0 0 0 3 &apciec1_port 0 0 0 2>,
+							<0 0 0 4 &apciec1_port 0 0 0 3>;
+				};
 			};
 		};
 
