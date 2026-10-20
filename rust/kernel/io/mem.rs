@@ -163,6 +163,27 @@ impl<'a> IoRequest<'a> {
     }
 }
 
+fn reserve_exclusive_region(resource: &Resource) -> Result<Region> {
+    let start = resource.start();
+    let size = resource.size();
+    let name = resource.name().unwrap_or_default();
+
+    // Reserve against the global MMIO tree, as request_mem_region() does.
+    // An OF platform resource can be a detached descriptor rather than a
+    // node in that tree. Requesting a child of that descriptor neither
+    // excludes other devices nor pairs with Region's release_mem_region().
+    // SAFETY: iomem_resource is the permanent global MMIO resource root;
+    // request_region serializes mutations through the C resource lock.
+    let root = unsafe { Resource::from_raw(&raw mut bindings::iomem_resource) };
+    root.request_region(
+        start,
+        size,
+        name.to_cstring()?,
+        io::resource::Flags::IORESOURCE_MEM,
+    )
+    .ok_or(EBUSY)
+}
+
 /// An exclusive memory-mapped IO region.
 ///
 /// # Invariants
@@ -195,18 +216,7 @@ pub type DevresExclusiveIoMem<const SIZE: usize> = DevresLt<ExclusiveIoMem<'stat
 impl<'a, const SIZE: usize> ExclusiveIoMem<'a, SIZE> {
     /// Creates a new `ExclusiveIoMem` instance.
     fn ioremap(dev: &'a Device<Bound>, resource: &Resource) -> Result<Self> {
-        let start = resource.start();
-        let size = resource.size();
-        let name = resource.name().unwrap_or_default();
-
-        let region = resource
-            .request_region(
-                start,
-                size,
-                name.to_cstring()?,
-                io::resource::Flags::IORESOURCE_MEM,
-            )
-            .ok_or(EBUSY)?;
+        let region = reserve_exclusive_region(resource)?;
 
         let iomem = IoMem::ioremap(dev, resource)?;
 
@@ -430,5 +440,50 @@ impl Drop for Mem {
         // SAFETY: By the type invariant, `self.ptr` is a value returned by a previous successful
         // call to `memremap`.
         unsafe { bindings::memunmap(self.ptr.as_ptr()) };
+    }
+}
+
+#[cfg(CONFIG_64BIT)]
+#[kunit_tests(rust_io_mem_resource)]
+mod tests {
+    use super::*;
+
+    fn detached(name: *const core::ffi::c_char) -> bindings::resource {
+        // Only resource-tree bookkeeping is exercised. No mapping is created
+        // and no hardware address is accessed. Keep the synthetic interval
+        // above the physical address ranges supported by 64-bit platforms.
+        let start = bindings::resource_size_t::MAX & !0xfffff;
+        bindings::resource {
+            start,
+            end: start + 0xfff,
+            name,
+            flags: bindings::IORESOURCE_MEM as _,
+            desc: 0,
+            parent: core::ptr::null_mut(),
+            sibling: core::ptr::null_mut(),
+            child: core::ptr::null_mut(),
+        }
+    }
+
+    #[test]
+    fn exclusive_claims_share_global_tree() -> Result {
+        let mut first_raw = detached(c"rust-io-first".as_ptr());
+        let mut second_raw = detached(c"rust-io-second".as_ptr());
+        // SAFETY: Both descriptors remain live for this test and are accessed
+        // only through their respective Resource wrappers until their last use.
+        let first = unsafe { Resource::from_raw(&raw mut first_raw) };
+        // SAFETY: As above, for the distinct second descriptor.
+        let second = unsafe { Resource::from_raw(&raw mut second_raw) };
+        assert!(!core::ptr::eq(first, second));
+
+        let claim = reserve_exclusive_region(first)?;
+        // Separate device descriptors must still conflict through the global
+        // tree. Reserving children of the detached descriptors misses this.
+        assert_eq!(reserve_exclusive_region(second).err(), Some(EBUSY));
+        drop(claim);
+        // Region::drop must release the same global reservation, so the next
+        // descriptor can acquire it without a leaked or dangling child.
+        drop(reserve_exclusive_region(second)?);
+        Ok(())
     }
 }

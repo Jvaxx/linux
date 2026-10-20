@@ -20,6 +20,7 @@ use crate::fw::channels::{
 };
 use crate::fw::types::*;
 use crate::fw::workqueue::*;
+use crate::module_parameters;
 use crate::no_debug;
 use crate::object::OpaqueGpuObject;
 use crate::{
@@ -134,7 +135,11 @@ impl Drop for GpuContext {
 
         guard.registration_data_with(|reg_data| {
             let data = self.data.take().unwrap();
-            reg_data.gpu.free_context(data);
+            // A context only exists for the manager whose allocators created it, so the manager is
+            // always present.
+            if let Some(gpu) = reg_data.gpu.manager() {
+                gpu.free_context(data);
+            }
         })
     }
 }
@@ -653,8 +658,20 @@ impl WorkQueue::ver {
         let ring = alloc.shared.array_empty(size as usize)?;
         let mut prio = *raw::PRIORITY.get(priority as usize).ok_or(EINVAL)?;
 
-        if pipe_type == PipeType::Compute && !debug_enabled(DebugFlags::Debug0) {
-            // Hack to disable compute preemption until we fix it
+        #[ver(G == G14X)]
+        let preempt_auto = true;
+        #[ver(G != G14X)]
+        let preempt_auto = false;
+        let preempt = match module_parameters::compute_preempt.value() {
+            -1 => preempt_auto,
+            value => value != 0,
+        };
+
+        // Without preemption the compute queue takes priority fields 0 and 5 of the highest
+        // priority entry. The firmware then cannot switch compute work out when another client
+        // needs the GPU, and on G14X it kills the work when the context-switch and kill
+        // timeouts expire.
+        if pipe_type == PipeType::Compute && !preempt {
             prio.0 = 0;
             prio.5 = 1;
         }

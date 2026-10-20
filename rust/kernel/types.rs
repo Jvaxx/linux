@@ -459,7 +459,7 @@ pub unsafe trait Ownable {
 ///
 /// When this type is implemented for an Ownable type, it allows Owned<T> to be dereferenced
 /// into a &mut T.
-
+///
 /// # Safety
 ///
 /// Implementers must ensure that the kernel never mutates the underlying type while
