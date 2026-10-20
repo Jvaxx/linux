@@ -2060,6 +2060,7 @@ T:	git git://anongit.freedesktop.org/drm/drm-misc
 F:	Documentation/devicetree/bindings/display/apple,dcp-typec-routes.yaml
 F:	drivers/gpu/drm/apple/
 F:	drivers/gpu/drm/apple/dcp-fabric*
+F:	tools/testing/selftests/drivers/gpu/apple-afkv2/
 
 APPLE PCIE CONTROLLER DRIVER
 M:	Marc Zyngier <maz@kernel.org>
@@ -2072,6 +2073,60 @@ M:	Henrik Rydberg <rydberg@bitmath.org>
 L:	linux-hwmon@vger.kernel.org
 S:	Odd fixes
 F:	drivers/hwmon/applesmc.c
+
+APPLE T8140 SOC AND J700 (MACBOOK NEO) SUPPORT
+M:	Ryan Murray <ryan@aurorasilicon.org>
+W:	https://aurora-silicon.github.io
+S:	Maintained
+F:	Documentation/devicetree/bindings/cpu/apple,t8140-cpuidle.yaml
+F:	Documentation/devicetree/bindings/cpufreq/apple,cluster-cpufreq.yaml
+F:	Documentation/devicetree/bindings/power/apple,t8140-pmp-report.yaml
+F:	Documentation/devicetree/bindings/soc/apple/apple,pmp.yaml
+F:	drivers/pmdomain/apple/pmp-report.c
+F:	drivers/soc/apple/pmp.rs
+F:	include/linux/mt7932.h
+F:	include/linux/soc/apple/pmp-report.h
+F:	Documentation/devicetree/bindings/chosen/apple,dcp-rtkit-quiesced.yaml
+F:	Documentation/devicetree/bindings/display/apple,dcp.yaml
+F:	Documentation/devicetree/bindings/display/apple,display-subsystem.yaml
+F:	Documentation/PCI/controller/apple-t8140.rst
+F:	Documentation/devicetree/bindings/iio/light/apple,t8140-aop-als.yaml
+F:	Documentation/devicetree/bindings/input/apple,dockchannel-hid.yaml
+F:	Documentation/devicetree/bindings/mailbox/apple,ascwrap-v6.yaml
+F:	Documentation/devicetree/bindings/media/apple,t8140-isp.yaml
+F:	Documentation/devicetree/bindings/mux/apple,display-crossbar.yaml
+F:	Documentation/devicetree/bindings/reserved-memory/apple,asc-mem.yaml
+F:	Documentation/devicetree/bindings/rtc/apple,j700-pmu-rtc.yaml
+F:	Documentation/devicetree/bindings/serial/apple,dockchannel-uart.yaml
+F:	Documentation/devicetree/bindings/soc/apple/apple,dockchannel.yaml
+F:	Documentation/devicetree/bindings/soc/apple/apple,rtk-helper-asc4.yaml
+F:	Documentation/devicetree/bindings/soc/apple/apple,t8140-aop.yaml
+F:	Documentation/devicetree/bindings/soc/apple/apple,t8140-mcc.yaml
+F:	Documentation/devicetree/bindings/sound/apple,t8140-aop-audio.yaml
+F:	Documentation/devicetree/bindings/usb/vialab,vl122.yaml
+F:	Documentation/gpu/apple-dcp-backlight.rst
+F:	Documentation/hid/apple-j700-multitouch.rst
+F:	Documentation/networking/device_drivers/wifi/mt7932-neo.rst
+F:	arch/arm64/boot/dts/apple/t8140*
+F:	arch/arm64/configs/j700*.config
+F:	arch/arm64/include/asm/apple-idle.h
+F:	arch/arm64/kernel/idle-apple.S
+F:	drivers/hid/dockchannel-hid/dockchannel-hid-parser-test.c
+F:	drivers/hid/dockchannel-hid/dockchannel-hid-protocol*
+F:	drivers/iio/common/aop_sensors/
+F:	drivers/phy/apple/atc-j700-dp.h
+F:	drivers/rtc/rtc-apple-pmu.c
+F:	drivers/soc/apple/aop.rs
+F:	drivers/soc/apple/mcc.c
+F:	drivers/tty/serial/apple_dockchannel*
+F:	drivers/pci/controller/pcie-apple-piodma*
+F:	include/linux/soc/apple/pci-apple-piodma.h
+F:	rust/kernel/iio/common/aop_sensors.rs
+F:	rust/kernel/soc/apple/aop.rs
+F:	sound/soc/apple/t8140_aop_audio.rs
+F:	tools/testing/apple/
+F:	tools/testing/kunit/configs/apple_firmware.config
+F:	tools/testing/selftests/drivers/gpu/apple-dcp/
 
 APPLETALK NETWORK LAYER
 L:	netdev@vger.kernel.org
@@ -2668,12 +2723,13 @@ F:	Documentation/devicetree/bindings/power/apple*
 F:	Documentation/devicetree/bindings/power/reset/apple,smc-reboot.yaml
 F:	Documentation/devicetree/bindings/pwm/apple,s5l-fpwm.yaml
 F:	Documentation/devicetree/bindings/reset/apple,t8103-cio-reset.yaml
-F:	Documentation/devicetree/bindings/rtc/apple,j700-pmu-rtc.yaml
 F:	Documentation/devicetree/bindings/rtc/apple,smc-rtc.yaml
 F:	Documentation/devicetree/bindings/soc/apple/apple,t6000-pmgr-misc.yaml
 F:	Documentation/devicetree/bindings/soc/apple/apple,sep.yaml
 F:	Documentation/devicetree/bindings/spi/apple,spi.yaml
 F:	Documentation/devicetree/bindings/spmi/apple,spmi.yaml
+F:	Documentation/devicetree/bindings/thunderbolt/apple,t8103-usb4-acio.yaml
+F:	Documentation/devicetree/bindings/thunderbolt/apple,t8103-usb4-nhi.yaml
 F:	Documentation/devicetree/bindings/usb/apple,dwc3.yaml
 F:	Documentation/devicetree/bindings/usb/apple,sn201202x.yaml
 F:	Documentation/devicetree/bindings/watchdog/apple,wdt.yaml
@@ -2695,7 +2751,7 @@ F:	drivers/iommu/apple-dart-test.c
 F:	drivers/iommu/apple-dart.c
 F:	drivers/iommu/io-pgtable-dart.c
 F:	drivers/irqchip/irq-apple-aic.c
-F:	drivers/mfd/macsmc.c
+F:	drivers/mfd/macsmc*.c
 F:	drivers/nvme/host/apple.c
 F:	drivers/nvmem/apple-efuses.c
 F:	drivers/nvmem/apple-spmi-nvmem.c
@@ -2704,10 +2760,9 @@ F:	drivers/phy/apple/.kunitconfig.apple-atc
 F:	drivers/pinctrl/pinctrl-apple-gpio.c
 F:	drivers/pmdomain/apple/
 F:	drivers/power/reset/macsmc-reboot.c
-F:	drivers/power/supply/macsmc-power.c
+F:	drivers/power/supply/macsmc-power*.c
 F:	drivers/pwm/pwm-apple.c
 F:	drivers/reset/reset-apple-cio.c
-F:	drivers/rtc/rtc-apple-pmu.c
 F:	drivers/rtc/rtc-macsmc.c
 F:	drivers/soc/apple/*
 F:	tools/asahi/pmp-bootargs-tests.rs
@@ -2716,6 +2771,8 @@ F:	drivers/spmi/spmi-apple-controller.c
 F:	drivers/thunderbolt/.kunitconfig.apple-dpin
 F:	drivers/thunderbolt/apple-dpin*
 F:	drivers/thunderbolt/apple.c
+F:	drivers/usb/dwc3/dwc3-apple-state-test.c
+F:	drivers/usb/dwc3/dwc3-apple-state.h
 F:	drivers/usb/dwc3/dwc3-apple.c
 F:	drivers/usb/typec/tipd/spmi.c
 F:	drivers/video/backlight/apple_dwi_bl.c
@@ -4402,6 +4459,18 @@ F:	include/uapi/linux/audit.h
 F:	kernel/audit*
 F:	lib/*audit.c
 K:	\baudit_[a-z_0-9]\+\b
+
+AURORA APPLE SILICON HOST TOOLS
+M:	Ryan Murray <ryan@aurorasilicon.org>
+S:	Maintained
+F:	tools/asahi-m3/
+F:	tools/asahi/
+F:	tools/aurora-m3/
+
+AURORA DISPLAY NOTIFIER
+M:	Ryan Murray <ryan@aurorasilicon.org>
+S:	Maintained
+F:	tools/aurora-display-notifier/
 
 AUTOFDO BUILD
 M:	Rong Xu <xur@google.com>

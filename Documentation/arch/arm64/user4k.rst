@@ -1,8 +1,8 @@
 .. SPDX-License-Identifier: GPL-2.0-only
 
-===========================================
+============================================
 Experimental per-process page sizes on arm64
-===========================================
+============================================
 
 The mixed-page implementation lets an address space use a different user
 translation granule from the kernel's native physical page size. The kernel
@@ -143,7 +143,7 @@ token through TLB invalidation and the required RCU grace period, including
 allocation-failure fallback paths.
 
 Translation context and invalidation
-===================================
+====================================
 
 The arm64 backend supplies per-mm page-table geometry. TTBR1 retains native
 kernel tables, while TTBR0 uses the selected user geometry. A granule change
@@ -163,7 +163,7 @@ Independent TG0/TG1 fields do not make all other translation controls
 independent; the LPA2 exclusion must not be removed merely by changing TG0.
 
 Sharing, pinning and interface limits
-====================================
+=====================================
 
 Mixed-granule sharing is permitted. Shared mappings refer to one coherent
 backing object, with permissions belonging to each virtual mapping. Shared
