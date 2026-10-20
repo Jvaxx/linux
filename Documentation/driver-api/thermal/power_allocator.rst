@@ -171,6 +171,12 @@ integral term.  This term is then multiplied by `k_i` and the result
 added to the output of the controller.  Typically `k_i` is set low (1
 or 2) and `integral_cutoff` is 0.
 
+A positive temperature error also unwinds a negative integral term, even
+when the error is at or above `integral_cutoff`.  In that case recovery
+stops at zero: the cutoff still prevents positive wind-up.  This lets the
+power budget recover after a temperature overshoot without requiring the
+zone to cool below its switch on temperature and reset the controller.
+
 k_d
 ---
 
