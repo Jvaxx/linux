@@ -3349,7 +3349,7 @@ static void tb_test_tunnel_dp_host_credits(struct kunit *test)
 
 	dev->ports[14].config.type = TB_TYPE_DP_HDMI_OUT;
 	tunnel = tb_tunnel_alloc_dp(NULL, &host->ports[5], &dev->ports[14],
-				    1, 0, 0, tb_test_dp_tunnel_active);
+				    1, 0, 0, tb_test_dp_tunnel_active, NULL);
 	KUNIT_ASSERT_NOT_NULL(test, tunnel);
 	KUNIT_EXPECT_EQ(test, tunnel->paths[0]->hops[0].nfc_credits, 5U);
 	tb_tunnel_put(tunnel);
@@ -3372,9 +3372,9 @@ static void tb_test_dprx_release(struct device *dev)
 	/* The context is owned by KUnit and survives the final device put. */
 }
 
-static void tb_test_dprx_complete(struct tb_tunnel *tunnel)
+static void tb_test_dprx_complete(struct tb_tunnel *tunnel, void *data)
 {
-	struct tb_test_dprx *ctx = container_of(tunnel->tb, struct tb_test_dprx, tb);
+	struct tb_test_dprx *ctx = data;
 
 	KUNIT_EXPECT_TRUE(ctx->test, tunnel->dprx_canceled);
 	ctx->completions++;
@@ -3398,7 +3398,7 @@ static void tb_test_dp_dprx_cancel_common(struct kunit *test, bool running)
 	dev = alloc_dev_default(test, host, 0x1, true);
 	KUNIT_ASSERT_NOT_NULL(test, dev);
 	tunnel = tb_tunnel_alloc_dp(tb, &host->ports[5], &dev->ports[13],
-				    1, 0, 0, tb_test_dprx_complete);
+				    1, 0, 0, tb_test_dprx_complete, ctx);
 	KUNIT_ASSERT_NOT_NULL(test, tunnel);
 	tb->wq = alloc_ordered_workqueue("tb-dprx-test", 0);
 	if (!tb->wq) {
@@ -3467,9 +3467,9 @@ static bool tb_test_dprx_awaits_display(struct tb_nhi *nhi, struct tb_port *in)
 	return gate->deferred;
 }
 
-static void tb_test_dprx_finished(struct tb_tunnel *tunnel)
+static void tb_test_dprx_finished(struct tb_tunnel *tunnel, void *data)
 {
-	struct tb_test_dprx *ctx = container_of(tunnel->tb, struct tb_test_dprx, tb);
+	struct tb_test_dprx *ctx = data;
 
 	ctx->completions++;
 	complete(&ctx->worker_passed);
@@ -3496,7 +3496,7 @@ static void tb_test_dp_dprx_deferred_first(struct kunit *test)
 	dev = alloc_dev_default(test, host, 0x1, true);
 	KUNIT_ASSERT_NOT_NULL(test, dev);
 	tunnel = tb_tunnel_alloc_dp(tb, &host->ports[5], &dev->ports[13],
-				    1, 0, 0, tb_test_dprx_finished);
+				    1, 0, 0, tb_test_dprx_finished, ctx);
 	KUNIT_ASSERT_NOT_NULL(test, tunnel);
 	tb->wq = alloc_ordered_workqueue("tb-dprx-gate-test", 0);
 	if (!tb->wq) {
