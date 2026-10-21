@@ -134,6 +134,7 @@ static int __init t8132_fdt_node_offset(const void *data,
 static int __init t8132_pmgr_policy(struct of_changeset *cs, unsigned int *changed)
 {
 	const void *data = __dtb_t8132_platform_data_begin;
+	const char * const ownership[] = { "apple,firmware-owned", "apple,inherited-on" };
 	struct device_node *pmgr;
 	int ret;
 
@@ -169,10 +170,11 @@ static int __init t8132_pmgr_policy(struct of_changeset *cs, unsigned int *chang
 					goto put_pmgr;
 				(*changed)++;
 			}
-			if (offset >= 0 &&
-			    fdt_getprop(data, offset, "apple,firmware-owned", NULL) &&
-			    !of_property_present(node, "apple,firmware-owned")) {
-				ret = of_changeset_add_prop_bool(cs, node, "apple,firmware-owned");
+			for (unsigned int i = 0; i < ARRAY_SIZE(ownership); i++) {
+				if (offset < 0 || !fdt_getprop(data, offset, ownership[i], NULL) ||
+				    of_property_present(node, ownership[i]))
+					continue;
+				ret = of_changeset_add_prop_bool(cs, node, ownership[i]);
 				if (ret)
 					goto put_pmgr;
 				(*changed)++;

@@ -52,7 +52,7 @@ def legacy_fixture(native, output):
         offset, depth = fdt.next_node(offset, depth, quiet=(libfdt.NOTFOUND,))
     # Delete later nodes first, retaining validity of the earlier offsets.
     for offset in reversed(offsets):
-        for name in ["status", "apple,firmware-owned"]:
+        for name in ["status", "apple,firmware-owned", "apple,inherited-on"]:
             fdt.delprop(offset, name, quiet=(libfdt.NOTFOUND,))
     output.write_bytes(fdt.as_bytearray())
 

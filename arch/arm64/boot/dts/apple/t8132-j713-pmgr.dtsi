@@ -278,7 +278,8 @@
 };
 
 &ps_atc1_common {
-	status = "disabled";
+	status = "okay";
+	apple,inherited-on;
 };
 
 &ps_atc1_pcie {
