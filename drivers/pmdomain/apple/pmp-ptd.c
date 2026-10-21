@@ -86,7 +86,7 @@ static int apple_pmp_ptd_power_on(struct generic_pm_domain *genpd)
 	void __iomem *req_reg = ptd->base + PTD_ENTRY(PTD_DISPLAY_REQ);
 	void __iomem *ack_reg = ptd->base + PTD_ENTRY(PTD_DISPLAY_ACK);
 	u64 sel = PTD_DISP | d->device;
-	u64 req, ack, want = 0;
+	u64 req, ack = 0, want = 0;
 	unsigned long flags;
 	int ret = 0;
 
