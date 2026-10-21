@@ -19,6 +19,16 @@ PINS = {
 GROUPS = ('ofdm', 'ru26', 'ru52', 'ru106', 'ru242', 'ru484', 'ru996', 'ru996X2')
 
 
+class NoVLPPrimary(ValueError):
+    """An otherwise valid country has no usable VLP primary."""
+
+
+def alpha2(value):
+    if not re.fullmatch(r'[A-Z]{2}', value):
+        raise ValueError('country must be two uppercase ASCII letters')
+    return value
+
+
 def sections(text):
     result, current, group = {}, None, None
     for raw in text.splitlines():
@@ -126,7 +136,8 @@ def pages(country, channels, parsed):
 
 
 def validate_legacy(data, country):
-    if (len(data) < 16 or data[:4] != b'J7RP' or struct.unpack_from('<H', data, 4)[0] != 1
+    if (not 16 <= len(data) <= 16384 or data[:4] != b'J7RP'
+            or struct.unpack_from('<H', data, 4)[0] != 1
             or data[6:8] != country.encode('ascii') or data[8] not in (2, 3)
             or data[9:12] != b'\x0d\0\0' or struct.unpack_from('<I', data, 12)[0] != len(data)):
         raise ValueError('legacy country package header')
@@ -171,7 +182,7 @@ def extend(legacy, country, channels, legal, parsed):
             if any(x not in (0xc4, 0x7f) for x in values):
                 allowed |= 1 << ((ch - 1) // 4)
     if not allowed:
-        raise ValueError('country has no VLP primary with power data')
+        raise NoVLPPrimary('country has no VLP primary with power data')
     messages = pages(country, channels, parsed)
     extension = bytearray(24)
     extension[:8] = b'6GRP' + bytes((1, 14, len(messages), 0))
@@ -188,36 +199,77 @@ def extend(legacy, country, channels, legal, parsed):
     return bytes(out), allowed, messages
 
 
-def main():
+def build(channels, countries, powers, legacy_dir, requested=None):
+    """Plan the complete output before writing anything; corrupt inputs are fatal."""
+    vlp = {key[:-4] for key in powers if key.endswith(',VLP')}
+    selected = sorted(set(requested) if requested is not None else set(countries) | vlp)
+    built, report, skipped = {}, {}, {}
+    for country in selected:
+        if not re.fullmatch(r'[A-Z]{2}', country):
+            skipped[country] = 'not an uppercase alpha2 country'
+            continue
+        if country not in vlp:
+            skipped[country] = 'no VLP section'
+            continue
+        if country not in countries:
+            skipped[country] = 'no 6 GHz country matrix row'
+            continue
+        source = legacy_dir / (country + '.bin')
+        if not source.is_file():
+            skipped[country] = 'no matching v1 package'
+            continue
+        parsed = rows(powers[country + ',VLP'], channels)
+        try:
+            blob, allowed, messages = extend(source.read_bytes(), country, channels,
+                                             countries[country], parsed)
+        except NoVLPPrimary as error:
+            skipped[country] = str(error)
+            continue
+        built[country] = blob
+        report[country] = {'sha256': hashlib.sha256(blob).hexdigest(), 'bytes': len(blob),
+                           'allowed_primaries': allowed.bit_count(), 'power_pages': len(messages)}
+    return built, {'countries': report, 'skipped': skipped,
+                   'counts': {'candidates': len(selected), 'generated': len(built),
+                              'skipped': len(skipped), 'vlp_sections': len(vlp),
+                              'matrix_countries': len(countries)}}
+
+
+def publish(output_dir, built):
+    """Publish a fresh inventory and packages; never mix with an earlier run."""
+    if output_dir.exists() and any(output_dir.iterdir()):
+        raise ValueError('output directory must be absent or empty')
+    inventory = ''.join(f'policy-v2/{country}.bin\t{hashlib.sha256(blob).hexdigest()}\n'
+                        for country, blob in sorted(built.items())).encode('ascii')
+    digest = hashlib.sha256(inventory).hexdigest()
+    output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    policy_dir = output_dir / 'policy-v2'
+    policy_dir.mkdir(mode=0o700)
+    files = [(policy_dir / (country + '.bin'), blob) for country, blob in sorted(built.items())]
+    files += [(output_dir / 'inventory.tsv', inventory),
+              (output_dir / 'inventory.sha256', (digest + '  inventory.tsv\n').encode('ascii'))]
+    for target, data in files:
+        with target.open('xb') as stream:
+            target.chmod(0o600)
+            stream.write(data)
+    return {'path': 'inventory.tsv', 'sha256': digest, 'entries': len(built)}
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--tables', type=Path, required=True)
     parser.add_argument('--legacy-dir', type=Path, required=True)
-    parser.add_argument('--output-dir', type=Path, required=True)
-    parser.add_argument('--country', action='append', choices=('AU', 'US', 'CA', 'DE'))
-    args = parser.parse_args()
+    parser.add_argument('--output-dir', type=Path, required=True,
+                        help='fresh root for policy-v2/, inventory.tsv and inventory.sha256')
+    parser.add_argument('--country', action='append', type=alpha2,
+                        help='uppercase alpha2; repeat to select countries (default: all eligible)')
+    args = parser.parse_args(argv)
     inputs = {name: (args.tables / name).read_bytes() for name in PINS}
     if any(hashlib.sha256(data).hexdigest() != PINS[name] for name, data in inputs.items()):
         raise ValueError('unrecognized input revision')
     channels, countries = matrix(inputs[DB_NAME].decode('ascii'))
     powers = sections(inputs[SIX_NAME].decode('ascii'))
-    built, report = {}, {}
-    for country in args.country or ('AU', 'US', 'CA', 'DE'):
-        parsed = rows(powers[country + ',VLP'], channels)
-        blob, allowed, messages = extend((args.legacy_dir / (country + '.bin')).read_bytes(),
-                                        country, channels, countries[country], parsed)
-        built[country] = blob
-        report[country] = {'sha256': hashlib.sha256(blob).hexdigest(), 'bytes': len(blob),
-                           'allowed_primaries': allowed.bit_count(), 'power_pages': len(messages)}
-    args.output_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    for country, blob in built.items():
-        target = args.output_dir / (country + '.bin')
-        if target.exists():
-            raise ValueError('output already exists')
-    for country, blob in built.items():
-        target = args.output_dir / (country + '.bin')
-        with target.open('xb') as stream:
-            target.chmod(0o600)
-            stream.write(blob)
+    built, report = build(channels, countries, powers, args.legacy_dir, args.country)
+    report['inventory'] = publish(args.output_dir, built)
     print(json.dumps(report, indent=2, sort_keys=True))
 
 

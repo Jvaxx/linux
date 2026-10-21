@@ -193,14 +193,16 @@ are installed under ``policy-v2/``. Generate them from the original text
 tables and the installed version-1 packages::
 
   python3 tools/asahi/mt7932-policy-6ghz.py --tables /path/to/IZUBA \
-    --legacy-dir /path/to/policy --output-dir /path/to/new-policy
+    --legacy-dir /path/to/policy --output-dir /path/to/new-policy-root
   python3 tools/asahi/mt7932-policy-6ghz-tests.py
 
-The default outputs are AU.bin, US.bin, CA.bin and DE.bin (the EU test
-country). Input hashes pin the macOS 25G83 revision of the tables. All files
-are validated before publication and existing output files are not replaced.
-Only code is distributed; the power tables and generated packages stay on
-the machine they come from.
+The default is every eligible VLP country, with skipped countries reported.
+Use repeated ``--country CC`` options to select a subset. Packages are written
+under ``policy-v2/`` with a sorted SHA-256 inventory beside that directory.
+Input hashes select the authenticated 25G83 revision. All files are validated
+before publication and the output root must be absent or empty. Only code is
+distributed; the power tables and generated packages stay on the machine
+they come from.
 
 The producer reads VLP sections and the 6 GHz country matrix. Mode 2 in a
 channel's operating-class set grants VLP eligibility, intersected with
@@ -217,33 +219,345 @@ PSD rounding uses allocation bandwidth lower bounds, so it cannot raise a
 limit. Unrepresentable reductions disable the affected rate. Legacy-band
 power handling is unchanged. LPI/AFC operation is not added by VLP packages.
 
-J7RP v2 format
-~~~~~~~~~~~~~~
+J7RP v1/v2 byte format and producer contract
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The unchanged 16-byte J7RP header, mode records and 13 version-1 tables are
-followed by a 24-byte extension header. The outer version is 2 and maximum
-package size is 65536 bytes:
+J7RP is a Linux country-policy container, not an Apple file. The following
+contract describes the wire format and the v2 derivation independently of
+its Python implementation, so an installer with an existing v1 builder can
+implement the extension without importing GPL code. Obtain original tables
+from the user's own macOS or IPSW at installation time; do not redistribute
+the Apple tables. Examples below contain no original power data.
 
-* bytes 0..3: ``6GRP``;
-* byte 4: class 1 (VLP); byte 5: 14 dBm profile ceiling;
-* byte 6: power-page count (1..32); byte 7: zero;
-* bytes 8..15: little-endian permission bitmap, bit i = primary 1+4*i,
-  with bits 59..63 clear;
-* bytes 16..17: alpha2; byte 18: native half-dBm rate-cell contract 1;
-* bytes 19..23: zero.
+All offsets are zero-based bytes, relative to the containing structure.
+Integers are unsigned little-endian unless specified otherwise. Structures
+are packed with no alignment gaps. Alpha2 is exactly two uppercase ASCII
+letters, without a terminator. XZ is the firmware world identity; Linux
+country 00 uses the v1 file ``policy/world-XZ.bin``. All other v1 files use
+``policy/CC.bin``. V2 files use ``policy-v2/CC.bin`` under the same
+``mediatek/mt7932/`` firmware root. Never replace a v1 file with v2: older
+kernels reject version 2 and packages larger than 16384 bytes.
 
-A page has CID, a zero byte, a little-endian 16-bit body length, then body.
-CID 0x5d uses version 3, tag 0x2a, band 3, matching alpha2, a 44-byte header
-and 122-byte entries. CID 0x95 uses a zero/reserved header without embedded
-length or country, band 3 and 33-byte legacy entries with 0x7f payload.
-The containing package supplies country identity for the latter. Both
-association pages are required exactly once with eight entries and length
-1020. Association selectors are not channel permissions.
+Outer header and v1 records
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Association submits those two pages after the queue bind. No transmit
-power envelope request is built. Generic runtime D7 calibration requests
-for 6 GHz are still rejected. These gaps and the SAE, OWE and per-country
-RF behavior need more hardware qualification.
+The 16-byte outer header is::
+
+  Offset  Size  Meaning
+   0       4    ASCII J7RP
+   4       2    Version: 1 or 2
+   6       2    Country alpha2
+   8       1    Mode-record count M: 2 or 3
+   9       1    Legacy table count: 13 (also in v2)
+  10       2    Reserved, zero
+  12       4    Entire file length, including header and any v2 extension
+
+Reject lengths below 16, v1 lengths above 16384, v2 lengths above 65536,
+unknown versions, nonzero reserved fields, or a country different from the
+requested firmware country. After the header come M consecutive 328-byte
+mode records, then exactly 13 legacy tables in index order. A mode record
+is a CID 0xca command body::
+
+  Offset  Size  Meaning
+   0       4    Reserved, zero
+   4       4    Payload length N, 1..320
+   8       N    ASCII chip-configuration string, excluding any NUL
+   8+N   320-N  Zero padding
+
+The v1 parser checks the zero word and the length range. The producer must
+retain the original country's mode strings and padding; the v2 extension
+never regenerates or changes these records.
+
+Every legacy table is a complete CID 0x5d command body, without a separate
+record wrapper. Its little-endian length at offset 2 includes its own
+header. Use that length to find the next table; every table must fit
+entirely within the file. Tables 1..9 have this layout::
+
+  Offset  Size  Meaning
+   0       1    Version 3
+   1       1    Tag 0x0a
+   2       2    Body length = 44 + 122*C
+   4       1    Entry count C
+   5       1    Band: 1 for tables 1..2, 2 for tables 3..9
+   6       1    Last page in band: 1 for tables 2 and 9, otherwise 0
+   7       1    Reserved, zero
+   8       2    Alpha2, identical to outer header
+  10       2    Reserved, zero
+  12      32    One-stream padding bitmap, indexed by channel number
+  44     122*C  Entries: one channel byte followed by 121 rate bytes
+
+Table 1 has eight entries (channels 1..8); table 2 has five (9..13),
+except world XZ has six (9..14). Channel 14 data is not Linux permission.
+Tables 3..8 have eight entries each; table 9 has five. Their ordered
+53-channel namespace is::
+
+  36,38,40,42,44,46,48,50,52,54,56,58,60,62,64,
+  100,102,104,106,108,110,112,114,116,118,120,122,124,
+  126,128,132,134,136,138,140,142,144,149,151,153,155,
+  157,159,161,163,165,167,169,171,173,175,177,181
+
+Rate-byte projection is specified below and is shared with v2. All XZ
+per-rate tables carry the same padding bitmap; the parser additionally
+checks XZ's 2.4 GHz channel order.
+
+The four remaining legacy tables have a zero-initialized 44-byte header:
+byte 0 is zero, byte 1 is 2, offsets 2..3 contain total length, and bytes
+4..7 and payloads are as follows. Unassigned bytes remain zero::
+
+  Index  Length  Bytes 4,5,6,7  Payload at offset 44
+   0      532     4,2,0,5       360-byte unsupported-rate bitmap,
+                                then 128 zero bytes
+  10      144    20,1,1,1       20 SAR entries, each index byte 0..19
+                                followed by four signed power bytes
+  11       58    13,1,1,4       13 signed common-path backoff bytes
+                                for channels 1..13, then one zero byte
+  12      265    17,1,1,2       17 SDB entries, each index byte 0..16
+                                followed by twelve signed power bytes
+
+Table 10 also carries alpha2 at offsets 8..9; offsets 10..11 are zero.
+The kernel validates each fixed length, version and type, and table 10's
+country. SAR columns are siso_wf0, siso_wf1, mimo_wf0, mimo_wf1. SDB columns
+are cck_siso_wf0/1, ofdm_siso_wf0/1, ofdma_siso_wf0/1, cck_mimo_wf0/1,
+ofdm_mimo_wf0/1, ofdma_mimo_wf0/1, in that order. SAR ``x`` and SDB
+``X``/``x`` encode 0x7f. Missing common-path backoffs encode zero.
+V2 copies all of these v1 bodies verbatim, including the unsupported-rate
+bitmap; it does not derive an additional 6 GHz unsupported-rate bitmap.
+
+For v1, the thirteenth table must end exactly at EOF. For v2 it must be
+followed immediately by the extension, with no padding. Copy the validated
+v1 file, change only the outer version to 2 and the total length, and append
+the extension. Non-XZ v1 sizes are 10119 (two modes) or 10447 (three modes).
+The producer rejects a v1 country, version, internal table identity or
+length mismatch before publishing any output.
+
+6 GHz eligibility and authenticated inputs
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Authenticate both complete ASCII files by SHA-256 before parsing::
+
+  IZUBA_TxPwrLimit6G_MT79x1.dat
+    bc22e249526867b62542ef61231c14b7027ae49f8c926ad6d73029c742dc53bc
+  IZUBA_db.dat
+    a61e0b70cbc9a381fc41ff9afa8f036cbd032cadad66209134d4a5adfa18c8b2
+
+A country is eligible only when CC is two uppercase ASCII letters and all
+of the following hold:
+
+* A ``[CC,VLP]`` power section exists. LP and SP sections cannot substitute.
+* The ``<6gCC,...>`` matrix contains a row for CC.
+* A structurally valid ``policy/CC.bin`` version-1 input matches CC,
+  including the per-rate and SAR table countries.
+* At least one primary ``ch = 1+4*i``, i = 0..58, has operating-class
+  token 2 in its matrix cell and at least one projected rate byte other
+  than 0xc4 or 0x7f. Match slash-delimited tokens, not substrings.
+
+The bitmap is precisely the intersection in the last bullet. Channel 2,
+bonded centers and padding bits never grant primary permission. A VLP
+section with empty groups, all sentinel cells, or power only outside the
+matrix's VLP primaries is skipped with a reason. Missing VLP, matrix or v1
+inputs are also reported as skips; malformed authenticated data or a
+present but invalid v1 package aborts the run. XZ has no 6 GHz data in this
+revision and must retain v1 with 6 GHz off. These are data eligibility
+rules, not a replacement for cfg80211 regulatory restrictions.
+
+The default candidate set is the sorted union of VLP-section countries and
+6 GHz matrix countries. Repeated ``--country CC`` options instead select
+that set of uppercase alpha2 values, deduplicated and sorted. Discovery
+reports pseudo-country identifiers as skips rather than emitting files for
+them. The pinned
+revision has 127 VLP sections and 132 matrix rows; section counts alone do
+not establish the number of usable outputs.
+
+Power-row derivation and rate-byte projection
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Skip blank lines, comment lines beginning with ``#`` after whitespace, and
+version lines beginning with ``{Ver:`` or ``<Ver:``. Sections are
+``[CC,mode]``. Groups open with ``<name,...>`` and close with ``</name>`` or
+``</end>``. Reject duplicate sections or groups, unknown groups, unclosed
+groups, and rows outside groups. Each VLP section must contain exactly
+``ofdm, ru26, ru52, ru106, ru242, ru484, ru996, ru996X2`` groups, possibly
+with no rows. Trim whitespace around comma fields. A row contains a label
+and eight cells for ofdm or 36 for an RU group. Each cell is ``X``, ``x``,
+``Y``, or a decimal integer -128..127. X/x encode 0xc4, Y encodes 0x7f;
+integers encode their low eight bits as signed two's-complement values in
+native half-dBm units. Preserve sentinels rather than treating them as
+numeric limits.
+
+Read the first 110 channel columns from the 6gCC header in file order.
+Their names are ``6gN`` with distinct N. The trailing columns must be
+``vht40,vht80,vht160,c2clpi,vlpp2p,flag``. Each matrix row has country,
+110 operating-class cells, six trailing cells and a trailing comma. A
+channel cell is 0..3, optionally followed by slash-separated 1..3 tokens.
+Reject duplicate countries, wrong row widths or invalid mode sets.
+
+The pinned 110-channel order is channel 2 followed by ascending odd
+channels 1..233, retaining width classes 0..3 and excluding channel 231.
+The width class W of band-3 channel 2 is 0. For other channels let d=ch-1:
+W is 0 when ``d & 3 == 0``, 1 when ``d & 7 == 2``, 2 when
+``d & 15 == 6``, 3 when ``d & 31 == 14``; otherwise it is invalid.
+These classes control row placement, not Linux channel permissions.
+
+Initialize every channel with all cells X in the following fifteen groups,
+in order (parentheses give dense-image width)::
+
+  cck(4), ofdm(8), ht20(24), ht40(24),
+  vht20(30), vht40(30), vht80(30), vht160(30),
+  ru26(36), ru52(36), ru106(36), ru242(36), ru484(36),
+  ru996(36), ru996X2(36)
+
+Process each input group's rows in file order; later writes overwrite earlier
+ones. Labels are ``chNNN``, ``chNNN-cdd``, ``chNNN-MMM`` or
+``chNNN-MMM-cdd``; both channel numbers must exist in the namespace. Let
+start=NNN, end=MMM (or NNN when omitted), g be the group's index above,
+and Ws/We their width classes.
+
+* A plain ``chNNN`` label, or any label with Ws=0, writes cells at offset
+  zero of group g on start. For ofdm, also write those cells at offset
+  zero of ht20 when Ws is 1..3 or start is channel 2.
+* For other labels, write on end. Non-ofdm RU groups ru242/ru484/ru996
+  select destination group index Ws+11, offset zero; other RU groups
+  retain their own index and use offset zero.
+* For ofdm with Ws=We, select ht20 offset 8. For (Ws,We)=(2,1) or
+  (3,2), select ht20 offset 16 without cdd, or ht40 offset 0 with cdd.
+  For (3,1), select ht40 offset 8 without cdd, or offset 16 with cdd.
+  Otherwise select ht20 offset (Ws-1)*8. Reject a write beyond a group's
+  width.
+
+Concatenate the fifteen groups at their dense widths to obtain a 432-byte
+value image V. Project V to 121 rate bytes by walking this descriptor list
+in order. Each descriptor gives source offset, repetition count, stride,
+and the offsets copied within each repetition::
+
+  Source  Repetitions  Stride  Offsets
+  0x000       1          4    0
+  0x004       1          8    0,4,6
+  0x00d       3          8    0,4,6
+  0x025       3          8    0,4,6
+  0x03c       3         10    0,3,5
+  0x05a       3         10    0,3,5
+  0x078       3         10    0,3,5
+  0x096       3         10    0,3,5
+  0x0b4       3         12    0,3,5
+  0x0d8       3         12    0,3,5
+  0x0fc       3         12    0,3,5
+  0x120       3         12    0,3,5
+  0x144       3         12    0,3,5
+  0x168       3         12    0,3,5
+  0x18c       3         12    0,3,5
+
+For each repetition r and listed offset k append V[source+r*stride+k].
+In particular 0x00d and 0x025 are literal offsets; do not replace them
+with dense-group boundaries. A wire entry is the channel byte followed by
+this projection. Neither the matrix nor the permission bitmap removes
+entries from the emitted pages.
+
+The 32-byte one-stream pad is computed once over all channel rows and
+reused on every native page. For a channel of width W, compare column 0
+and column 10 in each of groups vht20 through vht[20*2**W]. Interpret
+both as signed bytes, including sentinels. Set bit ``ch & 7`` of byte
+``ch >> 3`` only if every difference (column0 minus column10) is at least
+10. Otherwise leave the bit zero. For v1 use the legacy width classes
+(base 36 for channels below 149, base 149 otherwise; channels below 15
+have W=0) and legacy channel limit 181; v2 uses the band-3 classes above
+and limit 233. This bitmap is independent of the primary permission mask.
+
+6 GHz extension header and records
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Immediately following the thirteen legacy tables is a 24-byte header::
+
+  Offset  Size  Meaning
+   0       4    ASCII 6GRP
+   4       1    Power class: 1 (VLP)
+   5       1    Profile EIRP ceiling: 14 dBm
+   6       1    Extension record count P, 1..32; this producer emits 28
+   7       1    Reserved, zero
+   8       8    Nonzero primary permission bitmap; bit i means 1+4*i
+  16       2    Alpha2, identical to outer header
+  18       1    Rate-cell units contract: 1 (native half-dBm)
+  19       5    Reserved, zero
+
+Bits 59..63 must be zero. There is exactly one extension; unsupported
+class, ceiling or units values are rejected. Follow the header with P
+records, each consisting of a four-byte wrapper and its body::
+
+  Offset  Size  Meaning
+   0       1    Firmware CID: 0x5d or 0x95
+   1       1    Reserved, zero
+   2       2    Body length L, 44..1020, excluding wrapper
+   4       L    Body
+
+After P records the file must end exactly. Reject truncation, length
+mismatches, unknown CIDs, invalid counts or reserved fields. The canonical
+producer emits all fourteen CID 0x5d records first, then all fourteen CID
+0x95 records. Each sequence visits all 110 channels in matrix order,
+chunked into thirteen pages of eight entries and one of six. The final
+page flag is 1 only on the last page of each sequence.
+
+A native CID 0x5d body uses the same 44-byte header and 122-byte entries as
+a v1 per-rate body, with version 3, tag 0x2a, band 3 and matching country.
+Its body length is 44+122*C; its pad is the band-3 bitmap above. Its total
+body lengths are thirteen times 1020 then 776.
+
+A legacy CID 0x95 body has this independent layout::
+
+  Offset  Size  Meaning
+   0       4    Zero (no embedded version, tag or length)
+   4       1    Count C, 1..8
+   5       1    Band 3
+   6       1    Last page flag, 0 or 1
+   7       1    Reserved, zero
+   8      36    Reserved, zero (no country or pad)
+  44      33*C  Channel byte followed by 32 bytes of 0x7f per entry
+
+Its body length is 44+33*C, thirteen times 308 then 242. The enclosing
+package supplies country identity. Never substitute the native header for
+this body or treat its 0x7f bytes as power grants.
+
+The kernel requires exactly one native page whose first entry's channel
+is 0x02 and exactly one whose first entry is 0x0f. Both have eight entries
+and body length 1020; they are also reused for association. These selectors
+are the first channel of each page, not separate wrapper fields and not
+permission bits. The entire canonical extension is 18418 bytes; with two
+v1 modes the complete file is 28537 bytes (28865 with three modes).
+
+Deterministic publication and installer integration
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Validate all inputs and build all selected packages before writing output.
+Use an absent or empty output root; refuse a nonempty one to prevent stale
+packages being omitted from the inventory. Under that root write::
+
+  policy-v2/CC.bin
+  inventory.tsv
+  inventory.sha256
+
+``inventory.tsv`` consists of ASCII records sorted lexicographically by
+relative path. Each record is exactly ``policy-v2/CC.bin``, one TAB, the
+64 lowercase hexadecimal digits of that file's SHA-256, and LF. There is
+no header, BOM, CR, leading slash or metadata record. Only generated
+packages appear. An empty result has an empty inventory. Hash the exact
+inventory bytes, including the final LF when nonempty. Write
+``inventory.sha256`` as that digest, two spaces, ``inventory.tsv`` and LF.
+The JSON stdout report gives per-country hashes, sizes, allowed-primary
+counts and page counts, skips with reasons, aggregate counts and the
+inventory digest. No timestamps or absolute paths enter generated files.
+Fresh output directories use mode 0700 and files use 0600.
+
+The authenticated AU reference is 28537 bytes with SHA-256::
+
+  3425de282eb1a3c2c76d8cd65a31305e92f0e5b481d65096c0faa1ac631fea27
+
+Install v2 separately from v1 and keep world fallback v1. cfg80211 flags,
+NO_IR, VLP-client restrictions and runtime EIRP/PSD reductions remain
+authoritative. The driver preserves 0xc4/0x7f sentinels when reducing
+numeric native half-dBm cells. LPI, SP and AFC are outside this contract.
+
+The active association path submits the two native selector pages after
+queue binding and does not build a 60-byte TPE. Generic runtime D7
+requests for band 2 (6 GHz) remain rejected by the raw planner. RF behavior,
+rate accounting and calibration still require hardware qualification.
 
 Local firmware inputs
 ---------------------
@@ -339,7 +653,7 @@ Limitations
   transport.
 * The Bluetooth software queue limit does not provide HCI backpressure;
   saturation can drop an accounted frame.
-* Arbitrary scan IEs, AP/P2P, general country-package generation, roaming and
+* Arbitrary scan IEs, AP/P2P, country-specific RF behavior, roaming and
   long-duration reliability are unqualified. SAE and required MFP qualification
   are described under Station security.
 * SCO/headset microphone, LE Audio/ISO and simultaneous headset audio are
