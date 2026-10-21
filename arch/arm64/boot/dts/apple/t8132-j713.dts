@@ -26,6 +26,7 @@
 		ans-mbox = &ans_mbox;
 		atcphy0 = &atcphy0;
 		atcphy1 = &atcphy1;
+		bluetooth0 = &bluetooth0;
 		keyboard = &keyboard;
 		nvram = &nvram;
 		pmu-primary = &pmic1;
@@ -274,14 +275,25 @@
 
 &dart_apcie0 {
 	status = "okay";
-	apple,dma-range = <0x100 0x00010000 0x0 0x3fe00000>;
+	apple,managed-sids = <1 2>;
+	apple,dma-range = <0x100 0x00100000 0x0 0x3fe00000>;
 };
 
 &pcie0 {
 	status = "okay";
+	apple,managed-sids = <1 2>;
+	iommu-map = <0x100 &dart_apcie0 1 2>;
+	iommu-map-mask = <0xffff>;
 	pci@0,0 {
 		pwren-gpios = <&smc_gpio 0x13 GPIO_ACTIVE_HIGH>;
 		reset-gpios = <&pinctrl_ap 163 GPIO_ACTIVE_LOW>;
+		bluetooth0: bluetooth@0,1 {
+			compatible = "pci14e4,5f72";
+			reg = <0x10100 0x0 0x0 0x0 0x0>;
+			brcm,board-type = "apple,garden";
+			/* Per-machine address and calibration supplied by m1n1. */
+			local-bd-address = [00 00 00 00 00 00];
+		};
 		wifi0: wifi@0,0 {
 			compatible = "pci14e4,4434";
 			reg = <0x10000 0x0 0x0 0x0 0x0>;
