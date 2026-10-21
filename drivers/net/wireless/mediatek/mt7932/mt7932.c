@@ -1331,3 +1331,4 @@ MODULE_FIRMWARE("mediatek/mt7932/policy/world-XZ.bin");
  * Explicitly package world-XZ and every intended current/later country policy.
  */
 MODULE_FIRMWARE("mediatek/mt7932/policy/[A-Z][A-Z].bin");
+MODULE_FIRMWARE("mediatek/mt7932/policy-v2/[A-Z][A-Z].bin");

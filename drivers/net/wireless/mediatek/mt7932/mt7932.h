@@ -131,6 +131,8 @@ struct mt7932 {
 	bool reg_deferral;
 	/* Channels the applied country package leaves out; under RTNL. */
 	DECLARE_BITMAP(policy_disabled, MT7932_CHANNELS);
+	/* Last package pass for the current request; under response_lock. */
+	struct mt7932_policy_choice policy_choice;
 	struct net_device *netdev;
 	struct wireless_dev wdev;
 	struct cfg80211_scan_request *scan_request;
@@ -210,6 +212,7 @@ struct mt7932 {
 bool mt_rf_allowed(struct mt7932 *m);
 void mt_retry_missing_policy(struct mt7932 *m);
 void mt_reg_apply_deferred_locked(struct mt7932 *m);
+void mt_policy_debugfs_init(struct mt7932 *m);
 int mt_net_open(struct net_device *netdev);
 int mt_request_input(struct mt7932 *m, const struct firmware **fw, const char *name);
 /* response_lock held; closes RF admission and reports terminal host state. */
