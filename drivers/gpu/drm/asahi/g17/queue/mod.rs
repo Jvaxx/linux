@@ -130,7 +130,8 @@ impl<B: Backend> Queue<B> {
     }
 
     fn ensure_compute(&mut self, scs_pages: u16) -> Result {
-        // Admission is checked even when this queue already owns a scheduler.
+        // Validate every request, including an existing scheduler. Physical
+        // admission happens after its DRM dependencies, in backend publication.
         self.backend.ensure_compute(scs_pages)?;
         if self.compute.is_none() {
             self.compute = Some(Scheduler::new(
@@ -390,7 +391,10 @@ impl<B: Backend> crate::queue::Queue for Queue<B> {
             if self.context.status().get() != 0 {
                 return Err(EIO);
             }
-            let (pending, guards) = self.prepare_submission(bytes, objects)?;
+            let (mut pending, guards) = self.prepare_submission(bytes, objects)?;
+            if super::timeout::select_submission(pending.iter().map(|(cmd, _, _)| cmd.long_job())) {
+                for (command, _, _) in pending.iter_mut() { command.allow_long_job(); }
+            }
             let mut guards = guards.into_iter();
             let aggregate = outputs.publish(self.context.clone())?;
             for (command, order, destinations) in pending {

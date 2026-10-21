@@ -55,6 +55,12 @@ struct Entry {
     published: bool,
 }
 
+/// Unpublished objects removed together, then destroyed outside the device lock.
+pub(super) struct UnusedRenderSpare {
+    _entry: Option<Entry>,
+    _binding: Option<crate::g17::queue::render::RetiredBinding>,
+}
+
 pub(super) struct RenderState {
     config: Config,
     entries: KVec<Option<Entry>>,
@@ -198,7 +204,114 @@ impl RenderState {
 }
 
 impl Registry {
-    fn ensure_render_ids(&mut self, slot: u8, owner: u64) -> Result {
+    /// Yield unused warming only when admission has run out of physical slots.
+    /// Previously published graphs keep their existing ownership and retirement
+    /// rules. The caller destroys returned backing after dropping the device lock.
+    pub(super) fn reclaim_unused_render_spare(
+        &mut self,
+        owner: Option<u64>,
+        require_ids: bool,
+    ) -> Result<Option<UnusedRenderSpare>> {
+        // Prefer an empty reservation or an already parked channel.
+        for with_backing in [false, true] {
+            for slot in 1..RENDER_SLOTS {
+                let mut warm = false;
+                let expected = if let Some(entry) = self.render.entries[slot].as_ref() {
+                    if entry.constructing
+                        || entry.preparing.is_some()
+                        || entry.growing
+                        || entry.pending_error.is_some()
+                        || entry.pending_timeout
+                    {
+                        continue;
+                    }
+                    // Compute can gain identities only from physical channels
+                    // that never entered command publication. Render can reuse
+                    // a retained render identity without changing its lifetime.
+                    if owner.is_none()
+                        && !entry
+                            .reservation
+                            .ids
+                            .iter()
+                            .all(|id| self.qids.can_cancel_unpublished(*id))
+                    {
+                        continue;
+                    }
+                    if let Some(pair) = entry.pair.as_ref() {
+                        if !with_backing {
+                            continue;
+                        }
+                        if owner.is_some() && pair.reusable()? {
+                            None
+                        } else if pair.can_yield_unused()? {
+                            warm = true;
+                            Some(entry.reservation.owner)
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        if with_backing || entry.context.is_some() {
+                            continue;
+                        }
+                        None
+                    }
+                } else {
+                    if with_backing || require_ids || owner.is_none() {
+                        continue;
+                    }
+                    None
+                };
+                if !self
+                    .admission
+                    .reassign_unused_spare(slot as u8, expected, owner)
+                {
+                    continue;
+                }
+                if owner.is_none() {
+                    let entry = self.render.entries[slot].take();
+                    if let Some(entry) = entry.as_ref() {
+                        for id in entry.reservation.ids {
+                            self.qids.cancel_unpublished(id)?;
+                        }
+                        if let Some(pair) = entry.pair.as_ref() {
+                            self.buffers.unreserve_owner(pair.buffer_id())?;
+                        }
+                    }
+                    return Ok(Some(UnusedRenderSpare {
+                        _entry: entry,
+                        _binding: None,
+                    }));
+                }
+                let mut binding = None;
+                if warm {
+                    let entry = self.render.entries[slot].as_mut().ok_or(EIO)?;
+                    let mut pair = entry.pair.take().ok_or(EIO)?;
+                    self.buffers.unreserve_owner(pair.buffer_id())?;
+                    pair.release_owner();
+                    let (parked, retired) = KBox::into_inner(pair).park();
+                    entry.parked = Some(parked);
+                    entry.context = None;
+                    entry.pool = None;
+                    binding = Some(retired);
+                }
+                return Ok(Some(UnusedRenderSpare {
+                    _entry: None,
+                    _binding: binding,
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    fn has_render_ids(&self, owner: u64) -> bool {
+        self.render
+            .entries
+            .iter()
+            .enumerate()
+            .any(|(slot, entry)| entry.is_some() && self.admission.owns_slot(owner, slot))
+    }
+
+    pub(super) fn ensure_render_ids(&mut self, slot: u8, owner: u64) -> Result {
         if owner == 0 || slot == 0 || usize::from(slot) >= RENDER_SLOTS {
             return Err(EINVAL);
         }
@@ -262,12 +375,8 @@ impl Registry {
         {
             return Err(EBUSY);
         }
-        let ids = self.render.entry(slot)?.reservation.ids;
-        // Physical queue identities survive failed graph construction. Only
-        // failure to acquire the second identity can return the first one.
-        for id in ids {
-            self.qids.publish(id)?;
-        }
+        // Construction keeps identities reserved. Publication pins them at the
+        // first firmware-visible command, so unused warming can still yield.
         let buffer = self.buffers.allocate_render()?;
         let entry = self.render.entry_mut(slot)?;
         entry.reservation.owner = owner;
@@ -815,5 +924,58 @@ impl Registry {
         packet.completion.defer_timeout(error);
         entry.pending_timeout = true;
         true
+    }
+}
+
+impl RenderState {
+    pub(super) fn write_capacity(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        writeln!(f, "retired_render_bindings used={} total={}", self.retired.len(), self.retired.capacity())?;
+        self.pools.write_capacity(f)?;
+        for (slot, entry) in self.entries.iter().enumerate() {
+            if let Some(context) = entry.as_ref().and_then(|entry| entry.context.as_ref()) {
+                context.write_capacity(f, "render", slot)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Registry {
+    /// Give idle private backing to another ready client under capacity pressure.
+    /// Keep graph/QID/context ownership; the next use rearms the same pool after
+    /// its consumed release, exactly as eviction-driven reclaim does.
+    pub(super) fn reclaim_idle_render_pools(
+        &mut self, init: &crate::g17::initdata::InitData, deferred: &mut DeferredBatch,
+    ) -> Result {
+        let render = &mut self.render;
+        render.pools.observe(init)?;
+        for entry in render.entries.iter().flatten() {
+            if !deferred.render_backing_room() { break; }
+            let Some(pool) = entry.pool.as_ref() else { continue; };
+            // None means this pool never acquired a firmware registration;
+            // otherwise require its exact final release to have been consumed.
+            if pool.vacant() || !render.pools.released(u32::from(pool.id()), pool.control_va())
+                || self.admission.owner_active(entry.reservation.owner) { continue; }
+            // A sibling or replacement may be building off-lock before it has
+            // installed its pool reference. Its logical owner also excludes us.
+            let mut idle = true;
+            for other in render.entries.iter().flatten().filter(|other| {
+                other.reservation.owner == entry.reservation.owner
+                    || other.pool.as_ref().is_some_and(|bound| Arc::ptr_eq(bound, pool))
+            }) {
+                if other.constructing || other.growing || other.preparing.is_some()
+                    || other.pending_error.is_some() || other.pending_timeout {
+                    idle = false;
+                    break;
+                }
+                if let Some(pair) = other.pair.as_ref() {
+                    if !pair.idle_for_context(pair.context())? { idle = false; break; }
+                }
+            }
+            if idle {
+                if let Some(backing) = pool.vacate() { deferred.defer_render_backing(backing); }
+            }
+        }
+        Ok(())
     }
 }

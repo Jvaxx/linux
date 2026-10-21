@@ -23,6 +23,103 @@ impl Backend {
         self.render_with_lease(packet, None, deferred)
     }
 
+    /// Reserve identities before attaching a lease to the packet. An empty
+    /// logical slot must not hide reusable physical channels when the shared
+    /// queue-ID namespace is full.
+    fn acquire_render_with_ids(
+        &self,
+        packet: &Arc<Packet>,
+        mut next: Option<RenderLease>,
+    ) -> Result<RenderLease> {
+        let pool = {
+            let state = self.shared.state.lock();
+            (*state).as_deref().ok_or(ENODEV)?.queues.admission.clone()
+        };
+        let started = super::super::now_ns();
+        let deadline_ns = started.saturating_add(u64::from(crate::g17::job::TIMEOUT_MS) * 1_000_000);
+        loop {
+            self.admission_open()?;
+            if super::super::now_ns() >= deadline_ns { return Err(EBUSY); }
+            if packet.cancel_requested() {
+                return Err(ECANCELED);
+            }
+            if packet.completion.status().get() != 0 {
+                return Err(EIO);
+            }
+            let lease = if let Some(lease) = next.take() {
+                lease
+            } else {
+                match pool.acquire_render(self.owner, Request::of(packet), deadline_ns, || {
+                    // Atomics only: the callback runs under the pool mutex.
+                    if packet.cancel_requested() || self.closed.load(Ordering::Acquire) {
+                        return Err(ECANCELED);
+                    }
+                    if packet.completion.status().get() != 0 || self.shared.crashed.load(Ordering::Acquire) {
+                        return Err(EIO);
+                    }
+                    Ok(())
+                }) {
+                    Ok(lease) => lease,
+                    Err(error) if error == ENOSPC => {
+                        let reclaimed = {
+                            let mut state = self.shared.state.lock();
+                            (*state)
+                                .as_deref_mut()
+                                .ok_or(ENODEV)?
+                                .queues
+                                .reclaim_unused_render_spare(Some(self.owner), false)?
+                        };
+                        if reclaimed.is_none() {
+                            self.wait_render_capacity(started)?;
+                        }
+                        drop(reclaimed);
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            let slot = lease.slot();
+            let mut state = self.shared.state.lock();
+            let firmware = (*state).as_deref_mut().ok_or(ENODEV)?;
+            match firmware.queues.ensure_render_ids(slot, self.owner) {
+                Ok(()) => return Ok(lease),
+                Err(error) if error == ENOSPC => {
+                    let reclaimed = firmware.queues.reclaim_unused_render_spare(None, true)?;
+                    if reclaimed.is_some() {
+                        drop(state);
+                        drop(reclaimed);
+                        next = Some(lease);
+                        continue;
+                    }
+                    // ensure_render_ids leaves no partial entry on refusal.
+                    if firmware.queues.render.entries[usize::from(slot)].is_some() {
+                        return Err(error);
+                    }
+                    if !lease.cancel_empty(self.owner) {
+                        continue;
+                    }
+                    let reclaimed = firmware
+                        .queues
+                        .reclaim_unused_render_spare(Some(self.owner), true)?;
+                    let ready = firmware.queues.has_render_ids(self.owner);
+                    drop(state);
+                    if reclaimed.is_none() && !ready {
+                        self.wait_render_capacity(started)?;
+                    }
+                    drop(reclaimed);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// A closing owner may still hold its pair until exact retirement. Wait
+    /// outside both the device mutex and preparation gate so the event worker
+    /// and recovery can return capacity. No packet is firmware-visible here.
+    fn wait_render_capacity(&self, started: u64) -> Result {
+        self.wait_capacity(started)
+    }
+
     fn render_with_lease(
         &self,
         packet: &Arc<Packet>,
@@ -30,6 +127,7 @@ impl Backend {
         deferred: &mut DeferredBatch,
     ) -> Result {
         packet.check_dependencies()?;
+        self.admission_open()?;
         if packet.cancel_requested() {
             return Err(ECANCELED);
         }
@@ -37,22 +135,14 @@ impl Backend {
             return Err(EIO);
         }
         let interruptible = early.is_none();
-        let admission = match early {
-            Some(lease) => lease,
-            None => {
-                let pool = {
-                    let state = self.shared.state.lock();
-                    (*state).as_deref().ok_or(ENODEV)?.queues.admission.clone()
-                };
-                pool.acquire_render(self.owner, Request::of(packet))?
-            }
-        };
+        let admission = self.acquire_render_with_ids(packet, early)?;
         let slot = admission.slot();
         packet.completion.attach_render_lease(admission)?;
         let mut state_polls = 0;
         let mut state_delay = 20i64;
         let mut takeover_polls = 0;
         let mut recovery_polls = 0;
+        let capacity_started = super::super::now_ns();
         loop {
             if packet.cancel_requested() {
                 return Err(ECANCELED);
@@ -89,6 +179,10 @@ impl Backend {
                 }
             }
             match self.ensure_render(packet, slot) {
+                Err(error) if error == ENOSPC => {
+                    self.wait_capacity(capacity_started)?;
+                    continue;
+                }
                 Err(error) if error == EAGAIN => continue,
                 Err(error) if error == EBUSY => {
                     if takeover_polls == 5000 {
@@ -101,6 +195,10 @@ impl Backend {
                 result => result?,
             }
             match self.prepare_render(slot, packet, deferred) {
+                Err(error) if !packet.is_published() && error == ENOSPC => {
+                    self.wait_capacity(capacity_started)?;
+                    continue;
+                }
                 Err(error) if !packet.is_published() && [EAGAIN, EBUSY].contains(&error) => {
                     let recovering = {
                         let state = self.shared.state.lock();
