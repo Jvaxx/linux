@@ -69,6 +69,7 @@ static int regmap_sn201202x_read(void *context,
 				 const void *reg, size_t reg_size,
 				 void *val, size_t val_size)
 {
+	struct spmi_device *sdev = context;
 	int err;
 	unsigned int offset = 0x20;
 	size_t len;
@@ -85,9 +86,24 @@ static int regmap_sn201202x_read(void *context,
 
 	addr = *(u8 *)reg;
 
-	err = regmap_sn201202x_select_reg(context, addr);
+	err = regmap_sn201202x_select_reg(sdev, addr);
 	if (err)
 		return err;
+
+	if (of_device_is_compatible(sdev->dev.of_node, "apple,t8132-sn201202x")) {
+		u8 size;
+
+		/* Selection completion does not establish the payload's length. */
+		err = spmi_register_read(sdev, 0x1f, &size);
+		if (err)
+			return err;
+		if (size < val_size || size > TPS_MAX_LEN) {
+			dev_err_ratelimited(&sdev->dev,
+					    "Register %#x reports %u bytes for a %zu-byte read\n",
+					    addr, size, val_size);
+			return -EIO;
+		}
+	}
 
 	while (val_size) {
 		len = min_t(size_t, val_size, 16);

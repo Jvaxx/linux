@@ -24,6 +24,8 @@
 	aliases {
 		ans = &nvme;
 		ans-mbox = &ans_mbox;
+		atcphy0 = &atcphy0;
+		atcphy1 = &atcphy1;
 		keyboard = &keyboard;
 		nvram = &nvram;
 		pmu-primary = &pmic1;
@@ -179,6 +181,7 @@
 
 &atcphy0 {
 	status = "okay";
+	/* Retain USB2 until this port's common-power handoff is qualified. */
 	ports {
 		#address-cells = <1>;
 		#size-cells = <0>;
@@ -202,6 +205,7 @@
 
 &dwc3_0 {
 	status = "okay";
+	dr_mode = "host";
 	ports {
 		#address-cells = <1>;
 		#size-cells = <0>;
@@ -217,6 +221,17 @@
 
 &atcphy1 {
 	status = "okay";
+	/* Leave the display crossbar at core + 0x4c000 to its own driver. */
+	reg = <0x4 0x0aa90000 0x0 0x4000>,
+	      <0x4 0x0aa84000 0x0 0x4000>,
+	      <0x4 0x0b000000 0x0 0x24000>,
+	      <0x4 0x08000000 0x0 0x8000>,
+	      <0x4 0x08020000 0x0 0x4000>,
+	      <0x4 0x0b044000 0x0 0x4000>,
+	      <0x4 0x0b050000 0x0 0x4000>;
+	reg-names = "usb2phy", "pipehandler", "core", "axi2af", "lioa",
+		    "fabric", "common-config";
+	power-domains = <&ps_atc1_common>;
 	ports {
 		#address-cells = <1>;
 		#size-cells = <0>;
@@ -240,6 +255,10 @@
 
 &dwc3_1 {
 	status = "okay";
+	dr_mode = "host";
+	maximum-speed = "super-speed";
+	phys = <&atcphy1 PHY_TYPE_USB2>, <&atcphy1 PHY_TYPE_USB3>;
+	phy-names = "usb2-phy", "usb3-phy";
 	ports {
 		#address-cells = <1>;
 		#size-cells = <0>;

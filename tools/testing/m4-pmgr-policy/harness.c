@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #define __init
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define MAX_NODES 2048
 #define MAX_DEPTH 64
 struct property {
@@ -402,6 +403,10 @@ static unsigned int validate_policy(const char *name, unsigned int staged)
 					      NULL) != NULL;
 		if (of_property_present(n, "apple,firmware-owned") !=
 		    want_owned)
+			mismatches++;
+		bool want_inherited = fdt_getprop(policy, off,
+						 "apple,inherited-on", NULL) != NULL;
+		if (of_property_present(n, "apple,inherited-on") != want_inherited)
 			mismatches++;
 		domains++;
 		enabled += available(n);
