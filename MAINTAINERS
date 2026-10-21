@@ -2737,6 +2737,7 @@ F:	include/uapi/drm/asahi_drm.h
 F:	include/uapi/linux/apple-sep.h
 F:	net/bluetooth/brcm.c
 F:	net/bluetooth/brcm.h
+F:	tools/testing/selftests/drivers/apple/
 
 ARM/APPLE QSPIMC DRIVER
 M:	Ryan Murray <ryan@aurorasilicon.org>
