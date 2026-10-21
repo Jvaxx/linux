@@ -38,6 +38,13 @@ mt7932_connect_auth(const struct cfg80211_connect_params *p)
 		    (p->mfp == NL80211_MFP_NO || p->mfp == NL80211_MFP_OPTIONAL))
 			return WLAN_AKM_SUITE_PSK;
 		break;
+	case WLAN_AKM_SUITE_OWE:
+		if (p->auth_type == NL80211_AUTHTYPE_OPEN_SYSTEM &&
+		    p->mfp == NL80211_MFP_REQUIRED && !p->crypto.psk &&
+		    !p->crypto.sae_pwd && !p->crypto.sae_pwd_len &&
+		    !p->key && !p->key_len && !p->want_1x)
+			return WLAN_AKM_SUITE_OWE;
+		break;
 	case WLAN_AKM_SUITE_SAE:
 		if (p->auth_type != NL80211_AUTHTYPE_SAE ||
 		    !p->crypto.sae_pwd ||
@@ -251,7 +258,7 @@ static inline void mt7932_connect_sae_body(u8 *body, const u8 *password,
 	put_unaligned_le32(BIT(8), body + 0x20c);
 }
 
-/* Explicit OPEN, PMK-only WPA2/CCMP or SAE; no automatic security fallback.
+/* Explicit OPEN, OWE, PMK-only WPA2/CCMP or SAE; no automatic security fallback.
  * Caller owns identities/resources and validated BSS state. Never log this
  * body: it carries the PMK.
  */
@@ -259,15 +266,16 @@ static inline int mt7932_connect_body(u8 *body, size_t capacity, const u8 *ssid,
 				      size_t ssid_length, const u8 pmk[32], const u8 bssid[6],
 				      u8 channel, unsigned int listen_interval, u8 connection_flags,
 				      const struct mt7932_peer_ids *ids, bool open,
-				      const u8 *sae_pwd, size_t sae_pwd_length)
+				      const u8 *sae_pwd, size_t sae_pwd_length, bool owe)
 {
 	u8 resources[6];
 	bool sae = sae_pwd_length != 0;
 	unsigned int i, j;
 	int ret;
 
-	if ((open ? pmk != NULL : pmk == NULL) ||
-	    (sae && (open || !sae_pwd ||
+	if (((open || owe) ? !!pmk : !pmk) ||
+	    (open && owe) ||
+	    (sae && (open || owe || !sae_pwd ||
 		     sae_pwd_length < MT7932_SAE_PASSWORD_MIN ||
 		     sae_pwd_length > MT7932_SAE_PASSWORD_MAX)) ||
 	    (sae_pwd && !sae) ||
@@ -289,10 +297,15 @@ static inline int mt7932_connect_body(u8 *body, size_t capacity, const u8 *ssid,
 	 * automatic-authentication policy. Keep this coherent version/auth/
 	 * policy tuple together; no dummy keys or stale security state.
 	 */
-	if (open) {
+	if (open || owe) {
 		body[1] = 1;
 		put_unaligned_le32(0x78, body + 8);
 		put_unaligned_le16(1, body + 0x12);
+		/* Firmware owns OWE DH, keys and RSN generation. No host key
+		 * or cipher encoding belongs in this request arm.
+		 */
+		if (owe)
+			put_unaligned_le32(BIT(18), body + 0x20c);
 	} else if (sae) {
 		mt7932_connect_sae_body(body, sae_pwd, sae_pwd_length, pmk);
 	} else {
@@ -308,9 +321,9 @@ static inline int mt7932_connect_body(u8 *body, size_t capacity, const u8 *ssid,
 	body[0x1c0] = connection_flags;
 	/* Fresh HOST AIS media state1 selects CCMP type5 here. This is not
 	 * structured-key type0x44 or the association event's RSN suite encoding.
-	 * This builder is only used for the first, unassociated attempt.
+	 * This builder is only used for an unassociated attempt.
 	 */
-	put_unaligned_le32(open ? 0 : 5, body + 0x220);
+	put_unaligned_le32(open || owe ? 0 : 5, body + 0x220);
 	put_unaligned_le16(listen_interval > 20 ? 20 : listen_interval, body + 0x228);
 	memcpy(body + 0x32c, bssid, 6);
 	body[0x338] = mt7932_channel_band(channel);
@@ -321,7 +334,7 @@ static inline int mt7932_connect_body(u8 *body, size_t capacity, const u8 *ssid,
 	memcpy(body + 0x340, ids->station, 2);
 	memcpy(body + 0x348, ids->wtbl, 4);
 	body[0x354] = 1;
-	ret = open || sae ? 0 :
+	ret = open || owe || sae ? 0 :
 		mt7932_connect_binary_pmk(body, capacity, pmk, 32);
 	return ret ? ret : 856;
 }

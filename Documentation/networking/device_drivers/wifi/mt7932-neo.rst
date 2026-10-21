@@ -3,9 +3,9 @@
 MediaTek MT7932 radio on the MacBook Neo
 ========================================
 
-J700 MT7932 Wi-Fi uses cfg80211 with firmware-managed WPA2-PSK and WPA3-SAE
-authentication on 2.4 and 5 GHz. Bluetooth uses a transport on the radio's
-second PCIe function.
+J700 MT7932 Wi-Fi uses cfg80211 with firmware-managed WPA2-PSK, WPA3-SAE
+and Enhanced Open (OWE) authentication on 2.4 and 5 GHz. Bluetooth uses a
+transport on the radio's second PCIe function.
 
 The Wi-Fi driver carries configuration, scan IE and WPA2 AKM compatibility
 fixes on top of its original import. Existing source notices are retained.
@@ -106,6 +106,32 @@ layout, transition admission and PMK derivation also have automated tests.
 Separate SAE-selected transition coverage, exact PWE policy behavior,
 WPA2 throughput regression comparisons and long-duration reliability still
 need qualification.
+
+Enhanced Open (OWE)
+-------------------
+
+The station advertises the OWE AKM and ``OWE_OFFLOAD`` on the supported 2.4
+and 5 GHz channels. Use an OWE profile with CCMP, open-system authentication
+and required management frame protection, without a PSK or SAE password.
+Firmware performs the Diffie-Hellman exchange, generates RSN information and
+owns the handshake and key installation. Userspace must honor the offload
+feature instead of expecting a host-generated Diffie-Hellman element in the
+association response.
+
+Before the first OWE association of a firmware session, the driver reserves
+temporary live peer IDs and performs a typed disconnect and queue cleanup.
+An OWE authentication timeout, firmware rejection or firmware disconnect
+then permits one retry inside the connect worker. Before retrying, the
+driver waits for its typed disconnect and retires queues and the old peer
+through the normal ownership fences. A
+failed retirement, cancellation or RF failure ends the request. The retry
+shares a ten-second association-event deadline and programs the station
+identity again before association. No further retry is made by the worker.
+
+For OWE transition mode, the supplicant selects the encrypted BSS and can use
+a directed scan to find its hidden SSID. This driver change does not add the
+6 GHz band. Pure OWE, transition mode and first-authentication behavior after
+a cold boot still require physical qualification on both supported bands.
 
 Local firmware inputs
 ---------------------

@@ -96,7 +96,7 @@ static void schedule_work(int*w){work_count++;}
 static void netif_carrier_on(struct net_device*n){carrier++;}
 static void netif_wake_queue(struct net_device*n){}
 static void cfg80211_port_authorized(struct net_device*n,const u8*b,const u8*p,size_t l,gfp_t f){authorizations++;}
-static void report_worker(struct mt7932 *m,int ret){
+static void report_worker(struct mt7932 *m,int ret,bool retirement_attempted){
  struct cfg80211_connect_resp_params response={};unsigned long flags;bool submitted=true,peer_owned=true,cancelled;u16 reason;
 REPORT
 int main(void){struct net_device n={1};struct cfg80211_bss b={};
@@ -105,7 +105,7 @@ int main(void){struct net_device n={1};struct cfg80211_bss b={};
   struct mt7932 m={.connecting=true,.rf_ready=true,.netdev=&n,.connect_bss=&b,.data_ready=true};
   notifications=disconnections=retirements=authorizations=carrier=work_count=0;
   memset(m.connect_pmk,0x5a,sizeof(m.connect_pmk));memset(m.connect_sae_pwd,0x5a,sizeof(m.connect_sae_pwd));m.connect_sae_pwd_length=63;m.connect_pmk_valid=true;
-  report_worker(&m,errors[i]);
+  report_worker(&m,errors[i],false);
   for(unsigned j=0;j<sizeof(m.connect_pmk);j++)assert(!m.connect_pmk[j]);
   for(unsigned j=0;j<sizeof(m.connect_sae_pwd);j++)assert(!m.connect_sae_pwd[j]);
   assert(!m.connect_sae_pwd_length&&!m.connect_pmk_valid);assert(notifications==1&&disconnections==0);
@@ -120,15 +120,21 @@ int main(void){struct net_device n={1};struct cfg80211_bss b={};
  // Cancellation consumes the BSS and reports disconnect, not a connect result.
  struct mt7932 m={.connecting=true,.rf_ready=true,.netdev=&n,.connect_bss=&b,.connect_cancelled=true,.connect_error=-ECANCELED};
  notifications=disconnections=retirements=authorizations=carrier=0;
- report_worker(&m,0);assert(notifications==0&&disconnections==1&&retirements==1&&!m.connected);assert(authorizations==0&&carrier==0);
+ report_worker(&m,0,false);assert(notifications==0&&disconnections==1&&retirements==1&&!m.connected);assert(authorizations==0&&carrier==0);
  // A stale success cannot publish carrier after a terminal error.
  m=(struct mt7932){.connecting=true,.rf_ready=true,.netdev=&n,.connect_bss=&b,.connect_error=-ECONNRESET};
  notifications=disconnections=retirements=authorizations=carrier=0;
- report_worker(&m,0);assert(saved.status==1&&notifications==1&&retirements==1&&!m.connected&&!encoded.seen[NL80211_ATTR_TIMED_OUT]);assert(authorizations==0&&carrier==0);
+ report_worker(&m,0,false);assert(saved.status==1&&notifications==1&&retirements==1&&!m.connected&&!encoded.seen[NL80211_ATTR_TIMED_OUT]);assert(authorizations==0&&carrier==0);
+ // Failed retry retirement retains ownership and is not attempted again.
+ m=(struct mt7932){.connecting=true,.rf_ready=true,.netdev=&n,.connect_bss=&b};
+ notifications=disconnections=retirements=releases=authorizations=carrier=0;
+ report_worker(&m,-EIO,true);
+ assert(saved.status==1&&notifications==1&&!retirements&&!releases&&!m.connected);
+ assert(!authorizations&&!carrier);
  // Already-known IEEE AP status is preserved by the complete netlink encoder.
  struct cfg80211_registered_device r={};struct cfg80211_connect_resp_params ap={.status=17};
  nl80211_send_connect_result(&r,&n,&ap,0);assert(encoded.values[NL80211_ATTR_STATUS_CODE]==17&&!encoded.seen[NL80211_ATTR_TIMED_OUT]);
- puts("PASS 10 connect report and nl80211 timeout/rejection/cancellation controls");}
+ puts("PASS 11 connect report and nl80211 timeout/rejection/cancellation controls");}
 '''
 
 

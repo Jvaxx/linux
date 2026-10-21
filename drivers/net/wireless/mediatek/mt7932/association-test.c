@@ -72,27 +72,29 @@ static void mt_connect_body_test(struct kunit *test)
 
 	memset(pmk, 0xa5, sizeof(pmk));
 	memset(password, 'p', sizeof(password));
-	for (mode = 0; mode < 3; mode++) {
-		bool open = mode == 0, sae = mode == 2;
+	for (mode = 0; mode < 4; mode++) {
+		bool open = mode == 0, sae = mode == 2, owe = mode == 3;
 
 		for (band = 0; band < ARRAY_SIZE(channels); band++) {
 			int ret;
 
 			memset(body, 0xff, sizeof(body));
 			ret = mt7932_connect_body(body, sizeof(body), "IEEE", 4,
-						  open ? NULL : pmk, bssid, channels[band],
+						  open || owe ? NULL : pmk, bssid, channels[band],
 						  40, 2, &ids, open,
-						  sae ? password : NULL, sae ? 63 : 0);
+						  sae ? password : NULL, sae ? 63 : 0, owe);
 			KUNIT_ASSERT_EQ(test, ret, 856);
 			/* Complete golden requests also catch writes to reserved
 			 * fields and keep the established PSK and OPEN encodings.
 			 */
 			memset(expected, 0, sizeof(expected));
-			expected[1] = open ? 1 : sae ? 8 : 4;
-			expected[4] = open ? 0 : sae ? 6 : 0x10;
+			expected[1] = open || owe ? 1 : sae ? 8 : 4;
+			expected[4] = open || owe ? 0 : sae ? 6 : 0x10;
 			expected[8] = 0x78;
 			expected[0x12] = sae ? 5 : 1;
-			if (!open) {
+			if (owe)
+				expected[0x20e] = 4;
+			if (!open && !owe) {
 				put_unaligned_le16(sae ? 0x1000 : 8, expected + 0x14);
 				expected[0x40] = sae ? 63 : 32;
 				if (sae) {
@@ -157,7 +159,7 @@ static void mt_sae_body_bounds_test(struct kunit *test)
 		ret = mt7932_connect_body(body, requests[i].capacity, "IEEE", 4,
 					  requests[i].pmk ? pmk : NULL, bssid, 11, 20, 2, &ids,
 					  requests[i].open, requests[i].password ? password : NULL,
-					  requests[i].password_length);
+					  requests[i].password_length, false);
 		KUNIT_EXPECT_EQ(test, ret, requests[i].expected);
 		KUNIT_EXPECT_EQ(test, body[856], (u8)0xa5);
 		if (requests[i].expected < 0)
@@ -322,7 +324,120 @@ static void mt_connect_auth_test(struct kunit *test)
 	}
 }
 
+static void mt_owe_body_bounds_test(struct kunit *test)
+{
+	static const struct mt7932_peer_ids ids = { { 1, 2 }, { 3, 4, 5, 6 } };
+	static const u8 bssid[6] = { 2, 0, 0, 0, 0, 1 };
+	u8 body[857], pmk[32] = {}, password[8] = {};
+	unsigned int i;
+
+	for (i = 0; i < 6; i++) {
+		int ret;
+
+		memset(body, 0xa5, sizeof(body));
+		ret = mt7932_connect_body(body, i == 0 ? 855 : 856, "IEEE", 4,
+					  i == 1 ? pmk : NULL, bssid, 11, 20, 2, &ids,
+					  i == 2, i == 3 || i == 4 ? password : NULL,
+					  i == 3 || i == 5 ? 8 : 0, true);
+		KUNIT_EXPECT_EQ(test, ret, -EINVAL);
+		KUNIT_EXPECT_EQ(test, body[0], (u8)0xa5);
+		KUNIT_EXPECT_EQ(test, body[856], (u8)0xa5);
+	}
+}
+
+static void mt_owe_connect_auth_test(struct kunit *test)
+{
+	u8 credential[32] = {};
+	unsigned int i;
+
+	for (i = 0; i < 20; i++) {
+		struct cfg80211_connect_params p = {
+			.auth_type = NL80211_AUTHTYPE_OPEN_SYSTEM,
+			.mfp = NL80211_MFP_REQUIRED,
+			.crypto = {
+				.wpa_versions = NL80211_WPA_VERSION_2,
+				.n_ciphers_pairwise = 1,
+				.ciphers_pairwise = { WLAN_CIPHER_SUITE_CCMP },
+				.cipher_group = WLAN_CIPHER_SUITE_CCMP,
+				.n_akm_suites = 1,
+				.akm_suites = { WLAN_AKM_SUITE_OWE },
+			},
+		};
+		int expected = -EOPNOTSUPP;
+
+		switch (i) {
+		case 0:
+			expected = WLAN_AKM_SUITE_OWE;
+			break;
+		case 1:
+			p.crypto.psk = credential;
+			break;
+		case 2:
+			p.crypto.sae_pwd = credential;
+			break;
+		case 3:
+			p.crypto.sae_pwd_len = 8;
+			break;
+		case 4:
+			p.auth_type = NL80211_AUTHTYPE_AUTOMATIC;
+			break;
+		case 5:
+			p.auth_type = NL80211_AUTHTYPE_SAE;
+			break;
+		case 6:
+			p.mfp = NL80211_MFP_OPTIONAL;
+			break;
+		case 7:
+			p.mfp = NL80211_MFP_NO;
+			break;
+		case 8:
+			p.crypto.wpa_versions = NL80211_WPA_VERSION_1;
+			break;
+		case 9:
+			p.crypto.n_ciphers_pairwise = 0;
+			break;
+		case 10:
+			p.crypto.n_ciphers_pairwise = 2;
+			break;
+		case 11:
+			p.crypto.ciphers_pairwise[0] = WLAN_CIPHER_SUITE_TKIP;
+			break;
+		case 12:
+			p.crypto.cipher_group = WLAN_CIPHER_SUITE_TKIP;
+			break;
+		case 13:
+			p.crypto.n_akm_suites = 0;
+			break;
+		case 14:
+			p.key = credential;
+			break;
+		case 15:
+			p.key_len = 1;
+			break;
+		case 16:
+			p.want_1x = true;
+			break;
+		case 17:
+			p.crypto.n_akm_suites = 2;
+			p.crypto.akm_suites[1] = WLAN_AKM_SUITE_PSK;
+			expected = WLAN_AKM_SUITE_OWE;
+			break;
+		case 18:
+			p.crypto.n_akm_suites = 2;
+			p.crypto.akm_suites[0] = WLAN_AKM_SUITE_PSK;
+			p.crypto.akm_suites[1] = WLAN_AKM_SUITE_OWE;
+			break;
+		case 19:
+			p.crypto.wpa_versions |= NL80211_WPA_VERSION_1;
+			break;
+		}
+		KUNIT_EXPECT_EQ_MSG(test, mt7932_connect_auth(&p), expected, "case %u", i);
+	}
+}
+
 static struct kunit_case mt_association_test_cases[] = {
+	KUNIT_CASE(mt_owe_body_bounds_test),
+	KUNIT_CASE(mt_owe_connect_auth_test),
 	KUNIT_CASE(mt_sae_pmk_vectors_test),
 	KUNIT_CASE(mt_sae_pmk_bounds_test),
 	KUNIT_CASE(mt_connect_body_test),
