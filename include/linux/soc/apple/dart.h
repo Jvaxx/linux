@@ -16,11 +16,14 @@ int apple_dart_quiesce_commands(struct device *dev);
 int apple_dart_resume_commands(struct device *dev);
 int apple_dart_save_tunnel_state(struct device *dev);
 int apple_dart_restore_tunnel_state(struct device *dev);
+/* Registered J713 managed radio provider, with no owned valid root or fault. */
+int apple_dart_radio_check_idle(struct device *dev);
 #else
 static inline int apple_dart_quiesce_commands(struct device *dev) { return 0; }
 static inline int apple_dart_resume_commands(struct device *dev) { return 0; }
 static inline int apple_dart_save_tunnel_state(struct device *dev) { return -EOPNOTSUPP; }
 static inline int apple_dart_restore_tunnel_state(struct device *dev) { return -EOPNOTSUPP; }
+static inline int apple_dart_radio_check_idle(struct device *dev) { return -EOPNOTSUPP; }
 #endif
 
 #endif

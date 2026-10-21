@@ -339,6 +339,7 @@ struct apple_pcie {
 	bool			link_kept;
 	bool			resume_failed; /* cleared only by teardown and reprobe */
 	struct reset_control	*reset;
+	u16			managed_sids;
 	bool			neo_config_ready;
 	u8			neo_secondary_bus;
 	struct device		*piodma_supplier;
@@ -374,6 +375,9 @@ struct apple_pcie_port {
 	bool			link_failed;
 	bool			irq_disabled;
 };
+
+static int apple_pcie_managed_admit(struct apple_pcie_port *port);
+static int apple_pcie_radio_check_cold(struct apple_pcie_port *port);
 
 static void rmw_set(u32 set, void __iomem *addr)
 {
@@ -1385,7 +1389,8 @@ static void apple_pcie_port_teardown(struct apple_pcie_port *port)
 {
 	apple_pcie_port_disable_irq(port);
 
-	if (port->base)
+	/* Busy managed admission has not acquired or programmed this IRQ block. */
+	if (port->base && (!port->pcie->managed_sids || port->domain))
 		apple_pcie_port_writel(port, ~0, PORT_INTMSK);
 
 	if (port->pcie->hw->tunneled && (port->started || port->needs_stop))
@@ -1628,6 +1633,11 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 		port->base = NULL;
 		goto err_teardown;
 	}
+	if (pcie->managed_sids) {
+		ret = apple_pcie_managed_admit(port);
+		if (ret)
+			goto err_teardown;
+	}
 	if (pcie->hw->tunneled) {
 		port->tunable = devm_apple_tunable_parse(pcie->dev, np,
 							  "apple,tunable", res);
@@ -1708,6 +1718,11 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 		/* U-Boot may already have brought up a conventional root port. */
 		link_stat = apple_pcie_port_readl(port, PORT_LINKSTS);
 		if (!(link_stat & PORT_LINKSTS_UP)) {
+			if (pcie->managed_sids) {
+				ret = apple_pcie_radio_check_cold(port);
+				if (ret)
+					goto err_teardown;
+			}
 			ret = apple_pcie_setup_link(pcie, port, np);
 			if (ret)
 				goto err_teardown;
@@ -1731,6 +1746,10 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 	if (ret)
 		goto err_teardown;
 
+	if (pcie->managed_sids) {
+		goto rid2sid_ready;
+	}
+
 	/* Reset all RID/SID mappings, and check for RAZ/WI registers */
 	for (i = 0; i < pcie->hw->max_rid2sid; i++) {
 		if (apple_pcie_rid2sid_write(port, i, 0xbad1d) != 0xbad1d)
@@ -1741,7 +1760,7 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 	dev_dbg(pcie->dev, "%pOF: %d RID/SID mapping entries\n", np, i);
 
 	port->sid_map_sz = i;
-
+rid2sid_ready:
 	list_add_tail(&port->entry, &pcie->ports);
 	init_completion(&pcie->event);
 
@@ -1783,6 +1802,10 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 		if (left)
 			dev_info(pcie->dev, "%pOF link up after %ldms\n", np,
 				 (timeout - left) * 1000 / HZ);
+		else if (pcie->managed_sids) {
+			ret = -ETIMEDOUT;
+			goto err_teardown;
+		}
 	}
 	if (pcie->hw->tunneled &&
 	    (apple_pcie_port_readl(port, PORT_LINKSTS) & PORT_LINKSTS_UP))
@@ -2002,6 +2025,112 @@ static struct apple_pcie_port *apple_pcie_get_port(struct pci_dev *pdev)
 	return NULL;
 }
 
+/* Native T8132 normal SIDs are nonzero, four-bit, and indexed by SID. */
+static int apple_pcie_managed_sid_mask(const u32 *ids, unsigned int count, u16 *mask)
+{
+	u16 selected = 0;
+	unsigned int i;
+
+	if (!count || count > 15)
+		return -EINVAL;
+	for (i = 0; i < count; i++) {
+		if (!ids[i] || ids[i] >= 16 || (selected & BIT(ids[i])))
+			return -EINVAL;
+		selected |= BIT(ids[i]);
+	}
+	*mask = selected;
+	return 0;
+}
+
+static int apple_pcie_managed_word(u16 managed, u32 rid, u32 sid, u32 *word)
+{
+	if (!rid || rid > 0xffff || !sid || sid >= 16 || !(managed & BIT(sid)))
+		return -EINVAL;
+	*word = PORT_RID2SID_VALID | (sid << PORT_RID2SID_SID_SHIFT) | rid;
+	return 0;
+}
+
+static int apple_pcie_managed_admit(struct apple_pcie_port *port)
+{
+	u32 entries[16];
+	unsigned int sid, other;
+
+	for (sid = 0; sid < ARRAY_SIZE(entries); sid++)
+		entries[sid] = apple_pcie_port_readl(port, port_rid2sid_offset(port, sid));
+
+	/* Index zero is invalid in the native ordinary-RID contract. */
+	if (entries[0] & PORT_RID2SID_VALID) {
+		dev_err(port->pcie->dev, "inherited RID entry0 is still valid\n");
+		return -EBUSY;
+	}
+	for (sid = 1; sid < ARRAY_SIZE(entries); sid++) {
+		u32 target = (entries[sid] >> PORT_RID2SID_SID_SHIFT) & 0xf;
+		u32 rid = entries[sid] & 0xffff;
+
+		if (!(entries[sid] & PORT_RID2SID_VALID))
+			continue;
+		if (target != sid || (port->pcie->managed_sids & BIT(sid)) ||
+		    (port->pcie->managed_sids & BIT(target)) || rid == 0x100 || rid == 0x101) {
+			dev_err(port->pcie->dev, "inherited RID[%u] %#x conflicts with ordinary ownership\n",
+				sid, entries[sid]);
+			return -EBUSY;
+		}
+		for (other = 1; other < sid; other++)
+			if ((entries[other] & PORT_RID2SID_VALID) &&
+			    (entries[other] & 0xffff) == rid)
+				return -EBUSY;
+	}
+	/* No writes: every existing foreign or reserved entry stays untouched. */
+	port->sid_map_sz = 16;
+	return 0;
+}
+
+static int apple_pcie_radio_check_cold(struct apple_pcie_port *port)
+{
+	struct device_node *np = port->pcie->dev->of_node;
+	struct of_phandle_args wifi = {}, bt = {};
+	struct platform_device *provider;
+	u32 status, link;
+	unsigned int sid;
+	int ret;
+
+	status = apple_pcie_port_readl(port, PORT_STATUS);
+	link = apple_pcie_port_readl(port, PORT_LINKSTS);
+	if (!(status & PORT_STATUS_READY) ||
+	    (link & (PORT_LINKSTS_UP | PORT_LINKSTS_BUSY)))
+		return -EBUSY;
+	/* A cold endpoint reset is legal only before any ordinary RID is owned. */
+	for (sid = 0; sid < 16; sid++)
+		if (apple_pcie_port_readl(port, port_rid2sid_offset(port, sid)) &
+		    PORT_RID2SID_VALID)
+			return -EBUSY;
+
+	/* J713's two exact functions must name the same managed provider. */
+	ret = of_map_iommu_id(np, 0x100, &wifi);
+	if (ret)
+		return ret;
+	ret = of_map_iommu_id(np, 0x101, &bt);
+	if (ret)
+		goto out_wifi;
+	if (wifi.np != bt.np || wifi.args_count != 1 || bt.args_count != 1 ||
+	    wifi.args[0] != 1 || bt.args[0] != 2) {
+		ret = -EINVAL;
+		goto out_nodes;
+	}
+	provider = of_find_device_by_node(wifi.np);
+	if (!provider) {
+		ret = -EPROBE_DEFER;
+		goto out_nodes;
+	}
+	ret = apple_dart_radio_check_idle(&provider->dev);
+	put_device(&provider->dev);
+out_nodes:
+	of_node_put(bt.np);
+out_wifi:
+	of_node_put(wifi.np);
+	return ret;
+}
+
 static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_dev *pdev)
 {
 	struct apple_pcie *pcie = pci_host_bridge_priv(bridge);
@@ -2051,8 +2180,10 @@ static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_d
 	sid = iommu_spec.args[0];
 	mutex_lock(&port->pcie->lock);
 
-	if (port->pcie->hw->sid_indexed_rid2sid) {
-		if (sid >= port->sid_map_sz)
+	if (port->pcie->managed_sids || port->pcie->hw->sid_indexed_rid2sid) {
+		if (sid >= port->sid_map_sz ||
+		    (pcie->managed_sids && (!rid || !sid || sid >= 16 ||
+					  !(pcie->managed_sids & BIT(sid)))))
 			idx = -EINVAL;
 		else if (test_and_set_bit(sid, port->sid_map))
 			idx = -EBUSY;
@@ -2063,10 +2194,33 @@ static int apple_pcie_enable_device(struct pci_host_bridge *bridge, struct pci_d
 		if (idx < 0)
 			idx = -ENOSPC;
 	}
+	if (idx >= 0 && pcie->managed_sids) {
+		unsigned int other;
+
+		for (other = 0; other < 16; other++) {
+			u32 entry = apple_pcie_port_readl(port, port_rid2sid_offset(port, other));
+
+			if ((entry & PORT_RID2SID_VALID) &&
+			    (other == sid || (entry & 0xffff) == rid)) {
+				bitmap_release_region(port->sid_map, idx, 0);
+				idx = -EBUSY;
+				break;
+			}
+		}
+	}
 	if (idx >= 0) {
-		val = PORT_RID2SID_VALID | (sid << PORT_RID2SID_SID_SHIFT) | rid;
+		if (pcie->managed_sids) {
+			err = apple_pcie_managed_word(pcie->managed_sids, rid, sid, &val);
+			if (err) {
+				bitmap_release_region(port->sid_map, idx, 0);
+				mutex_unlock(&port->pcie->lock);
+				return err;
+			}
+		} else {
+			val = PORT_RID2SID_VALID | (sid << PORT_RID2SID_SID_SHIFT) | rid;
+		}
 		readback = apple_pcie_rid2sid_write(port, idx, val);
-		if (pcie->hw->sid_indexed_rid2sid && readback != val) {
+		if ((pcie->managed_sids || pcie->hw->sid_indexed_rid2sid) && readback != val) {
 			dev_err(&pdev->dev, "RID-to-SID readback %#x expected %#x\n",
 				readback, val);
 			/* Reserve the failed slot; do not enable or recycle it. */
@@ -2101,7 +2255,12 @@ static void apple_pcie_disable_device(struct pci_host_bridge *bridge, struct pci
 		val = apple_pcie_port_readl(port,
 					    port_rid2sid_offset(port, idx));
 		if ((val & 0xffff) == rid) {
-			apple_pcie_rid2sid_write(port, idx, 0);
+			val = apple_pcie_rid2sid_write(port, idx, 0);
+			if (port->pcie->managed_sids && val) {
+				dev_err(&pdev->dev,
+					"RID invalidation failed; retaining SID slot %d\n", idx);
+				break;
+			}
 			bitmap_release_region(port->sid_map, idx, 0);
 			dev_dbg(&pdev->dev, "Released %x (%d)\n", val, idx);
 			break;
@@ -2697,16 +2856,31 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	pcie = pci_host_bridge_priv(bridge);
 	pcie->dev = dev;
 	pcie->hw = hw;
+	if (of_property_present(dev->of_node, "apple,managed-sids")) {
+		u32 ids[15];
+		int count = of_property_count_u32_elems(dev->of_node, "apple,managed-sids");
+
+		if (!of_device_is_compatible(dev->of_node, "apple,t8132-pcie") ||
+		    !of_machine_is_compatible("apple,j713") || count <= 0 || count > 15)
+			return -EINVAL;
+		ret = of_property_read_u32_array(dev->of_node, "apple,managed-sids", ids, count);
+		if (!ret && (count != 2 || ids[0] != 1 || ids[1] != 2))
+			ret = -EINVAL;
+		if (!ret)
+			ret = apple_pcie_managed_sid_mask(ids, count, &pcie->managed_sids);
+		if (ret)
+			return ret;
+	}
 	pcie->piodma_supplier = piodma_supplier;
 	/* Only this retained-DMA radio hierarchy forbids user reset/removal. */
-	if (piodma_supplier) {
+	if (piodma_supplier || pcie->managed_sids) {
 		bridge->no_user_remove = true;
 		bridge->reset_sensitive = true;
 		bridge->native_pcie_hotplug = false;
 		bridge->native_shpc_hotplug = false;
 		bridge->native_aer = false;
 		bridge->native_dpc = false;
-		dev_info_once(dev, "Neo radio host: native AER/DPC recovery disabled for retained-DMA bootstrap\n");
+		dev_info_once(dev, "radio host: automatic AER/DPC recovery disabled for retained DMA\n");
 	}
 	if (hw->root_bus_only && !piodma_supplier)
 		dev_info(dev, "root-port probe only; downstream config is blocked\n");
@@ -3414,6 +3588,8 @@ static int apple_pcie_suspend_noirq(struct device *dev)
 {
 	struct apple_pcie *pcie = apple_pcie_lookup(dev);
 
+	if (pcie->managed_sids)
+		return -EBUSY;
 	if (!pcie->hw->tunneled)
 		return 0;
 	pcie->reset_on_resume = false;

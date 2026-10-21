@@ -6,15 +6,18 @@
  */
 
 #include <linux/async.h>
+#include <linux/atomic.h>
 #include <linux/bitfield.h>
 #include <linux/completion.h>
 #include <linux/dma-mapping.h>
 #include <linux/dmi.h>
 #include <linux/firmware.h>
 #include <linux/interrupt.h>
+#include <linux/iommu.h>
 #include <linux/module.h>
 #include <linux/msi.h>
 #include <linux/of.h>
+#include <linux/wait.h>
 #include <linux/pci.h>
 #include <linux/printk.h>
 #include <linux/property.h>
@@ -45,8 +48,9 @@ enum bcm4377_chip {
  * (possibly to avoid 64 bit arithmetic). The window size cannot exceed
  * 0xffffffff but is always aligned down to the previous 0x200 byte boundary
  * which effectively limits the window to [start, start+0xfffffe00].
- * We just limit the DMA window to [0, 0xfffffe00] to make sure we don't
- * run into this limitation.
+ * Use the original zero-based window by default. On BCM4388, a forced
+ * high DMA aperture can supply a bounded window instead; both the boot and
+ * RTI windows must then use that same base and size.
  */
 #define BCM4377_DMA_MASK 0xfffffe00
 
@@ -86,6 +90,8 @@ enum bcm4377_chip {
 
 #define BCM4377_BAR2_CONTEXT_ADDR_LO 0x20048c
 #define BCM4377_BAR2_CONTEXT_ADDR_HI 0x200450
+/* BCM4388 exposes capabilities at the old context-high location. */
+#define BCM4388_BAR2_CONTEXT_ADDR_HI 0x200490
 
 #define BCM4377_BAR2_RTI_STATUS	     0x20045c
 #define BCM4377_BAR2_RTI_WINDOW_LO   0x200494
@@ -300,7 +306,7 @@ static_assert(sizeof(struct bcm4377_destroy_transfer_ring_msg) ==
  * shared memory structures. A pointer to this structure is configured inside a
  * MMIO register.
  *
- * version: Protocol version, must be 2.
+ * version: Protocol version, must be 1.
  * size: Size of this structure, must be 0x68.
  * enabled_caps: Enabled capabilities. Unknown bitfield but should be 2.
  * peripheral_info_addr: DMA address for a 0x20 buffer to which the device will
@@ -494,6 +500,7 @@ struct bcm4377_data;
  * has_bar0_core2_window2: Set to true if this chip requires the second core's
  *                         second window to be configured
  * bar2_offset: Offset to the start of the variables in BAR2
+ * bar2_context_addr_hi: High-window context-address register before bar2_offset
  * clear_pciecfg_subsystem_ctrl_bit19: Set to true if bit 19 in the
  *                                     vendor-specific subsystem control
  *                                     register has to be cleared
@@ -518,6 +525,7 @@ struct bcm4377_hw {
 	u32 bar0_window2;
 	u32 bar0_core2_window2;
 	u32 bar2_offset;
+	u32 bar2_context_addr_hi;
 
 	unsigned long has_bar0_core2_window2 : 1;
 	unsigned long clear_pciecfg_subsystem_ctrl_bit19 : 1;
@@ -553,7 +561,10 @@ static const struct dmi_system_id bcm4377_dmi_board_table[];
  * stepping: Chip stepping read from OTP; used for firmware selection
  * vendor: Antenna vendor read from OTP; used for firmware selection
  * board_type: Board type from FDT or DMI match; used for firmware selection
- * event: Event for changed bootstage or rti_status; used for booting firmware
+ * event: Wait queue for changed bootstage or rti_status
+ * irq_count: Interrupt notifications observed during this binding
+ * dma_window_base: First address accepted by the firmware DMA window
+ * dma_window_size: Size of the shared boot and RTI DMA window
  * ctx: "Converged IPC" context
  * ctx_dma: "Converged IPC" context DMA address
  * ring_state: Shared memory buffer containing ring head and tail indexes
@@ -574,6 +585,9 @@ struct bcm4377_data {
 
 	u32 bootstage;
 	u32 rti_status;
+
+	dma_addr_t dma_window_base;
+	u32 dma_window_size;
 
 	const struct bcm4377_hw *hw;
 
@@ -604,7 +618,8 @@ struct bcm4377_data {
 	struct work_struct resume_work;
 	bdaddr_t bdaddr;
 
-	struct completion event;
+	wait_queue_head_t event;
+	atomic_t irq_count;
 
 	/* Set once a recovery reprobe has been queued for this binding. */
 	unsigned long reset_pending;
@@ -863,24 +878,67 @@ static void bcm4377_poll_completion_ring(struct bcm4377_data *bcm4377,
 	}
 }
 
+static void bcm4377_update_state(struct bcm4377_data *bcm4377,
+				 u32 bootstage, u32 rti_status)
+{
+	u32 old_bootstage = READ_ONCE(bcm4377->bootstage);
+	u32 old_rti_status = READ_ONCE(bcm4377->rti_status);
+
+	if (bootstage != old_bootstage || rti_status != old_rti_status) {
+		dev_dbg(&bcm4377->pdev->dev,
+			"bootstage = %d -> %d, rti state = %d -> %d\n",
+			old_bootstage, bootstage, old_rti_status, rti_status);
+		WRITE_ONCE(bcm4377->bootstage, bootstage);
+		WRITE_ONCE(bcm4377->rti_status, rti_status);
+		wake_up_all(&bcm4377->event);
+	}
+}
+
+static int bcm4377_wait_for_state(struct bcm4377_data *bcm4377, bool rti,
+				  u32 state, unsigned long timeout)
+{
+	long ret;
+	u32 observed;
+
+	ret = wait_event_interruptible_timeout(bcm4377->event,
+					       (rti ? READ_ONCE(bcm4377->rti_status) :
+						READ_ONCE(bcm4377->bootstage)) >= state, timeout);
+	if (ret < 0)
+		return ret;
+	if (!ret)
+		return -ETIMEDOUT;
+	observed = rti ? READ_ONCE(bcm4377->rti_status) : READ_ONCE(bcm4377->bootstage);
+	if (observed != state)
+		return rti ? -ENODEV : -ENXIO;
+	return 0;
+}
+
+static void bcm4377_report_state_failure(struct bcm4377_data *bcm4377,
+					 const char *phase, u32 expected,
+					 int error, u32 irq_before)
+{
+	u32 bootstage, rti_status, irq_count;
+
+	/* Read the same passive status registers as the interrupt handler. */
+	bootstage = ioread32(bcm4377->bar2 + bcm4377->hw->bar2_offset + BCM4377_BAR2_BOOTSTAGE);
+	rti_status = ioread32(bcm4377->bar2 + bcm4377->hw->bar2_offset + BCM4377_BAR2_RTI_STATUS);
+	irq_count = atomic_read(&bcm4377->irq_count);
+	dev_err(&bcm4377->pdev->dev,
+		"%s expected %u: %d; cached boot %u RTI %u, registers boot %#x RTI %#x, IRQs %u (+%u)\n",
+		phase, expected, error, READ_ONCE(bcm4377->bootstage),
+		READ_ONCE(bcm4377->rti_status), bootstage, rti_status,
+		irq_count, irq_count - irq_before);
+}
+
 static irqreturn_t bcm4377_irq(int irq, void *data)
 {
 	struct bcm4377_data *bcm4377 = data;
 	u32 bootstage, rti_status;
 
+	atomic_inc(&bcm4377->irq_count);
 	bootstage = ioread32(bcm4377->bar2 + bcm4377->hw->bar2_offset + BCM4377_BAR2_BOOTSTAGE);
 	rti_status = ioread32(bcm4377->bar2 + bcm4377->hw->bar2_offset + BCM4377_BAR2_RTI_STATUS);
-
-	if (bootstage != bcm4377->bootstage ||
-	    rti_status != bcm4377->rti_status) {
-		dev_dbg(&bcm4377->pdev->dev,
-			"bootstage = %d -> %d, rti state = %d -> %d\n",
-			bcm4377->bootstage, bootstage, bcm4377->rti_status,
-			rti_status);
-		complete(&bcm4377->event);
-		bcm4377->bootstage = bootstage;
-		bcm4377->rti_status = rti_status;
-	}
+	bcm4377_update_state(bcm4377, bootstage, rti_status);
 
 	if (rti_status > 2)
 		dev_err(&bcm4377->pdev->dev, "RTI status is %d\n", rti_status);
@@ -1254,11 +1312,15 @@ static const struct firmware *bcm4377_request_blob(struct bcm4377_data *bcm4377,
 		name0, name1);
 
 	ret = firmware_request_nowarn(&fw, name0, &bcm4377->pdev->dev);
-	if (!ret)
+	if (!ret) {
+		dev_dbg(&bcm4377->pdev->dev, "loaded %s (%zu bytes)\n", name0, fw->size);
 		return fw;
+	}
 	ret = firmware_request_nowarn(&fw, name1, &bcm4377->pdev->dev);
-	if (!ret)
+	if (!ret) {
+		dev_dbg(&bcm4377->pdev->dev, "loaded %s (%zu bytes)\n", name1, fw->size);
 		return fw;
+	}
 
 	dev_err(&bcm4377->pdev->dev,
 		"Unable to load firmware; tried '%s' and '%s'\n", name0, name1);
@@ -1342,6 +1404,13 @@ static int bcm4377_pci_reset(struct bcm4377_data *bcm4377)
 	int ret;
 	int irq;
 
+	/* The shared high-window radio has no qualified function-reset boundary. */
+	if (bcm4377->dma_window_base) {
+		dev_err_once(&bcm4377->pdev->dev,
+			     "controller recovery requires a platform reboot\n");
+		return -EIO;
+	}
+
 	/* Keep retrying a full reset if any recovery stage fails. */
 	bcm4377->needs_reset = true;
 	dev_info(&bcm4377->pdev->dev, "performing hardware reset recovery\n");
@@ -1371,9 +1440,8 @@ static int bcm4377_pci_reset(struct bcm4377_data *bcm4377)
 		goto out_irq;
 	}
 
-	bcm4377->bootstage = 0;
-	bcm4377->rti_status = 0;
-	reinit_completion(&bcm4377->event);
+	WRITE_ONCE(bcm4377->bootstage, 0);
+	WRITE_ONCE(bcm4377->rti_status, 0);
 
 	memset(bcm4377->ring_state, 0, sizeof(*bcm4377->ring_state));
 	bcm4377->control_h2d_ring.generation = 0;
@@ -2256,7 +2324,7 @@ static int bcm4377_boot(struct bcm4377_data *bcm4377)
 	void *bfr;
 	dma_addr_t fw_dma;
 	int ret = 0;
-	u32 bootstage, rti_status;
+	u32 bootstage, rti_status, irq_before;
 
 	bootstage = ioread32(bcm4377->bar2 + bcm4377->hw->bar2_offset + BCM4377_BAR2_BOOTSTAGE);
 	rti_status = ioread32(bcm4377->bar2 + bcm4377->hw->bar2_offset + BCM4377_BAR2_RTI_STATUS);
@@ -2288,9 +2356,11 @@ static int bcm4377_boot(struct bcm4377_data *bcm4377)
 
 	memcpy(bfr, fw->data, fw->size);
 
-	iowrite32(0, bcm4377->bar0 + BCM4377_BAR0_HOST_WINDOW_LO);
-	iowrite32(0, bcm4377->bar0 + BCM4377_BAR0_HOST_WINDOW_HI);
-	iowrite32(BCM4377_DMA_MASK,
+	iowrite32(lower_32_bits(bcm4377->dma_window_base),
+		  bcm4377->bar0 + BCM4377_BAR0_HOST_WINDOW_LO);
+	iowrite32(upper_32_bits(bcm4377->dma_window_base),
+		  bcm4377->bar0 + BCM4377_BAR0_HOST_WINDOW_HI);
+	iowrite32(bcm4377->dma_window_size,
 		  bcm4377->bar0 + BCM4377_BAR0_HOST_WINDOW_SIZE);
 
 	iowrite32(lower_32_bits(fw_dma),
@@ -2299,28 +2369,19 @@ static int bcm4377_boot(struct bcm4377_data *bcm4377)
 		  bcm4377->bar2 + bcm4377->hw->bar2_offset + BCM4377_BAR2_FW_HI);
 	iowrite32(fw->size,
 		  bcm4377->bar2 + bcm4377->hw->bar2_offset + BCM4377_BAR2_FW_SIZE);
+	irq_before = atomic_read(&bcm4377->irq_count);
 	iowrite32(0, bcm4377->bar0 + BCM4377_BAR0_FW_DOORBELL);
 
 	dev_dbg(&bcm4377->pdev->dev, "waiting for firmware to boot\n");
 
-	ret = wait_for_completion_interruptible_timeout(&bcm4377->event,
-							BCM4377_BOOT_TIMEOUT);
-	if (ret == 0) {
-		ret = -ETIMEDOUT;
-		goto out_dma_free;
-	} else if (ret < 0) {
-		goto out_dma_free;
-	}
-
-	if (bcm4377->bootstage != 2) {
-		dev_err(&bcm4377->pdev->dev, "boostage %d != 2\n",
-			bcm4377->bootstage);
-		ret = -ENXIO;
+	ret = bcm4377_wait_for_state(bcm4377, false, 2, BCM4377_BOOT_TIMEOUT);
+	if (ret) {
+		bcm4377_report_state_failure(bcm4377, "firmware boot", 2, ret, irq_before);
 		goto out_dma_free;
 	}
 
 	dev_dbg(&bcm4377->pdev->dev, "firmware has booted (stage = %x)\n",
-		bcm4377->bootstage);
+		 READ_ONCE(bcm4377->bootstage));
 	ret = 0;
 
 out_dma_free:
@@ -2332,59 +2393,46 @@ out_release_fw:
 
 static int bcm4377_setup_rti(struct bcm4377_data *bcm4377)
 {
+	u32 irq_before;
+	u32 context_addr_hi = bcm4377->dma_window_base ?
+		bcm4377->hw->bar2_context_addr_hi : BCM4377_BAR2_CONTEXT_ADDR_HI;
 	int ret;
 
 	dev_dbg(&bcm4377->pdev->dev, "starting RTI\n");
+	irq_before = atomic_read(&bcm4377->irq_count);
 	iowrite32(1, bcm4377->bar0 + BCM4377_BAR0_RTI_CONTROL);
 
-	ret = wait_for_completion_interruptible_timeout(&bcm4377->event,
-							BCM4377_TIMEOUT);
-	if (ret == 0) {
-		dev_err(&bcm4377->pdev->dev,
-			"timed out while waiting for RTI to transition to state 1");
-		return -ETIMEDOUT;
-	} else if (ret < 0) {
+	ret = bcm4377_wait_for_state(bcm4377, true, 1, BCM4377_TIMEOUT);
+	if (ret) {
+		bcm4377_report_state_failure(bcm4377, "RTI", 1, ret, irq_before);
 		return ret;
-	}
-
-	if (bcm4377->rti_status != 1) {
-		dev_err(&bcm4377->pdev->dev, "RTI did not ack state 1 (%d)\n",
-			bcm4377->rti_status);
-		return -ENODEV;
 	}
 	dev_dbg(&bcm4377->pdev->dev, "RTI is in state 1\n");
 
-	/* allow access to the entire IOVA space again */
-	iowrite32(0, bcm4377->bar2 + bcm4377->hw->bar2_offset + BCM4377_BAR2_RTI_WINDOW_LO);
-	iowrite32(0, bcm4377->bar2 + bcm4377->hw->bar2_offset + BCM4377_BAR2_RTI_WINDOW_HI);
-	iowrite32(BCM4377_DMA_MASK,
+	/* Reuse the boot window for all context and ring DMA addresses. */
+	iowrite32(lower_32_bits(bcm4377->dma_window_base),
+		  bcm4377->bar2 + bcm4377->hw->bar2_offset + BCM4377_BAR2_RTI_WINDOW_LO);
+	iowrite32(upper_32_bits(bcm4377->dma_window_base),
+		  bcm4377->bar2 + bcm4377->hw->bar2_offset + BCM4377_BAR2_RTI_WINDOW_HI);
+	iowrite32(bcm4377->dma_window_size,
 		  bcm4377->bar2 + bcm4377->hw->bar2_offset + BCM4377_BAR2_RTI_WINDOW_SIZE);
 
 	/* setup "Converged IPC" context */
 	iowrite32(lower_32_bits(bcm4377->ctx_dma),
 		  bcm4377->bar2 + bcm4377->hw->bar2_offset + BCM4377_BAR2_CONTEXT_ADDR_LO);
 	iowrite32(upper_32_bits(bcm4377->ctx_dma),
-		  bcm4377->bar2 + bcm4377->hw->bar2_offset + BCM4377_BAR2_CONTEXT_ADDR_HI);
+		  bcm4377->bar2 + bcm4377->hw->bar2_offset + context_addr_hi);
+	irq_before = atomic_read(&bcm4377->irq_count);
 	iowrite32(2, bcm4377->bar0 + BCM4377_BAR0_RTI_CONTROL);
 
-	ret = wait_for_completion_interruptible_timeout(&bcm4377->event,
-							BCM4377_TIMEOUT);
-	if (ret == 0) {
-		dev_err(&bcm4377->pdev->dev,
-			"timed out while waiting for RTI to transition to state 2");
-		return -ETIMEDOUT;
-	} else if (ret < 0) {
+	ret = bcm4377_wait_for_state(bcm4377, true, 2, BCM4377_TIMEOUT);
+	if (ret) {
+		bcm4377_report_state_failure(bcm4377, "RTI", 2, ret, irq_before);
 		return ret;
 	}
 
-	if (bcm4377->rti_status != 2) {
-		dev_err(&bcm4377->pdev->dev, "RTI did not ack state 2 (%d)\n",
-			bcm4377->rti_status);
-		return -ENODEV;
-	}
-
 	dev_dbg(&bcm4377->pdev->dev,
-		"RTI is in state 2; control ring is ready\n");
+		 "RTI is in state 2; control ring is ready\n");
 	bcm4377->control_ack_ring.enabled = true;
 
 	return 0;
@@ -2744,6 +2792,14 @@ static void bcm4377_hci_reset(struct hci_dev *hdev)
 		return;
 	if (test_and_set_bit(0, &bcm4377->reset_pending))
 		return;
+	/*
+	 * The shared high-window radio has no qualified DMA-stop boundary.
+	 * Rebinding could fault its retained domain and quarantine Wi-Fi too.
+	 */
+	if (bcm4377->dma_window_base) {
+		bt_dev_err(hdev, "controller recovery requires a platform reboot");
+		return;
+	}
 
 	rw = kzalloc_obj(*rw);
 	if (!rw) {
@@ -2770,15 +2826,52 @@ static void bcm4377_hci_unregister_dev(void *data)
 	cancel_delayed_work_sync(&bcm4377->setup_retry_work);
 }
 
+/*
+ * The ring ABI and both firmware-window bases carry full 64-bit addresses,
+ * but every allocation must fit in one window smaller than 4 GiB. A forced
+ * DMA-IOMMU aperture provides that lower bound as well as the DMA mask's
+ * upper bound. Identity DMA cannot guarantee a bounded allocation window.
+ */
+static int bcm4377_setup_dma(struct bcm4377_data *bcm4377)
+{
+	struct device *dev = &bcm4377->pdev->dev;
+	struct iommu_domain *domain = iommu_get_domain_for_dev(dev);
+	u64 base, end, size, mask = BCM4377_DMA_MASK;
+	int ret;
+
+	bcm4377->dma_window_base = 0;
+	bcm4377->dma_window_size = BCM4377_DMA_MASK;
+
+	if (bcm4377->hw->id == 0x4388 && domain &&
+	    iommu_is_dma_domain(domain) && domain->geometry.force_aperture &&
+	    domain->geometry.aperture_start > BCM4377_DMA_MASK) {
+		base = domain->geometry.aperture_start;
+		end = domain->geometry.aperture_end;
+		if (end < base || end - base >= BCM4377_DMA_MASK ||
+		    !IS_ALIGNED(base, 0x200) || !IS_ALIGNED(end + 1, 0x200)) {
+			dev_err(dev, "unsupported DMA window %#llx-%#llx\n", base, end);
+			return -ERANGE;
+		}
+
+		size = end - base + 1;
+		bcm4377->dma_window_base = base;
+		bcm4377->dma_window_size = size;
+		mask = DMA_BIT_MASK(fls64(end));
+	}
+
+	ret = dma_set_mask_and_coherent(dev, mask);
+	if (ret)
+		return dev_err_probe(dev, ret, "failed to configure DMA window\n");
+	dev_dbg(dev, "firmware DMA window %pad+%#x\n",
+		 &bcm4377->dma_window_base, bcm4377->dma_window_size);
+	return 0;
+}
+
 static int bcm4377_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	struct bcm4377_data *bcm4377;
 	struct hci_dev *hdev;
 	int ret, irq;
-
-	ret = dma_set_mask_and_coherent(&pdev->dev, BCM4377_DMA_MASK);
-	if (ret)
-		return ret;
 
 	bcm4377 = devm_kzalloc(&pdev->dev, sizeof(*bcm4377), GFP_KERNEL);
 	if (!bcm4377)
@@ -2786,7 +2879,11 @@ static int bcm4377_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	bcm4377->pdev = pdev;
 	bcm4377->hw = &bcm4377_hw_variants[id->driver_data];
-	init_completion(&bcm4377->event);
+	ret = bcm4377_setup_dma(bcm4377);
+	if (ret)
+		return ret;
+	init_waitqueue_head(&bcm4377->event);
+	atomic_set(&bcm4377->irq_count, 0);
 	INIT_DELAYED_WORK(&bcm4377->setup_retry_work, bcm4377_setup_retry_work);
 	spin_lock_init(&bcm4377->resume_lock);
 	INIT_WORK(&bcm4377->resume_work, bcm4377_resume_recovery_work);
@@ -2850,6 +2947,9 @@ static int bcm4377_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 		return ret;
 	}
 
+	dev_dbg(&pdev->dev, "BCM%04x%s OTP vendor %s, board %s\n",
+		 bcm4377->hw->id, bcm4377->stepping, bcm4377->vendor, bcm4377->board_type);
+
 	/*
 	 * Legacy interrupts result in an IRQ storm because we don't know where
 	 * the interrupt mask and status registers for these chips are.
@@ -2910,11 +3010,11 @@ static int bcm4377_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	ret = bcm4377_boot(bcm4377);
 	if (ret)
-		return ret;
+		return dev_err_probe(&pdev->dev, ret, "firmware boot handshake failed\n");
 
 	ret = bcm4377_setup_rti(bcm4377);
 	if (ret)
-		return ret;
+		return dev_err_probe(&pdev->dev, ret, "RTI handshake failed\n");
 
 	ret = hci_register_dev(hdev);
 	if (ret)
@@ -3031,6 +3131,7 @@ static const struct dmi_system_id bcm4377_dmi_board_table[] = {
 static const struct bcm4377_hw bcm4377_hw_variants[] = {
 	[BCM4377] = {
 		.id = 0x4377,
+		.bar2_context_addr_hi = BCM4377_BAR2_CONTEXT_ADDR_HI,
 		.otp_offset = 0x4120,
 		.bar0_window1 = 0x1800b000,
 		.bar0_window2 = 0x1810c000,
@@ -3041,6 +3142,7 @@ static const struct bcm4377_hw bcm4377_hw_variants[] = {
 
 	[BCM4378] = {
 		.id = 0x4378,
+		.bar2_context_addr_hi = BCM4377_BAR2_CONTEXT_ADDR_HI,
 		.otp_offset = 0x4120,
 		.bar0_window1 = 0x18002000,
 		.bar0_window2 = 0x1810a000,
@@ -3055,6 +3157,7 @@ static const struct bcm4377_hw bcm4377_hw_variants[] = {
 
 	[BCM4387] = {
 		.id = 0x4387,
+		.bar2_context_addr_hi = BCM4377_BAR2_CONTEXT_ADDR_HI,
 		.otp_offset = 0x413c,
 		.bar0_window1 = 0x18002000,
 		.bar0_window2 = 0x18109000,
@@ -3072,6 +3175,7 @@ static const struct bcm4377_hw bcm4377_hw_variants[] = {
 		.id = 0x4388,
 		.otp_offset = 0x415c,
 		.bar2_offset = 0x200000,
+		.bar2_context_addr_hi = BCM4388_BAR2_CONTEXT_ADDR_HI,
 		.bar0_window1 = 0x18002000,
 		.bar0_window2 = 0x18109000,
 		.bar0_core2_window2 = 0x18106000,
