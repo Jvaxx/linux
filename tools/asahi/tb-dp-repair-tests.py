@@ -42,7 +42,7 @@ struct tb_switch {struct device dev;};
 struct tb_port {struct tb_switch *sw;bool is_dpin;struct list_head list;};
 struct work_struct {void(*fn)(struct work_struct*);bool pending;};
 struct tb {int lock;struct device dev;void*wq;struct tb_switch*root_switch;};
-struct tb_cm {bool hotplug_active;struct work_struct dp_tunnel_work;};
+struct tb_cm {bool hotplug_active;struct work_struct dp_tunnel_work;bool dp_tunnel_pending;};
 struct domain {struct tb tb;struct tb_cm cm;};
 _Static_assert(offsetof(struct domain,cm)==sizeof(struct tb),"mock private storage adjacency");
 #define INIT_WORK(w,handler) ((w)->fn=(handler))
@@ -112,6 +112,7 @@ static void flush_queue(void){
   domain.cm.dp_tunnel_work.fn(&domain.cm.dp_tunnel_work);
  }
  CHECK(!lock_depth && !pm_refs && domain_refs==1);
+ if(alloc_successes)CHECK(!domain.cm.dp_tunnel_pending);
 }
 static void queue_repair(unsigned count){
  mutex_lock(&domain.tb.lock);
@@ -144,6 +145,15 @@ int main(int argc,char**argv){
   queue_repair(1);pm_error=-5;flush_queue();CHECK(!alloc_calls && pm_calls==1);
  }else if(!strcmp(c,"requeue-running")){
   queue_repair(1);requeue_once=1;flush_queue();CHECK(alloc_calls==2 && alloc_successes==2);
+ }else if(!strcmp(c,"freeze-thaw-repair")){
+  queue_repair(1);mutex_lock(&domain.tb.lock);CHECK(!tb_freeze_noirq(&domain.tb));mutex_unlock(&domain.tb.lock);
+  flush_queue();CHECK(!alloc_calls && !pm_calls && domain.cm.dp_tunnel_pending);
+  mutex_lock(&domain.tb.lock);CHECK(!tb_thaw_noirq(&domain.tb));mutex_unlock(&domain.tb.lock);
+  CHECK(domain.cm.dp_tunnel_work.pending && domain_refs==2);flush_queue();CHECK(alloc_successes==1);
+ }else if(!strcmp(c,"pm-failure-retry")){
+  queue_repair(1);pm_error=-5;flush_queue();CHECK(!alloc_calls && domain.cm.dp_tunnel_pending);
+  pm_error=0;mutex_lock(&domain.tb.lock);CHECK(!tb_thaw_noirq(&domain.tb));mutex_unlock(&domain.tb.lock);
+  flush_queue();CHECK(alloc_successes==1 && pm_calls==2);
  }else if(!strcmp(c,"ordinary-retirement")){
   new_tunnel(&domain.tb,&in,&out);mutex_lock(&domain.tb.lock);
   tb_dp_resource_unavailable(&domain.tb,&in,"ordinary detach");mutex_unlock(&domain.tb.lock);
@@ -155,9 +165,11 @@ int main(int argc,char**argv){
 
 CASES = ['callback-release-before-repair', 'coalesce', 'stop-before-queue',
          'stop-after-queue', 'stop-during-pm', 'no-root', 'pm-failure',
-         'requeue-running', 'ordinary-retirement']
+         'requeue-running', 'ordinary-retirement', 'freeze-thaw-repair',
+         'pm-failure-retry']
 MUTANTS = {
-    'inline-repair': ('\ttb_queue_dp_tunnels(tb);', '\ttb_tunnel_dp(tb);'),
+    'inline-repair': ('\ttb_recalc_estimated_bandwidth(tb);\n\ttb_queue_dp_tunnels(tb);',
+                      '\ttb_recalc_estimated_bandwidth(tb);\n\ttb_tunnel_dp(tb);'),
     'missing-queue-reference': ('\ttb_domain_get(tb);', '\t/* removed get */'),
     'coalescing-leaks-reference': ('\tif (!queue_work(tb->wq, &tcm->dp_tunnel_work))\n\t\ttb_domain_put(tb);',
                                  '\tqueue_work(tb->wq, &tcm->dp_tunnel_work);'),
@@ -168,6 +180,10 @@ MUTANTS = {
     'missing-pm-put': ('\tpm_runtime_put_autosuspend(&tb->dev);', '\t/* removed PM put */'),
     'missing-probe-init': ('INIT_WORK(&tcm->dp_tunnel_work, tb_dp_tunnel_work);',
                            '/* removed probe initialization */'),
+    'missing-pending-request': ('\ttcm->dp_tunnel_pending = true;', '\t/* lost request */'),
+    'pending-never-consumed': ('\t\ttcm->dp_tunnel_pending = false;', '\t\t/* pending forever */'),
+    'missing-thaw-requeue': ('\tif (tcm->dp_tunnel_pending)\n\t\ttb_queue_dp_tunnels(tb);',
+                             '\t/* lost thaw request */'),
 }
 
 
@@ -181,7 +197,8 @@ def main():
     names = ['tb_tunnel_get', 'tb_tunnel_destroy', 'tb_tunnel_put']
     parts = {n: function(tunnel, n) for n in names}
     for name in ['tb_deactivate_and_free_tunnel', 'tb_dp_tunnel_work',
-                 'tb_queue_dp_tunnels', 'tb_dp_resource_unavailable']:
+                 'tb_queue_dp_tunnels', 'tb_dp_resource_unavailable',
+                 'tb_freeze_noirq', 'tb_thaw_noirq']:
         parts[name] = function(tb, name)
     worker = function(tunnel, 'tb_dp_dprx_work')
     marker = '\ttunnel->dprx_started = false;'

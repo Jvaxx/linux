@@ -63,6 +63,7 @@ MODULE_PARM_DESC(asym_threshold,
  * @remove_work: Work used to remove any unplugged routers after
  *		 runtime resume
  * @dp_tunnel_work: Re-pair DP resources after retired DPRX work releases its paths
+ * @dp_tunnel_pending: A pairing request not yet serviced, retained across sleep
  * @groups: Bandwidth groups used in this domain.
  */
 struct tb_cm {
@@ -72,6 +73,7 @@ struct tb_cm {
 	bool stopping;
 	struct delayed_work remove_work;
 	struct work_struct dp_tunnel_work;
+	bool dp_tunnel_pending;
 	struct tb_bandwidth_group groups[MAX_GROUPS];
 };
 
@@ -2274,7 +2276,7 @@ static void tb_dp_tunnel_work(struct work_struct *work)
 	struct tb *tb = tcm_to_tb(tcm);
 	int ret;
 
-	/* Stop drains this queue before unregistering the domain. */
+	/* Domain removal drains this queue before unregistering the domain. */
 	if (!READ_ONCE(tcm->hotplug_active))
 		goto put_domain;
 
@@ -2284,8 +2286,10 @@ static void tb_dp_tunnel_work(struct work_struct *work)
 		goto put_domain;
 
 	mutex_lock(&tb->lock);
-	if (tcm->hotplug_active && tb->root_switch)
+	if (tcm->hotplug_active && tb->root_switch) {
+		tcm->dp_tunnel_pending = false;
 		tb_tunnel_dp(tb);
+	}
 	mutex_unlock(&tb->lock);
 
 	pm_runtime_mark_last_busy(&tb->dev);
@@ -2301,6 +2305,9 @@ static void tb_queue_dp_tunnels(struct tb *tb)
 	lockdep_assert_held(&tb->lock);
 	if (!tcm->hotplug_active)
 		return;
+
+	/* An inactive worker leaves this set for thaw or resume. */
+	tcm->dp_tunnel_pending = true;
 
 	/* One reference for each queued execution; coalescing adds none. */
 	tb_domain_get(tb);
@@ -3133,6 +3140,7 @@ static void tb_stop(struct tb *tb)
 	tb_switch_remove(tb->root_switch);
 	tb->root_switch = NULL;
 	tcm->hotplug_active = false; /* signal tb_handle_hotplug to quit */
+	tcm->dp_tunnel_pending = false;
 }
 
 static void tb_deinit(struct tb *tb)
@@ -3399,6 +3407,8 @@ out:
 	tb_switch_enter_redrive(tb->root_switch);
 	 /* Allow tb_handle_hotplug to progress events */
 	tcm->hotplug_active = true;
+	if (tcm->dp_tunnel_pending)
+		tb_queue_dp_tunnels(tb);
 	tb_dbg(tb, "resume finished\n");
 
 	return 0;
@@ -3417,6 +3427,8 @@ static int tb_thaw_noirq(struct tb *tb)
 	struct tb_cm *tcm = tb_priv(tb);
 
 	tcm->hotplug_active = true;
+	if (tcm->dp_tunnel_pending)
+		tb_queue_dp_tunnels(tb);
 	return 0;
 }
 
@@ -3532,6 +3544,8 @@ static int tb_runtime_resume(struct tb *tb)
 		tb_tunnel_activate(tunnel);
 	tb_switch_enter_redrive(tb->root_switch);
 	tcm->hotplug_active = true;
+	if (tcm->dp_tunnel_pending)
+		tb_queue_dp_tunnels(tb);
 	mutex_unlock(&tb->lock);
 
 	/*
