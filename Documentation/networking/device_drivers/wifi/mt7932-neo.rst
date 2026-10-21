@@ -33,7 +33,7 @@ associated, but never probes or joins an access point there, and scans made
 while associated skip them. A channel whose restrictions the driver cannot
 apply (reduced power, no OFDM, PSD limits) is disabled rather than used, and
 so is a channel the country package does not permit: every power limit of
-that channel in ``policy/<CC>.bin`` is left undefined.
+that channel in the applied country package is left undefined.
 
 Use the ordinary cfg80211 regulatory database and applicable country policy.
 The validated first-admission fallback is kernel country 00 with firmware XZ.
@@ -67,6 +67,35 @@ while probing, so build it as a module. The tested Wi-Fi driver owns function
 Use a saved NetworkManager WPA2 profile matching the current interface.
 KDE audio requires BlueZ, PipeWire, its PulseAudio compatibility service,
 WirePlumber and Bluetooth audio plugins in the logged-in user's session.
+
+Country packages
+----------------
+
+Every regulatory change selects a country package again, without a reload.
+For country CC the driver uses the first of these that exists and is valid:
+
+1. ``policy-v2/CC.bin``: J7RP version 2 (version 1 plus 6 GHz VLP pages);
+2. ``policy/CC.bin``: J7RP version 1 (2.4 and 5 GHz, at most 16 KiB);
+3. ``policy/world-XZ.bin``: the world package.
+
+Country 00 uses only the world package. ``policy/`` holds version 1 only and
+``policy-v2/`` version 2 only; a package in the wrong directory is refused.
+Kernels without version 2 support never read ``policy-v2/``, so version 2
+packages can be installed while those kernels remain bootable.
+
+A country without a usable package of its own falls back to the world
+package and logs one ``REGULATORY_FALLBACK`` line. cfg80211 keeps the
+requested country and its channel list; the firmware gets domain XZ and
+only the channels both the country and the world package permit. The world
+package has no 6 GHz section, so 6 GHz stays off. Installing the country's
+package takes effect on the next regulatory change. Only a missing or
+invalid world package leaves the radio without a regulatory domain.
+
+The applied package can be read back, as root, from
+``/sys/kernel/debug/ieee80211/phyN/mt7932_policy``: requested country,
+firmware domain, source directory and path, J7RP version, size, the first
+eight bytes of its SHA-256, the 6 GHz primaries in the firmware domain, the
+fallback reason and the result of each lookup.
 
 Station security
 ----------------
@@ -159,8 +188,9 @@ serialization is implemented. Full-band scans are split into bounded
 32-channel commands. Firmware event channel layout is checked before OCA
 association calibration, queue binding and the two association power pages.
 
-J7RP version 1 remains valid and never authorizes 6 GHz. Generate version 2
-from the original text tables and the installed version-1 packages::
+J7RP version 1 remains valid and never authorizes 6 GHz. Version 2 packages
+are installed under ``policy-v2/``. Generate them from the original text
+tables and the installed version-1 packages::
 
   python3 tools/asahi/mt7932-policy-6ghz.py --tables /path/to/IZUBA \
     --legacy-dir /path/to/policy --output-dir /path/to/new-policy
@@ -232,8 +262,9 @@ Wi-Fi requests the following files under ``mediatek/mt7932/``:
 * ``config-original.bin``: the bounded J7CF package with the original 64 or
   65 configuration records, including all required keys.
 * ``policy/world-XZ.bin`` and, when available, the matching country package
-  under ``policy/``: J7RP containers with original-derived modes and power
-  tables. Relabeling a different country's payload is unsupported.
+  under ``policy-v2/`` or ``policy/`` (see `Country packages`_): J7RP
+  containers with original-derived modes and power tables. Relabeling a
+  different country's payload is unsupported.
 
 Bluetooth requests these files under ``mediatek/``:
 
