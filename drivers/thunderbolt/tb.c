@@ -62,6 +62,7 @@ MODULE_PARM_DESC(asym_threshold,
  *		    after cfg has been paused.
  * @remove_work: Work used to remove any unplugged routers after
  *		 runtime resume
+ * @dp_tunnel_work: Re-pair DP resources after retired DPRX work releases its paths
  * @groups: Bandwidth groups used in this domain.
  */
 struct tb_cm {
@@ -70,6 +71,7 @@ struct tb_cm {
 	bool hotplug_active;
 	bool stopping;
 	struct delayed_work remove_work;
+	struct work_struct dp_tunnel_work;
 	struct tb_bandwidth_group groups[MAX_GROUPS];
 };
 
@@ -2260,6 +2262,52 @@ static void tb_switch_exit_redrive(struct tb_switch *sw)
 	}
 }
 
+/*
+ * A failed DPRX callback can retire the list's tunnel reference while its
+ * worker still owns the paths. Pairing here, on the same ordered domain
+ * queue, waits until that worker returns and drops its reference, releasing
+ * the old fixed HopIDs. Keep only the domain, never an unplugged port.
+ */
+static void tb_dp_tunnel_work(struct work_struct *work)
+{
+	struct tb_cm *tcm = container_of(work, struct tb_cm, dp_tunnel_work);
+	struct tb *tb = tcm_to_tb(tcm);
+	int ret;
+
+	/* Stop drains this queue before unregistering the domain. */
+	if (!READ_ONCE(tcm->hotplug_active))
+		goto put_domain;
+
+	/* Runtime resume can acquire the domain lock, so do it first. */
+	ret = pm_runtime_resume_and_get(&tb->dev);
+	if (ret < 0)
+		goto put_domain;
+
+	mutex_lock(&tb->lock);
+	if (tcm->hotplug_active && tb->root_switch)
+		tb_tunnel_dp(tb);
+	mutex_unlock(&tb->lock);
+
+	pm_runtime_mark_last_busy(&tb->dev);
+	pm_runtime_put_autosuspend(&tb->dev);
+put_domain:
+	tb_domain_put(tb);
+}
+
+static void tb_queue_dp_tunnels(struct tb *tb)
+{
+	struct tb_cm *tcm = tb_priv(tb);
+
+	lockdep_assert_held(&tb->lock);
+	if (!tcm->hotplug_active)
+		return;
+
+	/* One reference for each queued execution; coalescing adds none. */
+	tb_domain_get(tb);
+	if (!queue_work(tb->wq, &tcm->dp_tunnel_work))
+		tb_domain_put(tb);
+}
+
 static void tb_dp_resource_unavailable(struct tb *tb, struct tb_port *port,
 				       const char *reason)
 {
@@ -2288,7 +2336,7 @@ static void tb_dp_resource_unavailable(struct tb *tb, struct tb_port *port,
 	 * to create another tunnel.
 	 */
 	tb_recalc_estimated_bandwidth(tb);
-	tb_tunnel_dp(tb);
+	tb_queue_dp_tunnels(tb);
 }
 
 static void tb_dp_resource_available(struct tb *tb, struct tb_port *port)
@@ -3602,6 +3650,7 @@ struct tb *tb_probe(struct tb_nhi *nhi)
 	INIT_LIST_HEAD(&tcm->tunnel_list);
 	INIT_LIST_HEAD(&tcm->dp_resources);
 	INIT_DELAYED_WORK(&tcm->remove_work, tb_remove_work);
+	INIT_WORK(&tcm->dp_tunnel_work, tb_dp_tunnel_work);
 	tb_init_bandwidth_groups(tcm);
 
 	tb_dbg(tb, "using software connection manager\n");
