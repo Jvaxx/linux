@@ -2127,6 +2127,7 @@ F:	rust/kernel/soc/apple/aop.rs
 F:	sound/soc/apple/t8140_aop_audio.rs
 F:	tools/testing/apple/
 F:	tools/testing/kunit/configs/apple_firmware.config
+F:	tools/testing/kunit/configs/mt7932.config
 F:	tools/testing/selftests/drivers/gpu/apple-dcp/
 
 APPLETALK NETWORK LAYER

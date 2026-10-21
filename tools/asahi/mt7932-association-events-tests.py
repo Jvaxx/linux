@@ -38,6 +38,7 @@ PREFIX = r'''
 #include <limits.h>
 typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
 #define READ_ONCE(x) (x)
+#define BIT(n) (1U << (n))
 #define ARRAY_SIZE(x) (sizeof(x)/sizeof(*(x)))
 #define GFP_ATOMIC 0
 #define IEEE80211_CHAN_DISABLED 1
@@ -200,7 +201,13 @@ def main():
     parts["WAIT"]=worker[start:worker.index("\nreport:",start)]
     headers=[]
     for n in ["protocol.h","channels.h","bandwidth.h","association.h"]:
-        headers.append(re.sub(r"^#include .*\n","",(root/DRIVER/n).read_text(),flags=re.M))
+        header = re.sub(r"^#include .*\n", "", (root/DRIVER/n).read_text(), flags=re.M)
+        if n == "association.h":
+            # These event fixtures do not use the sleeping crypto/admission helpers.
+            start = header.index("/* The first AKM")
+            end = header.index("struct mt7932_peer_ids")
+            header = header[:start] + header[end:]
+        headers.append(header)
     cal=(root/DRIVER/"calibration.h").read_text()
     headers.append(cal[cal.index("struct mt7932_cal_completion {"):cal.index("struct mt7932_cal_segment {")])
     parts["HEADERS"]="\n".join(headers)

@@ -75,8 +75,8 @@ static void genlmsg_end(struct sk_buff*m,void*h){}
 static int wiphy_net(int*w){return 0;}
 static void genlmsg_multicast_netns(int*f,int n,struct sk_buff*m,int p,int g,gfp_t t){}
 ENCODER
-struct mt7932 {bool stopping,connect_open,assoc_request_seen,connecting,connected,disconnecting,connect_cancelled,connect_publishing,connect_lost,rf_ready;
- int connect_error,response_lock,command_mutex,data_lock,wiphy,power_work;u16 disconnect_reason;struct net_device *netdev;struct cfg80211_bss *connect_bss;u8 connect_bssid[6],connect_pmk[32],assoc_request_ies[512];unsigned assoc_request_ie_len;
+struct mt7932 {bool stopping,connect_open,assoc_request_seen,connecting,connected,disconnecting,connect_cancelled,connect_publishing,connect_lost,rf_ready,connect_pmk_valid;
+ int connect_error,response_lock,command_mutex,data_lock,wiphy,power_work;u16 disconnect_reason;struct net_device *netdev;struct cfg80211_bss *connect_bss;u8 connect_bssid[6],connect_pmk[32],connect_sae_pwd[63],connect_sae_pwd_length,assoc_request_ies[512];unsigned assoc_request_ie_len;
  struct {struct {bool ht_supported;}ht_cap;}band2;bool power_tim,data_ready,station_signal_valid,station_rx_rate_valid,station_tx_rate_valid;unsigned long station_tx_bytes,station_rx_bytes,station_tx_packets,station_rx_packets,station_connected;};
 static unsigned long jiffies=1;
 static unsigned notifications,disconnections,retirements,releases,authorizations,carrier,work_count;
@@ -104,7 +104,11 @@ int main(void){struct net_device n={1};struct cfg80211_bss b={};
  for(unsigned i=0;i<sizeof(errors)/sizeof(*errors);i++){
   struct mt7932 m={.connecting=true,.rf_ready=true,.netdev=&n,.connect_bss=&b,.data_ready=true};
   notifications=disconnections=retirements=authorizations=carrier=work_count=0;
-  report_worker(&m,errors[i]);assert(notifications==1&&disconnections==0);
+  memset(m.connect_pmk,0x5a,sizeof(m.connect_pmk));memset(m.connect_sae_pwd,0x5a,sizeof(m.connect_sae_pwd));m.connect_sae_pwd_length=63;m.connect_pmk_valid=true;
+  report_worker(&m,errors[i]);
+  for(unsigned j=0;j<sizeof(m.connect_pmk);j++)assert(!m.connect_pmk[j]);
+  for(unsigned j=0;j<sizeof(m.connect_sae_pwd);j++)assert(!m.connect_sae_pwd[j]);
+  assert(!m.connect_sae_pwd_length&&!m.connect_pmk_valid);assert(notifications==1&&disconnections==0);
   assert(saved.status==(errors[i]==-ETIMEDOUT?-1:errors[i]?1:0));
   assert(encoded.seen[NL80211_ATTR_TIMED_OUT]==(errors[i]==-ETIMEDOUT));
   assert(encoded.seen[NL80211_ATTR_TIMEOUT_REASON]==(errors[i]==-ETIMEDOUT));

@@ -3,9 +3,9 @@
 MediaTek MT7932 radio on the MacBook Neo
 ========================================
 
-J700 MT7932 Wi-Fi uses cfg80211 and NetworkManager with firmware-managed
-WPA2-CCMP authentication. Bluetooth uses a transport on the radio's second
-PCIe function.
+J700 MT7932 Wi-Fi uses cfg80211 with firmware-managed WPA2-PSK and WPA3-SAE
+authentication on 2.4 and 5 GHz. Bluetooth uses a transport on the radio's
+second PCIe function.
 
 The Wi-Fi driver carries configuration, scan IE and WPA2 AKM compatibility
 fixes on top of its original import. Existing source notices are retained.
@@ -67,6 +67,45 @@ while probing, so build it as a module. The tested Wi-Fi driver owns function
 Use a saved NetworkManager WPA2 profile matching the current interface.
 KDE audio requires BlueZ, PipeWire, its PulseAudio compatibility service,
 WirePlumber and Bluetooth audio plugins in the logged-in user's session.
+
+Station security
+----------------
+
+The driver advertises PSK and SAE with CCMP only. Firmware performs SAE
+authentication and the four-way handshake and owns PTK, GTK and IGTK;
+there is no host key-install interface or external-auth exchange.
+
+SAE offload accepts nl80211 WPA version 3, the combined version 2/3 mask,
+and version 2 for older offload clients. PSK requires the version 2 bit.
+The first AKM always selects the firmware arm; a version mask does not
+permit security fallback.
+
+For SAE, userspace supplies SAE authentication, an 8-63 byte password and
+required or optional management frame protection (MFP). Firmware uses required
+MFP for the SAE arm. On a PSK+SAE transition network, the first AKM supplied
+by userspace selects the arm: PSK keeps the existing binary-PMK request and
+disables MFP, while SAE uses the password and required MFP. PSK with required
+MFP and PSK-SHA256 are unsupported.
+
+BIP-CMAC-128 is not advertised because WPA2 with required MFP has not been
+implemented or qualified. Advertising BIP would also make supplicants request
+required MFP on WPA2 networks. iwd requires BIP-CMAC-128 before selecting SAE,
+so it remains WPA2-only with this driver, including on transition networks;
+it cannot join a pure-SAE network. SAE offload support here targets
+NetworkManager with wpa_supplicant, pending the hardware qualification below.
+
+The standard SAE PWE settings (unspecified, hunting-and-pecking,
+hash-to-element and both) are accepted; firmware chooses the exchange without
+a host PWE field. Exact PWE policy behavior on 2.4 and 5 GHz still needs
+qualification. SAE-PK, SAE-EXT-KEY, additional ciphers, OWE and 6 GHz are not
+advertised.
+
+One-shot J700 hardware testing has confirmed SAE connections on 2.4 and
+5 GHz, WPA2-PSK on both bands and PSK-selected transition. The SAE request
+layout, transition admission and PMK derivation also have automated tests.
+Separate SAE-selected transition coverage, exact PWE policy behavior,
+WPA2 throughput regression comparisons and long-duration reliability still
+need qualification.
 
 Local firmware inputs
 ---------------------
@@ -132,7 +171,8 @@ Limitations
   transport.
 * The Bluetooth software queue limit does not provide HCI backpressure;
   saturation can drop an accounted frame.
-* Arbitrary scan IEs, WPA3/SAE, required MFP, AP/P2P, general country-package
-  generation, roaming and long-duration reliability are unqualified.
+* Arbitrary scan IEs, AP/P2P, general country-package generation, roaming and
+  long-duration reliability are unqualified. SAE and required MFP qualification
+  are described under Station security.
 * SCO/headset microphone, LE Audio/ISO and simultaneous headset audio are
   unqualified.

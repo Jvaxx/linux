@@ -145,6 +145,8 @@ struct mt7932 {
 	u8 connect_bssid_req[ETH_ALEN], connect_bssid_hint[ETH_ALEN];
 	bool discovering, discovery_finished, connect_cancelled;
 	u8 connect_ssid[32], connect_pmk[32], connect_bssid[6];
+	u8 connect_sae_pwd[MT7932_SAE_PASSWORD_MAX], connect_sae_pwd_length;
+	bool connect_pmk_valid;
 	u8 assoc_request_ies[512];
 	u16 assoc_request_ie_len;
 	bool assoc_request_seen;

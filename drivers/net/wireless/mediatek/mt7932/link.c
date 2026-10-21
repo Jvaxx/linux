@@ -89,7 +89,7 @@ void mt_rf_fail_locked(struct mt7932 *m, int error)
 	}
 }
 
-/* One owned station, firmware WPA2-PSK handshake; no host key fabrication. */
+/* One owned station and firmware handshake; no host key fabrication. */
 static int mt_peer_reserve(struct mt7932 *m)
 {
 	u8 *ids = (u8 *)&m->peer_ids;
@@ -271,6 +271,9 @@ static void mt_peer_release(struct mt7932 *m)
 	memset(&m->peer_ids, 0, sizeof(m->peer_ids));
 	memset(m->duplicates, 0, sizeof(m->duplicates));
 	memzero_explicit(m->connect_pmk, sizeof(m->connect_pmk));
+	memzero_explicit(m->connect_sae_pwd, sizeof(m->connect_sae_pwd));
+	m->connect_sae_pwd_length = 0;
+	m->connect_pmk_valid = false;
 	m->peer_valid = false;
 	m->peer_wtbl = 0;
 	m->event_cipher = 0;
@@ -430,14 +433,21 @@ void mt_connect_work(struct work_struct *work)
 	spin_unlock_irqrestore(&m->response_lock, flags);
 	if (ret)
 		goto free;
-	/* Initial station policy: framework M=0 branch and no optional flags.
-	 * This yields flag2 independently of credentials; no scan-result count
-	 * belongs in this field. The original driver uses listen interval 20.
-	 * Other platform flag policies remain unsupported, not guessed mappings.
+	/* Keep policy value 2 and listen interval 20 for all security arms.
+	 * SAE is qualified with the same policy after correcting key_cipher.
 	 */
+	if (m->connect_sae_pwd_length && !m->connect_pmk_valid) {
+		ret = mt7932_sae_pmk(m->connect_pmk, m->connect_sae_pwd,
+				     m->connect_sae_pwd_length, m->connect_ssid,
+				     m->connect_ssid_length);
+		if (ret)
+			goto free;
+	}
 	ret = mt7932_connect_body(body, 856, m->connect_ssid, m->connect_ssid_length,
 		m->connect_open ? NULL : m->connect_pmk, m->connect_bssid,
-		m->connect_channel, 20, 2, &m->peer_ids, m->connect_open);
+		m->connect_channel, 20, 2, &m->peer_ids, m->connect_open,
+		m->connect_sae_pwd_length ? m->connect_sae_pwd : NULL,
+		m->connect_sae_pwd_length);
 	if (ret < 0)
 		goto free;
 	memcpy(mac + 2, m->mac, ETH_ALEN);
@@ -454,6 +464,9 @@ void mt_connect_work(struct work_struct *work)
 free:
 	kfree_sensitive(body);
 	memzero_explicit(m->connect_pmk, sizeof(m->connect_pmk));
+	memzero_explicit(m->connect_sae_pwd, sizeof(m->connect_sae_pwd));
+	m->connect_sae_pwd_length = 0;
+	m->connect_pmk_valid = false;
 	if (ret)
 		goto report;
 	dev_dbg(&m->pdev->dev, "CONNECT_SUBMITTED: BSSID=%pM channel=%u\n",
@@ -495,6 +508,9 @@ report:
 	if (ret && !READ_ONCE(m->stopping))
 		mt_transport_snapshot(m);
 	memzero_explicit(m->connect_pmk, sizeof(m->connect_pmk));
+	memzero_explicit(m->connect_sae_pwd, sizeof(m->connect_sae_pwd));
+	m->connect_sae_pwd_length = 0;
+	m->connect_pmk_valid = false;
 	if (ret) {
 		spin_lock_irqsave(&m->response_lock, flags);
 		m->disconnecting = true;
@@ -592,7 +608,7 @@ report:
 			READ_ONCE(m->data_ready));
 	else if (!ret)
 		dev_dbg(&m->pdev->dev,
-			"WPA2_AUTHORIZED: firmware handshake complete; Ethernet=%u\n",
+			"FIRMWARE_AUTHORIZED: handshake complete; Ethernet=%u\n",
 			READ_ONCE(m->data_ready));
 	else if (cancelled)
 		dev_dbg(&m->pdev->dev, "CONNECT_CANCELLED: %d\n", ret);
@@ -629,7 +645,7 @@ int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 	struct mt7932 *m = mt_from_wiphy(wiphy);
 	unsigned long flags;
 	bool open = mt_open_request(params);
-	int ret = 0;
+	int auth, ret = 0;
 
 	if (netdev == m->netdev)
 		mt_retry_missing_policy(m);
@@ -642,13 +658,9 @@ int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 		!!params->crypto.psk, params->mfp, params->ie_len);
 	if (!params->ssid_len || params->ssid_len > 32)
 		return -EINVAL;
-	if (!open && (params->crypto.wpa_versions != NL80211_WPA_VERSION_2 ||
-	    params->crypto.n_ciphers_pairwise != 1 || params->crypto.ciphers_pairwise[0] != WLAN_CIPHER_SUITE_CCMP ||
-	    params->crypto.cipher_group != WLAN_CIPHER_SUITE_CCMP ||
-	    !params->crypto.n_akm_suites || params->crypto.akm_suites[0] != WLAN_AKM_SUITE_PSK ||
-	    !params->crypto.psk || params->mfp == NL80211_MFP_REQUIRED ||
-	    !params->ssid_len || params->ssid_len > 32))
-		return -EOPNOTSUPP;
+	auth = open ? 0 : mt7932_connect_auth(params);
+	if (auth < 0)
+		return auth;
 	if (params->bssid && !is_valid_ether_addr(params->bssid))
 		return -EINVAL;
 	mutex_lock(&m->command_mutex);
@@ -675,8 +687,19 @@ int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 	m->connect_ssid_length = params->ssid_len;
 	m->connect_open = open;
 	memzero_explicit(m->connect_pmk, sizeof(m->connect_pmk));
-	if (!open)
+	memzero_explicit(m->connect_sae_pwd, sizeof(m->connect_sae_pwd));
+	m->connect_sae_pwd_length = 0;
+	m->connect_pmk_valid = false;
+	if (auth == WLAN_AKM_SUITE_SAE) {
+		m->connect_sae_pwd_length = params->crypto.sae_pwd_len;
+		memcpy(m->connect_sae_pwd, params->crypto.sae_pwd,
+		       m->connect_sae_pwd_length);
+	}
+	/* Transition requests may already carry a PMK; pure SAE needs derivation. */
+	if (!open && params->crypto.psk) {
 		memcpy(m->connect_pmk, params->crypto.psk, 32);
+		m->connect_pmk_valid = true;
+	}
 	m->connect_error = 0;
 	m->assoc_request_ie_len = 0;
 	m->assoc_request_seen = false;

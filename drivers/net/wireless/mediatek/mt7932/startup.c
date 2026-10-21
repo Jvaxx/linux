@@ -548,7 +548,7 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 {
 	static const int rates[] = {10,20,55,110,60,90,120,180,240,360,480,540};
 	static const u32 ciphers[] = { WLAN_CIPHER_SUITE_CCMP };
-	static const u32 akms[] = { WLAN_AKM_SUITE_PSK };
+	static const u32 akms[] = { WLAN_AKM_SUITE_PSK, WLAN_AKM_SUITE_SAE };
 	unsigned int i;
 	int ret;
 
@@ -567,6 +567,8 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 	m->wiphy->akm_suites = akms;
 	m->wiphy->n_akm_suites = ARRAY_SIZE(akms);
 	wiphy_ext_feature_set(m->wiphy, NL80211_EXT_FEATURE_4WAY_HANDSHAKE_STA_PSK);
+	wiphy_ext_feature_set(m->wiphy, NL80211_EXT_FEATURE_SAE_OFFLOAD);
+	wiphy_ext_feature_set(m->wiphy, NL80211_EXT_FEATURE_MFP_OPTIONAL);
 	m->wiphy->max_scan_ssids = 1;
 	m->wiphy->max_scan_ie_len = 600;
 	m->wiphy->reg_notifier = mt_regulatory_notify;
