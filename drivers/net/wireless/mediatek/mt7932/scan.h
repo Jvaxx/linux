@@ -85,6 +85,33 @@ static inline void mt7932_scan_disconnected_passive(u8 body[0x4d4])
 	put_unaligned_le16(233, body + 0x4ca);
 }
 
+/* CID03 carries up to four directed SSIDs in 36-byte slots (le32 length,
+ * 32 bytes) at offset 8; selector 8 marks a directed request and byte 4
+ * counts the populated slots. Wildcard entries occupy no slot. A directed
+ * request carries no probe IEs.
+ */
+#define MT7932_SCAN_SSIDS 4
+
+static inline int mt7932_scan_ssid_slot(u8 body[0x4d4], const u8 *ssid,
+					size_t ssid_length)
+{
+	u8 slot = body[4];
+
+	if (!ssid_length)
+		return 0;
+	if (ssid_length > 32 || !body[2])
+		return -EINVAL;
+	if (slot >= MT7932_SCAN_SSIDS)
+		return -ENOSPC;
+	body[3] = 8;
+	put_unaligned_le32(ssid_length, body + 8 + 36 * slot);
+	memcpy(body + 12 + 36 * slot, ssid, ssid_length);
+	body[4] = slot + 1;
+	memset(body + 0xe2, 0, 600);
+	put_unaligned_le16(0, body + 0xe0);
+	return 0;
+}
+
 /* This firmware requires its native wildcard template. Directed scans use
  * no probe IEs. Forwarding the normal supplicant extras stalled the scan
  * on J700; arbitrary caller probe-IE carriage remains unsupported here.
@@ -101,17 +128,7 @@ static inline int mt7932_scan_options(u8 body[0x4d4], const u8 *ssid,
 			return -EINVAL;
 		offset += 2 + ies[offset + 1];
 	}
-	if (ssid_length) {
-		body[3] = 8;
-		body[4] = 1;
-		put_unaligned_le32(ssid_length, body + 8);
-		memcpy(body + 12, ssid, ssid_length);
-	}
-	if (ssid_length) {
-		memset(body + 0xe2, 0, 600);
-		put_unaligned_le16(0, body + 0xe0);
-	}
-	return 0;
+	return mt7932_scan_ssid_slot(body, ssid, ssid_length);
 }
 
 /* Original online-scan state retains the BSS/keys and supplies its home

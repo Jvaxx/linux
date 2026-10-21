@@ -103,6 +103,20 @@ static void mt7932_band_scan_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, mt7932_scan_options(body, (const u8 *)"hidden", 6, NULL, 0), 0);
 	KUNIT_EXPECT_EQ(test, body[2], 1);
 	KUNIT_EXPECT_EQ(test, body[3], 8);
+	KUNIT_EXPECT_EQ(test, body[4], 1);
+	/* Further directed SSIDs fill the next slots; wildcards take none. */
+	KUNIT_EXPECT_EQ(test, mt7932_scan_ssid_slot(body, NULL, 0), 0);
+	KUNIT_EXPECT_EQ(test, mt7932_scan_ssid_slot(body, (const u8 *)"second", 6), 0);
+	KUNIT_EXPECT_EQ(test, body[4], 2);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(body + 8 + 36), 6);
+	KUNIT_EXPECT_EQ(test, memcmp(body + 12 + 36, "second", 6), 0);
+	KUNIT_EXPECT_EQ(test, memcmp(body + 12, "hidden", 6), 0);
+	KUNIT_EXPECT_EQ(test, mt7932_scan_ssid_slot(body, (const u8 *)"c", 1), 0);
+	KUNIT_EXPECT_EQ(test, mt7932_scan_ssid_slot(body, (const u8 *)"d", 1), 0);
+	KUNIT_EXPECT_EQ(test, body[4], 4);
+	KUNIT_EXPECT_EQ(test, mt7932_scan_ssid_slot(body, (const u8 *)"e", 1), -ENOSPC);
+	KUNIT_EXPECT_EQ(test, body[0xa0], 3);
+	KUNIT_EXPECT_EQ(test, body[0xa1], 5);
 	KUNIT_EXPECT_EQ(test, mt7932_scan_home(body, NL80211_BAND_6GHZ, 5), 0);
 	KUNIT_EXPECT_EQ(test, body[0x4cd], 3);
 	KUNIT_EXPECT_EQ(test, mt7932_scan_home(body, NL80211_BAND_2GHZ, 5), 0);

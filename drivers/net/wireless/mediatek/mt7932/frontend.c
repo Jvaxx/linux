@@ -162,12 +162,17 @@ int mt_scan_quiesce(struct mt7932 *m)
 static int mt_scan_submit_next(struct mt7932 *m)
 {
 	struct cfg80211_scan_request *request = m->scan_request;
-	const struct cfg80211_ssid *ssid = NULL;
 	u8 body[0x4d4], channels[MT7932_SCAN_CHANNELS];
 	unsigned int count = 0, i;
 	unsigned long flags;
-	bool passive = false;
+	bool passive = false, directed = false;
 	int ret;
+
+	/* Hidden networks are found by a directed probe; supplicants send the
+	 * hidden SSIDs together with a wildcard entry.
+	 */
+	for (i = 0; i < request->n_ssids; i++)
+		directed |= !!request->ssids[i].ssid_len;
 
 	/* 2GHz active/passive, then 5GHz active/passive. Never put a NO_IR
 	 * channel in a firmware request which can emit probe requests.
@@ -181,8 +186,7 @@ static int mt_scan_submit_next(struct mt7932 *m)
 			struct ieee80211_channel *channel = request->channels[i];
 			bool radar = channel->flags & IEEE80211_CHAN_RADAR;
 			bool listen = !request->n_ssids || radar ||
-				      (channel->band == NL80211_BAND_6GHZ &&
-				       !request->ssids[0].ssid_len) ||
+				      (channel->band == NL80211_BAND_6GHZ && !directed) ||
 				      (channel->flags & IEEE80211_CHAN_NO_IR);
 
 			/* Radar channels are never joined; while associated,
@@ -201,8 +205,6 @@ static int mt_scan_submit_next(struct mt7932 *m)
 	}
 	if (!count)
 		return 1;
-	if (!passive && request->n_ssids)
-		ssid = &request->ssids[0];
 	spin_lock_irqsave(&m->response_lock, flags);
 	if (m->scan_aborted || !mt_rf_allowed(m) || m->disconnecting ||
 	    (m->scan_home_channel && !m->connected)) {
@@ -226,9 +228,10 @@ static int mt_scan_submit_next(struct mt7932 *m)
 	if (ret >= 0)
 		ret = mt7932_scan_home(body, m->scan_home_band, m->scan_home_channel);
 	if (ret >= 0)
-		ret = mt7932_scan_options(body, ssid ? ssid->ssid : NULL,
-					  ssid ? ssid->ssid_len : 0,
-					  request->ie, request->ie_len);
+		ret = mt7932_scan_options(body, NULL, 0, request->ie, request->ie_len);
+	for (i = 0; ret >= 0 && !passive && i < request->n_ssids; i++)
+		ret = mt7932_scan_ssid_slot(body, request->ssids[i].ssid,
+					    request->ssids[i].ssid_len);
 	if (ret >= 0) {
 		schedule_delayed_work(&m->scan_timeout_work, msecs_to_jiffies(60000));
 		ret = mt_request(m, 3, true, true, false, body, sizeof(body));
@@ -373,9 +376,12 @@ int mt_scan(struct wiphy *wiphy, struct cfg80211_scan_request *request)
 		return -EOPNOTSUPP;
 	if (!request->n_channels || request->ie_len > 600 ||
 	    request->duration_mandatory ||
-	    (request->flags & ~(NL80211_SCAN_FLAG_FLUSH | NL80211_SCAN_FLAG_COLOCATED_6GHZ)) || request->n_ssids > 1 ||
-	    (request->n_ssids && request->ssids[0].ssid_len > 32))
+	    (request->flags & ~(NL80211_SCAN_FLAG_FLUSH | NL80211_SCAN_FLAG_COLOCATED_6GHZ)) ||
+	    request->n_ssids > MT7932_SCAN_SSIDS)
 		return -EOPNOTSUPP;
+	for (i = 0; i < request->n_ssids; i++)
+		if (request->ssids[i].ssid_len > 32)
+			return -EOPNOTSUPP;
 	for (i = 0; i < request->n_channels; i++) {
 		struct ieee80211_channel *channel = request->channels[i];
 
