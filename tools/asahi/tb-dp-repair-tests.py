@@ -41,7 +41,10 @@ struct device {int unused;};
 struct tb_switch {struct device dev;};
 struct tb_port {struct tb_switch *sw;bool is_dpin;struct list_head list;};
 struct work_struct {void(*fn)(struct work_struct*);bool pending;};
-struct tb {int lock;struct device dev;void*wq;struct tb_switch*root_switch;};
+struct tb_nhi {unsigned long quirks;};
+#define BIT(n) (1UL<<(n))
+#define QUIRK_NO_SYSTEM_SLEEP BIT(5)
+struct tb {int lock;struct device dev;void*wq;struct tb_switch*root_switch;struct tb_nhi*nhi;};
 struct tb_cm {bool hotplug_active;struct work_struct dp_tunnel_work;bool dp_tunnel_pending;};
 struct domain {struct tb tb;struct tb_cm cm;};
 _Static_assert(offsetof(struct domain,cm)==sizeof(struct tb),"mock private storage adjacency");
@@ -52,6 +55,7 @@ enum {TB_TUNNEL_DP,TB_TUNNEL_USB3};
 struct tb_tunnel {struct kref kref;struct tb*tb;struct tb_port*src_port,*dst_port;int npaths;void(*destroy)(struct tb_tunnel*);struct list_head list;int type;bool dprx_started;void(*callback)(struct tb_tunnel*,void*);void*callback_data;struct tb_path*paths[3];};
 static int tb_tunnel_lock,occupied,alloc_calls,alloc_failures,alloc_successes,freed;
 static int domain_refs,pm_refs,pm_calls,pm_error,stop_during_pm,requeue_once,lock_depth;
+static int restore_calls,scan_calls,unplugged_xdomains;
 static struct tb_tunnel *current;
 static struct domain domain;
 #define container_of(p,t,m) ((t*)((char*)(p)-offsetof(t,m)))
@@ -63,6 +67,18 @@ static struct tb*tcm_to_tb(struct tb_cm*c){return (struct tb*)((char*)c-sizeof(s
 static void mutex_lock(int*x){if(x==&domain.tb.lock){CHECK(!lock_depth);lock_depth++;}}
 static void mutex_unlock(int*x){if(x==&domain.tb.lock){CHECK(lock_depth==1);lock_depth--;}}
 #define lockdep_assert_held(x) CHECK((x)==&domain.tb.lock && lock_depth==1)
+/* guard()/scoped_guard() as in <linux/cleanup.h>: the lock is dropped when the scope ends. */
+static int*guard_mutex_lock(int*x){mutex_lock(x);return x;}
+static void guard_mutex_unlock(int**x){if(*x)mutex_unlock(*x);}
+#define GUARD_CAT2(a,b) a##b
+#define GUARD_CAT(a,b) GUARD_CAT2(a,b)
+#define guard(type) int*GUARD_CAT(guard_,__COUNTER__) __attribute__((unused,cleanup(guard_##type##_unlock)))=guard_##type##_lock
+#define scoped_guard(type,x) \
+ for(int*scope __attribute__((cleanup(guard_##type##_unlock)))=guard_##type##_lock(x),*scope_done=NULL; \
+     !scope_done;scope_done=scope)
+static int tb_domain_unregister_unplugged_xdomains(struct tb*t){return unplugged_xdomains;}
+static void tb_scan_switch(struct tb_switch*s){CHECK(lock_depth==1 && s);scan_calls++;}
+static void tb_restore_dp_resources(struct tb_switch*s){CHECK(lock_depth==1 && s);restore_calls++;}
 static void kref_get(struct kref*k){CHECK(k->count>0);k->count++;}
 static void kref_put(struct kref*k,void(*destroy)(struct kref*)){CHECK(k->count>0);if(!--k->count)destroy(k);}
 static void tb_path_free(struct tb_path*p){if(p->reserved)occupied--;freed++;free(p);}
@@ -119,8 +135,25 @@ static void queue_repair(unsigned count){
  for(unsigned i=0;i<count;i++)tb_queue_dp_tunnels(&domain.tb);
  mutex_unlock(&domain.tb.lock);
 }
+static struct tb_nhi nhi;
+/*
+ * Freeze drops the queued pass and keeps the request; thaw replays it while
+ * the domain's runtime PM is still disabled (-EACCES), so it is kept again;
+ * early resume then enables runtime PM before completion.
+ */
+static void freeze_then_thaw_with_pm_disabled(void){
+ queue_repair(1);
+ mutex_lock(&domain.tb.lock);CHECK(!tb_freeze_noirq(&domain.tb));mutex_unlock(&domain.tb.lock);
+ flush_queue();CHECK(!alloc_calls && !pm_calls && domain.cm.dp_tunnel_pending);
+ pm_error=-13;
+ mutex_lock(&domain.tb.lock);CHECK(!tb_thaw_noirq(&domain.tb));mutex_unlock(&domain.tb.lock);
+ CHECK(domain.cm.dp_tunnel_work.pending);
+ flush_queue();CHECK(!alloc_calls && pm_calls==1 && domain.cm.dp_tunnel_pending);
+ pm_error=0;
+}
 int main(int argc,char**argv){
  CHECK(argc==2);
+ domain.tb.nhi=&nhi;
  struct tb_switch sw={0};struct tb_port in={.sw=&sw,.is_dpin=true},out={.sw=&sw};
  domain_refs=1;domain.tb.root_switch=&sw;domain.tb.wq=&domain;domain.cm.hotplug_active=true;
  init_fixture(&domain.cm);CHECK(domain.cm.dp_tunnel_work.fn);
@@ -158,6 +191,31 @@ int main(int argc,char**argv){
   new_tunnel(&domain.tb,&in,&out);mutex_lock(&domain.tb.lock);
   tb_dp_resource_unavailable(&domain.tb,&in,"ordinary detach");mutex_unlock(&domain.tb.lock);
   CHECK(!occupied && freed==1 && !alloc_calls);flush_queue();CHECK(alloc_successes==1);
+ }else if(!strcmp(c,"noirq-pm-error-complete-replay")){
+  /* Generic host: completion replays the request the noirq pass could not serve. */
+  freeze_then_thaw_with_pm_disabled();
+  tb_complete(&domain.tb);
+  CHECK(!lock_depth && !restore_calls && !scan_calls && domain.cm.dp_tunnel_work.pending && domain_refs==2);
+  flush_queue();CHECK(alloc_calls==1 && alloc_successes==1 && pm_calls==2 && !domain.cm.dp_tunnel_pending);
+ }else if(!strcmp(c,"apple-complete-acknowledges")){
+  /* QUIRK_NO_SYSTEM_SLEEP pairs directly; that serves the request, so nothing is queued again. */
+  nhi.quirks=QUIRK_NO_SYSTEM_SLEEP;
+  freeze_then_thaw_with_pm_disabled();
+  tb_complete(&domain.tb);
+  CHECK(!lock_depth && restore_calls==1 && alloc_calls==1 && !domain.cm.dp_tunnel_pending);
+  CHECK(!domain.cm.dp_tunnel_work.pending && domain_refs==1);
+  flush_queue();CHECK(alloc_calls==1 && pm_calls==1);
+ }else if(!strcmp(c,"complete-no-request")){
+  tb_complete(&domain.tb);
+  CHECK(!lock_depth && !domain.cm.dp_tunnel_work.pending && !alloc_calls && !restore_calls && domain_refs==1);
+  flush_queue();CHECK(!alloc_calls && !pm_calls);
+ }else if(!strcmp(c,"complete-xdomain-rescan-replay")){
+  /* The rescan's scoped lock is dropped before the pairing lock is taken. */
+  unplugged_xdomains=1;
+  freeze_then_thaw_with_pm_disabled();
+  tb_complete(&domain.tb);
+  CHECK(!lock_depth && scan_calls==1 && domain.cm.dp_tunnel_work.pending);
+  flush_queue();CHECK(alloc_successes==1 && !domain.cm.dp_tunnel_pending);
  }else return 78;
  printf("PASS %s\n",c);return 0;
 }
@@ -166,7 +224,12 @@ int main(int argc,char**argv){
 CASES = ['callback-release-before-repair', 'coalesce', 'stop-before-queue',
          'stop-after-queue', 'stop-during-pm', 'no-root', 'pm-failure',
          'requeue-running', 'ordinary-retirement', 'freeze-thaw-repair',
-         'pm-failure-retry']
+         'pm-failure-retry', 'noirq-pm-error-complete-replay',
+         'apple-complete-acknowledges', 'complete-no-request',
+         'complete-xdomain-rescan-replay']
+# The cases a tb_complete() without the replay and the acknowledgement must fail.
+COMPLETE_CASES = {'noirq-pm-error-complete-replay', 'apple-complete-acknowledges',
+                  'complete-xdomain-rescan-replay'}
 MUTANTS = {
     'inline-repair': ('\ttb_recalc_estimated_bandwidth(tb);\n\ttb_queue_dp_tunnels(tb);',
                       '\ttb_recalc_estimated_bandwidth(tb);\n\ttb_tunnel_dp(tb);'),
@@ -181,9 +244,16 @@ MUTANTS = {
     'missing-probe-init': ('INIT_WORK(&tcm->dp_tunnel_work, tb_dp_tunnel_work);',
                            '/* removed probe initialization */'),
     'missing-pending-request': ('\ttcm->dp_tunnel_pending = true;', '\t/* lost request */'),
-    'pending-never-consumed': ('\t\ttcm->dp_tunnel_pending = false;', '\t\t/* pending forever */'),
-    'missing-thaw-requeue': ('\tif (tcm->dp_tunnel_pending)\n\t\ttb_queue_dp_tunnels(tb);',
-                             '\t/* lost thaw request */'),
+    'pending-never-consumed': ('if (tcm->hotplug_active && tb->root_switch) {\n\t\ttcm->dp_tunnel_pending = false;',
+                               'if (tcm->hotplug_active && tb->root_switch) {\n\t\t/* pending forever */'),
+    'missing-thaw-requeue': ('\ttcm->hotplug_active = true;\n\tif (tcm->dp_tunnel_pending)\n\t\ttb_queue_dp_tunnels(tb);',
+                             '\ttcm->hotplug_active = true;\n\t/* lost thaw request */'),
+    'missing-complete-replay': ('was disabled. */\n\tif (tcm->dp_tunnel_pending)\n\t\ttb_queue_dp_tunnels(tb);',
+                                'was disabled. */\n\t/* lost completion replay */'),
+    'missing-apple-ack': ('\t\ttb_restore_dp_resources(tb->root_switch);\n\t\ttcm->dp_tunnel_pending = false;',
+                          '\t\ttb_restore_dp_resources(tb->root_switch);\n\t\t/* request not acknowledged */'),
+    'unconditional-complete-replay': ('was disabled. */\n\tif (tcm->dp_tunnel_pending)\n\t\ttb_queue_dp_tunnels(tb);',
+                                      'was disabled. */\n\ttb_queue_dp_tunnels(tb);'),
 }
 
 
@@ -191,6 +261,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--mutations', action='store_true')
     parser.add_argument('--output', type=Path)
+    parser.add_argument('--complete-ref', help='negative control: take only tb_complete() from '
+                        'this commit; exactly the completion cases must fail')
     args = parser.parse_args()
     tb = (ROOT / 'drivers/thunderbolt/tb.c').read_text()
     tunnel = (ROOT / 'drivers/thunderbolt/tunnel.c').read_text()
@@ -198,8 +270,12 @@ def main():
     parts = {n: function(tunnel, n) for n in names}
     for name in ['tb_deactivate_and_free_tunnel', 'tb_dp_tunnel_work',
                  'tb_queue_dp_tunnels', 'tb_dp_resource_unavailable',
-                 'tb_freeze_noirq', 'tb_thaw_noirq']:
+                 'tb_freeze_noirq', 'tb_thaw_noirq', 'tb_complete']:
         parts[name] = function(tb, name)
+    if args.complete_ref:
+        old = subprocess.check_output(['git', 'show', args.complete_ref + ':drivers/thunderbolt/tb.c'],
+                                      cwd=ROOT, text=True)
+        parts['tb_complete'] = function(old, 'tb_complete')
     worker = function(tunnel, 'tb_dp_dprx_work')
     marker = '\ttunnel->dprx_started = false;'
     if worker.count(marker) != 1:
@@ -215,7 +291,7 @@ def main():
         out = args.output or Path(tmp)
         out.mkdir(parents=True, exist_ok=True)
         variants = {'real': production}
-        if args.mutations:
+        if args.mutations and not args.complete_ref:
             for name, (old, new) in MUTANTS.items():
                 if production.count(old) != 1:
                     raise ValueError('Mutation site changed: ' + name)
@@ -237,7 +313,12 @@ def main():
                 runs.append({'case': case, 'rc': run.returncode,
                              'stdout': run.stdout, 'stderr': run.stderr})
             failures = [r for r in runs if r['rc'] != 0]
-            if name == 'real' and failures:
+            if args.complete_ref:
+                failed = {r['case'] for r in failures}
+                if failed != COMPLETE_CASES or any(r['rc'] != 77 for r in failures):
+                    raise RuntimeError('Control did not fail exactly the completion cases: ' +
+                                       json.dumps(sorted(failed)))
+            elif name == 'real' and failures:
                 raise RuntimeError(json.dumps(failures))
             if name != 'real' and not any(r['rc'] == 77 for r in failures):
                 raise RuntimeError('Mutant not caught by a valid runtime assertion: ' + name)
@@ -246,9 +327,12 @@ def main():
             n: hashlib.sha256(body.encode()).hexdigest() for n, body in parts.items()},
             'worker_tail_sha256': hashlib.sha256(tail.encode()).hexdigest(),
             'probe_initializers': initializers,
+            'complete_ref': args.complete_ref,
             'results': results}
         (out / 'receipt.json').write_text(json.dumps(receipt, indent=2) + '\n')
         print(json.dumps({'cases': len(CASES), 'passed': True,
+                          'complete_ref': args.complete_ref,
+                          'control_failed': sorted(COMPLETE_CASES) if args.complete_ref else [],
                           'mutants_caught': len(variants) - 1, 'output': str(out)}))
 
 

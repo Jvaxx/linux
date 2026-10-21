@@ -3471,6 +3471,8 @@ static void tb_restore_dp_resources(struct tb_switch *sw)
 
 static void tb_complete(struct tb *tb)
 {
+	struct tb_cm *tcm = tb_priv(tb);
+
 	/*
 	 * Unregister unplugged XDomains and if there is a case where
 	 * another domain is swapped in place of unplugged XDomain we
@@ -3485,11 +3487,16 @@ static void tb_complete(struct tb *tb)
 	 * Routers kept awake through system sleep send no plug events for
 	 * the DP resources released at suspend, so pair them up again here.
 	 */
+	guard(mutex)(&tb->lock);
 	if (tb->nhi->quirks & QUIRK_NO_SYSTEM_SLEEP) {
-		guard(mutex)(&tb->lock);
 		tb_restore_dp_resources(tb->root_switch);
+		tcm->dp_tunnel_pending = false;
 		tb_tunnel_dp(tb);
 	}
+
+	/* A noirq replay may have failed while runtime PM was disabled. */
+	if (tcm->dp_tunnel_pending)
+		tb_queue_dp_tunnels(tb);
 }
 
 static int tb_runtime_suspend(struct tb *tb)
