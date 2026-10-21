@@ -97,15 +97,22 @@ NetworkManager with wpa_supplicant, pending the hardware qualification below.
 The standard SAE PWE settings (unspecified, hunting-and-pecking,
 hash-to-element and both) are accepted; firmware chooses the exchange without
 a host PWE field. Exact PWE policy behavior on 2.4 and 5 GHz still needs
-qualification. SAE-PK, SAE-EXT-KEY, additional ciphers, OWE and 6 GHz are not
+qualification. SAE-PK, SAE-EXT-KEY, additional ciphers and 6 GHz are not
 advertised.
 
-One-shot J700 hardware testing has confirmed SAE connections on 2.4 and
-5 GHz, WPA2-PSK on both bands and PSK-selected transition. The SAE request
-layout, transition admission and PMK derivation also have automated tests.
-Separate SAE-selected transition coverage, exact PWE policy behavior,
-WPA2 throughput regression comparisons and long-duration reliability still
-need qualification.
+J700 hardware testing with NetworkManager and wpa_supplicant on a PSK+SAE
+transition network has confirmed, on 2.4 GHz channel 6 and 5 GHz channel 149:
+
+* SAE with required MFP (``key-mgmt=sae``), including DHCP, DNS and HTTPS;
+* PSK with MFP disabled, and a ``wpa-psk`` profile with optional MFP, which
+  joins the transition network as PSK;
+* repeated reconnection through NetworkManager after each change of profile.
+
+The request layout, transition admission and PMK derivation also have
+automated tests. A pure WPA3 network, exact PWE policy behavior, WPA2
+throughput regression comparisons and long-duration reliability still need
+qualification. 2.4 GHz throughput is lower than 5 GHz with every security
+mode.
 
 Enhanced Open (OWE)
 -------------------
