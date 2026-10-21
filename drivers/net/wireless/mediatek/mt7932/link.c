@@ -179,11 +179,19 @@ void mt_link_event(struct mt7932 *m, const struct mt7932_event *event)
 			complete(&m->assoc_start);
 			complete(&m->assoc_done);
 		} else {
+			const struct element *ht;
 			const struct element *he = cfg80211_find_ext_elem(
 				WLAN_EID_EXT_HE_CAPABILITY, m->assoc_request_ies, ret);
 
 			m->assoc_request_ie_len = ret;
 			m->assoc_request_seen = true;
+			ht = cfg80211_find_elem(WLAN_EID_HT_CAPABILITY,
+						m->assoc_request_ies, ret);
+			if (ht)
+				dev_dbg(&m->pdev->dev,
+					"ASSOC_HT_CAPABILITIES: epoch=%u cap=%04x ampdu=%02x mcs=%02x/%02x\n",
+					m->connection_generation, get_unaligned_le16(ht->data),
+					ht->data[2], ht->data[3], ht->data[4]);
 			/* Generated station request, not the AP's capability or a
 			 * rate-control setting. Bounds were checked by the exporter.
 			 */

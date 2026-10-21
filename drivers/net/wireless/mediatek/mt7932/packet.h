@@ -221,6 +221,27 @@ static inline bool mt7932_rx_duplicate(struct mt7932_duplicate cache[17],
 	return false;
 }
 
+enum mt7932_rx_verdict {
+	MT7932_RX_ACCEPT,
+	MT7932_RX_UNPROTECTED,
+	MT7932_RX_DUPLICATE,
+};
+
+/* Rejected protection must not record a sequence as successfully received.
+ * Otherwise a later decrypted retry can be discarded as a duplicate even
+ * though no copy of its Ethernet payload reached the network stack.
+ */
+static inline enum mt7932_rx_verdict
+mt7932_rx_filter(struct mt7932_duplicate cache[17],
+		 const struct mt7932_rx_frame *frame, bool open)
+{
+	if (!mt7932_rx_protection_ok(frame, open))
+		return MT7932_RX_UNPROTECTED;
+	if (mt7932_rx_duplicate(cache, frame))
+		return MT7932_RX_DUPLICATE;
+	return MT7932_RX_ACCEPT;
+}
+
 /* Validate the complete variable walk before returning any completion IDs. */
 static inline int mt7932_tx_free(const u8 *packet, size_t size, u16 *tokens,
 				 unsigned int capacity)

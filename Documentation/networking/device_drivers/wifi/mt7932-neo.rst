@@ -261,6 +261,35 @@ Use ``--band bg`` for 2.4 GHz. Require ``WIFI_PHYSICAL_NETWORK_E2E_PASS`` in
 the JSON artifact printed on completion. The artifact records three traffic
 samples and response hashes, omitting network names, addresses and credentials.
 
+Receive diagnostics
+-------------------
+
+``ethtool -S <interface>`` reports lifetime host counters for malformed,
+unsupported and integrity-rejected RX records, wrong peers, unprotected
+data on protected connections, retry duplicates and allocation failures.
+Take before/after differences for each traffic sample; reconnecting does
+not reset these counters. Descriptor rejection counters include management
+records and off-channel traffic. The other counters describe the admitted
+peer's Ethernet receive path.
+
+Retry and A-MSDU counters count received MSDU records, including split
+A-MSDU subframes, before protection and duplicate filtering. They are not
+over-air MPDU counts, BA-window sizes, TX retries or firmware ACK counters.
+Duplicate suppression records sequences only after the protection check,
+so a rejected unprotected frame cannot suppress a later decrypted retry.
+
+Use the current RX bitrate from ``iw dev <interface> station dump`` while
+traffic is running. The driver expires that sample after one second; an
+idle or unsupported RX vector can leave it absent. TX bitrate is not
+reported because the firmware's TX-vector query cannot attest peer
+identity or freshness. Missing TX bitrate is not a zero-rate measurement.
+
+Dynamic debug messages ``ASSOC_HT_CAPABILITIES``,
+``ASSOC_HE_CAPABILITIES`` and ``ASSOC_START`` describe the firmware-generated
+station capabilities and channel event. ``POWER_SAVE_SUBMITTED`` records
+the requested mode and submission status, without asserting firmware
+readback. These messages contain neither credentials nor packet payloads.
+
 Limitations
 -----------
 

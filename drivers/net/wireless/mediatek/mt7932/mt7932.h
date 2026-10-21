@@ -14,6 +14,7 @@
 #include <linux/of.h>
 #include <linux/of_net.h>
 #include <linux/etherdevice.h>
+#include <linux/ethtool.h>
 #include <linux/if_vlan.h>
 #include <linux/pci.h>
 #include <linux/random.h>
@@ -192,6 +193,10 @@ struct mt7932 {
 	bool data_live[512], data_token[512], data_retired[512];
 	struct mt7932_duplicate duplicates[17];
 	u64 tx_released, rx_ethernet;
+	/* Lifetime host RX observations, protected by response_lock. */
+	u64 rx_integrity, rx_malformed, rx_unsupported;
+	u64 rx_wrong_peer, rx_unprotected, rx_duplicate, rx_no_memory;
+	u64 rx_retry, rx_amsdu;
 	/* TX0 descriptors published since the last doorbell; data_lock. */
 	unsigned int data_unkicked;
 	bool data_ready;
@@ -233,6 +238,7 @@ void mt_bss_presence(struct mt7932 *m, const struct mt7932_event *event);
 void mt_data_complete(struct mt7932 *m, const u8 *packet, size_t length);
 netdev_tx_t mt_net_xmit(struct sk_buff *skb, struct net_device *netdev);
 void mt_data_receive(struct mt7932 *m, const struct mt7932_rx_frame *frame);
+extern const struct ethtool_ops mt_ethtool_ops;
 int mt_data_prepare(struct mt7932 *m);
 struct mt7932 *mt_from_wiphy(struct wiphy *wiphy);
 void mt_scan_event(struct mt7932 *m, const struct mt7932_event *event);

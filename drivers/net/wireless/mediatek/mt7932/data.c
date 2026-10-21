@@ -219,6 +219,7 @@ static int mt_rate_width(enum rate_info_bw bw)
 void mt_data_receive(struct mt7932 *m, const struct mt7932_rx_frame *frame)
 {
 	struct sk_buff *skb;
+	enum mt7932_rx_verdict verdict;
 	unsigned long flags;
 	int signal;
 
@@ -229,12 +230,25 @@ void mt_data_receive(struct mt7932 *m, const struct mt7932_rx_frame *frame)
 	if (!m->connected || !m->peer_valid || m->disconnecting || m->stopping)
 		goto unlock;
 	if ((frame->unicast && frame->wtbl != m->peer_wtbl) ||
-	    (!frame->unicast && frame->wtbl != m->peer_ids.wtbl[0] && frame->wtbl != m->peer_wtbl) ||
-	    mt7932_rx_duplicate(m->duplicates, frame)) {
+	    (!frame->unicast && frame->wtbl != m->peer_ids.wtbl[0] &&
+	     frame->wtbl != m->peer_wtbl)) {
+		m->rx_wrong_peer++;
 		m->netdev->stats.rx_dropped++;
 		goto unlock;
 	}
-	if (!mt7932_rx_protection_ok(frame, m->connect_open)) {
+	/* These count MSDU records, including split A-MSDU subframes. */
+	if (frame->group4 && (frame->frame_control & IEEE80211_FCTL_RETRY))
+		m->rx_retry++;
+	if (frame->amsdu)
+		m->rx_amsdu++;
+	verdict = mt7932_rx_filter(m->duplicates, frame, m->connect_open);
+	if (verdict == MT7932_RX_DUPLICATE) {
+		m->rx_duplicate++;
+		m->netdev->stats.rx_dropped++;
+		goto unlock;
+	}
+	if (verdict == MT7932_RX_UNPROTECTED) {
+		m->rx_unprotected++;
 		m->netdev->stats.rx_dropped++;
 		dev_dbg_ratelimited(&m->pdev->dev,
 				    "RX_UNPROTECTED_DROPPED: cipher=%u mismatch=%u\n",
@@ -243,6 +257,7 @@ void mt_data_receive(struct mt7932 *m, const struct mt7932_rx_frame *frame)
 	}
 	skb = netdev_alloc_skb_ip_align(m->netdev, frame->length);
 	if (!skb) {
+		m->rx_no_memory++;
 		m->netdev->stats.rx_dropped++;
 		goto unlock;
 	}
