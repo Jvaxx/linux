@@ -1097,10 +1097,10 @@ impl SepData {
                 "sks: endpoint 0x{:02x} (key store) not advertised; {} EPs up (control={} xarm={} sbio={} scrd={}); keybag/ref-key cannot run\n",
                 proto::EP_SKS,
                 self.endpoint_count(),
-                self.endpoint_present(proto::EP_CONTROL) as u8,
-                self.endpoint_present(proto::EP_XARM) as u8,
-                self.endpoint_present(proto::EP_SBIO) as u8,
-                self.endpoint_present(proto::EP_SCRD) as u8,
+                u8::from(self.endpoint_present(proto::EP_CONTROL)),
+                u8::from(self.endpoint_present(proto::EP_XARM)),
+                u8::from(self.endpoint_present(proto::EP_SBIO)),
+                u8::from(self.endpoint_present(proto::EP_SCRD)),
             );
             return false;
         }

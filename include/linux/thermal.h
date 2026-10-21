@@ -192,6 +192,9 @@ struct thermal_zone_params {
 	 * 		Used by thermal zone drivers (default 0).
 	 */
 	int offset;
+
+	/* Integral time relative to k_pu, in ms; 0 keeps the per-poll estimate. */
+	u32 integral_time_constant_ms;
 };
 
 /* Function declarations */

@@ -117,6 +117,11 @@ class FakeMac:
         journal = self.tmp / "bin/journalctl"
         journal.write_text("#!/bin/sh\nexit 0\n")
         journal.chmod(0o755)
+        # Fake state files need no host-wide flush. Durability tests replace this
+        # with their recording/failing sync implementation.
+        sync = self.tmp / "bin/sync"
+        sync.write_text("#!/bin/sh\nexit 0\n")
+        sync.chmod(0o755)
 
     @staticmethod
     def b2(p):

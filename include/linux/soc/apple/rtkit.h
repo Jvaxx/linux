@@ -72,6 +72,11 @@ struct apple_rtkit_shmem {
  * @shmem_destroy: Undo the shared memory buffer setup in shmem_setup. If not
  *                 specified dma_free_coherent is used. Called in process
  *                 context.
+ * @syslog_is_debug:
+ *                 Optional policy for a decoded, NUL-terminated syslog record.
+ *                 Return true to log at debug instead of info. Called in
+ *                 process context; strings are borrowed until return. Records
+ *                 are acknowledged regardless of the chosen log level.
  */
 struct apple_rtkit_ops {
 	unsigned int flags;
@@ -80,6 +85,7 @@ struct apple_rtkit_ops {
 	bool (*recv_message_early)(void *cookie, u8 endpoint, u64 message);
 	int (*shmem_setup)(void *cookie, struct apple_rtkit_shmem *bfr);
 	void (*shmem_destroy)(void *cookie, struct apple_rtkit_shmem *bfr);
+	bool (*syslog_is_debug)(void *cookie, const char *context, const char *message);
 };
 
 struct apple_rtkit;

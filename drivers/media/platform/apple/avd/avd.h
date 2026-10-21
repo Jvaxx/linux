@@ -232,6 +232,7 @@ struct avd_dev {
 	struct reset_control *rstc;
 
 	const struct avd_variant *variant;
+	unsigned int capabilities;
 };
 
 struct avd_segment {

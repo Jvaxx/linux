@@ -699,7 +699,7 @@ static bool rmap_matches(struct mm_subpage_rmap map, struct vm_area_struct *vma,
 			 unsigned long address)
 {
 	return map.root == vma->anon_vma->root &&
-		vm_page_offset_equal(map.pos, vma_page_offset_at(vma, address));
+		vm_page_offset_equal(map.pos, vma_anon_page_offset_at(vma, address));
 }
 
 bool mm_subpage_match_rmap(struct mm_subpage *slot, struct vm_area_struct *vma,
@@ -797,7 +797,7 @@ int mm_subpage_bind_rmap(struct mm_subpage *slot, struct vm_area_struct *vma,
 			get_anon_vma(vma->anon_vma->root);
 			map->root = vma->anon_vma->root;
 		}
-		map->pos = vma_page_offset_at(vma, address);
+		map->pos = vma_anon_page_offset_at(vma, address);
 		map->offset = mm_subpage_offset(slot);
 	}
 	slot->rmap_bound = true;
@@ -886,7 +886,7 @@ int mm_subpage_move_prepare(struct mm_subpage_move *move, struct mm_subpage *slo
 	move->swap = swap;
 	move->map = (struct mm_subpage_rmap) {
 		.root = dst->anon_vma->root,
-		.pos = vma_page_offset_at(dst, dst_address),
+		.pos = vma_anon_page_offset_at(dst, dst_address),
 		.offset = mm_subpage_offset(slot),
 	};
 	return 0;
@@ -986,7 +986,7 @@ bool mm_subpage_address_in_vma(const struct folio *folio,
 			if (!owner->slots[i].rmap_bound ||
 			    owner->rmap[i].root != vma->anon_vma->root)
 				continue;
-			*address = vma_address_at_offset(vma, owner->rmap[i].pos);
+			*address = vma_address_at_anon_offset(vma, owner->rmap[i].pos);
 			if (*address != -EFAULT)
 				break;
 		}

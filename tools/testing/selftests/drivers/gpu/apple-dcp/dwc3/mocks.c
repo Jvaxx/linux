@@ -67,6 +67,7 @@ struct dwc3 {
 	int num_usb2_ports, num_usb3_ports, usb2_phy, usb3_phy;
 	struct reset_controller_dev *reset;
 	int dev, usb_psy, vbus_draw_work;
+	struct { void *notifier_call; } psy_nb;
 };
 struct dwc3_apple {
 	struct dwc3 dwc;
@@ -323,6 +324,7 @@ static int dwc3_gadget_init(struct dwc3 *d)
 #define dev_set_drvdata(...) ((void)0)
 #define cancel_work_sync(...) ((void)0)
 #define power_supply_put(...) ((void)0)
+#define power_supply_unreg_notifier(...) ((void)0)
 static void dwc3_core_exit_mode(struct dwc3 *d)
 {
 	(void)d;

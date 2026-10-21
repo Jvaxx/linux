@@ -37,7 +37,7 @@ pub(super) fn patch(bytes: &mut [u8], patches: &[(u32, u32)]) -> bool {
         let (key, size) = header(remaining).unwrap();
         let (body, rest) = remaining[8..].split_at_mut(size);
         if let Some((_, value)) = patches.iter().find(|(k, _)| *k == key) {
-            body.copy_from_slice(&(*value as u64).to_le_bytes()[..size]);
+            body.copy_from_slice(&u64::from(*value).to_le_bytes()[..size]);
         }
         remaining = rest;
     }

@@ -720,8 +720,13 @@ static void apple_rtkit_syslog_rx_log(struct apple_rtkit *rtk, u64 msg)
 		msglen--;
 
 	rtk->syslog_msg_buffer[msglen] = 0;
-	dev_info(rtk->dev, "RTKit: syslog message: %s: %s\n", log_context,
-		 rtk->syslog_msg_buffer);
+	if (rtk->ops->syslog_is_debug &&
+	    rtk->ops->syslog_is_debug(rtk->cookie, log_context, rtk->syslog_msg_buffer))
+		dev_dbg(rtk->dev, "RTKit: syslog message: %s: %s\n", log_context,
+			rtk->syslog_msg_buffer);
+	else
+		dev_info(rtk->dev, "RTKit: syslog message: %s: %s\n", log_context,
+			 rtk->syslog_msg_buffer);
 
 done:
 	apple_rtkit_send_message(rtk, APPLE_RTKIT_EP_SYSLOG, msg, NULL, false);

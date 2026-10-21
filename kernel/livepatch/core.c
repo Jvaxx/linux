@@ -808,9 +808,6 @@ void klp_free_replaced_patches_async(struct klp_patch *new_patch)
 
 static int klp_init_func(struct klp_object *obj, struct klp_func *func)
 {
-	if (!func->old_name)
-		return -EINVAL;
-
 	/*
 	 * NOPs get the address later. The patched module must be loaded,
 	 * see klp_init_object_loaded().
@@ -1101,6 +1098,25 @@ err:
 	return ret;
 }
 
+static int klp_check_patch(struct klp_patch *patch)
+{
+	struct klp_object *obj;
+	struct klp_func *func;
+
+	if (!patch || !patch->mod || !patch->objs)
+		return -EINVAL;
+
+	klp_for_each_object_static(patch, obj) {
+		if (!obj->funcs)
+			return -EINVAL;
+		klp_for_each_func_static(obj, func) {
+			if (!func->old_name)
+				return -EINVAL;
+		}
+	}
+	return 0;
+}
+
 /**
  * klp_enable_patch() - enable the livepatch
  * @patch:	patch to be enabled
@@ -1117,16 +1133,10 @@ err:
 int klp_enable_patch(struct klp_patch *patch)
 {
 	int ret;
-	struct klp_object *obj;
 
-	if (!patch || !patch->mod || !patch->objs)
-		return -EINVAL;
-
-	klp_for_each_object_static(patch, obj) {
-		if (!obj->funcs)
-			return -EINVAL;
-	}
-
+	ret = klp_check_patch(patch);
+	if (ret)
+		return ret;
 
 	if (!is_livepatch_module(patch->mod)) {
 		pr_err("module %s is not marked as a livepatch module\n",

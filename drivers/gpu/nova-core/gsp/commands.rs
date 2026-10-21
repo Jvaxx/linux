@@ -34,6 +34,7 @@ use crate::{
         },
     },
     sbuffer::SBufferIter,
+    vgpu::VgpuState, //
 };
 
 /// The `GspSetSystemInfo` command.
@@ -72,7 +73,7 @@ pub(crate) struct SetRegistry {
 
 impl SetRegistry {
     /// Creates a new `SetRegistry` command, using a set of hardcoded entries.
-    pub(crate) fn new() -> Result<Self> {
+    pub(crate) fn new(vgpu_state: VgpuState) -> Result<Self> {
         let mut entries = KVec::new();
 
         // RMSecBusResetEnable - enables PCI secondary bus reset
@@ -104,6 +105,17 @@ impl SetRegistry {
             GFP_KERNEL,
         )?;
 
+        if matches!(vgpu_state, VgpuState::Enabled { .. }) {
+            // RMSetSriovMode - required when vGPU is enabled.
+            entries.push(
+                RegistryEntry {
+                    key: "RMSetSriovMode",
+                    value: 1,
+                },
+                GFP_KERNEL,
+            )?;
+        }
+
         Ok(Self { entries })
     }
 }
@@ -115,10 +127,7 @@ impl CommandToGsp for SetRegistry {
     type InitError = Infallible;
 
     fn init(&self) -> impl Init<Self::Command, Self::InitError> {
-        Self::Command::init(
-            self.entries.len() as u32,
-            self.variable_payload_len() as u32,
-        )
+        Self::Command::init(self.entries.len() as u32, self.size() as u32)
     }
 
     fn variable_payload_len(&self) -> usize {

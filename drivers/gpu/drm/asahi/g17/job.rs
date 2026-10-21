@@ -201,7 +201,7 @@ impl Packet {
     }
     pub(crate) fn set_early_result(&self, result: Result) {
         self.early.store(
-            result.map_or_else(|error| error.to_errno(), |_| 1),
+            result.map_or_else(|error| error.to_errno(), |()| 1),
             Ordering::Release,
         );
     }
@@ -287,7 +287,8 @@ impl<B: Backend> Drop for Job<B> {
 
 impl<B: Backend> sched::JobImpl for Job<B> {
     type TimeoutData = Timeout<B>;
-    const MODULE: Option<&'static kernel::ThisModule> = Some(&crate::THIS_MODULE);
+    const MODULE: Option<&'static kernel::ThisModule> =
+        Some(kernel::module::this_module::<crate::LocalModule>());
 
     fn timeout_data(&self) -> Timeout<B> {
         Timeout {

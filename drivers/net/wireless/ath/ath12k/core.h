@@ -15,7 +15,6 @@
 #include <linux/ctype.h>
 #include <linux/firmware.h>
 #include <linux/of_reserved_mem.h>
-#include <linux/panic_notifier.h>
 #include <linux/average.h>
 #include <linux/of.h>
 #include <linux/rhashtable.h>
@@ -159,14 +158,6 @@ enum ath12k_hw_rev {
 	ATH12K_HW_IPQ5332_HW10,
 	ATH12K_HW_QCC2072_HW10,
 	ATH12K_HW_IPQ5424_HW10,
-};
-
-enum ath12k_firmware_mode {
-	/* the default mode, standard 802.11 functionality */
-	ATH12K_FIRMWARE_MODE_NORMAL,
-
-	/* factory tests etc */
-	ATH12K_FIRMWARE_MODE_FTM,
 };
 
 #define ATH12K_IRQ_NUM_MAX 57
@@ -942,6 +933,7 @@ struct ath12k_dp_profile_params {
 	u32 rxdma_monitor_dst_ring_size;
 	u32 num_pool_tx_desc;
 	u32 rx_desc_count;
+	u32 rx_release_ring_size;
 };
 
 struct ath12k_mem_profile_based_param {
@@ -1146,11 +1138,9 @@ struct ath12k_base {
 
 #endif /* CONFIG_ACPI */
 
-	struct notifier_block panic_nb;
-
 	struct ath12k_hw_group *ag;
 	struct ath12k_wsi_info wsi_info;
-	enum ath12k_firmware_mode fw_mode;
+	enum ath12k_qmi_firmware_mode fw_mode;
 	struct ath12k_ftm_event_obj ftm_event_obj;
 	bool hw_group_ref;
 

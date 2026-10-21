@@ -4644,6 +4644,7 @@ static int atcphy_mux_update(struct apple_atcphy *atcphy, const struct typec_mux
 		in_mode = atcphy_mux_in_mode(atcphy, target_mode);
 	}
 
+	dev_dbg(atcphy->dev, "mux target=%u: waiting for SuperSpeed root\n", target_mode);
 	ret = atcphy_usb3_pm_get(atcphy, &pm);
 	if (ret)
 		goto out;
@@ -4668,6 +4669,8 @@ static int atcphy_mux_update(struct apple_atcphy *atcphy, const struct typec_mux
 		atcphy->usb3_port_off = !ret;
 
 	ret = atcphy_mux_set_locked(atcphy, target_mode, &port_on);
+	dev_dbg(atcphy->dev, "mux target=%u: configured ret=%d restore=%u\n",
+		target_mode, ret, port_on);
 	usb_err = false;
 	if (port_on) {
 		int err = atcphy_usb3_port_on(atcphy, &pm);

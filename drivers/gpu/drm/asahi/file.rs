@@ -16,6 +16,7 @@ use crate::{
         AsahiDrmDevice, //
     },
     gem,
+    memacct,
     mmu,
     module_parameters,
     queue,
@@ -234,6 +235,8 @@ pub(crate) struct File {
     queues: xarray::XArray<Arc<Mutex<KBox<dyn queue::Queue>>>>,
     // #[pin]
     objects: xarray::XArray<KBox<Object>>,
+    /// GPU memory this client created and holds.
+    mem: Arc<memacct::Client>,
 }
 
 /// Convenience type alias for our DRM `File` type.
@@ -253,9 +256,20 @@ impl drm::file::DriverFile for File {
             let gpu = &reg_data.gpu;
             let id = gpu.ids().file.next();
             let user_range = gpu.uat_geometry().user_usable_range();
+            let mem = memacct::Client::new()?;
 
             mod_dev_dbg!(device, "[File {}]: DRM device opened\n", id);
-            Ok(KBox::pin_init(File::new(id, user_range), GFP_KERNEL)?)
+            KBox::pin_init(File::new(id, user_range, mem), GFP_KERNEL)
+        })
+    }
+
+    /// The objects this client created, which `memacct` attributes to it, not every object it
+    /// has a handle to: an imported or shared buffer is counted once, by its creator.
+    fn memory_stats(&self) -> Option<drm::file::MemoryStats> {
+        Some(drm::file::MemoryStats {
+            private: self.mem.committed(),
+            resident: Some(self.mem.resident()),
+            ..Default::default()
         })
     }
 
@@ -268,25 +282,36 @@ impl drm::file::DriverFile for File {
 unsafe impl AnyBitPattern for uapi::drm_asahi_gem_bind_op {}
 
 impl File {
-    fn new(id: u64, user_range: Range<u64>) -> impl PinInit<Self, Error> {
+    fn new(
+        id: u64,
+        user_range: Range<u64>,
+        mem: Arc<memacct::Client>,
+    ) -> impl PinInit<Self, Error> {
         unsafe {
             pin_init::pin_init_from_closure(move |slot: *mut Self| {
                 let raw_vms = addr_of_mut!((*slot).vms);
-                xarray::XArray::<KBox<Vm>>::new(xarray::AllocKind::Alloc1)
-                    .__pinned_init(raw_vms)?;
+                pin_init::raw_try_init(
+                    raw_vms,
+                    xarray::XArray::<KBox<Vm>>::new(xarray::AllocKind::Alloc1),
+                )?;
 
                 let raw_queues = addr_of_mut!((*slot).queues);
-                xarray::XArray::<Arc<Mutex<KBox<dyn queue::Queue>>>>::new(
-                    xarray::AllocKind::Alloc1,
-                )
-                .__pinned_init(raw_queues)?;
+                pin_init::raw_try_init(
+                    raw_queues,
+                    xarray::XArray::<Arc<Mutex<KBox<dyn queue::Queue>>>>::new(
+                        xarray::AllocKind::Alloc1,
+                    ),
+                )?;
 
                 let raw_objects = addr_of_mut!((*slot).objects);
-                xarray::XArray::<KBox<Object>>::new(xarray::AllocKind::Alloc1)
-                    .__pinned_init(raw_objects)?;
+                pin_init::raw_try_init(
+                    raw_objects,
+                    xarray::XArray::<KBox<Object>>::new(xarray::AllocKind::Alloc1),
+                )?;
 
                 (*slot).id = id;
                 (*slot).user_range = user_range;
+                addr_of_mut!((*slot).mem).write(mem);
                 Ok(())
             })
         }
@@ -338,7 +363,7 @@ impl File {
                 let limits = gpu.queue_limits().ok_or(EINVAL)?;
                 let words = [limits.max_queues, limits.max_in_flight_per_queue, 0, 0];
                 UserSlice::new(
-                    UserPtr::from_addr(data.pointer as _),
+                    UserPtr::from_addr(data.pointer as usize),
                     core::mem::size_of_val(&words),
                 )
                 .writer()
@@ -375,14 +400,15 @@ impl File {
         gpu.get_params(&mut params)?;
 
         if gpu.supports_vm_status() {
-            params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS as u64
-                | uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS_MIRROR as u64;
+            params.features |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS)
+                | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_VM_STATUS_MIRROR);
         }
         if gpu.queue_limits().is_some() {
-            params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES as u64;
+            params.features |=
+                u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_INDEPENDENT_QUEUES);
         }
 
-        if *module_parameters::fault_control.value() == 0xb {
+        if module_parameters::fault_control.value() == 0xb {
             params.features |= uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_SOFT_FAULTS as u64;
         }
 
@@ -390,7 +416,7 @@ impl File {
 
         // SAFETY: We only write to this userptr once, so there are no TOCTOU issues.
         let mut params_writer =
-            UserSlice::new(UserPtr::from_addr(data.pointer as _), size).writer();
+            UserSlice::new(UserPtr::from_addr(data.pointer as usize), size).writer();
 
         // SAFETY: `size` is at most the sizeof of `params`
         params_writer.write_slice(unsafe {
@@ -406,7 +432,7 @@ impl File {
         if data.pad != 0 || data.size < size as u64 {
             return Err(EINVAL);
         }
-        let user = UserPtr::from_addr(data.pointer as _);
+        let user = UserPtr::from_addr(data.pointer as usize);
         let [vm_id, flags, _, pad] = UserSlice::new(user, size).reader().read::<[u32; 4]>()?;
         if flags != 0 || pad != 0 {
             return Err(EINVAL);
@@ -425,7 +451,7 @@ impl File {
             return Err(EINVAL);
         }
         let [vm_id, handle, offset, flags] =
-            UserSlice::new(UserPtr::from_addr(data.pointer as _), size)
+            UserSlice::new(UserPtr::from_addr(data.pointer as usize), size)
                 .reader()
                 .read::<[u32; 4]>()?;
         if flags != 0 || handle == 0 || offset % core::mem::align_of::<i32>() as u32 != 0 {
@@ -627,7 +653,15 @@ impl File {
             None
         };
 
-        let gem = gem::new_object(device, data.size.try_into()?, data.flags, resv_obj, reclaim_cpu)?;
+        let size = gem::checked_object_size(data.size.try_into()?)?;
+        let commit = memacct::LEDGER.admit(&file.inner().mem, size as u64).inspect_err(|_| {
+            cls_pr_debug!(
+                Errors,
+                "gem_create: {:#x} bytes refused by the GPU memory limits\n",
+                size
+            );
+        })?;
+        let gem = gem::new_object(device, size, data.flags, resv_obj, reclaim_cpu, commit)?;
 
         let handle = gem.create_handle(file)?;
         data.handle = handle;
@@ -714,7 +748,7 @@ impl File {
         let size = usize::try_from(data.stride)?
             .checked_mul(usize::try_from(data.num_binds)?)
             .ok_or(EOVERFLOW)?;
-        let reader = UserSlice::new(UserPtr::from_addr(data.userptr as _), size).reader();
+        let reader = UserSlice::new(UserPtr::from_addr(data.userptr as usize), size).reader();
         reader.read_all(&mut vec, GFP_KERNEL)?;
         let mut reader = Reader::new(&vec);
 
@@ -732,7 +766,7 @@ impl File {
         let stride = usize::try_from(data.stride)?;
         let size = stride.checked_mul(count).ok_or(EOVERFLOW)?;
         let mut bytes = KVec::new();
-        UserSlice::new(UserPtr::from_addr(data.userptr as _), size)
+        UserSlice::new(UserPtr::from_addr(data.userptr as usize), size)
             .reader()
             .read_all(&mut bytes, GFP_KERNEL)?;
         let (vm, user_range, kernel_range) = {
@@ -1278,7 +1312,7 @@ impl File {
         let mut vec = KVec::new();
         let copy_commands = |bytes: &mut KVec<u8>| {
             UserSlice::new(
-                UserPtr::from_addr(data.cmdbuf as _),
+                UserPtr::from_addr(data.cmdbuf as usize),
                 data.cmdbuf_size as usize,
             )
             .reader()
@@ -1355,7 +1389,7 @@ impl File {
 
         // TODO: Do this on device-init for perf.
         let gpu = &reg_data.gpu;
-        let frequency_hz = gpu.base_clock_hz() as u64;
+        let frequency_hz = u64::from(gpu.base_clock_hz());
         let ts_gcd = gcd(frequency_hz, NSEC_PER_SEC as u64);
 
         let num = (NSEC_PER_SEC as u64) / ts_gcd;

@@ -20,6 +20,7 @@ mod hwrng;
 mod image;
 mod keybag;
 mod keybag_identity;
+mod os_identity;
 mod pm;
 mod profile;
 mod proto;
@@ -63,8 +64,9 @@ use kernel::{
             Relaxed, //
         },
         barrier::{
-            dma_rmb,
-            dma_wmb, //
+            dma_mb,
+            Read,
+            Write, //
         },
         new_condvar,
         Arc,
@@ -845,10 +847,10 @@ impl SepData {
         )?;
         let dma_ring = dma::Coherent::<u8>::zeroed_slice(dev, DMA_RING_SIZE, GFP_KERNEL)?;
 
-        let xart_writes = *module_parameters::xart_writes.value() != 0;
-        let xart_start = *module_parameters::xart_start_sector.value();
+        let xart_writes = module_parameters::xart_writes.value() != 0;
+        let xart_start = module_parameters::xart_start_sector.value();
         let xart_guard =
-            xart_guard::level(*module_parameters::xart_guard.value(), profile.xart_guard);
+            xart_guard::level(module_parameters::xart_guard.value(), profile.xart_guard);
         let store = match xart_store::Store::open_owner(xart_writes, xart_start) {
             Ok(mut store) => {
                 match xart_guard {
@@ -1002,7 +1004,7 @@ impl SepData {
         let (iova, size) = {
             let guard = self.shmem.lock();
             let buf = guard.as_ref().ok_or(EINVAL)?;
-            (buf.dma_handle(), buf.len())
+            (buf.dma_address(), buf.len())
         };
 
         let msg = proto::shmem_registration(iova, size)?;
@@ -1034,7 +1036,7 @@ impl SepData {
         // The SEP stays booted after rmmod and Linux cannot reset it, so a
         // reload's TZ0 would go unanswered. Record the boot first, as the warm
         // path does, so a reload stops at probe and says to reboot instead.
-        let iova = self.shmem.lock().as_ref().map_or(0, |buf| buf.dma_handle());
+        let iova = self.shmem.lock().as_ref().map_or(0, |buf| buf.dma_address());
         if let Err(e) = dt::mark_registration_sent(sep_node, iova) {
             dev_err!(
                 self.dev,
@@ -1137,7 +1139,7 @@ impl SepData {
         let shm = {
             let guard = self.shmem.lock();
             let buf = guard.as_ref().ok_or(EINVAL)?;
-            buf.dma_handle()
+            buf.dma_address()
         };
         let msg = Message {
             msg0: u64::from(proto::EP_SHMEM)
@@ -1187,7 +1189,7 @@ impl SepData {
     /// reply's header overwritten by a refill that lands late. dma_wmb() is
     /// what writel() would put there, and what RTKit puts before its sends.
     fn ring(mbox: &Mailbox<SepData>, msg: Message) -> Result<()> {
-        dma_wmb();
+        dma_mb(Write);
         mbox.send(msg, false)
     }
 
@@ -1484,8 +1486,8 @@ impl SepData {
                 b.allocated,
                 b.declared_in,
                 b.declared_out,
-                b.inbound.dma_handle(),
-                b.outbound.dma_handle(),
+                b.inbound.dma_address(),
+                b.outbound.dma_address(),
             )
         };
 
@@ -1535,28 +1537,23 @@ impl SepData {
     }
 
     fn prepare_os_uuid(&self) {
-        let hi = *module_parameters::os_uuid_hi.value();
-        let lo = *module_parameters::os_uuid_lo.value();
-        if hi != 0 || lo != 0 {
-            let mut uuid = [0u8; 16];
-            uuid[..8].copy_from_slice(&hi.to_be_bytes());
-            uuid[8..].copy_from_slice(&lo.to_be_bytes());
-            self.xarm.lock().os_uuid = Some(uuid);
-            dev_info!(
-                self.dev,
-                "xART: using explicit OS UUID {:016x}-{:016x}\n",
-                hi,
-                lo
-            );
-            return;
-        }
-
-        if let Some(uuid) = dt::preboot_uuid() {
-            self.xarm.lock().os_uuid = Some(uuid);
-            dev_info!(self.dev, "xART: using /chosen/apfs-preboot-uuid\n");
-        } else {
-            self.xarm.lock().os_uuid = None;
-            dev_warn!(self.dev, "xART: /chosen/apfs-preboot-uuid is unavailable\n");
+        let hi = module_parameters::os_uuid_hi.value();
+        let lo = module_parameters::os_uuid_lo.value();
+        // Keep the existing lane on installed systems. The tested selector
+        // never invents an identity or lets a profile override explicit params.
+        match os_identity::select(hi, lo, dt::preboot_uuid) {
+            os_identity::Selection::Explicit(uuid) => {
+                self.xarm.lock().os_uuid = Some(uuid);
+                dev_info!(self.dev, "xART: using explicit OS identity\n");
+            }
+            os_identity::Selection::Chosen(uuid) => {
+                self.xarm.lock().os_uuid = Some(uuid);
+                dev_info!(self.dev, "xART: using /chosen/apfs-preboot-uuid\n");
+            }
+            os_identity::Selection::Unavailable => {
+                self.xarm.lock().os_uuid = None;
+                dev_warn!(self.dev, "xART: /chosen/apfs-preboot-uuid is unavailable\n");
+            }
         }
     }
 
@@ -1636,7 +1633,7 @@ impl SepData {
             );
         }
 
-        if *module_parameters::xarm_trace.value() != 0 {
+        if module_parameters::xarm_trace.value() != 0 {
             dev_info!(
                 self.dev,
                 "xarm: op 0x{:02x} request_len {} reply_status 0x{:02x} reply_len {}\n",
@@ -2526,7 +2523,7 @@ impl MailCallback for SepData {
         }
         // The message was read from the mailbox with relaxed MMIO. Read the
         // buffers the enclave wrote before it only after that, as RTKit does.
-        dma_rmb();
+        dma_mb(Read);
         if !data.rx.push(msg) && data.rx.dropped() == 1 {
             dev_err!(
                 data.dev,
@@ -2610,7 +2607,7 @@ struct SepDriver(Arc<SepData>);
 // partition link exists, which the xART store needs at probe, and only after
 // the owner has enabled it (or chosen read-only) for this Mac.
 const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, (), 1> =
-    kernel::device_id::IdArray::new([(of::DeviceId::new(c"apple,sep"), ())]);
+    kernel::device_id::IdArray::new([(of::DeviceId::new(c"apple,sep"), &())]);
 
 impl platform::Driver for SepDriver {
     type IdInfo = ();
@@ -2623,8 +2620,8 @@ impl platform::Driver for SepDriver {
         _info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let dev: &device::Device<device::Core<'_>> = pdev.as_ref();
-        if *module_parameters::provision_keybag.value() != 0
-            && *module_parameters::xart_writes.value() == 0
+        if module_parameters::provision_keybag.value() != 0
+            && module_parameters::xart_writes.value() == 0
         {
             dev_err!(dev, "provision_keybag=1 requires xart_writes=1\n");
             return Err(EINVAL);

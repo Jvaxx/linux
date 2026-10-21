@@ -51,6 +51,7 @@ def main():
                                        'failed-flip-return', 'live-park'))
     tests = [
         ('boot', 'oslog-events', boot.oslog, ((),), ()),
+        ('boot', 'syslog-policy', boot.syslog, ((),), ()),
         ('edid', 'dpavserv-start', edid.startup, ((),), ()),
         ('edid', 'service-rebind', edid.rebind, ((),), ()),
         ('edid', 'provider-admission', edid.admission, ((),), ()),

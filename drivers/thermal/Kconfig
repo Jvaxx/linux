@@ -174,6 +174,16 @@ config THERMAL_GOV_POWER_ALLOCATOR
 	  Enable this to manage platform thermals by dynamically
 	  allocating and limiting power to devices.
 
+config THERMAL_GOV_POWER_ALLOCATOR_KUNIT_TEST
+	bool "KUnit tests for the power allocator governor" if !KUNIT_ALL_TESTS
+	depends on THERMAL_GOV_POWER_ALLOCATOR && KUNIT=y
+	default KUNIT_ALL_TESTS
+	help
+	  Test integral recovery after a temperature overshoot, the configured
+	  integral cutoff, power bounds and polling-period gain calibration.
+	  The tests use synthetic thermal zones and do not need hardware.
+	  Only useful for kernel developers; say N unless testing the governor.
+
 config CPU_THERMAL
 	bool "Generic cpu cooling support"
 	depends on THERMAL_OF

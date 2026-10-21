@@ -96,7 +96,6 @@ impl drm::driver::Driver for AsahiDrmDriver {
     type ParentDevice<Ctx: DeviceContext> = platform::Device<Ctx>;
 
     const INFO: drm::driver::DriverInfo = INFO;
-    const MODULE: Option<&'static kernel::ThisModule> = Some(&crate::THIS_MODULE);
     const FEAT_RENDER: bool = true;
     const FEAT_SYNCOBJ: bool = true;
     const FEAT_SYNCOBJ_TIMELINE: bool = true;
@@ -139,7 +138,6 @@ pub(crate) enum ProbeConfig {
 // OF Device ID table.
 kernel::of_device_table!(
     OF_TABLE,
-    MODULE_OF_TABLE,
     <AsahiPlatformDriver as platform::Driver>::IdInfo,
     [
         (
@@ -219,6 +217,7 @@ impl platform::Driver for AsahiPlatformDriver {
         info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         debug::update_debug_flags();
+        crate::memacct::LEDGER.configure();
 
         dev_info!(pdev.as_ref(), "Probing...\n");
 
@@ -288,7 +287,7 @@ impl platform::Driver for AsahiPlatformDriver {
         let raw_stats = crate::sysfs_exports::register(
             raw_dev,
             snapshot,
-            stats.is_some() && *module_parameters::stats_export.value() != 0,
+            stats.is_some() && module_parameters::stats_export.value() != 0,
         )?;
 
         let driver = AsahiPlatformDriverData {
@@ -351,7 +350,7 @@ impl AsahiPlatformDriver {
 
 impl Drop for AsahiPlatformDriverData<'_> {
     fn drop(&mut self) {
-        // SAFETY: `self.raw_dev` was set in `probe` from the platform
+        // `self.raw_dev` was set in `probe` from the platform
         // device's `as_raw()`, valid for the lifetime of the bound driver.
         if !self.raw_dev.is_null() {
             crate::sysfs_exports::unregister(self.raw_dev, self.raw_stats);

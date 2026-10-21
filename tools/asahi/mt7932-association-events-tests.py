@@ -36,8 +36,14 @@ PREFIX = r'''
 #include <string.h>
 #include <errno.h>
 #include <limits.h>
+enum nl80211_band { NL80211_BAND_2GHZ, NL80211_BAND_5GHZ, NL80211_BAND_6GHZ=3, NUM_NL80211_BANDS=6 };
+enum nl80211_mfp { NL80211_MFP_NO, NL80211_MFP_REQUIRED, NL80211_MFP_OPTIONAL };
+enum nl80211_sae_pwe_mechanism { NL80211_SAE_PWE_UNSPECIFIED, NL80211_SAE_PWE_HUNT_AND_PECK, NL80211_SAE_PWE_HASH_TO_ELEMENT, NL80211_SAE_PWE_BOTH };
+#define WLAN_AKM_SUITE_SAE 0x000fac08
+#define WLAN_AKM_SUITE_OWE 0x000fac12
 typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
 #define READ_ONCE(x) (x)
+#define BIT(n) (1U << (n))
 #define ARRAY_SIZE(x) (sizeof(x)/sizeof(*(x)))
 #define GFP_ATOMIC 0
 #define IEEE80211_CHAN_DISABLED 1
@@ -70,12 +76,15 @@ struct ieee80211_channel {int center_freq;};
 struct cfg80211_chan_def {struct ieee80211_channel *chan;int width,center_freq1;};
 struct element {u8 data[32];};
 struct test_band {struct {bool ht_supported;}ht_cap;};
+struct test_wiphy {struct test_band *bands[NUM_NL80211_BANDS];};
+static struct test_wiphy wiphy;
 struct mt7932 {
- void *pdev,*netdev,*wiphy;int response_lock,command_mutex,cal_work,disconnect_work;
+ void *pdev,*netdev;struct test_wiphy *wiphy;int response_lock,command_mutex,cal_work,disconnect_work;
  struct completion assoc_start,assoc_done,discovery_done,disconnect_done,cal_response,response;
  bool connecting,connected,disconnecting,disconnect_seen,disconnect_event_received;
  bool disconnect_local,connect_open,assoc_request_seen,peer_valid,link_failed,stopping,rf_ready;
  u8 connect_channel,connect_center,peer_wtbl,smart_version,waiting;
+ enum nl80211_band connect_band; u8 six_assoc_power[2][1020];
  int waiting_eid;
  struct cfg80211_chan_def connect_chandef;
  struct test_band band2,band5;
@@ -86,8 +95,12 @@ struct mt7932 {
  u8 cal_requests[32][16],cal_request_seq[32];unsigned cal_request_head,cal_request_count;
  u8 reply[MT7932_RX_CAPACITY];size_t reply_length;u64 packets;
 };
+static int ieee80211_channel_to_frequency(int ch,enum nl80211_band band){return (band==NL80211_BAND_2GHZ?2407:band==NL80211_BAND_5GHZ?5000:5950)+5*ch;}
 static bool usable=true;
 static unsigned cal_calls,queue_calls,scheduled;
+static unsigned long jiffies;
+static bool retried;
+static unsigned first_elapsed,cal_elapsed,queue_elapsed,final_budget;
 static int queue_error,cal_error;
 static struct ieee80211_channel channel;
 static struct ieee80211_channel *ieee80211_get_channel(void*w,int f){channel.center_freq=f;return &channel;}
@@ -113,19 +126,19 @@ static void receive(struct mt7932*m,u8 eid,u8 seq,const u8*body,size_t n,u32 sel
  if(eid==0xee)put_unaligned_le32(selector,packet+40);
  memcpy(packet+offset,body,n);mt_receive(m,packet,total);
 }
-static void start(struct mt7932*m,u8 ch){u8 b[24]={};put_unaligned_le32(mt7932_channel_band(ch),b+12);b[17]=ch;receive(m,0xee,0,b,sizeof(b),0x4d);}
-static void report(struct mt7932*m,bool valid){u8 b[52]={};b[11]=mt7932_channel_band(m->connect_channel);b[12]=m->connect_channel;b[17]=m->peer_ids.wtbl[0];b[20]=valid?m->peer_ids.station[0]:12;b[21]=m->peer_ids.wtbl[1];put_unaligned_le32(0x000fac04,b+48);receive(m,0xee,0,b,sizeof(b),0x40);}
+static void start(struct mt7932*m,u8 ch){u8 b[24]={};put_unaligned_le32(mt7932_channel_band(m->connect_band,ch),b+12);b[17]=ch;receive(m,0xee,0,b,sizeof(b),0x4d);}
+static void report(struct mt7932*m,bool valid){u8 b[52]={};b[11]=mt7932_channel_band(m->connect_band,m->connect_channel);b[12]=m->connect_channel;b[17]=m->peer_ids.wtbl[0];b[20]=valid?m->peer_ids.station[0]:12;b[21]=m->peer_ids.wtbl[1];put_unaligned_le32(0x000fac04,b+48);receive(m,0xee,0,b,sizeof(b),0x40);}
 static void done(struct mt7932*m){u8 b[2]={};receive(m,0xee,0,b,sizeof(b),0x42);}
 static void cal_null(struct mt7932*m,u8 seq){u8 b[20]={};b[3]=1;receive(m,0xd6,seq,b,sizeof(b),0);}
 static int mt_association_calibration(struct mt7932*m){
- assert(command_locked);cal_calls++;if(cal_error)return cal_error;
+ assert(command_locked);cal_calls++;jiffies+=cal_elapsed;if(cal_error)return cal_error;
  int e=mt7932_cal_begin(&m->cal_state,1);if(e)return e;
  cal_null(m,181);assert(m->cal_state.done&&m->cal_state.received==1);
  return m->cal_state.error;
 }
 static int mt_request(struct mt7932*m,u8 cid,bool runtime,bool set,bool wait,const void*body,size_t n){
  assert(command_locked&&cid==0x6b&&runtime&&set&&!wait&&n==32);
- queue_calls++;return queue_error;
+ queue_calls++;jiffies+=queue_elapsed;return queue_error;
 }
 enum scenario {SUCCESS,DUP_SUCCESS,DUP_BEFORE_SUCCESS,DUP_TIMEOUT,CANCEL,LATE_ERROR,UNOWNED_REPORT,DUP_BAD_CHANNEL,NO_START,DONE_WITHOUT_REPORT,DISCONNECT,DUP_FLOOD};
 static enum scenario which;
@@ -133,8 +146,8 @@ static struct mt7932 *active;
 static unsigned first_waits,final_waits,total_wait_budget;
 static unsigned long wait_for_completion_timeout(struct completion*c,unsigned long timeout){
  assert(!command_locked);total_wait_budget+=timeout;
- if(c==&active->assoc_start){assert(timeout==5000);first_waits++;if(which!=NO_START)start(active,active->connect_channel);if(which==DUP_BEFORE_SUCCESS)start(active,active->connect_channel);}
- else {assert(c==&active->assoc_done&&timeout==10000);final_waits++;
+ if(c==&active->assoc_start){assert(timeout==(retried?10000:5000));first_waits++;jiffies+=first_elapsed;if(which!=NO_START)start(active,active->connect_channel);if(which==DUP_BEFORE_SUCCESS)start(active,active->connect_channel);}
+ else {assert(c==&active->assoc_done&&timeout==(retried?final_budget:10000));final_waits++;
   if(which==DUP_SUCCESS||which==DUP_TIMEOUT||which==DUP_BAD_CHANNEL)start(active,which==DUP_BAD_CHANNEL?6:active->connect_channel);
   if(which==DUP_FLOOD)for(unsigned i=0;i<1000;i++)start(active,active->connect_channel);
   if(which==CANCEL||which==LATE_ERROR){active->disconnecting=which==CANCEL;active->connect_error=which==CANCEL?-ECANCELED:-EIO;complete(c);report(active,true);done(active);}
@@ -145,13 +158,15 @@ static unsigned long wait_for_completion_timeout(struct completion*c,unsigned lo
  }
  if(!c->done)return 0;if(c->done!=UINT_MAX)c->done--;return timeout;
 }
-static int worker_wait(struct mt7932*m){int ret=0;u8 queue[32];command_locked=1;
+#define time_after_eq(a,b) ((long)((a)-(b))>=0)
+#define max_t(t,a,b) ((t)(a)>(t)(b)?(t)(a):(t)(b))
+static int worker_wait(struct mt7932*m){int ret=0;u8 queue[32];bool retry=retried;unsigned long deadline=jiffies+10000,timeout;command_locked=1;
 WAIT
-report:
+out:
  assert(command_locked);command_locked=0;return ret?:m->connect_error;
 }
-static struct mt7932 fresh(void){return (struct mt7932){.netdev=(void*)1,.connecting=true,.rf_ready=true,.connect_channel=11,.smart_version=12,.peer_ids={{1,2},{3,4,5,6}}};}
-static void reset(struct mt7932*m,enum scenario s){*m=fresh();active=m;which=s;cal_calls=queue_calls=scheduled=first_waits=final_waits=total_wait_budget=0;queue_error=cal_error=0;usable=true;command_locked=0;}
+static struct mt7932 fresh(void){return (struct mt7932){.netdev=(void*)1,.wiphy=&wiphy,.connecting=true,.rf_ready=true,.connect_channel=11,.smart_version=12,.peer_ids={{1,2},{3,4,5,6}}};}
+static void reset(struct mt7932*m,enum scenario s){*m=fresh();active=m;which=s;cal_calls=queue_calls=scheduled=first_waits=final_waits=total_wait_budget=0;queue_error=cal_error=0;usable=true;command_locked=0;jiffies=first_elapsed=cal_elapsed=queue_elapsed=0;retried=false;final_budget=10000;}
 int main(void){struct mt7932 m;unsigned cases=0;
  for(enum scenario s=SUCCESS;s<=DUP_FLOOD;s++){
   reset(&m,s);int e=worker_wait(&m);
@@ -181,6 +196,19 @@ int main(void){struct mt7932 m;unsigned cases=0;
  reset(&m,SUCCESS);m.cal_request_count=32;receive(&m,0xd7,92,request,16,0);assert(m.cal_request_count==32&&m.link_failed&&!scheduled);cases++;
  reset(&m,SUCCESS);receive(&m,0xd7,93,request,15,0);assert(!m.cal_request_count&&m.link_failed);cases++;
  reset(&m,SUCCESS);usable=false;start(&m,11);assert(m.connect_error==-EPROTO&&m.assoc_start.done&&m.assoc_done.done&&!m.connect_center);cases++;
+ // The retry shares one deadline across start, calibration, queue and done.
+ reset(&m,SUCCESS);retried=true;first_elapsed=7000;cal_elapsed=1000;queue_elapsed=500;final_budget=1500;
+ assert(!worker_wait(&m)&&first_waits==1&&final_waits==1&&jiffies==8500);cases++;
+ reset(&m,SUCCESS);retried=true;first_elapsed=7000;cal_elapsed=3000;
+ assert(worker_wait(&m)==-ETIMEDOUT&&cal_calls==1&&!queue_calls&&!final_waits);cases++;
+ reset(&m,SUCCESS);retried=true;first_elapsed=7000;cal_elapsed=2000;queue_elapsed=1000;
+ assert(worker_wait(&m)==-ETIMEDOUT&&queue_calls==1&&!final_waits);cases++;
+ reset(&m,NO_START);retried=true;
+ assert(worker_wait(&m)==-ETIMEDOUT&&total_wait_budget==10000&&!final_waits);cases++;
+ // A well-formed firmware rejection is retryable; malformed ownership is not.
+ reset(&m,SUCCESS);u8 rejected[52]={};put_unaligned_le16(1,rejected);
+ receive(&m,0xee,0,rejected,sizeof(rejected),0x40);
+ assert(m.connect_error==-ECONNREFUSED&&m.assoc_start.done&&m.assoc_done.done&&!m.peer_valid);cases++;
  printf("PASS %u association event/wait/calibration ownership controls\n",cases);
 }
 '''
@@ -195,12 +223,18 @@ def main():
     root=args.source_root;out=args.out;out.mkdir(parents=True,exist_ok=True)
     link=(root/DRIVER/"link.c").read_text();rx=(root/DRIVER/"mt7932.c").read_text()
     parts={"CHANNEL":function(link,"mt_channel_event"),"LINK":function(link,"mt_link_event"),"RECEIVE":function(rx,"mt_receive")}
-    worker=function(link,"mt_connect_work")
+    worker=function(link,"mt_connect_attempt")
     start=worker.index("\t/* Genuine D7 requests")
-    parts["WAIT"]=worker[start:worker.index("\nreport:",start)]
+    parts["WAIT"]=worker[start:worker.index("\nout:",start)]
     headers=[]
     for n in ["protocol.h","channels.h","bandwidth.h","association.h"]:
-        headers.append(re.sub(r"^#include .*\n","",(root/DRIVER/n).read_text(),flags=re.M))
+        header = re.sub(r"^#include .*\n", "", (root/DRIVER/n).read_text(), flags=re.M)
+        if n == "association.h":
+            # These event fixtures do not use the sleeping crypto/admission helpers.
+            start = header.index("/* The first AKM")
+            end = header.index("struct mt7932_peer_ids")
+            header = header[:start] + header[end:]
+        headers.append(header)
     cal=(root/DRIVER/"calibration.h").read_text()
     headers.append(cal[cal.index("struct mt7932_cal_completion {"):cal.index("struct mt7932_cal_segment {")])
     parts["HEADERS"]="\n".join(headers)

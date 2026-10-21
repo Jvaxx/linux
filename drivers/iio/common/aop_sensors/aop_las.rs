@@ -29,7 +29,6 @@ struct IIOAopLasDriver {
 
 kernel::of_device_table!(
     OF_TABLE,
-    MODULE_OF_TABLE,
     (),
     [(of::DeviceId::new(c_str!("apple,aop-las")), ())]
 );
@@ -62,7 +61,7 @@ impl platform::Driver for IIOAopLasDriver {
         let listener = FakehidRegistration::new(adata, service, data.clone())?;
         let info_mask = 1 << bindings::BINDINGS_IIO_CHAN_INFO_RAW;
         let iio =
-            IIORegistration::<MsgProc>::new(data, c"aop-sensors-las", ty, info_mask, &THIS_MODULE)?;
+            IIORegistration::<MsgProc>::new(data, c"aop-sensors-las", ty, info_mask, kernel::module::this_module::<crate::LocalModule>())?;
         Ok(IIOAopLasDriver {
             listener,
             _iio: iio,

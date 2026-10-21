@@ -1089,6 +1089,12 @@ static void swap_reclaim_full_clusters(struct swap_info_struct *si, bool force)
 		swap_cluster_unlock(ci);
 		if (to_scan <= 0)
 			break;
+
+		/*
+		 * When 'force' is false, 'to_scan' is initialized to 1.
+		 * The loop breaks above, making this cond_resched() unreachable
+		 * in atomic contexts.
+		 */
 		cond_resched();
 	}
 }
@@ -1113,7 +1119,7 @@ static bool swap_folio_alloc_allowed(struct swap_info_struct *si, struct folio *
 	if (flags & SWP_BLKDEV)
 		return true;
 	/* Filesystem swap_rw implementations retain their existing contract. */
-	return si->bdev && !(flags & SWP_FS_OPS) && mandatory;
+	return si->bdev && si->ops == &swap_bdev_ops && mandatory;
 }
 
 /*
@@ -1979,7 +1985,7 @@ again:
 /**
  * folio_dup_swap() - Increase swap count of swap entries of a folio.
  * @folio: folio with swap entries bounded.
- * @subpage: if not NULL, only increase the swap count of this subpage.
+ * @page: if not NULL, only increase the swap count of this page.
  *
  * Typically called when the folio is unmapped and have its swap entry to
  * take its place: Swap entries allocated to a folio has count == 0 and pinned
@@ -2011,7 +2017,7 @@ void folio_put_swap_range(struct folio *folio, struct page *page, unsigned int n
 	swap_put_entries_cluster(__swap_entry_to_info(entry), swp_offset(entry), nr, false, -1);
 }
 
-int folio_dup_swap(struct folio *folio, struct page *subpage)
+int folio_dup_swap(struct folio *folio, struct page *page)
 {
 	swp_entry_t entry = folio->swap;
 	unsigned long nr_pages = folio_nr_pages(folio);
@@ -2019,8 +2025,8 @@ int folio_dup_swap(struct folio *folio, struct page *subpage)
 	VM_WARN_ON_FOLIO(!folio_test_locked(folio), folio);
 	VM_WARN_ON_FOLIO(!folio_test_swapcache(folio), folio);
 
-	if (subpage) {
-		entry.val += folio_page_idx(folio, subpage);
+	if (page) {
+		entry.val += folio_page_idx(folio, page);
 		nr_pages = 1;
 	}
 
@@ -2031,13 +2037,13 @@ int folio_dup_swap(struct folio *folio, struct page *subpage)
 /**
  * folio_put_swap() - Decrease swap count of swap entries of a folio.
  * @folio: folio with swap entries bounded, must be in swap cache and locked.
- * @subpage: if not NULL, only decrease the swap count of this subpage.
+ * @page: if not NULL, only decrease the swap count of this page.
  *
  * This won't free the swap slots even if swap count drops to zero, they are
  * still pinned by the swap cache. User may call folio_free_swap to free them.
  * Context: Caller must ensure the folio is locked and in the swap cache.
  */
-void folio_put_swap(struct folio *folio, struct page *subpage)
+void folio_put_swap(struct folio *folio, struct page *page)
 {
 	swp_entry_t entry = folio->swap;
 	unsigned long nr_pages = folio_nr_pages(folio);
@@ -2046,8 +2052,8 @@ void folio_put_swap(struct folio *folio, struct page *subpage)
 	VM_WARN_ON_FOLIO(!folio_test_locked(folio), folio);
 	VM_WARN_ON_FOLIO(!folio_test_swapcache(folio), folio);
 
-	if (subpage) {
-		entry.val += folio_page_idx(folio, subpage);
+	if (page) {
+		entry.val += folio_page_idx(folio, page);
 		nr_pages = 1;
 	}
 
@@ -2685,8 +2691,8 @@ static int unuse_subpage(struct vm_area_struct *vma, pmd_t *pmd,
 		pte = pte_mkold(phys_pte_mm(mm, mm_subpage_phys(slot), vma->vm_page_prot));
 		if (pte_swp_soft_dirty(old))
 			pte = pte_mksoft_dirty(pte);
-		if (pte_swp_uffd_wp(old))
-			pte = pte_mkuffd_wp(pte);
+		if (pte_swp_uffd(old))
+			pte = pte_mkuffd(pte);
 		inc_mm_counter(mm, MM_ANONPAGES);
 		slot = NULL;
 		ret = 1;
@@ -2807,8 +2813,13 @@ static int unuse_pte(struct vm_area_struct *vma, pmd_t *pmd,
 	new_pte = pte_mkold(mk_pte(page, vma->vm_page_prot));
 	if (pte_swp_soft_dirty(old_pte))
 		new_pte = pte_mksoft_dirty(new_pte);
-	if (pte_swp_uffd_wp(old_pte))
-		new_pte = pte_mkuffd_wp(new_pte);
+	if (pte_swp_uffd(old_pte))
+		new_pte = pte_mkuffd(new_pte);
+
+	/* See do_swap_page(): restore PAGE_NONE for RWP */
+	if (pte_swp_uffd(old_pte) && userfaultfd_rwp(vma))
+		new_pte = pte_modify(new_pte, PAGE_NONE);
+
 setpte:
 	set_pte_at(vma->vm_mm, addr, pte, new_pte);
 	folio_put_swap(swapcache, folio_file_page(swapcache, swp_offset(entry)));
@@ -3268,6 +3279,12 @@ static int setup_swap_extents(struct swap_info_struct *sis,
 	struct inode *inode = mapping->host;
 	int ret;
 
+	ret = sio_pool_init();
+	if (ret)
+		return ret;
+
+	sis->ops = &swap_bdev_ops;
+
 	if (S_ISBLK(inode->i_mode)) {
 		ret = add_swap_extent(sis, 0, sis->max, 0);
 		*span = sis->pages;
@@ -3279,17 +3296,12 @@ static int setup_swap_extents(struct swap_info_struct *sis,
 		if (ret < 0)
 			return ret;
 		sis->flags |= SWP_ACTIVATED;
-		if ((sis->flags & SWP_FS_OPS) &&
-		    sio_pool_init() != 0) {
-			destroy_swap_extents(sis, swap_file);
-			return -ENOMEM;
-		}
 	} else {
 		ret = generic_swapfile_activate(sis, swap_file, span);
 	}
 	/* Only subpage swap needs the reserve for splitting large folio I/O. */
 	if (IS_ENABLED(CONFIG_MM_SUBPAGE) && ret >= 0 && sis->bdev &&
-	    !(sis->flags & SWP_FS_OPS) && swap_extent_io_init()) {
+	    sis->ops == &swap_bdev_ops && swap_extent_io_init()) {
 		destroy_swap_extents(sis, swap_file);
 		return -ENOMEM;
 	}

@@ -23,6 +23,7 @@ struct device;
 #include <linux/device.h>
 #include <linux/idr.h>
 #include <linux/list.h>
+#include <linux/lockdep.h>
 #include <linux/mutex.h>
 #include <linux/device-id/tb.h>
 #include <linux/pci.h>
@@ -468,7 +469,7 @@ static inline struct tb_service *tb_to_service(struct device *dev)
  */
 struct tb_service_driver {
 	struct device_driver driver;
-	int (*probe)(struct tb_service *svc, const struct tb_service_id *id);
+	int (*probe)(struct tb_service *svc);
 	void (*remove)(struct tb_service *svc);
 	void (*shutdown)(struct tb_service *svc);
 	const struct tb_service_id *id_table;
@@ -521,6 +522,11 @@ void tb_service_properties_changed(struct tb_service *svc);
  * @host_dp_policy: Host display tunnel policies supplied by the NHI glue
  * @host_dp_dual_stream: The host connector has two physically wired DP-IN streams
  * @domain_released: Completed when domain has been fully released
+ * @host_reset: Host router was reset on driver load, or forced on system
+ *		shutdown/reboot. When set, tb_stop() asserts DPR on connected
+ *		downstream ports to signal disconnect before tearing down the
+ *		router tree. Only Thunderbolt 3 devices are reset; USB4
+ *		routers are skipped.
  */
 struct tb_nhi {
 	spinlock_t lock;
@@ -538,6 +544,7 @@ struct tb_nhi {
 	unsigned long host_dp_policy;
 	bool host_dp_dual_stream;
 	struct completion domain_released;
+	bool host_reset;
 };
 
 /**
@@ -569,6 +576,7 @@ struct tb_nhi {
  * @interval_nsec: Interval counter if interrupt throttling is to be
  *		   used with this ring (in ns)
  * @wait: Used to signal that the ring may be empty now
+ * @lock_key: Lock validator class key per-ring
  */
 struct tb_ring {
 	spinlock_t lock;
@@ -594,6 +602,7 @@ struct tb_ring {
 	void *poll_data;
 	unsigned int interval_nsec;
 	wait_queue_head_t wait;
+	struct lock_class_key lock_key;
 };
 
 /* Leave ring interrupt enabled on suspend */

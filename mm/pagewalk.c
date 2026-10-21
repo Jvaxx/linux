@@ -775,7 +775,7 @@ static bool walk_mapping_clip(struct vm_area_struct *vma, pgoff_t first_index,
 			      pgoff_t last_index, unsigned long *start_addr,
 			      unsigned long *end_addr)
 {
-	*start_addr = first_index <= vma->vm_pgoff ? vma->vm_start :
+	*start_addr = first_index <= vma_start_pgoff(vma) ? vma->vm_start :
 		vma_address_at_offset(vma, (struct vm_page_offset) { first_index, 0 });
 	*end_addr = last_index >= vma_last_pgoff(vma) ? vma->vm_end :
 		vma_address_at_offset(vma, (struct vm_page_offset) { last_index + 1, 0 });
@@ -788,7 +788,7 @@ static bool walk_mapping_clip(struct vm_area_struct *vma, pgoff_t first_index,
 			      pgoff_t last_index, unsigned long *start_addr,
 			      unsigned long *end_addr)
 {
-	pgoff_t vba = vma->vm_pgoff;
+	pgoff_t vba = vma_start_pgoff(vma);
 	pgoff_t vea = vba + vma_pages(vma);
 	pgoff_t cba = max(first_index, vba);
 	pgoff_t cea = min(last_index + 1, vea);
@@ -854,8 +854,7 @@ int walk_page_mapping(struct address_space *mapping, pgoff_t first_index,
 	}
 
 	lockdep_assert_held(&mapping->i_mmap_rwsem);
-	vma_interval_tree_foreach(vma, &mapping->i_mmap, first_index,
-				  last_index) {
+	mapping_rmap_tree_foreach(vma, mapping, first_index, last_index) {
 		if (!walk_mapping_clip(vma, first_index, last_index,
 				       &start_addr, &end_addr))
 			continue;

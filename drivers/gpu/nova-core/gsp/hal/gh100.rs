@@ -7,29 +7,26 @@ use kernel::{
     device,
     dma::Coherent,
     io::poll::read_poll_timeout,
-    time::Delta, //
+    time::Delta,
+    types::ScopeGuard, //
 };
 
 use crate::{
-    driver::Bar0,
     falcon::{
         gsp::Gsp as GspEngine,
-        sec2::Sec2,
         Falcon, //
     },
-    fb::FbLayout,
-    fsp::{
-        FmcBootArgs,
-        Fsp, //
-    },
+    fb::FbSizes,
+    firmware::gsp::GspFirmware,
+    fsp::FmcBootArgs,
     gsp::{
-        boot::BootUnloadGuard,
         hal::{
             GspHal,
             UnloadBundle, //
         },
         Gsp,
         GspBootContext,
+        GspFmcBootParams,
         GspFwWprMeta, //
     },
 };
@@ -61,13 +58,13 @@ impl GspMbox {
     fn lockdown_released_or_error(
         &self,
         gsp_falcon: &Falcon<'_, GspEngine>,
-        fmc_boot_params_addr: u64,
+        fmc_boot_params: &Coherent<GspFmcBootParams>,
     ) -> bool {
         // GSP-FMC normally clears the boot parameters address from the mailboxes early during
         // boot. If the address is still there, keep polling rather than treating it as an error.
         // Any other non-zero mailbox0 value is a GSP-FMC error code.
         if self.mbox0 != 0 {
-            return self.combined_addr() != fmc_boot_params_addr;
+            return self.combined_addr() != fmc_boot_params.dma_address();
         }
 
         !gsp_falcon.riscv_branch_privilege_lockdown()
@@ -78,7 +75,7 @@ impl GspMbox {
 fn wait_for_gsp_lockdown_release(
     dev: &device::Device<device::Bound>,
     gsp_falcon: &Falcon<'_, GspEngine>,
-    fmc_boot_params_addr: u64,
+    fmc_boot_params: &Coherent<GspFmcBootParams>,
 ) -> Result {
     dev_dbg!(dev, "Waiting for GSP lockdown release\n");
 
@@ -93,7 +90,7 @@ fn wait_for_gsp_lockdown_release(
         },
         |mbox| match mbox {
             None => false,
-            Some(mbox) => mbox.lockdown_released_or_error(gsp_falcon, fmc_boot_params_addr),
+            Some(mbox) => mbox.lockdown_released_or_error(gsp_falcon, fmc_boot_params),
         },
         Delta::from_millis(10),
         Delta::from_secs(30),
@@ -117,22 +114,23 @@ fn wait_for_gsp_lockdown_release(
 struct FspUnloadBundle;
 
 impl UnloadBundle for FspUnloadBundle {
-    fn run(
-        &self,
-        dev: &device::Device<device::Bound>,
-        _bar: Bar0<'_>,
-        gsp_falcon: &Falcon<'_, GspEngine>,
-        _sec2_falcon: &Falcon<'_, Sec2>,
-    ) -> Result {
+    fn run(&self, ctx: &mut GspBootContext<'_, '_>) -> Result {
         // GSP falcon does most of the work of resetting, so just wait for it to finish.
         read_poll_timeout(
-            || Ok(gsp_falcon.is_riscv_active()),
-            |&active| !active,
+            || {
+                // GSP register reads are not meaningful until the PRIV target mask is released.
+                if !ctx.gsp_falcon.priv_target_mask_released() {
+                    return Ok(false);
+                }
+
+                ctx.gsp_falcon.is_riscv_halted()
+            },
+            |&halted| halted,
             Delta::from_millis(10),
             Delta::from_secs(5),
         )
         .map(|_| ())
-        .inspect_err(|_| dev_err!(dev, "GSP falcon failed to halt\n"))
+        .inspect_err(|_| dev_err!(ctx.dev(), "GSP falcon failed to halt\n"))
     }
 }
 
@@ -143,42 +141,44 @@ impl GspHal for Gh100 {
     ///
     /// This path uses FSP to establish a chain of trust and boot GSP-FMC. FSP handles
     /// the GSP boot internally - no manual GSP reset/boot is needed.
-    fn boot<'a>(
+    fn boot(
         &self,
-        gsp: &'a Gsp,
-        ctx: &GspBootContext<'a>,
-        fb_layout: &FbLayout,
-        wpr_meta: &Coherent<GspFwWprMeta>,
-    ) -> Result<BootUnloadGuard<'a>> {
+        gsp: &Gsp,
+        ctx: &mut GspBootContext<'_, '_>,
+        gsp_fw: &GspFirmware,
+    ) -> Result<Option<crate::gsp::UnloadBundle>> {
         let dev = ctx.dev();
-        let bar = ctx.bar;
         let chipset = ctx.chipset;
         let gsp_falcon = ctx.gsp_falcon;
-        let sec2_falcon = ctx.sec2_falcon;
+
+        let fb_sizes = FbSizes::new(chipset, ctx.bar, ctx.vgpu.state())?;
+        dev_dbg!(dev, "{:#x?}\n", fb_sizes);
+
+        let wpr_meta =
+            Coherent::init(dev, GFP_KERNEL, GspFwWprMeta::from_sizes(gsp_fw, &fb_sizes))?;
+        let args = FmcBootArgs::new(dev, chipset, wpr_meta, &gsp.libos, false)?;
 
         let unload_bundle = crate::gsp::UnloadBundle(
             KBox::new(FspUnloadBundle, GFP_KERNEL)? as KBox<dyn UnloadBundle>
         );
 
-        // Wrap the unload bundle into a drop guard so it is automatically run upon failure.
-        let unload_guard =
-            BootUnloadGuard::new(gsp, dev, bar, gsp_falcon, sec2_falcon, Some(unload_bundle));
+        // Wait for the GSP RISC-V core to halt in case of error. We create this guard after `args`
+        // to make sure that the boot args and the WPR metadata they own are kept alive until halt,
+        // in case they are still being accessed.
+        let mut unload_guard =
+            ScopeGuard::new_with_data((unload_bundle, ctx), |(unload_bundle, ctx)| {
+                let _ = unload_bundle.0.run(ctx);
+            });
 
-        let mut fsp = Fsp::wait_secure_boot(dev, bar, chipset)?;
+        let fsp = unload_guard.1.fsp.as_mut().ok_or(ENODEV)?;
 
-        let args = FmcBootArgs::new(
-            dev,
-            chipset,
-            wpr_meta.dma_handle(),
-            gsp.libos.dma_handle(),
-            false,
-        )?;
+        fsp.boot_fmc(dev, &fb_sizes, &args)?;
 
-        fsp.boot_fmc(dev, fb_layout, &args)?;
+        // Wait for GSP-FMC to release the GSP lockdown, indicating that `args` is not accessed
+        // anymore.
+        wait_for_gsp_lockdown_release(dev, gsp_falcon, args.boot_params())?;
 
-        wait_for_gsp_lockdown_release(dev, gsp_falcon, args.boot_params_dma_handle())?;
-
-        Ok(unload_guard)
+        Ok(Some(unload_guard.dismiss().0))
     }
 }
 

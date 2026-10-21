@@ -170,7 +170,6 @@ struct IIOAopAlsDriver {
 
 kernel::of_device_table!(
     OF_TABLE,
-    MODULE_OF_TABLE,
     (),
     [(of::DeviceId::new(c_str!("apple,aop-als")), ())]
 );
@@ -204,7 +203,7 @@ impl platform::Driver for IIOAopAlsDriver {
         enable_als(adata.as_ref(), pdev, &service, offset)?;
         let info_mask = 1 << bindings::BINDINGS_IIO_CHAN_INFO_PROCESSED;
         let iio =
-            IIORegistration::<MsgProc>::new(data, c"aop-sensors-als", ty, info_mask, &THIS_MODULE)?;
+            IIORegistration::<MsgProc>::new(data, c"aop-sensors-als", ty, info_mask, kernel::module::this_module::<crate::LocalModule>())?;
         Ok(IIOAopAlsDriver {
             listener,
             _iio: iio,

@@ -1408,7 +1408,7 @@ static void tb_test_tunnel_pcie(struct kunit *test)
 	tb_tunnel_put(tunnel1);
 }
 
-static void tb_test_dp_tunnel_active(struct tb_tunnel *tunnel)
+static void tb_test_dp_tunnel_active(struct tb_tunnel *tunnel, void *data)
 {
 }
 
@@ -1433,7 +1433,7 @@ static void tb_test_tunnel_dp(struct kunit *test)
 	out = &dev->ports[13];
 
 	tunnel = tb_tunnel_alloc_dp(NULL, in, out, 1, 0, 0,
-				    tb_test_dp_tunnel_active);
+				    tb_test_dp_tunnel_active, NULL);
 	KUNIT_ASSERT_NOT_NULL(test, tunnel);
 	KUNIT_EXPECT_EQ(test, tunnel->type, TB_TUNNEL_DP);
 	KUNIT_EXPECT_PTR_EQ(test, tunnel->src_port, in);
@@ -1480,7 +1480,7 @@ static void tb_test_tunnel_dp_chain(struct kunit *test)
 	out = &dev4->ports[14];
 
 	tunnel = tb_tunnel_alloc_dp(NULL, in, out, 1, 0, 0,
-				    tb_test_dp_tunnel_active);
+				    tb_test_dp_tunnel_active, NULL);
 	KUNIT_ASSERT_NOT_NULL(test, tunnel);
 	KUNIT_EXPECT_EQ(test, tunnel->type, TB_TUNNEL_DP);
 	KUNIT_EXPECT_PTR_EQ(test, tunnel->src_port, in);
@@ -1531,7 +1531,7 @@ static void tb_test_tunnel_dp_tree(struct kunit *test)
 	out = &dev5->ports[13];
 
 	tunnel = tb_tunnel_alloc_dp(NULL, in, out, 1, 0, 0,
-				    tb_test_dp_tunnel_active);
+				    tb_test_dp_tunnel_active, NULL);
 	KUNIT_ASSERT_NOT_NULL(test, tunnel);
 	KUNIT_EXPECT_EQ(test, tunnel->type, TB_TUNNEL_DP);
 	KUNIT_EXPECT_PTR_EQ(test, tunnel->src_port, in);
@@ -1597,7 +1597,7 @@ static void tb_test_tunnel_dp_max_length(struct kunit *test)
 	out = &dev12->ports[13];
 
 	tunnel = tb_tunnel_alloc_dp(NULL, in, out, 1, 0, 0,
-				    tb_test_dp_tunnel_active);
+				    tb_test_dp_tunnel_active, NULL);
 	KUNIT_ASSERT_NOT_NULL(test, tunnel);
 	KUNIT_EXPECT_EQ(test, tunnel->type, TB_TUNNEL_DP);
 	KUNIT_EXPECT_PTR_EQ(test, tunnel->src_port, in);
@@ -1668,7 +1668,7 @@ static void tb_test_tunnel_3dp(struct kunit *test)
 	out3 = &dev4->ports[14];
 
 	tunnel1 = tb_tunnel_alloc_dp(NULL, in1, out1, 1, 0, 0,
-				     tb_test_dp_tunnel_active);
+				     tb_test_dp_tunnel_active, NULL);
 	KUNIT_ASSERT_TRUE(test, tunnel1 != NULL);
 	KUNIT_EXPECT_EQ(test, tunnel1->type, TB_TUNNEL_DP);
 	KUNIT_EXPECT_PTR_EQ(test, tunnel1->src_port, in1);
@@ -1677,7 +1677,7 @@ static void tb_test_tunnel_3dp(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, tunnel1->paths[0]->path_length, 3);
 
 	tunnel2 = tb_tunnel_alloc_dp(NULL, in2, out2, 1, 0, 0,
-				     tb_test_dp_tunnel_active);
+				     tb_test_dp_tunnel_active, NULL);
 	KUNIT_ASSERT_TRUE(test, tunnel2 != NULL);
 	KUNIT_EXPECT_EQ(test, tunnel2->type, TB_TUNNEL_DP);
 	KUNIT_EXPECT_PTR_EQ(test, tunnel2->src_port, in2);
@@ -1686,7 +1686,7 @@ static void tb_test_tunnel_3dp(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, tunnel2->paths[0]->path_length, 4);
 
 	tunnel3 = tb_tunnel_alloc_dp(NULL, in3, out3, 1, 0, 0,
-				     tb_test_dp_tunnel_active);
+				     tb_test_dp_tunnel_active, NULL);
 	KUNIT_ASSERT_TRUE(test, tunnel3 != NULL);
 	KUNIT_EXPECT_EQ(test, tunnel3->type, TB_TUNNEL_DP);
 	KUNIT_EXPECT_PTR_EQ(test, tunnel3->src_port, in3);
@@ -1785,7 +1785,7 @@ static void tb_test_tunnel_port_on_path(struct kunit *test)
 	out = &dev5->ports[13];
 
 	dp_tunnel = tb_tunnel_alloc_dp(NULL, in, out, 1, 0, 0,
-				       tb_test_dp_tunnel_active);
+				       tb_test_dp_tunnel_active, NULL);
 	KUNIT_ASSERT_NOT_NULL(test, dp_tunnel);
 
 	KUNIT_EXPECT_TRUE(test, tb_tunnel_port_on_path(dp_tunnel, in));
@@ -2218,7 +2218,7 @@ static void tb_test_credit_alloc_dp(struct kunit *test)
 	out = &dev->ports[14];
 
 	tunnel = tb_tunnel_alloc_dp(NULL, in, out, 1, 0, 0,
-				    tb_test_dp_tunnel_active);
+				    tb_test_dp_tunnel_active, NULL);
 	KUNIT_ASSERT_NOT_NULL(test, tunnel);
 	KUNIT_ASSERT_EQ(test, tunnel->npaths, (size_t)3);
 
@@ -2455,7 +2455,7 @@ static struct tb_tunnel *TB_TEST_DP_TUNNEL1(struct kunit *test,
 	in = &host->ports[5];
 	out = &dev->ports[13];
 	dp_tunnel1 = tb_tunnel_alloc_dp(NULL, in, out, 1, 0, 0,
-					tb_test_dp_tunnel_active);
+					tb_test_dp_tunnel_active, NULL);
 	KUNIT_ASSERT_NOT_NULL(test, dp_tunnel1);
 	KUNIT_ASSERT_EQ(test, dp_tunnel1->npaths, (size_t)3);
 
@@ -2493,7 +2493,7 @@ static struct tb_tunnel *TB_TEST_DP_TUNNEL2(struct kunit *test,
 	in = &host->ports[6];
 	out = &dev->ports[14];
 	dp_tunnel2 = tb_tunnel_alloc_dp(NULL, in, out, 1, 0, 0,
-					tb_test_dp_tunnel_active);
+					tb_test_dp_tunnel_active, NULL);
 	KUNIT_ASSERT_NOT_NULL(test, dp_tunnel2);
 	KUNIT_ASSERT_EQ(test, dp_tunnel2->npaths, (size_t)3);
 
@@ -3349,7 +3349,7 @@ static void tb_test_tunnel_dp_host_credits(struct kunit *test)
 
 	dev->ports[14].config.type = TB_TYPE_DP_HDMI_OUT;
 	tunnel = tb_tunnel_alloc_dp(NULL, &host->ports[5], &dev->ports[14],
-				    1, 0, 0, tb_test_dp_tunnel_active);
+				    1, 0, 0, tb_test_dp_tunnel_active, NULL);
 	KUNIT_ASSERT_NOT_NULL(test, tunnel);
 	KUNIT_EXPECT_EQ(test, tunnel->paths[0]->hops[0].nfc_credits, 5U);
 	tb_tunnel_put(tunnel);
@@ -3372,9 +3372,9 @@ static void tb_test_dprx_release(struct device *dev)
 	/* The context is owned by KUnit and survives the final device put. */
 }
 
-static void tb_test_dprx_complete(struct tb_tunnel *tunnel)
+static void tb_test_dprx_complete(struct tb_tunnel *tunnel, void *data)
 {
-	struct tb_test_dprx *ctx = container_of(tunnel->tb, struct tb_test_dprx, tb);
+	struct tb_test_dprx *ctx = data;
 
 	KUNIT_EXPECT_TRUE(ctx->test, tunnel->dprx_canceled);
 	ctx->completions++;
@@ -3398,7 +3398,7 @@ static void tb_test_dp_dprx_cancel_common(struct kunit *test, bool running)
 	dev = alloc_dev_default(test, host, 0x1, true);
 	KUNIT_ASSERT_NOT_NULL(test, dev);
 	tunnel = tb_tunnel_alloc_dp(tb, &host->ports[5], &dev->ports[13],
-				    1, 0, 0, tb_test_dprx_complete);
+				    1, 0, 0, tb_test_dprx_complete, ctx);
 	KUNIT_ASSERT_NOT_NULL(test, tunnel);
 	tb->wq = alloc_ordered_workqueue("tb-dprx-test", 0);
 	if (!tb->wq) {
@@ -3467,9 +3467,9 @@ static bool tb_test_dprx_awaits_display(struct tb_nhi *nhi, struct tb_port *in)
 	return gate->deferred;
 }
 
-static void tb_test_dprx_finished(struct tb_tunnel *tunnel)
+static void tb_test_dprx_finished(struct tb_tunnel *tunnel, void *data)
 {
-	struct tb_test_dprx *ctx = container_of(tunnel->tb, struct tb_test_dprx, tb);
+	struct tb_test_dprx *ctx = data;
 
 	ctx->completions++;
 	complete(&ctx->worker_passed);
@@ -3496,7 +3496,7 @@ static void tb_test_dp_dprx_deferred_first(struct kunit *test)
 	dev = alloc_dev_default(test, host, 0x1, true);
 	KUNIT_ASSERT_NOT_NULL(test, dev);
 	tunnel = tb_tunnel_alloc_dp(tb, &host->ports[5], &dev->ports[13],
-				    1, 0, 0, tb_test_dprx_finished);
+				    1, 0, 0, tb_test_dprx_finished, ctx);
 	KUNIT_ASSERT_NOT_NULL(test, tunnel);
 	tb->wq = alloc_ordered_workqueue("tb-dprx-gate-test", 0);
 	if (!tb->wq) {

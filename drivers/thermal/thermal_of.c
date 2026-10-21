@@ -207,6 +207,9 @@ static void thermal_of_parameters_init(struct device_node *np,
 	if (!of_property_read_u32(np, "sustainable-power", &prop))
 		tzp->sustainable_power = prop;
 
+	of_property_read_u32(np, "integral-time-constant-ms",
+			     &tzp->integral_time_constant_ms);
+
 	/*
 	 * For now, the thermal framework supports only one sensor per
 	 * thermal zone. Thus, we are considering only the first two
@@ -444,7 +447,7 @@ static struct thermal_zone_device *thermal_of_zone_register(struct device_node *
 
 	ret = thermal_zone_device_enable(tz);
 	if (ret) {
-		pr_err("Failed to enabled thermal zone '%s', id=%d: %d\n",
+		pr_err("Failed to enable thermal zone '%s', id=%d: %d\n",
 		       tz->type, tz->id, ret);
 		thermal_of_zone_unregister(tz);
 		return ERR_PTR(ret);
