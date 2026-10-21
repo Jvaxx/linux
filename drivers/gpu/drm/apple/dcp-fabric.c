@@ -2198,6 +2198,24 @@ unwind:
 	return ret;
 }
 
+/*
+ * Can no pipeline that drives @port take the second half of a tiled display?
+ * A tile joins DPTX port 1 of the pipeline that drives dpin0, which an
+ * external display processor never does (see dcp_tb_split_locked()). That is
+ * fixed when the processor probes, before its routes are registered, so it
+ * holds before any of its services are up. On T6030 every Type-C pipeline is
+ * an external processor. A port with no routes is not judged here.
+ */
+static bool dcp_typec_port_untileable(struct apple_dcp_typec_port *port)
+{
+	struct apple_dcp_typec_route *route;
+
+	list_for_each_entry(route, &port->routes, port_link)
+		if (!route->dcp->external)
+			return false;
+	return !list_empty(&port->routes);
+}
+
 /* -EOPNOTSUPP: not a tile, route dpin1 as a display of its own. */
 static int dcp_tb_split_locked(struct apple_dcp_typec_port *port,
 			       const struct dcp_tb_attach_context *req)
@@ -2229,6 +2247,9 @@ static int dcp_tb_split_locked(struct apple_dcp_typec_port *port,
 		return dcp_tb_split_teardown_locked(port, false);
 	}
 	if (!req->active)
+		return -EOPNOTSUPP;
+	/* No tile is possible here: there is no dpin0 to wait for. */
+	if (dcp_typec_port_untileable(port))
 		return -EOPNOTSUPP;
 	/* dpin0 first: the Thunderbolt side retries on -ENODEV */
 	if (!route || !route->tunnel || route->tunnel_dpin != 0)
