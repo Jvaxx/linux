@@ -97,8 +97,8 @@ NetworkManager with wpa_supplicant, pending the hardware qualification below.
 The standard SAE PWE settings (unspecified, hunting-and-pecking,
 hash-to-element and both) are accepted; firmware chooses the exchange without
 a host PWE field. Exact PWE policy behavior on 2.4 and 5 GHz still needs
-qualification. SAE-PK, SAE-EXT-KEY, additional ciphers and 6 GHz are not
-advertised.
+qualification. SAE-PK, SAE-EXT-KEY and additional ciphers are not advertised. OWE and
+6 GHz support are described below.
 
 J700 hardware testing with NetworkManager and wpa_supplicant on a PSK+SAE
 transition network has confirmed, on 2.4 GHz channel 6 and 5 GHz channel 149:
@@ -113,6 +113,9 @@ automated tests. A pure WPA3 network, exact PWE policy behavior, WPA2
 throughput regression comparisons and long-duration reliability still need
 qualification. 2.4 GHz throughput is lower than 5 GHz with every security
 mode.
+
+The SAE key cipher is at offset 0x44; offset 0x48 is the 16-bit key-flags
+field and stays zero.
 
 Enhanced Open (OWE)
 -------------------
@@ -136,9 +139,81 @@ shares a ten-second association-event deadline and programs the station
 identity again before association. No further retry is made by the worker.
 
 For OWE transition mode, the supplicant selects the encrypted BSS and can use
-a directed scan to find its hidden SSID. This driver change does not add the
-6 GHz band. Pure OWE, transition mode and first-authentication behavior after
-a cold boot still require physical qualification on both supported bands.
+a directed scan to find its hidden SSID. Pure OWE, transition mode and
+first-authentication behavior after a cold boot still need hardware
+qualification on every band.
+
+6 GHz country packages
+----------------------
+
+The qualified two-stream PHY profile exposes UNII-5..8 with station HE and
+HE 6 GHz capabilities, up to 80 MHz. Firmware band 3 is independent of the
+single-interface MAC index. Channel numbers always carry their nl80211 band.
+Only SAE and OWE with required MFP are admitted on 6 GHz. Hunting-and-pecking
+only is refused there; firmware owns H2E. These checks extend the SAE and
+OWE layers without another crypto or authentication implementation.
+
+Wildcard 6 GHz scans listen passively. Hidden SSIDs use directed scanning
+when NO_IR permits it. RNR-only requests remain passive until target-list
+serialization is implemented. Full-band scans are split into bounded
+32-channel commands. Firmware event channel layout is checked before OCA
+association calibration, queue binding and the two association power pages.
+
+J7RP version 1 remains valid and never authorizes 6 GHz. Generate version 2
+from the original text tables and the installed version-1 packages::
+
+  python3 tools/asahi/mt7932-policy-6ghz.py --tables /path/to/IZUBA \
+    --legacy-dir /path/to/policy --output-dir /path/to/new-policy
+  python3 tools/asahi/mt7932-policy-6ghz-tests.py
+
+The default outputs are AU.bin, US.bin, CA.bin and DE.bin (the EU test
+country). Input hashes pin the macOS 25G83 revision of the tables. All files
+are validated before publication and existing output files are not replaced.
+Only code is distributed; the power tables and generated packages stay on
+the machine they come from.
+
+The producer reads VLP sections and the 6 GHz country matrix. Mode 2 in a
+channel's operating-class set grants VLP eligibility, intersected with
+available per-rate data. It emits 14 native per-rate pages and 14 legacy
+pages, including the eight-entry selector-02 and selector-0f association
+pages. The unsupported-rate bitmap is not generated, so the firmware's
+default rate accounting applies and still needs qualification.
+
+No regulatory model is replaced: cfg80211 flags, including NO_IR and VLP
+client restrictions, remain authoritative. The driver consumes EIRP and PSD
+limits by reducing native half-dBm rate cells before publication, preserving
+unsupported and unpopulated sentinels. Association reuses the reduced pages.
+PSD rounding uses allocation bandwidth lower bounds, so it cannot raise a
+limit. Unrepresentable reductions disable the affected rate. Legacy-band
+power handling is unchanged. LPI/AFC operation is not added by VLP packages.
+
+J7RP v2 format
+~~~~~~~~~~~~~~
+
+The unchanged 16-byte J7RP header, mode records and 13 version-1 tables are
+followed by a 24-byte extension header. The outer version is 2 and maximum
+package size is 65536 bytes:
+
+* bytes 0..3: ``6GRP``;
+* byte 4: class 1 (VLP); byte 5: 14 dBm profile ceiling;
+* byte 6: power-page count (1..32); byte 7: zero;
+* bytes 8..15: little-endian permission bitmap, bit i = primary 1+4*i,
+  with bits 59..63 clear;
+* bytes 16..17: alpha2; byte 18: native half-dBm rate-cell contract 1;
+* bytes 19..23: zero.
+
+A page has CID, a zero byte, a little-endian 16-bit body length, then body.
+CID 0x5d uses version 3, tag 0x2a, band 3, matching alpha2, a 44-byte header
+and 122-byte entries. CID 0x95 uses a zero/reserved header without embedded
+length or country, band 3 and 33-byte legacy entries with 0x7f payload.
+The containing package supplies country identity for the latter. Both
+association pages are required exactly once with eight entries and length
+1020. Association selectors are not channel permissions.
+
+Association submits those two pages after the queue bind. No transmit
+power envelope request is built. Generic runtime D7 calibration requests
+for 6 GHz are still rejected. These gaps and the SAE, OWE and per-country
+RF behavior need more hardware qualification.
 
 Local firmware inputs
 ---------------------

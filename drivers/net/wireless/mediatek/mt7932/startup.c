@@ -4,8 +4,9 @@
 #include "mt7932.h"
 
 static int mt_stock_config(struct mt7932 *m);
-static int mt_publish_policy(struct mt7932 *m, const struct mt7932_reg_snapshot *reg,
-			     const struct mt7932_policy *policy);
+static noinline_for_stack int mt_publish_policy(struct mt7932 *m,
+						const struct mt7932_reg_snapshot *reg,
+						const struct mt7932_policy *policy);
 static int mt_privacy_defaults(struct mt7932 *m);
 static int mt_startup_once(struct mt7932 *m);
 static void mt_startup_work(struct work_struct *work);
@@ -137,11 +138,15 @@ out:
 	return ret;
 }
 
-static int mt_publish_policy(struct mt7932 *m, const struct mt7932_reg_snapshot *reg,
-			     const struct mt7932_policy *policy)
+static noinline_for_stack int mt_publish_policy(struct mt7932 *m,
+						const struct mt7932_reg_snapshot *reg,
+						const struct mt7932_policy *policy)
 {
 	u8 dbdc[36] = {0,0,0,0,2,0,36};
 	unsigned int i;
+	struct mt7932_6g_limits limits = mt7932_6g_limits(reg);
+	u8 body[1020];
+	unsigned int j;
 	int ret;
 
 	if (!m->startup_started) {
@@ -154,7 +159,14 @@ static int mt_publish_policy(struct mt7932 *m, const struct mt7932_reg_snapshot 
 		if (ret)
 			return ret;
 	}
-	ret = mt_request(m, 0x0f, true, true, false, reg->domain, reg->length);
+	memcpy(body, reg->domain, reg->length);
+	for (j = reg->domain[8] + reg->domain[9];
+	     j < reg->domain[8] + reg->domain[9] + reg->domain[10]; j++) {
+		u32 flags = get_unaligned_le32(body + 16 + j * 8);
+
+		put_unaligned_le32(flags & ~IEEE80211_CHAN_PSD, body + 16 + j * 8);
+	}
+	ret = mt_request(m, 0x0f, true, true, false, body, reg->length);
 	if (ret)
 		return ret;
 	for (i = 0; i < MT7932_POLICY_TABLES; i++) {
@@ -162,6 +174,21 @@ static int mt_publish_policy(struct mt7932 *m, const struct mt7932_reg_snapshot 
 		if (ret)
 			return ret;
 	}
+	m->six_power_valid = false;
+	for (i = 0; i < policy->six_pages; i++) {
+		memcpy(body, policy->six_page[i], policy->six_length[i]);
+		if (policy->six_cid[i] == 0x5d)
+			mt7932_6g_limit_page(body, &limits);
+		ret = mt_request(m, policy->six_cid[i], true, true, false,
+				 body, policy->six_length[i]);
+		for (j = 0; j < 2; j++)
+			if (policy->six_page[i] == policy->assoc_power[j])
+				memcpy(m->six_assoc_power[j], body, 1020);
+		if (ret)
+			return ret;
+	}
+	if (policy->six_pages)
+		m->six_power_valid = true;
 	/* Native SETs have no response/atomic policy-commit event. Command
 	 * submission is not misrepresented as firmware readback or an ACK.
 	 */
@@ -236,8 +263,11 @@ static int mt_startup_once(struct mt7932 *m)
 
 static struct ieee80211_channel *mt_channel(struct mt7932 *m, unsigned int i)
 {
-	return i < MT7932_CHANNELS_2G ? &m->channels[i] :
-	       &m->channels5[i - MT7932_CHANNELS_2G];
+	if (i < MT7932_CHANNELS_2G)
+		return &m->channels[i];
+	i -= MT7932_CHANNELS_2G;
+	return i < MT7932_CHANNELS_5G ? &m->channels5[i] :
+		&m->channels6[i - MT7932_CHANNELS_5G];
 }
 
 /* Keep cfg80211's channel list in step with the channels the country
@@ -265,7 +295,15 @@ static void mt_policy_disable(struct mt7932 *m, const struct mt7932_policy *poli
 	wiphy_lock(m->wiphy);
 	for (i = 0; i < MT7932_CHANNELS; i++) {
 		struct ieee80211_channel *channel = mt_channel(m, i);
-		bool forbidden = !mt7932_policy_permits(policy, channel->hw_value);
+		bool forbidden = !mt7932_policy_permits(policy, channel->band, channel->hw_value);
+
+		if (!forbidden && channel->band == NL80211_BAND_6GHZ) {
+			const struct ieee80211_reg_rule *rule;
+
+			rule = freq_reg_info(m->wiphy, MHZ_TO_KHZ(channel->center_freq));
+			if (!IS_ERR(rule) && !(rule->flags & NL80211_RRF_NO_IR))
+				channel->flags &= ~IEEE80211_CHAN_NO_IR;
+		}
 
 		__assign_bit(i, m->policy_disabled, forbidden);
 		if (forbidden)
@@ -311,7 +349,7 @@ static void mt_startup_work(struct work_struct *work)
 {
 	struct mt7932 *m = container_of(work, struct mt7932, startup_work);
 	struct mt7932_reg_snapshot reg;
-	struct mt7932_policy policy;
+	struct mt7932_policy *policy;
 	const struct firmware *file;
 	unsigned long flags;
 	u32 generation;
@@ -349,6 +387,7 @@ static void mt_startup_work(struct work_struct *work)
 		if (READ_ONCE(m->retired_scan_seq))
 			ret = -EBUSY;
 		file = NULL;
+		policy = NULL;
 		submitted = false;
 		if (READ_ONCE(m->policy_failed) || READ_ONCE(m->link_failed) ||
 		    (m->startup_started && !READ_ONCE(m->rf_ready)))
@@ -363,10 +402,14 @@ static void mt_startup_work(struct work_struct *work)
 			ret = mt_request_input(m, &file, path);
 		}
 		if (!ret) {
-			ret = mt7932_policy_parse(&policy, file->data, file->size, reg.domain);
+			policy = kzalloc_obj(*policy, GFP_KERNEL);
+			ret = -ENOMEM;
+			if (policy)
+				ret = mt7932_policy_parse(policy, file->data,
+							  file->size, reg.domain);
 			if (!ret) {
-				mt7932_policy_filter(&reg, &policy);
-				mt_policy_disable(m, &policy, generation);
+				mt7932_policy_filter(&reg, policy);
+				mt_policy_disable(m, policy, generation);
 			} else {
 				dev_err_ratelimited(&m->pdev->dev, "local input %s has invalid policy: %d\n", path, ret);
 			}
@@ -376,7 +419,7 @@ static void mt_startup_work(struct work_struct *work)
 			goto next;
 		if (!ret) {
 			submitted = true;
-			ret = mt_publish_policy(m, &reg, &policy);
+			ret = mt_publish_policy(m, &reg, policy);
 			if (!ret && !m->startup_started)
 				ret = mt_startup_once(m);
 			/* A partial SET sequence is not a rollback. Only missing or
@@ -407,6 +450,7 @@ next:
 		mutex_unlock(&m->command_mutex);
 		if (file)
 			release_firmware(file);
+		kfree(policy);
 	}
 }
 
@@ -437,11 +481,23 @@ static void mt_regulatory_notify(struct wiphy *wiphy, struct regulatory_request 
 		memcpy(reg.domain, "XZ", 2);
 	reg.domain[4] = 1; /* 2 GHz remains 20 MHz. */
 	reg.domain[5] = mt7932_domain_5g_bw();
+	reg.domain[6] = 2;
 	for (i = 0; i < MT7932_CHANNELS; i++) {
 		struct ieee80211_channel *channel = mt_channel(m, i);
 		u32 flags = channel->flags;
 
+		if (channel->band == NL80211_BAND_6GHZ) {
+			const struct ieee80211_reg_rule *rule;
+
+			rule = freq_reg_info(m->wiphy, MHZ_TO_KHZ(channel->center_freq));
+			if (!IS_ERR(rule) && !(rule->flags & NL80211_RRF_NO_IR))
+				flags &= ~IEEE80211_CHAN_NO_IR;
+			if (flags & IEEE80211_CHAN_NO_6GHZ_VLP_CLIENT)
+				flags |= IEEE80211_CHAN_DISABLED;
+		}
+
 		reg.power[i] = channel->max_power;
+		reg.psd[i] = channel->psd;
 		if (flags & IEEE80211_CHAN_DISABLED)
 			continue;
 		/* Native per-rate units are not a proven dBm conversion. Do not
@@ -451,8 +507,10 @@ static void mt_regulatory_notify(struct wiphy *wiphy, struct regulatory_request 
 		 * out of the firmware domain and disabled for cfg80211 instead.
 		 */
 		if (flags & (IEEE80211_CHAN_NO_OFDM | IEEE80211_CHAN_NO_20MHZ |
-			     IEEE80211_CHAN_PSD | IEEE80211_CHAN_IR_CONCURRENT) ||
-		    channel->max_power < 20) {
+			     IEEE80211_CHAN_IR_CONCURRENT) ||
+		    (channel->band != NL80211_BAND_6GHZ &&
+		     ((flags & IEEE80211_CHAN_PSD) || channel->max_power < 20)) ||
+		    (channel->band == NL80211_BAND_6GHZ && channel->max_power < -64)) {
 			channel->flags |= IEEE80211_CHAN_DISABLED;
 			continue;
 		}
@@ -466,7 +524,7 @@ static void mt_regulatory_notify(struct wiphy *wiphy, struct regulatory_request 
 		 */
 		put_unaligned_le32(flags, reg.domain + 16 + count * 8);
 		count++;
-		reg.domain[i < MT7932_CHANNELS_2G ? 8 : 9]++;
+		reg.domain[8 + mt7932_channel_band(channel->band, channel->hw_value) - 1]++;
 	}
 	reg.length = 12 + count * 8;
 	if (!count)
@@ -598,6 +656,7 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 		m->rates[i].bitrate = rates[i];
 		m->rates[i].hw_value = i;
 	}
+	m->band2.band = NL80211_BAND_2GHZ;
 	m->band2.channels = m->channels;
 	m->band2.n_channels = ARRAY_SIZE(m->channels);
 	m->band2.bitrates = m->rates;
@@ -626,6 +685,7 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 			if (!MT7932_MAX_5G_BW)
 				m->channels5[i].flags |= IEEE80211_CHAN_NO_HT40;
 		}
+		m->band5.band = NL80211_BAND_5GHZ;
 		m->band5.channels = m->channels5;
 		m->band5.n_channels = ARRAY_SIZE(m->channels5);
 		m->band5.bitrates = m->rates + 4;
@@ -635,6 +695,35 @@ int mt_register_regulatory_gate(struct mt7932 *m)
 	if (mt7932_phy_profile(m->phy_cap)) {
 		mt7932_band_capabilities(&m->band2, false);
 		mt7932_band_capabilities(&m->band5, true);
+		if (m->six_ghz) {
+			for (i = 0; i < MT7932_CHANNELS_6G; i++) {
+				struct ieee80211_channel *ch = &m->channels6[i];
+				unsigned int pair, primary = mt7932_channel_6g(i);
+
+				ch->band = NL80211_BAND_6GHZ;
+				ch->hw_value = primary;
+				ch->center_freq = ieee80211_channel_to_frequency(primary, ch->band);
+				ch->max_power = 14;
+				ch->flags = IEEE80211_CHAN_NO_IR | IEEE80211_CHAN_NO_160MHZ;
+				pair = mt7932_channel_6g_center(primary, false);
+				if (!pair)
+					ch->flags |= IEEE80211_CHAN_NO_HT40;
+				else
+					ch->flags |= pair < primary ? IEEE80211_CHAN_NO_HT40PLUS :
+						IEEE80211_CHAN_NO_HT40MINUS;
+				if (!mt7932_channel_6g_center(primary, true))
+					ch->flags |= IEEE80211_CHAN_NO_80MHZ;
+			}
+			m->band6.band = NL80211_BAND_6GHZ;
+			m->band6.channels = m->channels6;
+			m->band6.n_channels = MT7932_CHANNELS_6G;
+			m->band6.bitrates = m->rates + 4;
+			m->band6.n_bitrates = ARRAY_SIZE(m->rates) - 4;
+			mt7932_he_6g_capabilities(&m->he6, &m->band5);
+			m->band6.iftype_data = &m->he6;
+			m->band6.n_iftype_data = 1;
+			m->wiphy->bands[NL80211_BAND_6GHZ] = &m->band6;
+		}
 	}
 	ret = wiphy_register(m->wiphy);
 	if (ret) {

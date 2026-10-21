@@ -12,6 +12,19 @@
 #define MT7932_SAE_PASSWORD_MIN 8
 #define MT7932_SAE_PASSWORD_MAX 63
 
+/* 6 GHz requires PMF and firmware SAE-H2E or OWE, never a legacy arm. */
+static inline bool mt7932_connect_band_allowed(enum nl80211_band band, u32 akm,
+					       enum nl80211_mfp mfp,
+					       enum nl80211_sae_pwe_mechanism pwe)
+{
+	if (band != NL80211_BAND_6GHZ)
+		return true;
+	if (mfp != NL80211_MFP_REQUIRED)
+		return false;
+	return akm == WLAN_AKM_SUITE_OWE ||
+		(akm == WLAN_AKM_SUITE_SAE && pwe != NL80211_SAE_PWE_HUNT_AND_PECK);
+}
+
 /* The first AKM is selected by userspace. Credentials for an alternative
  * must never change the selected security arm on a transition BSS.
  */
@@ -30,6 +43,11 @@ mt7932_connect_auth(const struct cfg80211_connect_params *p)
 	    p->crypto.ciphers_pairwise[0] != WLAN_CIPHER_SUITE_CCMP ||
 	    p->crypto.cipher_group != WLAN_CIPHER_SUITE_CCMP ||
 	    p->crypto.n_akm_suites < 1)
+		return -EOPNOTSUPP;
+
+	if (p->channel && !mt7932_connect_band_allowed(p->channel->band,
+						       p->crypto.akm_suites[0], p->mfp,
+						       p->crypto.sae_pwe))
 		return -EOPNOTSUPP;
 
 	switch (p->crypto.akm_suites[0]) {
@@ -264,7 +282,8 @@ static inline void mt7932_connect_sae_body(u8 *body, const u8 *password,
  */
 static inline int mt7932_connect_body(u8 *body, size_t capacity, const u8 *ssid,
 				      size_t ssid_length, const u8 pmk[32], const u8 bssid[6],
-				      u8 channel, unsigned int listen_interval, u8 connection_flags,
+				      enum nl80211_band band, u8 channel,
+				      unsigned int listen_interval, u8 connection_flags,
 				      const struct mt7932_peer_ids *ids, bool open,
 				      const u8 *sae_pwd, size_t sae_pwd_length, bool owe)
 {
@@ -280,7 +299,8 @@ static inline int mt7932_connect_body(u8 *body, size_t capacity, const u8 *ssid,
 		     sae_pwd_length > MT7932_SAE_PASSWORD_MAX)) ||
 	    (sae_pwd && !sae) ||
 	    capacity < 856 || !ssid_length || ssid_length > 32 ||
-	    !mt7932_channel_band(channel) || connection_flags > 63 || (bssid[0] & 1))
+	    !mt7932_channel_band(band, channel) ||
+	    (band == NL80211_BAND_6GHZ && !sae && !owe) || connection_flags > 63 || (bssid[0] & 1))
 		return -EINVAL;
 	memcpy(resources, ids->station, 2);
 	memcpy(resources + 2, ids->wtbl, 4);
@@ -319,6 +339,8 @@ static inline int mt7932_connect_body(u8 *body, size_t capacity, const u8 *ssid,
 	memcpy(body + 0x1c, ssid, ssid_length);
 	/* Retain the established policy byte for the qualified request. */
 	body[0x1c0] = connection_flags;
+	if (band == NL80211_BAND_6GHZ)
+		body[0x1c4] = BIT(1);
 	/* Fresh HOST AIS media state1 selects CCMP type5 here. This is not
 	 * structured-key type0x44 or the association event's RSN suite encoding.
 	 * This builder is only used for an unassociated attempt.
@@ -326,7 +348,7 @@ static inline int mt7932_connect_body(u8 *body, size_t capacity, const u8 *ssid,
 	put_unaligned_le32(open || owe ? 0 : 5, body + 0x220);
 	put_unaligned_le16(listen_interval > 20 ? 20 : listen_interval, body + 0x228);
 	memcpy(body + 0x32c, bssid, 6);
-	body[0x338] = mt7932_channel_band(channel);
+	body[0x338] = mt7932_channel_band(band, channel);
 	body[0x339] = channel;
 	body[0x33c] = 1;
 	body[0x33d] = 2;
@@ -353,13 +375,15 @@ static inline void mt7932_peer_queue(u8 body[32], u8 station, bool bind)
 }
 
 static inline bool mt7932_assoc_resources(const u8 *body, size_t length,
-					 const struct mt7932_peer_ids *ids, u8 channel, bool open)
+					 const struct mt7932_peer_ids *ids,
+					 enum nl80211_band band, u8 channel, bool open)
 {
 	unsigned int i;
 
 	if (length < 52 || get_unaligned_le16(body) || body[16] ||
 	    body[17] != ids->wtbl[0] || body[20] != ids->station[0] ||
-	    !mt7932_channel_band(channel) || body[11] != mt7932_channel_band(channel) || body[12] != channel ||
+	    !mt7932_channel_band(band, channel) ||
+	    body[11] != mt7932_channel_band(band, channel) || body[12] != channel ||
 	    (!open && get_unaligned_le32(body + 48) != 0x000fac04))
 		return false;
 	for (i = 0; i < 4; i++)

@@ -163,7 +163,7 @@ static int mt_scan_submit_next(struct mt7932 *m)
 {
 	struct cfg80211_scan_request *request = m->scan_request;
 	const struct cfg80211_ssid *ssid = NULL;
-	u8 body[0x4d4], channels[MT7932_CHANNELS_5G];
+	u8 body[0x4d4], channels[MT7932_SCAN_CHANNELS];
 	unsigned int count = 0, i;
 	unsigned long flags;
 	bool passive = false;
@@ -172,26 +172,32 @@ static int mt_scan_submit_next(struct mt7932 *m)
 	/* 2GHz active/passive, then 5GHz active/passive. Never put a NO_IR
 	 * channel in a firmware request which can emit probe requests.
 	 */
-	while (!count && ++m->scan_batch <= 4) {
+	while (!count && m->scan_batch <= 6) {
+		if (!m->scan_cursor && ++m->scan_batch > 6)
+			break;
 		m->scan_band = (m->scan_batch + 1) / 2;
 		passive = !(m->scan_batch & 1);
-		for (i = 0; i < request->n_channels; i++) {
+		for (i = m->scan_cursor; i < request->n_channels; i++) {
 			struct ieee80211_channel *channel = request->channels[i];
 			bool radar = channel->flags & IEEE80211_CHAN_RADAR;
 			bool listen = !request->n_ssids || radar ||
+				      (channel->band == NL80211_BAND_6GHZ &&
+				       !request->ssids[0].ssid_len) ||
 				      (channel->flags & IEEE80211_CHAN_NO_IR);
 
 			/* Radar channels are never joined; while associated,
 			 * a passive dwell there only delays the home channel.
 			 */
-			if (mt7932_channel_band(channel->hw_value) != m->scan_band ||
+			if (mt7932_channel_band(channel->band, channel->hw_value) != m->scan_band ||
 			    listen != passive || (radar && m->scan_home_channel))
 				continue;
-			if (channel->flags & (IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_20MHZ) ||
-			    count == ARRAY_SIZE(channels))
+			if (channel->flags & (IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_20MHZ))
 				return -EINVAL;
+			if (count == ARRAY_SIZE(channels))
+				break;
 			channels[count++] = channel->hw_value;
 		}
+		m->scan_cursor = i == request->n_channels ? 0 : i;
 	}
 	if (!count)
 		return 1;
@@ -207,7 +213,10 @@ static int mt_scan_submit_next(struct mt7932 *m)
 	m->scan_finished = false;
 	reinit_completion(&m->scan_done);
 	spin_unlock_irqrestore(&m->response_lock, flags);
-	ret = mt7932_scan_body(body, sizeof(body), m->scan_seq, channels, count);
+	ret = mt7932_scan_body(body, sizeof(body), m->scan_seq,
+			       m->scan_band == 1 ? NL80211_BAND_2GHZ :
+			       m->scan_band == 2 ? NL80211_BAND_5GHZ : NL80211_BAND_6GHZ,
+				 channels, count);
 	if (ret >= 0 && passive) {
 		if (m->scan_home_channel)
 			mt7932_scan_passive(body);
@@ -215,7 +224,7 @@ static int mt_scan_submit_next(struct mt7932 *m)
 			mt7932_scan_disconnected_passive(body);
 	}
 	if (ret >= 0)
-		ret = mt7932_scan_home(body, m->scan_home_channel);
+		ret = mt7932_scan_home(body, m->scan_home_band, m->scan_home_channel);
 	if (ret >= 0)
 		ret = mt7932_scan_options(body, ssid ? ssid->ssid : NULL,
 					  ssid ? ssid->ssid_len : 0,
@@ -237,7 +246,7 @@ static int mt_scan_submit_next(struct mt7932 *m)
  */
 int mt_connect_discover(struct mt7932 *m)
 {
-	u8 body[0x4d4], channels[MT7932_CHANNELS_5G], cancel[4] = {};
+	u8 body[0x4d4], channels[MT7932_SCAN_CHANNELS], cancel[4] = {};
 	unsigned long flags;
 	unsigned int attempt, band, i, count;
 	int ret = 0;
@@ -246,14 +255,18 @@ int mt_connect_discover(struct mt7932 *m)
 	 * passive fallback obtains real beacons, without treating a stale
 	 * userspace candidate as evidence or relaxing association admission.
 	 */
-	for (attempt = 0; attempt < 4; attempt++) {
+	for (attempt = 0; attempt < 12; attempt++) {
 		struct ieee80211_supported_band *sband;
-		bool passive = attempt >= 2;
+		bool passive = attempt >= 6;
 
-		band = 1 + attempt % 2;
-		sband = band == 1 ? &m->band2 : &m->band5;
+		band = 1 + (attempt / 2) % 3;
+		sband = band == 1 ? &m->band2 : band == 2 ? &m->band5 : &m->band6;
+		if (band == 3 && m->connect_akm != WLAN_AKM_SUITE_SAE &&
+		    m->connect_akm != WLAN_AKM_SUITE_OWE)
+			continue;
 		count = 0;
-		for (i = 0; i < sband->n_channels; i++) {
+		for (i = (attempt % 2) * MT7932_SCAN_CHANNELS;
+		     i < sband->n_channels && i < (attempt % 2 + 1) * MT7932_SCAN_CHANNELS; i++) {
 			struct ieee80211_channel *channel = &sband->channels[i];
 
 			if (m->connect_channel_req && channel != m->connect_channel_req)
@@ -262,7 +275,8 @@ int mt_connect_discover(struct mt7932 *m)
 					      IEEE80211_CHAN_RADAR))
 				continue;
 			passive |= !!(channel->flags & IEEE80211_CHAN_NO_IR);
-			channels[count++] = channel->hw_value;
+			if (count < ARRAY_SIZE(channels))
+				channels[count++] = channel->hw_value;
 		}
 		if (!count)
 			continue;
@@ -276,7 +290,8 @@ int mt_connect_discover(struct mt7932 *m)
 		m->discovering = true;
 		m->discovery_finished = false;
 		spin_unlock_irqrestore(&m->response_lock, flags);
-		ret = mt7932_scan_body(body, sizeof(body), m->scan_seq, channels, count);
+		ret = mt7932_scan_body(body, sizeof(body), m->scan_seq,
+				       sband->band, channels, count);
 		if (ret >= 0) {
 			/* NO_IR forbids probes, not listening. A missing candidate in
 			 * the world domain still needs discovery; the connect worker
@@ -364,9 +379,9 @@ int mt_scan(struct wiphy *wiphy, struct cfg80211_scan_request *request)
 	for (i = 0; i < request->n_channels; i++) {
 		struct ieee80211_channel *channel = request->channels[i];
 
-		if (!mt7932_channel_band(channel->hw_value) ||
+		if (!mt7932_channel_band(channel->band, channel->hw_value) ||
 		    (channel->band != NL80211_BAND_2GHZ &&
-		     channel->band != NL80211_BAND_5GHZ) ||
+		     channel->band != NL80211_BAND_5GHZ && channel->band != NL80211_BAND_6GHZ) ||
 		    channel->flags & (IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_20MHZ))
 			return -EINVAL;
 	}
@@ -379,7 +394,9 @@ int mt_scan(struct wiphy *wiphy, struct cfg80211_scan_request *request)
 	}
 	m->scan_band = 0;
 	m->scan_batch = 0;
+	m->scan_cursor = 0;
 	m->scan_home_channel = m->connected ? m->connect_channel : 0;
+	m->scan_home_band = m->connect_band;
 	m->scan_request = request;
 	m->scan_finished = m->scan_aborted = false;
 	spin_unlock_irqrestore(&m->response_lock, flags);
@@ -651,13 +668,12 @@ void mt_packet_receive(struct mt7932 *m, const u8 *packet, size_t length)
 	struct mt7932_rx_frame frame;
 	struct cfg80211_bss *bss;
 	struct ieee80211_channel *channel;
-	unsigned int band;
 	int ret = mt7932_rx_frame(packet, length, &frame);
 
 	if (ret || !READ_ONCE(m->rf_ready))
 		return;
-	band = mt7932_channel_band(frame.channel);
-	channel = ieee80211_get_channel(m->wiphy, band == 1 ? 2407 + 5 * frame.channel : 5000 + 5 * frame.channel);
+	channel = ieee80211_get_channel(m->wiphy,
+					ieee80211_channel_to_frequency(frame.channel, frame.band));
 	if (!channel || (channel->flags & IEEE80211_CHAN_DISABLED))
 		return;
 	if (frame.translated) {

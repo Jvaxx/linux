@@ -13,6 +13,7 @@ struct mt7932_rx_frame {
 	u32 timestamp, rcpi, rxv;
 	u16 frame_control, sequence_control, qos_control, wtbl;
 	u8 channel, amsdu, sec_mode;
+	enum nl80211_band band;
 	bool translated, group4, signal_valid, rate_valid, unicast;
 	bool cipher_mismatch;
 };
@@ -69,7 +70,7 @@ static inline int mt7932_rx_frame(const u8 *packet, size_t size, struct mt7932_r
 	out->sec_mode = (w1 >> MT7932_RXD1_SEC_MODE_SHIFT) & MT7932_RXD1_SEC_MODE_MASK;
 	out->cipher_mismatch = w1 & (MT7932_RXD1_CIPHER_MISMATCH |
 				     MT7932_RXD1_CIPHER_LEN_MISMATCH);
-	if (!mt7932_channel_band(out->channel))
+	if (!mt7932_channel_from_rx(out->channel, &out->band, &out->channel))
 		return -EOPNOTSUPP;
 	if ((out->translated && (w2 & (1U << 27))) || (!out->translated && out->amsdu))
 		return -EOPNOTSUPP;

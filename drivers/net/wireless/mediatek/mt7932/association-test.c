@@ -80,7 +80,9 @@ static void mt_connect_body_test(struct kunit *test)
 
 			memset(body, 0xff, sizeof(body));
 			ret = mt7932_connect_body(body, sizeof(body), "IEEE", 4,
-						  open || owe ? NULL : pmk, bssid, channels[band],
+						  open || owe ? NULL : pmk, bssid,
+						  band ? NL80211_BAND_5GHZ :
+						  NL80211_BAND_2GHZ, channels[band],
 						  40, 2, &ids, open,
 						  sae ? password : NULL, sae ? 63 : 0, owe);
 			KUNIT_ASSERT_EQ(test, ret, 856);
@@ -157,7 +159,8 @@ static void mt_sae_body_bounds_test(struct kunit *test)
 
 		memset(body, 0xa5, sizeof(body));
 		ret = mt7932_connect_body(body, requests[i].capacity, "IEEE", 4,
-					  requests[i].pmk ? pmk : NULL, bssid, 11, 20, 2, &ids,
+					  requests[i].pmk ? pmk : NULL, bssid,
+					  NL80211_BAND_2GHZ, 11, 20, 2, &ids,
 					  requests[i].open, requests[i].password ? password : NULL,
 					  requests[i].password_length, false);
 		KUNIT_EXPECT_EQ(test, ret, requests[i].expected);
@@ -336,7 +339,8 @@ static void mt_owe_body_bounds_test(struct kunit *test)
 
 		memset(body, 0xa5, sizeof(body));
 		ret = mt7932_connect_body(body, i == 0 ? 855 : 856, "IEEE", 4,
-					  i == 1 ? pmk : NULL, bssid, 11, 20, 2, &ids,
+					  i == 1 ? pmk : NULL, bssid,
+					  NL80211_BAND_2GHZ, 11, 20, 2, &ids,
 					  i == 2, i == 3 || i == 4 ? password : NULL,
 					  i == 3 || i == 5 ? 8 : 0, true);
 		KUNIT_EXPECT_EQ(test, ret, -EINVAL);

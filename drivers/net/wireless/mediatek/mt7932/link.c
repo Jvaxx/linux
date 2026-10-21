@@ -15,15 +15,18 @@ static bool mt_channel_event(struct mt7932 *m, const u8 *body, size_t length)
 	struct cfg80211_chan_def def = {};
 	u8 center, bw;
 
-	if (length < 20 || get_unaligned_le32(body + 12) != mt7932_channel_band(m->connect_channel) ||
+	if (length < 20 ||
+	    get_unaligned_le32(body + 12) !=
+	    mt7932_channel_band(m->connect_band, m->connect_channel) ||
 	    body[17] != m->connect_channel ||
-	    !mt7932_channel_layout(body[17], body[16], body[19], MT7932_MAX_5G_BW, &center, &bw))
+	    !mt7932_channel_layout(m->connect_band, body[17], body[16], body[19],
+				   MT7932_MAX_5G_BW, &center, &bw))
 		return false;
-	def.chan = ieee80211_get_channel(m->wiphy, body[17] <= 13 ?
-				       2407 + 5 * body[17] : 5000 + 5 * body[17]);
+	def.chan = ieee80211_get_channel(m->wiphy,
+					 ieee80211_channel_to_frequency(body[17], m->connect_band));
 	def.width = bw == 2 ? NL80211_CHAN_WIDTH_80 : bw == 1 ?
 		NL80211_CHAN_WIDTH_40 : NL80211_CHAN_WIDTH_20;
-	def.center_freq1 = body[17] <= 13 ? 2407 + 5 * center : 5000 + 5 * center;
+	def.center_freq1 = ieee80211_channel_to_frequency(center, m->connect_band);
 	if (!def.chan || !cfg80211_chandef_valid(&def) ||
 	    !cfg80211_chandef_usable(m->wiphy, &def, IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_RADAR))
 		return false;
@@ -168,7 +171,7 @@ void mt_link_event(struct mt7932 *m, const struct mt7932_event *event)
 					sizeof(m->assoc_request_ies), body + 4, count,
 					m->connect_open);
 		if (ret >= 0 && m->band2.ht_cap.ht_supported &&
-		    !mt7932_assoc_phy_valid(m->connect_channel <= 14 ? &m->band2 : &m->band5,
+		    !mt7932_assoc_phy_valid(m->wiphy->bands[m->connect_band],
 					   m->assoc_request_ies, ret))
 			ret = -EPROTO;
 		if (ret < 0) {
@@ -218,7 +221,8 @@ void mt_link_event(struct mt7932 *m, const struct mt7932_event *event)
 			complete(&m->assoc_done);
 			break;
 		}
-		if (!mt7932_assoc_resources(body, length, &m->peer_ids, m->connect_channel, m->connect_open)) {
+		if (!mt7932_assoc_resources(body, length, &m->peer_ids, m->connect_band,
+					    m->connect_channel, m->connect_open)) {
 			m->connect_error = -EPROTO;
 			complete(&m->assoc_start);
 			complete(&m->assoc_done);
@@ -253,7 +257,8 @@ static int mt_association_calibration(struct mt7932 *m)
 	ret = mt_request_input(m, &oca, "mediatek/mt7932/oca2.bin");
 	if (ret)
 		return ret;
-	ret = mt7932_cal_association(oca->data, oca->size, m->connect_center, pieces, &input_tag);
+	ret = mt7932_cal_association(oca->data, oca->size, m->connect_band,
+				     m->connect_center, pieces, &input_tag);
 	if (ret < 0)
 		mt_cal_input_error(m, ret, input_tag, "association plan");
 	if (ret == 2) {
@@ -413,6 +418,10 @@ static int mt_connect_prepare(struct mt7932 *m, bool *peer_owned)
 		if (ret)
 			return ret;
 	}
+	if (!mt7932_connect_band_allowed(m->connect_bss->channel->band, m->connect_akm,
+					 m->connect_mfp, m->connect_sae_pwe) ||
+	    (m->connect_bss->channel->band == NL80211_BAND_6GHZ && !m->six_power_valid))
+		return -EOPNOTSUPP;
 	if (m->connect_bss->channel->flags & (IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_IR |
 					    IEEE80211_CHAN_NO_20MHZ | IEEE80211_CHAN_RADAR)) {
 		return -EINVAL;
@@ -422,6 +431,7 @@ static int mt_connect_prepare(struct mt7932 *m, bool *peer_owned)
 	if (!ret) {
 		*peer_owned = true;
 		m->connect_channel = m->connect_bss->channel->hw_value;
+		m->connect_band = m->connect_bss->channel->band;
 		memcpy(m->connect_bssid, m->connect_bss->bssid, ETH_ALEN);
 	}
 	spin_unlock_irqrestore(&m->response_lock, flags);
@@ -504,7 +514,7 @@ static int mt_connect_attempt(struct mt7932 *m, bool *submitted,
 	}
 	ret = mt7932_connect_body(body, 856, m->connect_ssid, m->connect_ssid_length,
 		m->connect_open || m->connect_owe ? NULL : m->connect_pmk, m->connect_bssid,
-		m->connect_channel, 20, 2, &m->peer_ids, m->connect_open,
+		m->connect_band, m->connect_channel, 20, 2, &m->peer_ids, m->connect_open,
 		m->connect_sae_pwd_length ? m->connect_sae_pwd : NULL,
 		m->connect_sae_pwd_length, m->connect_owe);
 	if (ret < 0)
@@ -557,6 +567,12 @@ free:
 	}
 	mt7932_peer_queue(queue, m->peer_ids.station[0], true);
 	ret = mt_request(m, 0x6b, true, true, false, queue, sizeof(queue));
+	if (!ret && m->connect_band == NL80211_BAND_6GHZ) {
+		unsigned int i;
+
+		for (i = 0; !ret && i < 2; i++)
+			ret = mt_request(m, 0x5d, true, true, false, m->six_assoc_power[i], 1020);
+	}
 	if (ret)
 		goto out;
 	if (retry && time_after_eq(jiffies, deadline)) {
@@ -811,6 +827,9 @@ int mt_connect(struct wiphy *wiphy, struct net_device *netdev,
 	m->connect_ssid_length = params->ssid_len;
 	m->connect_open = open;
 	m->connect_owe = auth == WLAN_AKM_SUITE_OWE;
+	m->connect_akm = auth;
+	m->connect_mfp = params->mfp;
+	m->connect_sae_pwe = params->crypto.sae_pwe;
 	memzero_explicit(m->connect_pmk, sizeof(m->connect_pmk));
 	memzero_explicit(m->connect_sae_pwd, sizeof(m->connect_sae_pwd));
 	m->connect_sae_pwd_length = 0;

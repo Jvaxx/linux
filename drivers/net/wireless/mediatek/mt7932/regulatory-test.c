@@ -7,7 +7,9 @@
 #include <kunit/test.h>
 #include <linux/prandom.h>
 
-#include "mt7932.h"
+#include <linux/unaligned.h>
+
+#include "regulatory.h"
 
 /* A world-domain snapshot: channels 1, 6, 36 and 149, the 5 GHz ones NO_IR. */
 static void reg_build(struct mt7932_reg_snapshot *reg)
@@ -209,14 +211,14 @@ static void mt7932_policy_valid_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, policy.modes, 3);
 	KUNIT_EXPECT_PTR_EQ(test, policy.table[0], data + 16 + 3 * PKG_MODE_SIZE);
 	KUNIT_EXPECT_EQ(test, policy.length[12], 265);
-	KUNIT_EXPECT_TRUE(test, mt7932_policy_permits(&policy, 36));
-	KUNIT_EXPECT_FALSE(test, mt7932_policy_permits(&policy, 14));
+	KUNIT_EXPECT_TRUE(test, mt7932_policy_permits(&policy, NL80211_BAND_5GHZ, 36));
+	KUNIT_EXPECT_FALSE(test, mt7932_policy_permits(&policy, NL80211_BAND_2GHZ, 14));
 
 	data = pkg_build(test, "XZ", &size);
 	KUNIT_EXPECT_EQ(test, size, 10241);
 	KUNIT_ASSERT_EQ(test, mt7932_policy_parse(&policy, data, size, "XZ"), 0);
 	KUNIT_EXPECT_EQ(test, policy.modes, 2);
-	KUNIT_EXPECT_TRUE(test, mt7932_policy_permits(&policy, 14));
+	KUNIT_EXPECT_TRUE(test, mt7932_policy_permits(&policy, NL80211_BAND_2GHZ, 14));
 }
 
 /* A package serves only the country it names, in the header and table 10. */
@@ -337,12 +339,30 @@ static void mt7932_policy_permits_test(struct kunit *test)
 	entry = pkg_entry(&policy, 144);
 	KUNIT_ASSERT_NOT_NULL(test, entry);
 	memset(entry + 1, MT7932_POLICY_NOT_PERMITTED, PKG_ENTRY_SIZE - 1);
-	KUNIT_EXPECT_FALSE(test, mt7932_policy_permits(&policy, 144));
+	KUNIT_EXPECT_FALSE(test, mt7932_policy_permits(&policy, NL80211_BAND_5GHZ, 144));
 	/* One rate with a limit is enough to permit the channel. */
 	entry[PKG_ENTRY_SIZE - 1] = 8;
-	KUNIT_EXPECT_TRUE(test, mt7932_policy_permits(&policy, 144));
+	KUNIT_EXPECT_TRUE(test, mt7932_policy_permits(&policy, NL80211_BAND_5GHZ, 144));
 	/* A channel the package does not list is not permitted. */
-	KUNIT_EXPECT_FALSE(test, mt7932_policy_permits(&policy, 177));
+	KUNIT_EXPECT_FALSE(test, mt7932_policy_permits(&policy, NL80211_BAND_5GHZ, 177));
+}
+
+/* A table's band key must agree even when the numeric channel matches. */
+static void mt7932_policy_band_test(struct kunit *test)
+{
+	struct mt7932_policy policy;
+	size_t size;
+	u8 *data;
+
+	data = pkg_build(test, "AU", &size);
+	KUNIT_ASSERT_EQ(test, mt7932_policy_parse(&policy, data, size, "AU"), 0);
+	KUNIT_EXPECT_TRUE(test, mt7932_policy_permits(&policy, NL80211_BAND_2GHZ, 5));
+	KUNIT_EXPECT_FALSE(test, mt7932_policy_permits(&policy, NL80211_BAND_5GHZ, 5));
+	KUNIT_EXPECT_FALSE(test, mt7932_policy_permits(&policy, NL80211_BAND_6GHZ, 5));
+	KUNIT_EXPECT_FALSE(test, mt7932_policy_permits(&policy, NL80211_BAND_2GHZ, 149));
+	KUNIT_EXPECT_TRUE(test, mt7932_policy_permits(&policy, NL80211_BAND_5GHZ, 149));
+	KUNIT_EXPECT_FALSE(test, mt7932_policy_permits(&policy, NL80211_BAND_6GHZ, 149));
+	KUNIT_EXPECT_FALSE(test, mt7932_policy_permits(&policy, NUM_NL80211_BANDS, 5));
 }
 
 static void mt7932_policy_filter_test(struct kunit *test)
@@ -383,12 +403,73 @@ static void mt7932_policy_filter_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, !memchr_inv(reg->domain + 12 + 5 * 8, 0, 2 * 8));
 }
 
+static void mt7932_policy_6g_test(struct kunit *test)
+{
+	struct mt7932_policy policy;
+	size_t base_size, size;
+	u8 *base, *data, *ext;
+	unsigned int i;
+
+	base = pkg_build(test, "AU", &base_size);
+	size = base_size + 24 + 2 * 1024;
+	data = kunit_kzalloc(test, size, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, data);
+	memcpy(data, base, base_size);
+	put_unaligned_le16(2, data + 4);
+	put_unaligned_le32(size, data + 12);
+	ext = data + base_size;
+	memcpy(ext, "6GRP", 4);
+	ext[4] = 1;
+	ext[5] = 14;
+	ext[6] = 2;
+	put_unaligned_le64(BIT_ULL(1) | BIT_ULL(9), ext + 8);
+	memcpy(ext + 16, "AU", 2);
+	ext[18] = 1;
+	for (i = 0; i < 2; i++) {
+		u8 *record = ext + 24 + i * 1024, *page = record + 4;
+
+		record[0] = 0x5d;
+		put_unaligned_le16(1020, record + 2);
+		page[0] = 3;
+		page[1] = 0x2a;
+		put_unaligned_le16(1020, page + 2);
+		page[4] = 8;
+		page[5] = 3;
+		memcpy(page + 8, "AU", 2);
+		page[44] = i ? 0x0f : 0x02;
+	}
+	KUNIT_ASSERT_EQ(test, mt7932_policy_parse(&policy, data, size, "AU"), 0);
+	KUNIT_EXPECT_EQ(test, policy.six_pages, 2);
+	KUNIT_EXPECT_TRUE(test, mt7932_policy_permits(&policy, NL80211_BAND_6GHZ, 5));
+	KUNIT_EXPECT_TRUE(test, mt7932_policy_permits(&policy, NL80211_BAND_6GHZ, 37));
+	KUNIT_EXPECT_FALSE(test, mt7932_policy_permits(&policy, NL80211_BAND_6GHZ, 1));
+	KUNIT_EXPECT_TRUE(test, policy.assoc_power[0]);
+	KUNIT_EXPECT_TRUE(test, policy.assoc_power[1]);
+	/* Bound every extension record before dereferencing it. */
+	for (i = base_size; i < size; i++) {
+		put_unaligned_le32(i, data + 12);
+		KUNIT_EXPECT_LT(test, mt7932_policy_parse(&policy, data, i, "AU"), 0);
+	}
+	put_unaligned_le32(size, data + 12);
+	ext[16] = 'U';
+	KUNIT_EXPECT_LT(test, mt7932_policy_parse(&policy, data, size, "AU"), 0);
+	ext[16] = 'A';
+	ext[24 + 1024 + 4 + 44] = 2;
+	KUNIT_EXPECT_LT(test, mt7932_policy_parse(&policy, data, size, "AU"), 0);
+	ext[24 + 1024 + 4 + 44] = 0x0f;
+	ext[24 + 4 + 1] = 0x0a;
+	KUNIT_EXPECT_LT(test, mt7932_policy_parse(&policy, data, size, "AU"), 0);
+	ext[24 + 4 + 1] = 0x2a;
+	put_unaligned_le64(BIT_ULL(59), ext + 8);
+	KUNIT_EXPECT_LT(test, mt7932_policy_parse(&policy, data, size, "AU"), 0);
+}
+
 /* Random corruption must never be accepted in a way that reads out of bounds. */
 static void mt7932_policy_corruption_test(struct kunit *test)
 {
 	struct rnd_state rnd;
 	struct mt7932_policy policy;
-	unsigned int round, flips, channel;
+	unsigned int round, flips, channel, band;
 	size_t size;
 	u8 *data, *copy;
 
@@ -402,9 +483,34 @@ static void mt7932_policy_corruption_test(struct kunit *test)
 			copy[prandom_u32_state(&rnd) % size] ^= 1 << (prandom_u32_state(&rnd) % 8);
 		if (mt7932_policy_parse(&policy, copy, size, "AU"))
 			continue;
-		for (channel = 0; channel < 256; channel++)
-			mt7932_policy_permits(&policy, channel);
+		for (band = 0; band < NUM_NL80211_BANDS; band++)
+			for (channel = 0; channel < 256; channel++)
+				mt7932_policy_permits(&policy, band, channel);
 	}
+}
+
+static void mt7932_6g_power_limit_test(struct kunit *test)
+{
+	struct mt7932_6g_limits limits = {.eirp = 24, .psd = -10};
+	u8 page[44 + 122] = {};
+	unsigned int i;
+
+	page[4] = 1;
+	page[44] = 5;
+	memset(page + 45, 28, 121);
+	page[45] = 0xc4;
+	page[46] = 0x7f;
+	mt7932_6g_limit_page(page, &limits);
+	KUNIT_EXPECT_EQ(test, page[44], 5);
+	KUNIT_EXPECT_EQ(test, page[45], 0xc4);
+	KUNIT_EXPECT_EQ(test, page[46], 0x7f);
+	for (i = 47; i < sizeof(page); i++)
+		KUNIT_EXPECT_LE(test, (s8)page[i], 24);
+	/* First RU26 cell: -5 dBm/MHz plus at most 3 dB occupied-band gain. */
+	KUNIT_EXPECT_EQ(test, (s8)page[45 + 1 + 3 + 6 * 9], -4);
+	limits.psd = -256;
+	mt7932_6g_limit_page(page, &limits);
+	KUNIT_EXPECT_TRUE(test, !memchr_inv(page + 47, 0xc4, sizeof(page) - 47));
 }
 
 static struct kunit_case mt7932_policy_test_cases[] = {
@@ -417,6 +523,9 @@ static struct kunit_case mt7932_policy_test_cases[] = {
 	KUNIT_CASE(mt7932_policy_world_order_test),
 	KUNIT_CASE(mt7932_policy_permits_test),
 	KUNIT_CASE(mt7932_policy_filter_test),
+	KUNIT_CASE(mt7932_policy_band_test),
+	KUNIT_CASE(mt7932_policy_6g_test),
+	KUNIT_CASE(mt7932_6g_power_limit_test),
 	KUNIT_CASE(mt7932_policy_corruption_test),
 	{}
 };

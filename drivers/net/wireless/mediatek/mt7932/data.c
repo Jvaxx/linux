@@ -266,7 +266,7 @@ void mt_data_receive(struct mt7932 *m, const struct mt7932_rx_frame *frame)
 
 		m->station_rx_rate_valid = mt7932_rx_rate(frame->rxv, m->phy_cap[4], rate);
 		/* No CCK on 5 GHz, and no rate wider than the associated channel. */
-		if ((frame->channel > 14 && !((frame->rxv >> 24) & 15)) ||
+		if ((frame->band != NL80211_BAND_2GHZ && !((frame->rxv >> 24) & 15)) ||
 		    mt_rate_width(rate->bw) > cfg80211_chandef_get_width(&m->connect_chandef))
 			m->station_rx_rate_valid = false;
 		m->station_rx_rate_time = jiffies;

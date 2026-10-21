@@ -36,6 +36,11 @@ PREFIX = r'''
 #include <string.h>
 #include <errno.h>
 #include <limits.h>
+enum nl80211_band { NL80211_BAND_2GHZ, NL80211_BAND_5GHZ, NL80211_BAND_6GHZ=3, NUM_NL80211_BANDS=6 };
+enum nl80211_mfp { NL80211_MFP_NO, NL80211_MFP_REQUIRED, NL80211_MFP_OPTIONAL };
+enum nl80211_sae_pwe_mechanism { NL80211_SAE_PWE_UNSPECIFIED, NL80211_SAE_PWE_HUNT_AND_PECK, NL80211_SAE_PWE_HASH_TO_ELEMENT, NL80211_SAE_PWE_BOTH };
+#define WLAN_AKM_SUITE_SAE 0x000fac08
+#define WLAN_AKM_SUITE_OWE 0x000fac12
 typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef uint64_t u64;
 #define READ_ONCE(x) (x)
 #define BIT(n) (1U << (n))
@@ -71,12 +76,15 @@ struct ieee80211_channel {int center_freq;};
 struct cfg80211_chan_def {struct ieee80211_channel *chan;int width,center_freq1;};
 struct element {u8 data[32];};
 struct test_band {struct {bool ht_supported;}ht_cap;};
+struct test_wiphy {struct test_band *bands[NUM_NL80211_BANDS];};
+static struct test_wiphy wiphy;
 struct mt7932 {
- void *pdev,*netdev,*wiphy;int response_lock,command_mutex,cal_work,disconnect_work;
+ void *pdev,*netdev;struct test_wiphy *wiphy;int response_lock,command_mutex,cal_work,disconnect_work;
  struct completion assoc_start,assoc_done,discovery_done,disconnect_done,cal_response,response;
  bool connecting,connected,disconnecting,disconnect_seen,disconnect_event_received;
  bool disconnect_local,connect_open,assoc_request_seen,peer_valid,link_failed,stopping,rf_ready;
  u8 connect_channel,connect_center,peer_wtbl,smart_version,waiting;
+ enum nl80211_band connect_band; u8 six_assoc_power[2][1020];
  int waiting_eid;
  struct cfg80211_chan_def connect_chandef;
  struct test_band band2,band5;
@@ -87,6 +95,7 @@ struct mt7932 {
  u8 cal_requests[32][16],cal_request_seq[32];unsigned cal_request_head,cal_request_count;
  u8 reply[MT7932_RX_CAPACITY];size_t reply_length;u64 packets;
 };
+static int ieee80211_channel_to_frequency(int ch,enum nl80211_band band){return (band==NL80211_BAND_2GHZ?2407:band==NL80211_BAND_5GHZ?5000:5950)+5*ch;}
 static bool usable=true;
 static unsigned cal_calls,queue_calls,scheduled;
 static unsigned long jiffies;
@@ -117,8 +126,8 @@ static void receive(struct mt7932*m,u8 eid,u8 seq,const u8*body,size_t n,u32 sel
  if(eid==0xee)put_unaligned_le32(selector,packet+40);
  memcpy(packet+offset,body,n);mt_receive(m,packet,total);
 }
-static void start(struct mt7932*m,u8 ch){u8 b[24]={};put_unaligned_le32(mt7932_channel_band(ch),b+12);b[17]=ch;receive(m,0xee,0,b,sizeof(b),0x4d);}
-static void report(struct mt7932*m,bool valid){u8 b[52]={};b[11]=mt7932_channel_band(m->connect_channel);b[12]=m->connect_channel;b[17]=m->peer_ids.wtbl[0];b[20]=valid?m->peer_ids.station[0]:12;b[21]=m->peer_ids.wtbl[1];put_unaligned_le32(0x000fac04,b+48);receive(m,0xee,0,b,sizeof(b),0x40);}
+static void start(struct mt7932*m,u8 ch){u8 b[24]={};put_unaligned_le32(mt7932_channel_band(m->connect_band,ch),b+12);b[17]=ch;receive(m,0xee,0,b,sizeof(b),0x4d);}
+static void report(struct mt7932*m,bool valid){u8 b[52]={};b[11]=mt7932_channel_band(m->connect_band,m->connect_channel);b[12]=m->connect_channel;b[17]=m->peer_ids.wtbl[0];b[20]=valid?m->peer_ids.station[0]:12;b[21]=m->peer_ids.wtbl[1];put_unaligned_le32(0x000fac04,b+48);receive(m,0xee,0,b,sizeof(b),0x40);}
 static void done(struct mt7932*m){u8 b[2]={};receive(m,0xee,0,b,sizeof(b),0x42);}
 static void cal_null(struct mt7932*m,u8 seq){u8 b[20]={};b[3]=1;receive(m,0xd6,seq,b,sizeof(b),0);}
 static int mt_association_calibration(struct mt7932*m){
@@ -156,7 +165,7 @@ WAIT
 out:
  assert(command_locked);command_locked=0;return ret?:m->connect_error;
 }
-static struct mt7932 fresh(void){return (struct mt7932){.netdev=(void*)1,.connecting=true,.rf_ready=true,.connect_channel=11,.smart_version=12,.peer_ids={{1,2},{3,4,5,6}}};}
+static struct mt7932 fresh(void){return (struct mt7932){.netdev=(void*)1,.wiphy=&wiphy,.connecting=true,.rf_ready=true,.connect_channel=11,.smart_version=12,.peer_ids={{1,2},{3,4,5,6}}};}
 static void reset(struct mt7932*m,enum scenario s){*m=fresh();active=m;which=s;cal_calls=queue_calls=scheduled=first_waits=final_waits=total_wait_budget=0;queue_error=cal_error=0;usable=true;command_locked=0;jiffies=first_elapsed=cal_elapsed=queue_elapsed=0;retried=false;final_budget=10000;}
 int main(void){struct mt7932 m;unsigned cases=0;
  for(enum scenario s=SUCCESS;s<=DUP_FLOOD;s++){

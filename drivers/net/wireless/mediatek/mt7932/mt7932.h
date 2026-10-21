@@ -105,8 +105,17 @@ struct mt7932 {
 	u8 connect_center;
 	struct ieee80211_channel channels[MT7932_CHANNELS_2G];
 	struct ieee80211_channel channels5[MT7932_CHANNELS_5G];
-	struct ieee80211_supported_band band5;
+	struct ieee80211_supported_band band5, band6;
+	struct ieee80211_channel channels6[MT7932_CHANNELS_6G];
+	struct ieee80211_sband_iftype_data he6;
+	u8 six_assoc_power[2][1020];
+	bool six_power_valid;
 	u8 scan_band, scan_batch;
+	unsigned int scan_cursor;
+	enum nl80211_band connect_band, scan_home_band;
+	u32 connect_akm;
+	enum nl80211_mfp connect_mfp;
+	enum nl80211_sae_pwe_mechanism connect_sae_pwe;
 	struct ieee80211_rate rates[12];
 	struct work_struct startup_work;
 	struct mutex command_mutex;

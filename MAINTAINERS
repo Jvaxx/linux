@@ -2125,7 +2125,7 @@ F:	include/linux/soc/apple/pci-apple-piodma.h
 F:	rust/kernel/iio/common/aop_sensors.rs
 F:	rust/kernel/soc/apple/aop.rs
 F:	sound/soc/apple/t8140_aop_audio.rs
-F:	tools/asahi/mt7932-*.py
+F:	tools/asahi/mt7932*
 F:	tools/testing/apple/
 F:	tools/testing/kunit/configs/apple_firmware.config
 F:	tools/testing/kunit/configs/mt7932.config

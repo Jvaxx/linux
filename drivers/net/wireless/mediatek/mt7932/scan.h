@@ -13,7 +13,7 @@
  * channels require mt7932_scan_passive() before submission. The body uses
  * a 20 ms dwell and fills the MT7932-specific tail.
  */
-static inline int mt7932_scan_body(u8 *body, size_t capacity, u8 seq,
+static inline int mt7932_scan_body(u8 *body, size_t capacity, u8 seq, enum nl80211_band band,
 				   const u8 *channels, unsigned int count)
 {
 	static const u8 ies[] = {0x7f,0x0a,1,0,8,0x8c,1,0x40,0,0,0,0,
@@ -23,8 +23,7 @@ static inline int mt7932_scan_body(u8 *body, size_t capacity, u8 seq,
 	if (capacity < 0x4d4 || !seq || seq > 127 || !count || count > MT7932_SCAN_CHANNELS)
 		return -EINVAL;
 	for (i = 0; i < count; i++) {
-		if (!mt7932_channel_band(channels[i]) ||
-		    mt7932_channel_band(channels[i]) != mt7932_channel_band(channels[0]))
+		if (!mt7932_channel_band(band, channels[i]))
 			return -EINVAL;
 		for (j = 0; j < i; j++)
 			if (channels[i] == channels[j])
@@ -40,7 +39,7 @@ static inline int mt7932_scan_body(u8 *body, size_t capacity, u8 seq,
 	body[0x9e] = 4;
 	body[0x9f] = count;
 	for (i = 0; i < count; i++) {
-		body[0xa0 + 2 * i] = mt7932_channel_band(channels[i]);
+		body[0xa0 + 2 * i] = mt7932_channel_band(band, channels[i]);
 		body[0xa1 + 2 * i] = channels[i];
 	}
 	put_unaligned_le16(sizeof(ies), body + 0xe0);
@@ -119,14 +118,14 @@ static inline int mt7932_scan_options(u8 body[0x4d4], const u8 *ssid,
  * channel at the end of CID03. This never narrows the requested scan list.
  * Keep the batch's active/passive dwell settings and native home timing tail.
  */
-static inline int mt7932_scan_home(u8 body[0x4d4], u8 channel)
+static inline int mt7932_scan_home(u8 body[0x4d4], enum nl80211_band band, u8 channel)
 {
-	u8 band = mt7932_channel_band(channel);
+	u8 firmware_band = channel ? mt7932_channel_band(band, channel) : 0;
 
-	if (channel && !band)
+	if (channel && !firmware_band)
 		return -EINVAL;
 	body[0x4cc] = channel;
-	body[0x4cd] = band;
+	body[0x4cd] = firmware_band;
 	return 0;
 }
 
