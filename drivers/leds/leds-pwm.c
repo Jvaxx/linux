@@ -244,6 +244,9 @@ static void led_pwm_shutdown(struct platform_device *pdev)
 	for (i = 0; i < priv->num_leds; i++) {
 		struct led_classdev *cdev = &priv->leds[i].cdev;
 
+		if (cdev->flags & LED_RETAIN_AT_SHUTDOWN)
+			continue;
+
 		mutex_lock(&cdev->led_access);
 		led_sysfs_disable(cdev);
 		mutex_unlock(&cdev->led_access);
