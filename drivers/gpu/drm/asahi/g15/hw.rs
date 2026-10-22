@@ -150,7 +150,6 @@ pub(crate) mod t6030 {
           // UUID dbf37c40-ead5-3760-9441-995018782955 and uses the same
           // 0x0c08e21e83800490 InitData ABI. Pin its complete measured TEXT
           // digest here, rather than enabling the bring-up prefix override.
-          #[cfg(CONFIG_SILICONFOREST_NATIVE_GPU)]
           FirmwareBuild {
             name: "J516S B0 RTKit-2419.140.12 (maintained 14.x handoff)",
             machine: Some(kernel::c_str!("apple,j516s")),

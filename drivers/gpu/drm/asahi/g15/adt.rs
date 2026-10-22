@@ -308,16 +308,13 @@ fn parse(dev: &device::Device, adt: &Adt<'_>) -> Result<GpuAdt> {
     // The maintained loader deliberately retains the UAT's linear mapping.
     // Cross-check every ADT range against its exact enabled FDT reservation;
     // admit_regions still rejects holes, allocator-owned pages and overlaps.
-    let reserved_ram = cfg!(CONFIG_SILICONFOREST_NATIVE_GPU);
-    if reserved_ram {
-        for (i, r) in region[..4].iter().enumerate() {
-            if !glue::reserved_uat(i as u32, r.start, r.end - r.start) {
-                dev_err!(dev, "GPU UAT {} has no matching boot reservation\n", REGION_NAMES[i]);
-                return Err(EINVAL);
-            }
+    for (i, r) in region[..4].iter().enumerate() {
+        if !glue::reserved_uat(i as u32, r.start, r.end - r.start) {
+            dev_err!(dev, "GPU UAT {} has no matching boot reservation\n", REGION_NAMES[i]);
+            return Err(EINVAL);
         }
     }
-    admit_regions(dev, &region, Some(dram_base..dram_base + dram_size), reserved_ram)?;
+    admit_regions(dev, &region, Some(dram_base..dram_base + dram_size), true)?;
     let [ttbs, tables, handoff, shared_l2, text, data] = region;
     let mut out = GpuAdt {
         ttbs,

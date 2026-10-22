@@ -328,20 +328,14 @@ unsafe impl Send for Rtkit {}
 unsafe impl Sync for Rtkit {}
 
 impl Rtkit {
-    /// Initializes RTKit on the GPU node's mailbox (not device-managed: retained): the one
-    /// named "mbox" where the node names its mailboxes (the synthesized T6030 node), else the
-    /// first.
-    fn new(dev: &device::Device, shared: &Arc<Shared>, named: bool) -> Result<Self> {
+    /// Initializes RTKit on the maintained GPU node's first, unnamed mailbox.
+    /// The session is not device-managed because it is retained until reboot.
+    fn new(dev: &device::Device, shared: &Arc<Shared>) -> Result<Self> {
         let cookie = Arc::into_raw(shared.clone()) as *mut c_void;
-        let name = if named {
-            c_str!("mbox").as_char_ptr()
-        } else {
-            core::ptr::null()
-        };
         // SAFETY: `dev` is valid, the name is a NUL-terminated string or null and the ops are
         // static.
         let rtk = from_err_ptr(unsafe {
-            bindings::apple_rtkit_init(dev.as_raw(), cookie, name, 0, &RTKIT_OPS)
+            bindings::apple_rtkit_init(dev.as_raw(), cookie, core::ptr::null(), 0, &RTKIT_OPS)
         });
         match rtk {
             // INVARIANT: The cookie stays leaked from here on.
@@ -680,11 +674,7 @@ pub(crate) fn start(
     // From here on the firmware is touched: nothing it can reach is freed, the vote included.
     glue::retain_module();
     vote.keep();
-    // Full-stack T6030 synthesizes a named mailbox. The maintained T6030
-    // DT instead has one unnamed mailbox, like the other device-tree GPUs.
-    let named_mailbox = cfg.platform == hw::Platform::AdtWithPmp
-        && !cfg!(CONFIG_SILICONFOREST_NATIVE_GPU);
-    let rtkit = match Rtkit::new(&d, shared, named_mailbox) {
+    let rtkit = match Rtkit::new(&d, shared) {
         Ok(rtkit) => rtkit,
         Err(e) => {
             dev_err!(d, "G15: RTKit mailbox initialization failed: {:?}\n", e);
