@@ -285,9 +285,15 @@ int apple_smc_write_atomic(struct apple_smc *smc, smc_key key, const void *buf, 
 		return -EIO;
 	if (!smc->atomic_mode)
 		return -EIO;
-	/* A send/poll timeout does not cancel the command or release its SRAM. */
-	if (smc->atomic_pending)
-		return -EBUSY;
+	/*
+	 * A poll timeout or a mismatched reply does not cancel the command or
+	 * release its SRAM. Its late reply does: take it if it has arrived.
+	 */
+	if (smc->atomic_pending) {
+		ret = apple_rtkit_poll(smc->rtk);
+		if (ret < 0 || smc->atomic_pending)
+			return -EBUSY;
+	}
 
 	memcpy_toio(smc->shmem.iomem, buf, size);
 	smc->msg_id = (smc->msg_id + 1) & 0xf;
@@ -299,6 +305,8 @@ int apple_smc_write_atomic(struct apple_smc *smc, smc_key key, const void *buf, 
 
 	ret = apple_rtkit_send_message(smc->rtk, SMC_ENDPOINT, msg, NULL, true);
 	if (ret < 0) {
+		/* Never sent, so no reply will release the buffer. */
+		smc->atomic_pending = false;
 		dev_err(smc->dev, "Failed to send command (%d)\n", ret);
 		return ret;
 	}
