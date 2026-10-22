@@ -24,13 +24,25 @@ struct dcpavserv {
 	u32 unit;
 	struct apple_epic_service *service;
 	/*
-	 * The 14.7 external role: the instance the host opened as a client
-	 * (DCPAV Open), closed again before the sink's HPD low or at the
-	 * instance's Terminate report; compared only, never dereferenced.
+	 * The 14.7 external role's AV client, per instance: an instance is
+	 * named by the epoch it was published in, so a slot reused for its
+	 * successor is not mistaken for it.
+	 *
+	 * opened/opened_epoch: the instance the host opened as a client (DCPAV
+	 * Open), closed again before the sink's HPD low or at its Terminate;
+	 * the pointer is compared, and pinned before use.
+	 * opening: an Open is on its way. close_gen: bumped by every Close and
+	 * Terminate; an Open that sees it change was cancelled, and its opener
+	 * closes what it opened.
+	 * terminated_epoch: Terminate reported; that instance gets no new use.
+	 * close_epoch: the instance the Close work was queued for.
 	 */
 	struct apple_epic_service *opened;
-	/* Terminate reported: no new use of the instance, its Close pending. */
-	struct apple_epic_service *terminated;
+	u64 opened_epoch;
+	bool opening;
+	u64 close_gen;
+	u64 terminated_epoch;
+	u64 close_epoch;
 	struct work_struct close_wq;
 };
 
