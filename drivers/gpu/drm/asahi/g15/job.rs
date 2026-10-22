@@ -9,8 +9,8 @@
 //!   scheduler, the entity priority orders nothing.
 //! - Timeout [`super::hw::tuning::SCHED_TIMEOUT_MS`], always "no hang": the engine's
 //!   progress-based deadlines own failure.
-//! - Dependency errors from another VM do not fail a job (per-client isolation); an input error
-//!   fails the job only if its own VM already has an error.
+//! - A failed input refuses unpublished work and reports the error before its fence signals.
+//!   A foreign device-loss error does not become this VM's sticky hardware-admission failure.
 //! - `run` hands the job to the engine ([`super::Firmware::enqueue`], then
 //!   [`super::Firmware::publish`]) under the device lock and returns the job's fence; FINISHED
 //!   fences stay in queue order ([`super::fence::Timeline`]).
@@ -123,24 +123,37 @@ impl Job {
         self.fence.signal(result);
     }
 
-    /// Hands the job to the engine, or completes it when the GPU failed or the job's own VM
-    /// failed with an input error.
+    /// Reports an input failure without quarantining or poisoning a healthy consumer VM.
+    fn finish_dependency(&self, error: Error) {
+        if self.progress.signaled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.vm.status.report_failure(error);
+        self.fence.signal(Err(error));
+    }
+
+    /// Hands the job to the engine, or completes it before publication on GPU/input failure.
     fn start(self: &Arc<Self>, shared: &Arc<Shared>, inputs: &[Fence]) {
         self.started.store(true, Ordering::Release);
         if shared.crashed.load(Ordering::Acquire) {
             self.finish(Err(EIO), false);
             return;
         }
-        if self.vm.status.get() != 0 {
-            // SAFETY: Each retained fence owns its pointer for this read.
-            let failed = inputs
-                .iter()
-                .map(|fence| unsafe { bindings::dma_fence_get_status(fence.raw()) })
-                .find(|&status| status < 0);
-            if let Some(status) = failed {
-                self.finish(Err(Error::from_errno(status)), false);
-                return;
+        // SAFETY: Each retained fence owns its pointer for this read. drm_sched has
+        // waited for every dependency; inspect errors even while this VM is healthy.
+        let failed = inputs
+            .iter()
+            .map(|fence| unsafe { bindings::dma_fence_get_status(fence.raw()) })
+            .find(|&status| status < 0);
+        if let Some(status) = failed {
+            let error = Error::from_errno(status);
+            if self.vm.status.get() != 0 {
+                // Preserve the existing own-failed-VM completion semantics.
+                self.finish(Err(error), false);
+            } else {
+                self.finish_dependency(crate::g17::inherited_error(error));
             }
+            return;
         }
         // `Shared::submit`: enqueue, publish and rearm under the device lock,
         // completions after it.

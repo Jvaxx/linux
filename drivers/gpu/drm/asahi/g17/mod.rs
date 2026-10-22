@@ -24,6 +24,7 @@ pub(crate) use command::Attachments;
 mod completion;
 pub(crate) mod context;
 mod dependency;
+pub(crate) use dependency::inherited_error;
 mod event;
 mod feed;
 mod fence;
