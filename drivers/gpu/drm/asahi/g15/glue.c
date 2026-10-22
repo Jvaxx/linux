@@ -19,6 +19,7 @@
 #include <linux/pfn.h>
 #include <linux/pm_runtime.h>
 #include <linux/soc/apple/pmp.h>
+#include <linux/soc/apple/display.h>
 
 void asahi_g15_sha256(const u8 *data, size_t len, u8 *out);
 bool asahi_g15_board(void);
@@ -74,11 +75,21 @@ bool asahi_g15_reserved_uat(u32 index, u64 start, u64 size)
  */
 int asahi_g15_pmp_prepare(struct device *dev)
 {
+	typeof(&apple_drm_t6030_link_device) link_display;
+	int ret;
+
 	if (!asahi_g15_board() || !dev->of_node ||
 	    !of_device_is_compatible(dev->of_node, "apple,agx-t6030"))
 		return -ENODEV;
+	/* DISP ACK alone does not prove the native DRM component set is up. */
+	link_display = symbol_get(apple_drm_t6030_link_device);
+	if (!link_display)
+		return -EPROBE_DEFER;
+	ret = link_display(dev);
+	symbol_put(apple_drm_t6030_link_device);
+	if (ret)
+		return ret;
 	return apple_pmp_link_device(dev);
-
 }
 
 int asahi_g15_pmp_get(struct device *dev)
