@@ -731,7 +731,8 @@ struct atcphy_hw {
  * @dp_t8122.rate: Main link rate in Mb/s per lane, 0 while stopped
  * @pipe_state: Backend the PIPE mux ("pipehandler") is routed to
  * @t8103_dummy_pending: A live T8103-generation handoff still needs its unlock ACK
- * @t8103_usb3_retry: USB3 must reconnect if a parked lane change is canceled
+ * @t8103_usb3_retry: USB3 routing owed after a deferred role or parked lane change
+ * @t8103_usb3_workaround: Base M1 admission for the USB3 handoff workaround
  * @pd_nb: Power domain notifier, registered with restore_after_pd_off
  * @pd_was_off: The power domain was switched off since the state was last
  *              brought back; set from the notifier, cleared under @lock
@@ -799,6 +800,7 @@ struct apple_atcphy {
 	enum atcphy_pipehandler_state pipe_state;
 	bool t8103_dummy_pending;
 	bool t8103_usb3_retry;
+	bool t8103_usb3_workaround;
 
 	struct notifier_block pd_nb;
 	bool pd_was_off;
@@ -1201,7 +1203,7 @@ static int atcphy_pipehandler_lock(struct apple_atcphy *atcphy)
 /* Retry only a live legacy PIPE: USB4 and stopped parking cannot clock the ACK. */
 static int atcphy_pipehandler_lock_live(struct apple_atcphy *atcphy)
 {
-	unsigned int attempts = atcphy->hw->gen == ATCPHY_GENERATION_T8103 ? 10 : 1;
+	unsigned int attempts = atcphy->t8103_usb3_workaround ? 10 : 1;
 	int ret;
 
 	for (unsigned int attempt = 0; attempt < attempts; attempt++) {
@@ -1643,7 +1645,7 @@ static int atcphy_configure_pipehandler_dummy(struct apple_atcphy *atcphy, bool 
 static int atcphy_configure_pipehandler(struct apple_atcphy *atcphy, bool host)
 {
 	enum atcphy_pipehandler_state state = atcphy_modes[atcphy->mode].pipehandler_state;
-	bool host_bist = host && atcphy->hw->gen != ATCPHY_GENERATION_T8103;
+	bool host_bist = host && !atcphy->t8103_usb3_workaround;
 	int ret = -EINVAL;
 
 	lockdep_assert_held(&atcphy->lock);
@@ -1688,7 +1690,7 @@ static int atcphy_park_live_t8103_pipehandler(struct apple_atcphy *atcphy)
 	int ret;
 
 	lockdep_assert_held(&atcphy->lock);
-	if (atcphy->hw->gen != ATCPHY_GENERATION_T8103)
+	if (!atcphy->t8103_usb3_workaround)
 		return -EOPNOTSUPP;
 
 	if (!atcphy->t8103_dummy_pending) {
@@ -1745,7 +1747,7 @@ static int atcphy_park_pipehandler(struct apple_atcphy *atcphy, bool stopped)
 		atcphy->mode, atcphy->pipe_state, atcphy->host_active, atcphy->mode_dirty,
 		atcphy->dp_owned_pmas, atcphy->dp_idle_pmas);
 	if (atcphy->t8103_dummy_pending ||
-	    (!stopped && atcphy->hw->gen == ATCPHY_GENERATION_T8103 &&
+	    (!stopped && atcphy->t8103_usb3_workaround &&
 	     atcphy->pipe_state == ATCPHY_PIPEHANDLER_STATE_USB3))
 		return atcphy_park_live_t8103_pipehandler(atcphy);
 	if (atcphy->pipe_state == ATCPHY_PIPEHANDLER_STATE_DUMMY && !atcphy->pipe_pending)
@@ -3800,8 +3802,12 @@ static int atcphy_usb3_route(struct apple_atcphy *atcphy, bool host)
 	if (atcphy->mode_dirty)
 		return -EBUSY;
 	/* dwc3 can select its role before the debounced Type-C mux update. */
-	if (atcphy->hw->gen == ATCPHY_GENERATION_T8103 &&
+	if (atcphy->t8103_usb3_workaround &&
 	    atcphy->mode == APPLE_ATCPHY_MODE_OFF) {
+		/* Keep the valid role's route owed across a late mux update or failure. */
+		atcphy->t8103_usb3_retry = true;
+		if (atcphy->typec_mode != APPLE_ATCPHY_MODE_USB3)
+			return 0;
 		if (atcphy->dp_only || !atcphy->ss_tunables)
 			return -EOPNOTSUPP;
 		ret = atcphy_configure(atcphy, APPLE_ATCPHY_MODE_USB3);
@@ -4723,9 +4729,11 @@ static int atcphy_mux_switch(struct apple_atcphy *atcphy, enum atcphy_mode targe
 	if (atcphy->mode == target_mode && !atcphy->mode_dirty) {
 		atcphy->typec_mode = target_mode;
 		/* A canceled lane change owes the old USB3 backend its reconnect. */
-		if (atcphy->t8103_usb3_retry &&
-		    atcphy_modes[target_mode].pipehandler_state == ATCPHY_PIPEHANDLER_STATE_USB3)
-			return atcphy_configure_pipehandler(atcphy, false);
+		if (atcphy->t8103_usb3_retry) {
+			if (atcphy_modes[target_mode].pipehandler_state == ATCPHY_PIPEHANDLER_STATE_USB3)
+				return atcphy_configure_pipehandler(atcphy, false);
+			atcphy->t8103_usb3_retry = false;
+		}
 		/* Retry a failed PIPE setup without disturbing the configured lanes. */
 		if (atcphy->fixed_usb2 && atcphy->host_active &&
 		    (atcphy->pipe_state != atcphy_modes[target_mode].pipehandler_state ||
@@ -4792,7 +4800,7 @@ static int atcphy_mux_switch(struct apple_atcphy *atcphy, enum atcphy_mode targe
 	 * complain loudly. We can still try to switch modes and hope for the best though,
 	 * in the worst case the hardware will fall back to USB2-only.
 	 */
-	if (atcphy->hw->gen == ATCPHY_GENERATION_T8103) {
+	if (atcphy->t8103_usb3_workaround) {
 		if (atcphy->pipe_state == ATCPHY_PIPEHANDLER_STATE_USB3 &&
 		    atcphy_modes[target_mode].pipehandler_state == ATCPHY_PIPEHANDLER_STATE_DUMMY) {
 			ret = atcphy_park_live_t8103_pipehandler(atcphy);
@@ -5358,6 +5366,14 @@ static void atcphy_probe_pd_notifier(struct apple_atcphy *atcphy)
 			 ret);
 }
 
+/* The T8103 PHY compatible is also a fallback on unqualified M1/M2 variants. */
+static bool atcphy_has_t8103_usb3_workaround(const struct atcphy_hw *hw,
+					   const struct device_node *root)
+{
+	return hw->gen == ATCPHY_GENERATION_T8103 &&
+	       of_device_is_compatible(root, "apple,t8103");
+}
+
 static int atcphy_probe(struct platform_device *pdev)
 {
 	struct apple_atcphy *atcphy;
@@ -5371,6 +5387,7 @@ static int atcphy_probe(struct platform_device *pdev)
 	atcphy->hw = of_device_get_match_data(&pdev->dev);
 	if (!atcphy->hw)
 		return -EINVAL;
+	atcphy->t8103_usb3_workaround = atcphy_has_t8103_usb3_workaround(atcphy->hw, of_root);
 
 	atcphy->dev = dev;
 	atcphy->np = dev->of_node;

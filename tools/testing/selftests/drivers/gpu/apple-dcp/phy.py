@@ -45,7 +45,7 @@ struct apple_atcphy {
     u32 dp_usb_context[2][27];
     bool pipe_pending, usb_off_pending, usb_off_drained;
     bool usb3_port_off, park_owed;
-    bool t8103_dummy_pending, t8103_usb3_retry;
+    bool t8103_dummy_pending, t8103_usb3_retry, t8103_usb3_workaround;
     bool dp_only, pd_was_off, tunnel_clock_on;
     unsigned int tunnel_rate, tunnel_users;
     struct { bool aux, pll; unsigned int pairs, rate; } dp_t8122;
@@ -252,6 +252,7 @@ static void cold_initial(struct apple_atcphy *p, bool fixed, bool swapped)
     pipe_regs[PIPEHANDLER_AON_GEN / 4] = PIPEHANDLER_AON_GEN_DWC3_RESET_N;
     usb2_regs[USB2PHY_USBCTL / 4] = USB2PHY_USBCTL_RUN;
     *p = (struct apple_atcphy) {
+        .t8103_usb3_workaround = hw.gen == ATCPHY_GENERATION_T8103,
         .hw = &hw, .regs.core = (unsigned char *)registers,
         .regs.lpdptx = (unsigned char *)registers,
         .regs.pipehandler = (unsigned char *)pipe_regs,
@@ -988,9 +989,10 @@ def adverse(root):
     # continued PLL clock macro exercised by the legacy rate helper here.
     ns = parking(root)
     production = ns['production'] + '\n' + ns['function'](ns['atc'], 'atcphy_usb2_init')
-    # A T8103-generation host start may skip the native BIST, and the lock it holds.
+    # An admitted base-M1 host start may skip the native BIST, and the lock it holds.
     dispatch = ns['function'](ns['atc'], 'atcphy_configure_pipehandler')
-    production = ('#define T8103_HOST_BIST ' + str(int('ATCPHY_GENERATION_T8103' not in dispatch)) +
+    production = ('#define T8103_HOST_BIST ' + str(int('ATCPHY_GENERATION_T8103' not in dispatch and
+                  't8103_usb3_workaround' not in dispatch)) +
                   '\n' + production)
     production = production.replace('bool pipe_pending, usb_off_pending, usb_off_drained;',
                                     'bool pipe_pending, usb_off_pending, usb_off_drained, tunnel_saved;', 1)
@@ -1920,7 +1922,7 @@ struct apple_atcphy {
     u32 dp_usb_context[2][27];
     bool pipe_pending, usb_off_pending, usb_off_drained;
     bool usb3_port_off, park_owed;
-    bool t8103_dummy_pending, t8103_usb3_retry;
+    bool t8103_dummy_pending, t8103_usb3_retry, t8103_usb3_workaround;
     bool swap_lanes;
     enum atcphy_mode mode, typec_mode;
     enum atcphy_pipehandler_state pipe_state;
@@ -1986,8 +1988,9 @@ static int atcphy_configure(struct apple_atcphy *p, enum atcphy_mode mode)
                  'atcphy_usb3_route', 'atcphy_usb3_set_mode', 'atcphy_mux_set'):
         parts.append(function(name))
     production = '\n'.join(parts)
-    # A T8103-generation host start may skip the native BIST, and the lock it holds.
+    # An admitted base-M1 host start may skip the native BIST, and the lock it holds.
     production = ('#define T8103_HOST_BIST ' + str(int('ATCPHY_GENERATION_T8103' not in
+                  function('atcphy_configure_pipehandler') and 't8103_usb3_workaround' not in
                   function('atcphy_configure_pipehandler'))) + '\n' + production)
     prefix = r'''
 #include <assert.h>
@@ -2044,6 +2047,7 @@ static void initial(struct apple_atcphy *p, enum atcphy_mode mode,
     memset(core_regs, 0, sizeof(core_regs));
     core_regs[ACIOPHY_TOP_PHY_STAT / 4] = ACIOPHY_TOP_PHY_STAT_LN0_UNK0;
     *p = (struct apple_atcphy) {
+        .t8103_usb3_workaround = hw.gen == ATCPHY_GENERATION_T8103,
         .hw = &hw, .regs.core = (unsigned char *)core_regs,
         .regs.pipehandler = (unsigned char *)pipe_regs,
         .mode = mode, .typec_mode = mode, .pipe_state = backend,
@@ -2307,7 +2311,7 @@ struct apple_atcphy {
     u32 dp_usb_context[2][27];
     bool pipe_pending, usb_off_pending, usb_off_drained;
     bool usb3_port_off, park_owed;
-    bool t8103_dummy_pending, t8103_usb3_retry;
+    bool t8103_dummy_pending, t8103_usb3_retry, t8103_usb3_workaround;
     enum atcphy_mode mode, typec_mode;
     enum atcphy_pipehandler_state pipe_state;
 };
@@ -2442,6 +2446,7 @@ static void initial(struct apple_atcphy *p, bool fixed, bool swapped)
     memset(registers, 0, sizeof(registers));
     registers[AUS_COMMON_DIG_RCAL1 / 4] = AUS_COMMON_DIG_RCAL1_ALL_CODES_DONE;
     *p = (struct apple_atcphy) {
+        .t8103_usb3_workaround = hw.gen == ATCPHY_GENERATION_T8103,
         .hw = &hw, .regs.core = (unsigned char *)registers,
         .regs.lpdptx = (unsigned char *)registers,
         .fixed_usb2 = fixed, .swap_lanes = swapped,

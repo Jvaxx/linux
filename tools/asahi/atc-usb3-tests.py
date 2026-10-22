@@ -5,9 +5,11 @@
 Compile the actual driver functions, defines, enums and mode table. MMIO polling
 models a single completed timeout/success per invocation; no timing, electrical
 behavior, firmware, real BIST sequence or kernel mutex behavior is simulated.
-The T8103 generation includes all M1/M2 fallback-compatible PHYs, including
-T600x and T602x; this is not a board whitelist. The DT-to-driver match contract
-is checked from the actual sources. Hardware qualification remains necessary.
+The actual admission helper restricts the workaround to base M1 machines;
+T600x/T8112/T602x still match the T8103 PHY fallback but keep their previous
+single-poll/BIST/role behavior. OF compatible lookup is a modeled boundary.
+The DT-to-driver match contract is checked from the actual sources.
+Hardware qualification remains necessary.
 Run --mutations for sensitivity checks.
 """
 
@@ -49,6 +51,7 @@ PRELUDE = r'''
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <strings.h>
 #include <errno.h>
 #include <stddef.h>
 typedef uint32_t u32;
@@ -72,6 +75,14 @@ typedef uint32_t u32;
 STUBS = r'''
 struct atcphy_hw { enum atcphy_generation gen;
     bool has_t8140_dp, dp_t8122, has_usb4, park_pipe_unlocked, park_dummy_phy; };
+struct device_node { const char *const *compatible; unsigned int count; };
+static bool of_device_is_compatible(const struct device_node *root, const char *compatible) {
+    if (!root) return false;
+    for (unsigned int i = 0; i < root->count; i++)
+        if (!strcasecmp(root->compatible[i], compatible)) return true;
+    return false;
+}
+/* ACTUAL_ADMISSION */
 struct reset_controller_dev { int unused; };
 struct apple_atcphy {
     struct atcphy_hw *hw;
@@ -82,7 +93,7 @@ struct apple_atcphy {
     enum atcphy_mode mode;
     enum atcphy_pipehandler_state pipe_state;
     enum atcphy_mode typec_mode;
-    bool pipe_pending, t8103_dummy_pending, t8103_usb3_retry, mode_dirty, usb_off_pending;
+    bool pipe_pending, t8103_dummy_pending, t8103_usb3_retry, t8103_usb3_workaround, mode_dirty, usb_off_pending;
     bool host_active, usb3_port_off, dp_only, ss_tunables, fixed_usb2, t8140_dp_tunables, dp_tunables;
 };
 struct phy { struct apple_atcphy *data; };
@@ -171,7 +182,11 @@ static void reset(enum atcphy_generation generation, bool t8140) {
     memset(memory, 0, sizeof(memory));
     hw = (struct atcphy_hw){ .gen = generation, .has_t8140_dp = t8140 };
     p = (struct apple_atcphy){ .hw = &hw, .regs = {memory, memory},
-        .mode = APPLE_ATCPHY_MODE_OFF, .ss_tunables = true };
+        .mode = APPLE_ATCPHY_MODE_OFF, .typec_mode = APPLE_ATCPHY_MODE_USB3,
+        .ss_tunables = true };
+    const char *const compatibles[] = {generation == ATCPHY_GENERATION_T8103 ? "apple,t8103" : "apple,t8122"};
+    const struct device_node root = {compatibles, 1};
+    p.t8103_usb3_workaround = atcphy_has_t8103_usb3_workaround(&hw, &root);
     phy.data = &p;
     polls = sleeps = sets = clears = muxes = bist_old = bist_new = 0;
     configure_calls = restore_calls = unlocks = warnings = 0;
@@ -180,6 +195,12 @@ static void reset(enum atcphy_generation generation, bool t8140) {
     ack_on = 1;
     check_ret = bist_ret = unlock_ret = configure_ret = 0;
     concurrent_override_change = false;
+}
+static void reset_machine(enum atcphy_generation generation, const char *machine) {
+    reset(generation, false);
+    const char *const compatibles[] = {"apple,synthetic-board", machine};
+    const struct device_node root = {compatibles, 2};
+    p.t8103_usb3_workaround = atcphy_has_t8103_usb3_workaround(&hw, &root);
 }
 '''
 
@@ -384,9 +405,122 @@ static void fixed_hub_nonusb3_commit_discharges_retry(void) {
 }
 static void actual_dt_fallback_generation_scope(void) {
  for(unsigned i=0;i<sizeof(scope_generations)/sizeof(scope_generations[0]);i++) {
- reset(scope_generations[i],false);ack_on=0;
+ reset_machine(scope_generations[i],scope_machines[i]);ack_on=0;
  assert(atcphy_pipehandler_lock_live(&p)==-ETIMEDOUT);
- assert(polls==(i<4?10:1) && sleeps==(i<4?9:0));
+ assert(polls==(i==0?10:1) && sleeps==(i==0?9:0));
+ }
+}
+static void admission_requires_machine_and_generation(void) {
+ reset_machine(ATCPHY_GENERATION_T8103,"apple,t8103");
+ assert(p.t8103_usb3_workaround);
+ reset_machine(ATCPHY_GENERATION_T8122,"apple,t8103");
+ assert(!p.t8103_usb3_workaround);
+ reset_machine(ATCPHY_GENERATION_T8103,"apple,t8103-extra");
+ assert(!p.t8103_usb3_workaround);
+ reset_machine(ATCPHY_GENERATION_T8103,"APPLE,T8103");
+ assert(p.t8103_usb3_workaround); /* OF compatible lookup is case-insensitive. */
+ assert(!atcphy_has_t8103_usb3_workaround(&hw,NULL));
+}
+static void fallback_machines_keep_previous_behavior(void) {
+ const char *const machines[]={"apple,t6000","apple,t6001","apple,t6002",
+     "apple,t8112","apple,t6020","apple,t6021","apple,t6022"};
+ for(unsigned i=0;i<sizeof(machines)/sizeof(machines[0]);i++)for(unsigned host=0;host<2;host++) {
+  reset_machine(ATCPHY_GENERATION_T8103,machines[i]);
+  assert(!p.t8103_usb3_workaround);
+  ack_on=0;assert(atcphy_pipehandler_lock_live(&p)==-ETIMEDOUT);
+  assert(polls==1&&!sleeps);
+  reset_machine(ATCPHY_GENERATION_T8103,machines[i]);
+  assert(!atcphy_usb3_set_mode(&phy,host?PHY_MODE_USB_HOST:PHY_MODE_USB_DEVICE,0));
+  assert(p.mode==APPLE_ATCPHY_MODE_OFF&&!configure_calls&&!muxes&&!polls);
+  assert(!p.t8103_usb3_retry);
+  p.mode=APPLE_ATCPHY_MODE_USB3;
+  assert(!atcphy_usb3_set_mode(&phy,host?PHY_MODE_USB_HOST:PHY_MODE_USB_DEVICE,0));
+  assert(bist_old==host&&!bist_new&&polls==host);
+  reset_machine(ATCPHY_GENERATION_T8103,machines[i]);
+  p.mode=APPLE_ATCPHY_MODE_USB3;p.pipe_state=ATCPHY_PIPEHANDLER_STATE_USB3;
+  assert(atcphy_park_live_t8103_pipehandler(&p)==-EOPNOTSUPP);
+  assert(!polls&&!muxes&&!p.t8103_usb3_retry);
+  ack_on=0;assert(!atcphy_park_pipehandler(&p,false));
+  assert(polls==1&&!sleeps&&muxes==1&&!p.t8103_dummy_pending&&!p.t8103_usb3_retry);
+  reset_machine(ATCPHY_GENERATION_T8103,machines[i]);
+  p.mode=APPLE_ATCPHY_MODE_USB3;p.pipe_state=ATCPHY_PIPEHANDLER_STATE_USB3;
+  assert(!atcphy_mux_switch(&p,APPLE_ATCPHY_MODE_DP));
+  assert(configure_calls==1&&!polls&&!muxes&&!p.t8103_usb3_retry&&warnings==1);
+ }
+}
+static void early_role_requires_explicit_usb3_request(void) {
+ for(unsigned mode=APPLE_ATCPHY_MODE_OFF;mode<=APPLE_ATCPHY_MODE_DP;mode++) {
+  for(unsigned host=0;host<2;host++) {
+   reset_machine(ATCPHY_GENERATION_T8103,"apple,t8103");
+   p.typec_mode=mode;
+   assert(!atcphy_usb3_set_mode(&phy,host?PHY_MODE_USB_HOST:PHY_MODE_USB_DEVICE,0));
+   bool usb3=mode==APPLE_ATCPHY_MODE_USB3;
+   assert(configure_calls==usb3&&muxes==usb3&&!polls&&!bist_old&&!bist_new);
+   assert(p.mode==(usb3?APPLE_ATCPHY_MODE_USB3:APPLE_ATCPHY_MODE_OFF));
+   assert(p.t8103_usb3_retry==!usb3);
+  }
+ }
+}
+static void both_role_and_typec_orders_complete_usb3(void) {
+ const enum atcphy_mode targets[]={APPLE_ATCPHY_MODE_USB3,APPLE_ATCPHY_MODE_USB3_DP};
+ for(unsigned target=0;target<2;target++)for(unsigned host=0;host<2;host++)for(unsigned first=0;first<2;first++) {
+  reset_machine(ATCPHY_GENERATION_T8103,"apple,t8103");
+  p.typec_mode=APPLE_ATCPHY_MODE_USB2; /* Actual probe default. */
+  if(first) {
+   assert(!atcphy_usb3_set_mode(&phy,host?PHY_MODE_USB_HOST:PHY_MODE_USB_DEVICE,0));
+   assert(p.mode==APPLE_ATCPHY_MODE_OFF&&p.pipe_state==ATCPHY_PIPEHANDLER_STATE_DUMMY);
+   assert(p.t8103_usb3_retry&&!configure_calls&&!muxes);
+  }
+  assert(!atcphy_mux_switch(&p,targets[target]));
+  if(!first)
+   assert(!atcphy_usb3_set_mode(&phy,host?PHY_MODE_USB_HOST:PHY_MODE_USB_DEVICE,0));
+  assert(p.mode==targets[target]&&p.typec_mode==targets[target]);
+  assert(p.pipe_state==ATCPHY_PIPEHANDLER_STATE_USB3&&!p.t8103_usb3_retry&&!p.pipe_pending);
+  assert(configure_calls==1&&muxes==1&&!polls&&!bist_old&&!bist_new);
+  assert(atcphy_mux_is_noop(&p,targets[target]));
+  assert(!atcphy_mux_switch(&p,targets[target]));
+  assert(configure_calls==1&&muxes==1);
+ }
+}
+static void nonusb3_commit_discharges_deferred_role(void) {
+ const enum atcphy_mode targets[]={APPLE_ATCPHY_MODE_OFF,APPLE_ATCPHY_MODE_USB2,
+     APPLE_ATCPHY_MODE_DP,APPLE_ATCPHY_MODE_USB4,APPLE_ATCPHY_MODE_TBT};
+ for(unsigned target=0;target<5;target++)for(unsigned host=0;host<2;host++)for(unsigned same=0;same<2;same++) {
+  reset_machine(ATCPHY_GENERATION_T8103,"apple,t8103");p.typec_mode=APPLE_ATCPHY_MODE_USB2;
+  hw.has_usb4=true;
+  assert(!atcphy_usb3_set_mode(&phy,host?PHY_MODE_USB_HOST:PHY_MODE_USB_DEVICE,0));
+  assert(p.t8103_usb3_retry&&!configure_calls&&!muxes);
+  /* Also exercise a committed same-mode notification with the outstanding role. */
+  if(same)p.mode=targets[target];
+  assert(!atcphy_mux_switch(&p,targets[target]));
+  assert(p.mode==targets[target]&&!p.t8103_usb3_retry&&!p.pipe_pending);
+  assert(p.pipe_state==ATCPHY_PIPEHANDLER_STATE_DUMMY&&!muxes&&!polls&&!bist_old&&!bist_new);
+  assert(atcphy_mux_is_noop(&p,targets[target]));
+  unsigned configured=configure_calls;
+  assert(!atcphy_mux_switch(&p,targets[target]));assert(configure_calls==configured&&!muxes);
+ }
+}
+static void deferred_role_survives_configuration_failures(void) {
+ for(unsigned host=0;host<2;host++)for(unsigned early=0;early<2;early++) {
+  reset_machine(ATCPHY_GENERATION_T8103,"apple,t8103");
+  p.typec_mode=early?APPLE_ATCPHY_MODE_USB3:APPLE_ATCPHY_MODE_USB2;
+  configure_ret=early?-EIO:0;
+  assert(atcphy_usb3_set_mode(&phy,host?PHY_MODE_USB_HOST:PHY_MODE_USB_DEVICE,0)==(early?-EIO:0));
+  assert(p.t8103_usb3_retry&&!muxes);
+  configure_ret=-EIO;
+  assert(atcphy_mux_switch(&p,APPLE_ATCPHY_MODE_USB3)==-EIO);
+  assert(p.t8103_usb3_retry&&p.mode_dirty&&!muxes);
+  configure_ret=0;assert(!atcphy_mux_switch(&p,APPLE_ATCPHY_MODE_USB3));
+  assert(p.pipe_state==ATCPHY_PIPEHANDLER_STATE_USB3&&!p.t8103_usb3_retry&&!p.mode_dirty);
+  assert(muxes==1&&!bist_old&&!bist_new);
+ }
+ for(unsigned host=0;host<2;host++) {
+  reset_machine(ATCPHY_GENERATION_T8103,"apple,t8103");p.typec_mode=APPLE_ATCPHY_MODE_USB2;
+  assert(!atcphy_usb3_set_mode(&phy,host?PHY_MODE_USB_HOST:PHY_MODE_USB_DEVICE,0));
+  check_ret=-EIO;assert(atcphy_mux_switch(&p,APPLE_ATCPHY_MODE_USB3)==-EIO);
+  assert(p.t8103_usb3_retry&&p.pipe_pending&&configure_calls==1&&!muxes);
+  check_ret=0;assert(!atcphy_mux_switch(&p,APPLE_ATCPHY_MODE_USB3));
+  assert(!p.t8103_usb3_retry&&!p.pipe_pending&&configure_calls==1&&muxes==1);
  }
 }
 static void role_after_typec_mux(void) {
@@ -402,6 +536,12 @@ static void role_after_typec_mux(void) {
  }
 }
 int main(void) {
+ TEST(both_role_and_typec_orders_complete_usb3);
+ TEST(nonusb3_commit_discharges_deferred_role);
+ TEST(deferred_role_survives_configuration_failures);
+ TEST(admission_requires_machine_and_generation);
+ TEST(fallback_machines_keep_previous_behavior);
+ TEST(early_role_requires_explicit_usb3_request);
  TEST(role_after_typec_mux);
  TEST(actual_dt_fallback_generation_scope);
  TEST(live_park_finishes_generic_pending);TEST(fixed_hub_nonusb3_commit_discharges_retry);
@@ -442,7 +582,10 @@ def generation_scope(source, root):
             assert selected is not None, compatibles
             generation = tables[matches[selected]]
             assert generation == expected, (family, selected, generation)
-        scope.append({"family": family, "generation": expected})
+        machine = {"t600x": "t6000", "t602x": "t6020"}.get(family, family)
+        scope.append({"family": family, "generation": expected,
+                      "machine_compatible": "apple," + machine,
+                      "workaround": family == "t8103"})
     assert tables[matches["apple,t8142-atcphy"]] == "ATCPHY_GENERATION_T8122"
     return scope
 
@@ -509,6 +652,10 @@ def harness(source):
     guard_start = configure.index("lockdep_assert_held")
     guard_end = configure.index("if (atcphy->usb_off_pending")
     stubs = STUBS.replace("/* ACTUAL_CONFIGURE_ENTRY */", configure[guard_start:guard_end])
+    stubs = stubs.replace("/* ACTUAL_ADMISSION */",
+                          block(source, "static bool atcphy_has_t8103_usb3_workaround("))
+    scope_c += "static const char *const scope_machines[] = {" + ",".join(
+        json.dumps(row["machine_compatible"]) for row in scope) + "};\n"
     return PRELUDE + defines + "\n" + "\n".join(usb_defines) + "\n" + types + "\n" + table + stubs + functions + scope_c + TESTS
 
 
@@ -532,18 +679,45 @@ MUTATIONS = {'no-live-retry': ('atcphy_pipehandler_lock_live', '? 10 : 1;', '? 1
                            'if (atcphy->dp_only || !atcphy->ss_tunables)',
                            'if (!atcphy->ss_tunables)'),
  'early-all-generations': ('atcphy_usb3_route',
-                           'atcphy->hw->gen == ATCPHY_GENERATION_T8103 &&',
+                           'atcphy->t8103_usb3_workaround &&',
                            'true &&'),
+ 'early-ignores-typec-request': ('atcphy_usb3_route',
+                                'atcphy->typec_mode != APPLE_ATCPHY_MODE_USB3',
+                                'false'),
+ 'early-role-not-remembered': ('atcphy_usb3_route',
+                              'atcphy->t8103_usb3_retry = true;',
+                              '(void)0;'),
+ 'early-configure-error-loses-obligation': ('atcphy_usb3_route',
+                                           'atcphy->t8103_usb3_retry = true;',
+                                           'if (atcphy->typec_mode != APPLE_ATCPHY_MODE_USB3) atcphy->t8103_usb3_retry = true;'),
+ 'same-mode-nonusb3-keeps-role-obligation': ('atcphy_mux_switch',
+                                            '\t\t\tatcphy->t8103_usb3_retry = false;\n\t\t}\n\t\t/* Retry a failed PIPE setup',
+                                            '\t\t\t(void)0;\n\t\t}\n\t\t/* Retry a failed PIPE setup'),
+ 'admission-ignores-machine': ('bool atcphy_has_t8103_usb3_workaround',
+                              'of_device_is_compatible(root, "apple,t8103")',
+                              'true'),
+ 'admission-ignores-generation': ('bool atcphy_has_t8103_usb3_workaround',
+                                 'hw->gen == ATCPHY_GENERATION_T8103 &&',
+                                 'true &&'),
  'bist-restored-t8103': ('atcphy_configure_pipehandler',
-                         'host && atcphy->hw->gen != ATCPHY_GENERATION_T8103',
+                         'host && !atcphy->t8103_usb3_workaround',
                          'host'),
  'bist-skipped-later': ('atcphy_configure_pipehandler',
-                        'host && atcphy->hw->gen != ATCPHY_GENERATION_T8103',
+                        'host && !atcphy->t8103_usb3_workaround',
                         'false'),
+ 'bist-skipped-fallback-machines': ('atcphy_configure_pipehandler',
+                                   'host && !atcphy->t8103_usb3_workaround',
+                                   'host && atcphy->hw->gen != ATCPHY_GENERATION_T8103'),
  'failed-state-published': ('atcphy_configure_pipehandler', 'if (!ret) {', 'if (true) {'),
  'live-generation-gate-removed': ('atcphy_park_live_t8103_pipehandler',
-                                  'if (atcphy->hw->gen != ATCPHY_GENERATION_T8103)',
+                                  'if (!atcphy->t8103_usb3_workaround)',
                                   'if (false)'),
+ 'live-park-dispatch-all-fallbacks': ('atcphy_park_pipehandler',
+                                    '!stopped && atcphy->t8103_usb3_workaround &&',
+                                    '!stopped && atcphy->hw->gen == ATCPHY_GENERATION_T8103 &&'),
+ 'mux-live-park-all-fallbacks': ('atcphy_mux_switch',
+                               'if (atcphy->t8103_usb3_workaround)',
+                               'if (atcphy->hw->gen == ATCPHY_GENERATION_T8103)'),
  'no-values-restore': ('atcphy_park_live_t8103_pipehandler',
                        'mask32(pipe + PIPEHANDLER_OVERRIDE_VALUES, value_mask,\n'
                        '\t\t\t       values & value_mask);',
@@ -582,8 +756,8 @@ MUTATIONS = {'no-live-retry': ('atcphy_pipehandler_lock_live', '? 10 : 1;', '? 1
  'role-ignores-pending': ('atcphy_usb3_route', 'if (atcphy->t8103_dummy_pending)', 'if (false)'),
  'mux-ignores-pending': ('atcphy_mux_switch', 'if (atcphy->t8103_dummy_pending)', 'if (false)'),
  'canceled-not-reconnected': ('atcphy_mux_switch',
-                              'if (atcphy->t8103_usb3_retry &&',
-                              'if (false &&'),
+                              'if (atcphy_modes[target_mode].pipehandler_state == ATCPHY_PIPEHANDLER_STATE_USB3)\n\t\t\t\treturn atcphy_configure_pipehandler',
+                              'if (false)\n\t\t\t\treturn atcphy_configure_pipehandler'),
  'retry-cleared-at-unlock': ('atcphy_park_live_t8103_pipehandler',
                              'atcphy->t8103_dummy_pending = false;',
                              'atcphy->t8103_dummy_pending = false; atcphy->t8103_usb3_retry = '
