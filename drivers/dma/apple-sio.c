@@ -175,6 +175,11 @@ static inline bool sio_is_t6030(struct sio_data *sio)
 #define SIO_T6030_PARAMS_MAX	64	/* key and value pairs */
 #define SIO_T6030_WINDOWS_MAX	8
 #define SIO_T6030_IOVA_LIMIT	BIT_ULL(42)
+/*
+ * A parameter goes to the firmware as an endpoint byte (key >> 8) and a
+ * parameter byte (key & 0xff), so a wider key would alias another one.
+ */
+#define SIO_T6030_KEY_MAX	0xffff
 
 struct sio_t6030_window {
 	u64 start;
@@ -201,6 +206,9 @@ static int sio_t6030_check_params(const u32 *params, unsigned int nparams,
 
 	if (!nparams || nparams % 2 || nparams > 2 * SIO_T6030_PARAMS_MAX)
 		return -EINVAL;
+	for (i = 0; i < nparams; i += 2)
+		if (params[i] > SIO_T6030_KEY_MAX)
+			return -EINVAL;
 	for (i = 0; i < nparams; i += 2)
 		for (j = i + 2; j < nparams; j += 2)
 			if (params[i] == params[j])

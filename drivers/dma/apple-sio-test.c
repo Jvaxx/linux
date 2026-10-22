@@ -164,6 +164,48 @@ static void sio_t6030_malformed_test(struct kunit *test)
 	}
 }
 
+/*
+ * A key wider than 16 bits is refused: the firmware gets its low 16 bits as
+ * the endpoint and parameter bytes, so it would overwrite a checked parameter.
+ */
+static void sio_t6030_key_alias_test(struct kunit *test)
+{
+	static const u32 aliases[] = { 0x1001a, 0xff00001a, 0x1000022, 0x10023, 0x1001c, 0x1001d };
+	struct sio_t6030_layout l;
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(aliases); i++) {
+		u32 key = aliases[i], checked;
+
+		/* A run-time value, as the driver has: FIELD_PREP() masks it */
+		OPTIMIZER_HIDE_VAR(key);
+		checked = key & 0xffff;
+		/* The setup message sio_send_dt_params() sends is that of the checked key */
+		KUNIT_EXPECT_EQ(test, FIELD_PREP(SIOMSG_PARAM, key & 0xff) |
+				      FIELD_PREP(SIOMSG_EP, key >> 8),
+				FIELD_PREP(SIOMSG_PARAM, checked & 0xff) |
+				FIELD_PREP(SIOMSG_EP, checked >> 8));
+		sio_t6030_build(&l, 6 * 36, 9 * 8);
+		KUNIT_ASSERT_NOT_NULL(test, sio_t6030_value(&l, checked));
+		l.params[l.nparams] = key;
+		l.params[l.nparams + 1] = 0x80;
+		l.nparams += 2;
+		KUNIT_EXPECT_EQ_MSG(test, sio_t6030_check(&l), -EINVAL, "key %#x", key);
+	}
+	/* Wider than 16 bits but aliasing no listed key: refused all the same */
+	sio_t6030_build(&l, 6 * 36, 9 * 8);
+	l.params[l.nparams] = 0x10099;
+	l.params[l.nparams + 1] = 0;
+	l.nparams += 2;
+	KUNIT_EXPECT_EQ(test, sio_t6030_check(&l), -EINVAL);
+	/* Any 16-bit key is its own message, and is admitted */
+	sio_t6030_build(&l, 6 * 36, 9 * 8);
+	l.params[l.nparams] = 0xffff;
+	l.params[l.nparams + 1] = 0;
+	l.nparams += 2;
+	KUNIT_EXPECT_EQ(test, sio_t6030_check(&l), 0);
+}
+
 /* Each table must lie inside one mapped window; spans must not overflow. */
 static void sio_t6030_spans_test(struct kunit *test)
 {
@@ -270,6 +312,7 @@ static struct kunit_case sio_t6030_test_cases[] = {
 	KUNIT_CASE(sio_t6030_earlier_loader_test),
 	KUNIT_CASE(sio_t6030_wrong_counts_test),
 	KUNIT_CASE(sio_t6030_malformed_test),
+	KUNIT_CASE(sio_t6030_key_alias_test),
 	KUNIT_CASE(sio_t6030_spans_test),
 	KUNIT_CASE(sio_t6030_device_tree_test),
 	KUNIT_CASE(sio_t6030_probe_test),
