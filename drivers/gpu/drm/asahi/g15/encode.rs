@@ -19,7 +19,7 @@
 //! offsets in image order. This file only depends on `core`, the UAPI and the `hw`/`fw::work`
 //! constants.
 
-use kernel::uapi;
+use super::wire as uapi;
 
 use super::fw::work::{self, barrier, compute, fs, initbm, scene, ta, tail, ts_record, REG_RECORD};
 use super::hw;

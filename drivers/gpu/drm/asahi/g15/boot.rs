@@ -29,7 +29,7 @@ use core::ffi::c_void;
 use core::sync::atomic::Ordering;
 
 use kernel::{
-    bindings, c_str, device,
+    bindings, device,
     device::Core,
     error::{from_err_ptr, to_result},
     platform,

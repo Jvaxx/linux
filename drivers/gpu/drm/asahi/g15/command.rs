@@ -29,7 +29,9 @@
 
 use core::mem::{offset_of, size_of};
 use core::ops::Range;
-use kernel::{prelude::*, sync::Arc, uapi, xarray};
+use kernel::{prelude::*, sync::Arc, xarray};
+
+use super::wire as uapi;
 
 use super::{gate, hw};
 use crate::{file, mmu, util::AnyBitPattern, util::Reader};
