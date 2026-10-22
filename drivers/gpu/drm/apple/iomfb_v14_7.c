@@ -1658,25 +1658,17 @@ enum {
 static void dcpext_bringup(struct work_struct *work);
 
 /*
- * The bounded translator (900-config-tooling) is optional at link time;
- * without it, refuse a tuple that does not fit before using the unbounded one.
+ * Translate one iommu-addresses tuple, refusing a truncated one.
+ * of_translate_dma_region_checked() is an ordinary exported symbol and
+ * DRM_APPLE depends on OF_ADDRESS, so it is always linked: call it directly.
+ * The former symbol_get() could never resolve it -- symbol_get() takes only
+ * GPL-only symbols -- so the bounded check was silently skipped.
  */
 static const __be32 *dcpext_translate_region(struct device_node *np,
 					     const __be32 *maps, size_t cells,
 					     phys_addr_t *iova, size_t *length)
 {
-	typeof(&of_translate_dma_region_checked) checked;
-	const __be32 *next;
-
-	checked = symbol_get(of_translate_dma_region_checked);
-	if (checked) {
-		next = checked(np, maps, cells, iova, length);
-		symbol_put(of_translate_dma_region_checked);
-		return next;
-	}
-	if (cells < (size_t)(of_n_addr_cells(np) + of_n_size_cells(np)))
-		return NULL;
-	return of_translate_dma_region(np, maps, iova, length);
+	return of_translate_dma_region_checked(np, maps, cells, iova, length);
 }
 
 /*
