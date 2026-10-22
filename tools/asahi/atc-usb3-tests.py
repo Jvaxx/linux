@@ -389,7 +389,20 @@ static void actual_dt_fallback_generation_scope(void) {
  assert(polls==(i<4?10:1) && sleeps==(i<4?9:0));
  }
 }
+static void role_after_typec_mux(void) {
+ for(unsigned gen=0;gen<2;gen++)for(unsigned host=0;host<2;host++) {
+ reset(gen?ATCPHY_GENERATION_T8122:ATCPHY_GENERATION_T8103,false);
+ assert(!atcphy_mux_switch(&p,APPLE_ATCPHY_MODE_USB3));
+ assert(configure_calls==1&&!muxes&&!polls&&!bist_old&&!bist_new);
+ assert(!atcphy_usb3_set_mode(&phy,host?PHY_MODE_USB_HOST:PHY_MODE_USB_DEVICE,0));
+ assert(p.host_active==host&&muxes==1&&bist_new==(gen&&host)&&!bist_old);
+ unsigned old_polls=polls;
+ assert(!atcphy_usb3_set_mode(&phy,host?PHY_MODE_USB_DEVICE:PHY_MODE_USB_HOST,0));
+ assert(p.host_active!=host&&muxes==1&&polls==old_polls&&bist_new==(gen&&host));
+ }
+}
 int main(void) {
+ TEST(role_after_typec_mux);
  TEST(actual_dt_fallback_generation_scope);
  TEST(live_park_finishes_generic_pending);TEST(fixed_hub_nonusb3_commit_discharges_retry);
  TEST(live_retry_last);TEST(live_retry_exhausted);TEST(request_is_not_ack);TEST(requested_ack_no_writes);TEST(later_ack_semantics_unchanged);
