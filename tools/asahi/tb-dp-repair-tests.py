@@ -52,7 +52,7 @@ _Static_assert(offsetof(struct domain,cm)==sizeof(struct tb),"mock private stora
 struct kref {int count;};
 struct tb_path {bool reserved;};
 enum {TB_TUNNEL_DP,TB_TUNNEL_USB3};
-struct tb_tunnel {struct kref kref;struct tb*tb;struct tb_port*src_port,*dst_port;int npaths;void(*destroy)(struct tb_tunnel*);struct list_head list;int type;bool dprx_started;void(*callback)(struct tb_tunnel*,void*);void*callback_data;struct tb_path*paths[3];};
+struct tb_tunnel {struct kref kref;struct tb*tb;struct tb_port*src_port,*dst_port;int npaths;void(*destroy)(struct tb_tunnel*);struct list_head list;int type;bool dprx_started,dprx_canceled;void(*callback)(struct tb_tunnel*);struct tb_path*paths[3];};
 static int tb_tunnel_lock,occupied,alloc_calls,alloc_failures,alloc_successes,freed;
 static int domain_refs,pm_refs,pm_calls,pm_error,stop_during_pm,requeue_once,lock_depth;
 static int restore_calls,scan_calls,unplugged_xdomains;
@@ -62,6 +62,8 @@ static struct domain domain;
 #define READ_ONCE(x) (x)
 #define fallthrough __attribute__((fallthrough))
 #define tb_port_dbg(...) ((void)0)
+#define tb_tunnel_dbg(...) ((void)0)
+#define tb_tunnel_warn(...) ((void)0)
 static struct tb_cm*tb_priv(struct tb*t){return (struct tb_cm*)((char*)t+sizeof(*t));}
 static struct tb*tcm_to_tb(struct tb_cm*c){return (struct tb*)((char*)c-sizeof(struct tb));}
 static void mutex_lock(int*x){if(x==&domain.tb.lock){CHECK(!lock_depth);lock_depth++;}}
@@ -101,6 +103,10 @@ static int pm_runtime_resume_and_get(struct device*d){
  return 0;
 }
 static void tb_reclaim_usb3_bandwidth(struct tb*t,struct tb_port*i,struct tb_port*o){}
+static bool tb_tunnel_is_active(struct tb_tunnel*t){return false;}
+static int tb_tunnel_consumed_bandwidth(struct tb_tunnel*t,int*up,int*down){return 0;}
+static void tb_configure_asym(struct tb*t,struct tb_port*i,struct tb_port*o,int up,int down){}
+static void tb_increase_tmu_accuracy(struct tb_tunnel*t){}
 static struct tb_tunnel*tb_find_tunnel(struct tb*t,int type,struct tb_port*in,struct tb_port*out){return current;}
 static void tb_enter_redrive(struct tb_port*p){}
 static void tb_recalc_estimated_bandwidth(struct tb*t){}
@@ -116,10 +122,9 @@ static void tb_tunnel_dp(struct tb*t){
 '''
 
 FOOTER = r'''
-static void failed_callback(struct tb_tunnel*t,void*data){tb_dp_resource_unavailable(data,t->src_port,"DPRX negotiation failed");}
 static struct tb_tunnel*new_tunnel(struct tb*tb,struct tb_port*in,struct tb_port*out){
  struct tb_tunnel*t=calloc(1,sizeof(*t));CHECK(t);t->tb=tb;t->src_port=in;t->dst_port=out;t->type=TB_TUNNEL_DP;t->kref.count=1;t->npaths=1;
- t->paths[0]=calloc(1,sizeof(struct tb_path));CHECK(t->paths[0]);t->paths[0]->reserved=true;occupied++;t->callback=failed_callback;t->callback_data=tb;current=t;return t;
+ t->paths[0]=calloc(1,sizeof(struct tb_path));CHECK(t->paths[0]);t->paths[0]->reserved=true;occupied++;t->callback=tb_dp_tunnel_active;current=t;return t;
 }
 static void flush_queue(void){
  unsigned n=0;
@@ -160,10 +165,17 @@ int main(int argc,char**argv){
  const char*c=argv[1];
  if(!strcmp(c,"callback-release-before-repair")){
   struct tb_tunnel*t=new_tunnel(&domain.tb,&in,&out);
-  tb_tunnel_get(t);tb_domain_get(&domain.tb);mutex_lock(&domain.tb.lock);
+  tb_tunnel_get(t);tb_domain_get(&domain.tb);
   worker_tail(&domain.tb,t);
   CHECK(domain.cm.dp_tunnel_work.pending && !alloc_calls && !occupied && freed==1 && domain_refs==2);
   flush_queue();CHECK(alloc_calls==1 && !alloc_failures && alloc_successes==1);
+ }else if(!strcmp(c,"canceled-callback-does-not-repair")){
+  struct tb_tunnel*t=new_tunnel(&domain.tb,&in,&out);
+  t->dprx_canceled=true;tb_tunnel_get(t);tb_domain_get(&domain.tb);
+  worker_tail(&domain.tb,t);
+  CHECK(!domain.cm.dp_tunnel_work.pending && !alloc_calls && occupied==1 && !freed && domain_refs==1);
+  mutex_lock(&domain.tb.lock);tb_deactivate_and_free_tunnel(t);mutex_unlock(&domain.tb.lock);
+  CHECK(!occupied && freed==1 && !lock_depth);
  }else if(!strcmp(c,"coalesce")){
   queue_repair(20);CHECK(domain_refs==2);flush_queue();CHECK(alloc_calls==1);
  }else if(!strcmp(c,"stop-before-queue")){
@@ -221,7 +233,7 @@ int main(int argc,char**argv){
 }
 '''
 
-CASES = ['callback-release-before-repair', 'coalesce', 'stop-before-queue',
+CASES = ['callback-release-before-repair', 'canceled-callback-does-not-repair', 'coalesce', 'stop-before-queue',
          'stop-after-queue', 'stop-during-pm', 'no-root', 'pm-failure',
          'requeue-running', 'ordinary-retirement', 'freeze-thaw-repair',
          'pm-failure-retry', 'noirq-pm-error-complete-replay',
@@ -231,6 +243,7 @@ CASES = ['callback-release-before-repair', 'coalesce', 'stop-before-queue',
 COMPLETE_CASES = {'noirq-pm-error-complete-replay', 'apple-complete-acknowledges',
                   'complete-xdomain-rescan-replay'}
 MUTANTS = {
+    'missing-canceled-callback-guard': ('if (tunnel->dprx_canceled)', 'if (false)'),
     'inline-repair': ('\ttb_recalc_estimated_bandwidth(tb);\n\ttb_queue_dp_tunnels(tb);',
                       '\ttb_recalc_estimated_bandwidth(tb);\n\ttb_tunnel_dp(tb);'),
     'missing-queue-reference': ('\ttb_domain_get(tb);', '\t/* removed get */'),
@@ -269,7 +282,7 @@ def main():
     names = ['tb_tunnel_get', 'tb_tunnel_destroy', 'tb_tunnel_put']
     parts = {n: function(tunnel, n) for n in names}
     for name in ['tb_deactivate_and_free_tunnel', 'tb_dp_tunnel_work',
-                 'tb_queue_dp_tunnels', 'tb_dp_resource_unavailable',
+                 'tb_queue_dp_tunnels', 'tb_dp_resource_unavailable', 'tb_dp_tunnel_active',
                  'tb_freeze_noirq', 'tb_thaw_noirq', 'tb_complete']:
         parts[name] = function(tb, name)
     if args.complete_ref:
@@ -277,10 +290,12 @@ def main():
                                       cwd=ROOT, text=True)
         parts['tb_complete'] = function(old, 'tb_complete')
     worker = function(tunnel, 'tb_dp_dprx_work')
-    marker = '\ttunnel->dprx_started = false;'
+    marker = '\ttunnel->callback(tunnel);'
     if worker.count(marker) != 1:
         raise ValueError('DPRX completion tail changed; review extraction')
     tail = worker[worker.index(marker):].rstrip()[:-1]
+    if tail.strip() != 'tunnel->callback(tunnel);\n\ttb_tunnel_put(tunnel);\n\ttb_domain_put(tb);':
+        raise ValueError('DPRX reference-release order changed; review extraction')
     production = '\n'.join(parts.values())
     probe = (ROOT / 'drivers/thunderbolt/tb.c').read_text()
     probe = probe[probe.index('struct tb *tb_probe(struct tb_nhi *nhi)'):]
