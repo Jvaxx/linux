@@ -484,3 +484,7 @@ MODULE_AUTHOR("Hector Martin <marcan@marcan.st>");
 MODULE_DESCRIPTION("PMGR power state driver for Apple SoCs");
 
 module_platform_driver(apple_pmgr_ps_driver);
+
+#if IS_ENABLED(CONFIG_APPLE_PMGR_PWRSTATE_KUNIT_TEST)
+#include "pmgr-pwrstate-test.c"
+#endif
