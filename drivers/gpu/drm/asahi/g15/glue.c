@@ -16,7 +16,6 @@
 #include <linux/page-flags.h>
 #include <linux/pfn.h>
 #include <linux/pm_runtime.h>
-#include <linux/soc/apple/pmp-display.h>
 #include <linux/soc/apple/pmp.h>
 
 void asahi_g15_sha256(const u8 *data, size_t len, u8 *out);
@@ -75,11 +74,8 @@ int asahi_g15_pmp_prepare(struct device *dev)
 	if (!asahi_g15_board() || !dev->of_node ||
 	    !of_device_is_compatible(dev->of_node, "apple,agx-t6030"))
 		return -ENODEV;
-#ifdef CONFIG_SILICONFOREST_NATIVE_GPU
 	return apple_pmp_link_device(dev);
-#else
-	return apple_pmp_j514s_gpu_prepare(dev);
-#endif
+
 }
 
 int asahi_g15_pmp_get(struct device *dev)
@@ -87,11 +83,8 @@ int asahi_g15_pmp_get(struct device *dev)
 	if (!asahi_g15_board() || !dev->of_node ||
 	    !of_device_is_compatible(dev->of_node, "apple,agx-t6030"))
 		return -ENODEV;
-#ifdef CONFIG_SILICONFOREST_NATIVE_GPU
 	return apple_pmp_set_device_power(0x0f, 5, 1);
-#else
-	return apple_pmp_j514s_gpu_get(dev);
-#endif
+
 }
 
 /*
@@ -101,14 +94,11 @@ int asahi_g15_pmp_get(struct device *dev)
  */
 void asahi_g15_pmp_put(struct device *dev)
 {
-#ifdef CONFIG_SILICONFOREST_NATIVE_GPU
 	int ret = apple_pmp_set_device_power(0x0f, 5, 0);
 
 	if (ret)
 		dev_warn(dev, "G15: PMP AGX vote release failed: %d\n", ret);
-#else
-	(void)dev;
-#endif
+
 }
 
 /* SHA-256 of the firmware TEXT and the board templates. */
@@ -120,7 +110,9 @@ void asahi_g15_sha256(const u8 *data, size_t len, u8 *out)
 /* Whether this is a J514S/J516S T6030 board. */
 bool asahi_g15_board(void)
 {
-	return apple_pmp_t6030_board();
+	return of_machine_is_compatible("apple,t6030") &&
+	       (of_machine_is_compatible("apple,j514s") ||
+		of_machine_is_compatible("apple,j516s"));
 }
 
 /* Whether the machine carries this compatible (of_machine_is_compatible()). */
@@ -149,13 +141,10 @@ void asahi_g15_hold_power(struct device *dev)
  */
 void asahi_g15_release_power(struct device *dev)
 {
-#ifdef CONFIG_SILICONFOREST_NATIVE_GPU
 	pm_runtime_put_noidle(dev);
 	pm_runtime_disable(dev);
 	pm_runtime_set_suspended(dev);
-#else
-	(void)dev;
-#endif
+
 }
 
 /* Pin this module until reboot. */

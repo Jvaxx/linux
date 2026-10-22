@@ -42,7 +42,7 @@ use kernel::{
 
 use super::hw;
 use super::regs::{mb, rmb, wmb, Mapping};
-use crate::driver::AsahiDevice;
+use crate::driver::AsahiDrmDevice as AsahiDevice;
 use crate::{mmu, pgtable};
 
 /// Entries of a UAT table page.

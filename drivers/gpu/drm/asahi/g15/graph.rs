@@ -25,7 +25,7 @@ use super::fw::graph::{job_list, manager, notifier, pools, qinfo, qinfo_row2, qs
 use super::hw::{client, engine, pte, sizes, tuning};
 use super::object::{Class, FwObject, Objects, Placement, Request};
 use super::Firmware;
-use crate::driver::AsahiDevice;
+use crate::driver::AsahiDrmDevice as AsahiDevice;
 
 /// Firmware class of firmware-maintained command objects.
 pub(crate) const fn cmd_fw() -> Class {
@@ -389,7 +389,7 @@ impl Graphs {
     /// Allocates both graphs.
     pub(crate) fn new(dev: &AsahiDevice, objects: &mut Objects) -> Result<Self> {
         Ok(Self {
-            dev: dev.as_ref().into(),
+            dev: dev.as_ref().as_ref().into(),
             compute: ComputeGraph::new(objects)?,
             render: RenderGraph::new(objects)?,
         })

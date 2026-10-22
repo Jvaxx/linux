@@ -16,12 +16,12 @@
 use kernel::{
     bindings, c_str,
     device::Core,
-    io::{Io, Mmio, MmioRaw},
+    io::{Io, Mmio, MmioRaw, Region},
     platform,
     prelude::*,
 };
 
-use crate::regs::Resources;
+
 
 /// Write memory barrier (`wmb()`): `dsb st`.
 #[inline(always)]
@@ -63,7 +63,7 @@ enum Kind {
 /// `raw` describes a live mapping of `raw.maxsize()` bytes created as `kind` says, which is
 /// unmapped only on drop.
 pub(crate) struct Mapping {
-    raw: MmioRaw<0>,
+    raw: MmioRaw<Region<0>>,
     phys: u64,
     kind: Kind,
 }
@@ -93,7 +93,7 @@ impl Mapping {
             return Err(ENOMEM);
         }
         Ok(Self {
-            raw: MmioRaw::new(addr as usize, size)?,
+            raw: MmioRaw::new_region(addr as usize, size)?,
             phys,
             kind: Kind::Device,
         })
@@ -111,7 +111,7 @@ impl Mapping {
             return Err(ENOMEM);
         }
         Ok(Self {
-            raw: MmioRaw::new(addr as usize, size)?,
+            raw: MmioRaw::new_region(addr as usize, size)?,
             phys,
             kind: Kind::WriteCombined,
         })
@@ -136,16 +136,16 @@ impl Mapping {
             return Err(ENOMEM);
         }
         Ok(Self {
-            raw: MmioRaw::new(addr as usize, size)?,
+            raw: MmioRaw::new_region(addr as usize, size)?,
             phys,
             kind: Kind::WriteBack,
         })
     }
 
     /// The `readl`/`writel` accessors of this mapping.
-    pub(crate) fn io(&self) -> &Mmio {
+    pub(crate) fn io(&self) -> Mmio<'_, Region<0>> {
         // SAFETY: By the type invariant `raw` describes a live mapping of `maxsize` bytes.
-        unsafe { Mmio::from_raw(&self.raw) }
+        unsafe { Mmio::from_raw(self.raw) }
     }
 
     /// Physical address of byte 0.
@@ -204,7 +204,7 @@ impl EngineState {
 /// G15 register access.
 pub(crate) struct Regs {
     /// The shared SGX mapping.
-    pub(crate) res: Resources,
+    sgx: Mapping,
     /// ASC control (`asc`, 0x4000).
     asc: Mapping,
     /// SGX status window (`sgx + 0xc000`, 0x4000).
@@ -213,7 +213,7 @@ pub(crate) struct Regs {
 
 impl Regs {
     /// Maps the ASC control page and the SGX status window.
-    pub(crate) fn new(pdev: &platform::Device<Core<'_>>, res: Resources) -> Result<Self> {
+    pub(crate) fn new(pdev: &platform::Device<Core<'_>>) -> Result<Self> {
         let window = |name: &CStr, offset: u64| -> Result<Mapping> {
             let r = pdev.resource_by_name(name).ok_or(EINVAL)?;
             let nonposted = r
@@ -227,18 +227,22 @@ impl Regs {
         Ok(Self {
             asc: window(c_str!("asc"), 0)?,
             status: window(c_str!("sgx"), SGX_STATUS as u64)?,
-            res,
+            sgx: {
+                let r = pdev.resource_by_name(c_str!("sgx")).ok_or(EINVAL)?;
+                let size = usize::try_from(r.size())?;
+                Mapping::device(r.start(), size, r.flags().contains(kernel::io::resource::Flags::IORESOURCE_MEM_NONPOSTED))?
+            },
         })
     }
 
     /// Reads the identification words and the enabled-core mask (once the GPU is powered). A
     /// SoC with more than 32 core slots carries the mask in two words.
     pub(crate) fn identity(&self, cfg: &super::Config) -> Result<Identity> {
-        let version = self.res.sgx_read32_at(SGX_ID)?;
-        let counts = self.res.sgx_read32_at(SGX_ID + 0x10)?;
-        let mut cores = u64::from(self.res.sgx_read32_at(SGX_CORE + 0x1500)?);
+        let version = self.sgx.io().try_read32(SGX_ID)?;
+        let counts = self.sgx.io().try_read32(SGX_ID + 0x10)?;
+        let mut cores = u64::from(self.sgx.io().try_read32(SGX_CORE + 0x1500)?);
         if cfg.core_slots() > 32 {
-            cores |= u64::from(self.res.sgx_read32_at(SGX_CORE + 0x1504)?) << 32;
+            cores |= u64::from(self.sgx.io().try_read32(SGX_CORE + 0x1504)?) << 32;
         }
         let bits = super::hw::CLUSTER_BITS;
         let mask = (1u64 << bits) - 1;
@@ -260,7 +264,7 @@ impl Regs {
 
     /// Opens the SGX for the firmware.
     pub(crate) fn open(&self) -> Result {
-        self.res.sgx_write32_at(SGX_OPEN, 0x70001)
+        self.sgx.io().try_write32(0x70001, SGX_OPEN)
     }
 
     /// ASC control word (`asc + 0x44`).

@@ -225,7 +225,7 @@ impl Registry {
                 vm.map_at(
                     alias.gva,
                     alias.size,
-                    alias.gem,
+                    &alias.gem,
                     mmu::Prot::from_pte(alias.leaf),
                     false,
                 )?,

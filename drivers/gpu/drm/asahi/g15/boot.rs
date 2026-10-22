@@ -47,8 +47,8 @@ use super::hw;
 use super::initdata::{self, InitData};
 use super::object::Objects;
 use super::{identity, regs, uat, Config, Shared};
-use crate::driver::AsahiDevice;
-use crate::{mmu, regs as shared_regs};
+use crate::driver::AsahiDrmDevice as AsahiDevice;
+use crate::mmu;
 
 /// The C shim (`g15/glue.c`): helpers without Rust bindings.
 pub(crate) mod glue {
@@ -460,7 +460,6 @@ pub(crate) fn admit(
     pdev: &platform::Device<Core<'_>>,
     _dev: &AsahiDevice,
     cfg: &'static Config,
-    res: shared_regs::Resources,
 ) -> Result<Admitted> {
     let dev = pdev.as_ref();
     let pmp = cfg.platform == hw::Platform::AdtWithPmp;
@@ -505,7 +504,7 @@ pub(crate) fn admit(
         return Err(EINVAL);
     }
     let board_images = initdata::prepare_board(dev, cfg, &adt)?;
-    let regs = regs::Regs::new(pdev, res)?;
+    let regs = regs::Regs::new(pdev)?;
     // Keep the GFX domain powered for the whole (retained) session.
     glue::hold_power(dev);
     dev_info!(dev, "{} admitted, ASC={:#x}\n", cfg.name, regs.asc_control()?);

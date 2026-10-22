@@ -22,12 +22,13 @@ mod geometry;
 
 use core::ptr::NonNull;
 
+use kernel::io::Io;
 use kernel::{drm::gem::BaseObject, prelude::*, sync::aref::ARef, sync::Arc};
 
 use super::hw::{self, pte};
 use super::regs::wmb;
 use super::uat;
-use crate::driver::AsahiDevice;
+use crate::driver::AsahiDrmDevice as AsahiDevice;
 use crate::{gem, mmu};
 
 /// Firmware-side cache class of an object (the leaf words of [`super::hw::pte`]).
@@ -189,7 +190,7 @@ impl FwObject {
 }
 
 /// The pinned pages of a firmware-visible object, as [`gpu_backing`] returns them.
-pub(crate) type HeldPages = kernel::drm::gem::shmem::SGTable<gem::AsahiObject, kernel::drm::Uninit>;
+pub(crate) type HeldPages = ARef<gem::Object>;
 
 // The host tests of the geometry use the hardware's page size and page-frame mask.
 static_assert!(geometry::PAGE == hw::PAGE && geometry::PA_MASK == hw::PA_MASK);
@@ -207,14 +208,17 @@ pub(crate) fn gpu_backing(dev: &AsahiDevice, bytes: usize) -> Result<(gem::Objec
     if backing.gem.size() != bytes {
         return Err(EINVAL);
     }
-    let sgt = gem::held_sg_table(&backing.gem)?;
+    // SAFETY: Backing is populated only while probing the bound G15 platform device,
+    // or through its retained session. Manual unbind is suppressed for this adapter.
+    let sgt = gem::held_sg_table(&backing.gem, unsafe { dev.as_ref().as_ref().as_bound() })?;
     let segments = sgt
         .iter()
         .map(|range| (range.dma_address() as u64, range.dma_len() as u64));
     if !geometry::backing_ok(bytes as u64, hw::PAGE, hw::PA_MASK, segments) {
         return Err(EPERM);
     }
-    Ok((backing, sgt))
+    let held = backing.gem.clone();
+    Ok((backing, held))
 }
 
 /// Allocation request.
@@ -332,10 +336,11 @@ impl Objects {
         // point of coherency before any write-combined access.
         let (mut backing, sgt) = gpu_backing(&self.dev, bytes)?;
         let cpu = if req.cpu {
-            let mut vmap = backing.vmap()?;
-            vmap.memset(0);
-            let ptr = NonNull::new(vmap.as_mut_ptr()).ok_or(ENOMEM)?;
-            core::mem::drop(vmap);
+            let vmap = backing.vmap()?;
+            for i in 0..bytes {
+                vmap.try_write8(0, i)?;
+            }
+            let ptr = NonNull::new(vmap.addr.cast::<u8>()).ok_or(ENOMEM)?;
             Some(ptr)
         } else {
             None
@@ -350,7 +355,7 @@ impl Objects {
                     kernel_vm.map_at(
                         page_va,
                         bytes,
-                        backing.gem.clone(),
+                        &backing.gem,
                         mmu::Prot::from_pte(req.class.pte()),
                         guard,
                     )?,
@@ -400,7 +405,7 @@ impl Objects {
                 self.uat.kernel_lower_vm().map_at(
                     lower,
                     bytes,
-                    backing.gem.clone(),
+                    &backing.gem,
                     mmu::Prot::from_pte(pte::LOWER),
                     false,
                 )?,
@@ -437,6 +442,7 @@ impl Objects {
     /// Maps a device range (an IOMapping record) for the firmware as [`Class::Mmio`].
     pub(crate) fn map_mmio(&mut self, va: u64, pa: u64, size: u64) -> Result {
         let mapping = self.uat.kernel_vm().map_io(
+            self.dev.as_ref().as_ref(),
             va,
             usize::try_from(pa)?,
             usize::try_from(size)?,
@@ -468,7 +474,9 @@ impl Objects {
             pte::LEAF_PB_LIST,
         ];
         let scratch = gem::new_kernel_object_wc(&self.dev, hw::PAGE as usize)?;
-        let sgt = gem::held_sg_table(&scratch.gem)?;
+        // SAFETY: The self-check runs during the bound platform probe. Its retained
+        // mappings and GEM owner keep the backing pinned after the check.
+        let sgt = gem::held_sg_table(&scratch.gem, unsafe { self.dev.as_ref().as_ref().as_bound() })?;
         let pa = sgt.iter().next().ok_or(EINVAL)?.dma_address() as u64;
         let checks = Iterator::chain(
             window
@@ -490,7 +498,7 @@ impl Objects {
             let mapping = vm.map_at(
                 va,
                 hw::PAGE as usize,
-                scratch.gem.clone(),
+                &scratch.gem,
                 mmu::Prot::from_pte(word),
                 false,
             )?;
@@ -509,7 +517,7 @@ impl Objects {
             count += 1;
         }
         // The scratch page stays mapped: retain its backing with the mappings.
-        core::mem::forget(sgt);
+        // SG backing is permanently pinned by held_sg_table; scratch remains retained.
         core::mem::forget(scratch);
         dev_info!(
             self.dev.as_ref(),

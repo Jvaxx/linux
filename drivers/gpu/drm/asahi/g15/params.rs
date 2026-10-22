@@ -113,3 +113,6 @@ pub(crate) fn queue_limits() -> uapi::drm_asahi_queue_limits {
         ..Default::default()
     }
 }
+
+/// Shared native G15 status/queue feature assignments, replaced by named wire constants next.
+pub(crate) fn feature_flags() -> u64 { 0x16 }

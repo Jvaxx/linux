@@ -73,6 +73,7 @@ mod slots;
 mod timestamp;
 mod uat;
 mod vm;
+mod wire;
 
 use core::any::Any;
 use core::ops::Range;
@@ -89,11 +90,10 @@ use kernel::{
     workqueue::{DelayedWork, WorkItem},
 };
 
-use crate::driver::{AsahiDevice, AsahiDriver};
-use crate::{alloc, gem, gpu, mmu, regs as shared_regs};
+use crate::driver::AsahiDrmDevice as AsahiDevice;
+use crate::{alloc, gem, gpu, mmu};
 
 /// Name of the G15 platform driver.
-pub(crate) const DRIVER_NAME: &CStr = c_str!("asahi-g15");
 
 /// GPU generation reported to userspace.
 pub(crate) const GPU_GENERATION: u32 = 15;
@@ -156,17 +156,19 @@ const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, &'static Config, 2> =
         ),
     ]);
 
-/// The G15 platform driver: the shared [`AsahiDriver`] probed through
-/// [`AsahiDriver::probe_g15`].
+/// The G15 platform adapter: the shared DRM registration probed through
+/// [`crate::driver::AsahiPlatformDriver::probe_g15`].
 ///
 /// `None` after a probe that failed once the firmware had been touched: the device stays bound
 /// (unbinding would detach and power off the GFX domain under the running firmware), the
 /// firmware session is retained until reboot and no DRM device exists.
-pub(crate) struct Driver(Option<AsahiDriver>);
+pub(crate) struct Driver<'bound> {
+    _driver: Option<crate::driver::AsahiPlatformDriverData<'bound>>,
+}
 
-impl platform::Driver for Driver {
+impl platform::Driver for Driver<'_> {
     type IdInfo = &'static Config;
-    type Data<'bound> = Self;
+    type Data<'bound> = Driver<'bound>;
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
 
     /// The firmware session cannot be stopped once started.
@@ -180,27 +182,20 @@ impl platform::Driver for Driver {
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
         let cfg = *info.ok_or(ENODEV)?;
         dev_info!(pdev.as_ref(), "G15: probing ({})\n", cfg.name);
-        match AsahiDriver::probe_g15(pdev, cfg) {
-            Ok(driver) => Ok(Driver(Some(driver))),
+        match crate::driver::AsahiPlatformDriver::probe_g15(pdev, cfg) {
+            Ok(driver) => Ok(Driver { _driver: Some(driver) }),
             Err(error) if boot::glue::retained() => {
                 dev_err!(
                     pdev.as_ref(),
                     "G15: probe failed after the firmware start ({:?}); device kept bound, firmware retained until reboot\n",
                     error
                 );
-                Ok(Driver(None))
+                Ok(Driver { _driver: None })
             }
             Err(error) => Err(error),
         }
     }
 
-    fn unbind<'bound>(_pdev: &'bound platform::Device<Core<'_>>, this: Pin<&Self::Data<'bound>>) {
-        if let Some(driver) = &this.0 {
-            if let Some(gpu) = driver.drm().gpu().ok().and_then(|gpu| gpu.as_any().downcast_ref::<Gpu>()) {
-                gpu.retain();
-            }
-        }
-    }
 }
 
 /// Work item ID of the poll work.
@@ -367,22 +362,21 @@ impl Gpu {
         pdev: &platform::Device<Core<'_>>,
         dev: &AsahiDevice,
         cfg: &'static Config,
-        res: shared_regs::Resources,
     ) -> Result<Arc<Gpu>> {
         // Admission (probe-time checks), then the firmware start to READY.
-        let admitted = boot::admit(pdev, dev, cfg, res)?;
+        let admitted = boot::admit(pdev, dev, cfg)?;
         // Admission holds the GFX domain. A failure before the firmware is touched gives it
         // back (a start that touched the firmware keeps it, retained until reboot).
         let unretained = |error: Error| -> Error {
             if !boot::glue::retained() {
-                boot::glue::release_power(dev.as_ref());
+                boot::glue::release_power(dev.as_ref().as_ref());
             }
             error
         };
         let data = admitted.adt.data.clone();
         let shared = Arc::pin_init(
             pin_init!(Shared {
-                dev: dev.as_ref().into(),
+                dev: dev.as_ref().as_ref().into(),
                 crashed: AtomicBool::new(false),
                 evented: AtomicBool::new(false),
                 error: AtomicI32::new(0),
@@ -520,6 +514,10 @@ impl Firmware {
 }
 
 impl gpu::Gpu for Gpu {
+    fn stats_snapshot(&self) -> Option<Arc<crate::stats::StatsSnapshot>> {
+        None
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -546,6 +544,10 @@ impl gpu::Gpu for Gpu {
 
     fn get_params(&self, params: &mut uapi::drm_asahi_params_global) -> Result {
         params::fill(self, params)
+    }
+
+    fn feature_flags(&self) -> u64 {
+        params::feature_flags()
     }
 
     fn supports_vm_status(&self) -> bool {

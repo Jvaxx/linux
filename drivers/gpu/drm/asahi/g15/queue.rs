@@ -168,6 +168,7 @@ impl Queue {
 impl crate::queue::Queue for Queue {
     fn submit(
         &mut self,
+        _reg_data: &crate::driver::AsahiRegData<'_>,
         id: u64,
         syncs: KVec<file::SyncItem>,
         in_sync_count: usize,

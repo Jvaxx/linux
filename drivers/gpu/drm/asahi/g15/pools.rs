@@ -55,7 +55,7 @@ use super::hw::{client, pte, sizes, tuning};
 use super::object::{self, Class, FwObject, HeldPages, Objects, Placement, Request};
 use super::vm::VmState;
 use super::Firmware;
-use crate::driver::AsahiDevice;
+use crate::driver::AsahiDrmDevice as AsahiDevice;
 use crate::{gem, mmu};
 
 pub(crate) use growth::Ledger;
@@ -112,7 +112,7 @@ impl PbChunk {
         vm.map_at(
             client::PB_HEAP + self.first as u64 * buffer::BLOCK_BYTES,
             self.blocks as usize * buffer::BLOCK_BYTES as usize,
-            self.backing.gem.clone(),
+            &self.backing.gem,
             mmu::Prot::from_pte(pte::LEAF_CACHED),
             false,
         )
@@ -382,7 +382,7 @@ impl Pools {
             KVec::with_capacity(growth::max_chunks(ledger.initial, ledger.max), GFP_KERNEL)?;
         chunks.push(PbChunk::new(dev, 0, ledger.initial)?, GFP_KERNEL)?;
         Ok(Self {
-            dev: dev.as_ref().into(),
+            dev: dev.as_ref().as_ref().into(),
             drm: dev.into(),
             uma: [uma0, uma1],
             live,
