@@ -104,6 +104,17 @@ config APPLE_SIO
 	  Enable support for the SIO coprocessor found on Apple Silicon SoCs
 	  where it provides DMA services.
 
+config APPLE_SIO_KUNIT_TEST
+	bool "KUnit tests for the Apple SIO probe" if !KUNIT_ALL_TESTS
+	depends on APPLE_SIO=y && KUNIT=y
+	depends on OF_OVERLAY
+	default KUNIT_ALL_TESTS
+	help
+	  Check which SIO device-tree nodes the probe goes on with: the
+	  generic SIO of the M1 and M2 in every configuration, and a T6030
+	  SIO only with APPLE_SIO_T6030 and protocol-10 boot tables. Run it
+	  both with and without APPLE_SIO_T6030.
+
 config APPLE_SIO_T6030
 	bool "Apple SIO on the M3 Pro (T6030)"
 	depends on APPLE_SIO
@@ -115,7 +126,7 @@ config APPLE_SIO_T6030
 	  published whole. The firmware's boot tables come from the boot
 	  loader, as on the other SoCs; the SIO is only started when they
 	  are protocol-10 tables, which a boot loader without T6030 support
-	  does not build.
+	  does not build. Without this option a T6030 SIO is left stopped.
 
 config APPLE_SIO_T6030_KUNIT_TEST
 	bool "KUnit tests for the T6030 SIO boot-table check" if !KUNIT_ALL_TESTS

@@ -972,6 +972,16 @@ static int sio_probe(struct platform_device *pdev)
 	int nchannels;
 	int err, i;
 
+	/*
+	 * Only APPLE_SIO_T6030 checks a T6030's boot tables and configures its
+	 * channels: without it, leave the SIO stopped rather than start it as
+	 * the generic one.
+	 */
+	if (!IS_ENABLED(CONFIG_APPLE_SIO_T6030) &&
+	    of_device_is_compatible(np, "apple,t6030-sio"))
+		return dev_err_probe(&pdev->dev, -ENODEV,
+				     "T6030 SIO support (APPLE_SIO_T6030) not built; leaving the SIO stopped\n");
+
 	err = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(42));
 	if (err)
 		return dev_err_probe(&pdev->dev, err, "Failed to set DMA mask\n");
@@ -1135,4 +1145,8 @@ MODULE_LICENSE("Dual MIT/GPL");
 
 #if IS_ENABLED(CONFIG_APPLE_SIO_T6030_KUNIT_TEST)
 #include "apple-sio-test.c"
+#endif
+
+#if IS_ENABLED(CONFIG_APPLE_SIO_KUNIT_TEST)
+#include "apple-sio-probe-test.c"
 #endif
