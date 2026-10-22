@@ -1961,6 +1961,32 @@ static void fabric_t6030_dual_policy_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, mask, (u32)(BIT(1) | BIT(2)));
 }
 
+static void fabric_t6030_clock_header_parity_test(struct kunit *test)
+{
+	static const struct {
+		unsigned int source;
+		unsigned int dpin;
+		int pclk;
+	} cases[] = {
+		{ 0, 0, 0 }, { 0, 1, 1 }, { 2, 0, 0 }, { 2, 1, 1 },
+		{ 1, 0, -EOPNOTSUPP }, { 1, 1, -EOPNOTSUPP },
+		{ 3, 0, -EOPNOTSUPP }, { 4, 0, -EOPNOTSUPP },
+		{ UINT_MAX, 0, -EOPNOTSUPP },
+		{ 0, 2, -EOPNOTSUPP }, { 2, 2, -EOPNOTSUPP },
+		{ 0, UINT_MAX, -EOPNOTSUPP },
+	};
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(cases); i++) {
+		KUNIT_EXPECT_EQ(test,
+			apple_dp_tunnel_t6030_pclk(cases[i].source, cases[i].dpin),
+			cases[i].pclk);
+		KUNIT_EXPECT_EQ(test,
+			dcp_fabric_t6030_pclk(cases[i].source, cases[i].dpin),
+			cases[i].pclk);
+	}
+}
+
 static void fabric_t6030_clock_routes_test(struct kunit *test)
 {
 	struct fabric_fixture f;
@@ -2326,6 +2352,7 @@ static struct kunit_case fabric_tests[] = {
 	KUNIT_CASE(relink_stamp_test),
 	KUNIT_CASE(fabric_t6030_dual_policy_test),
 	KUNIT_CASE(fabric_t6030_clock_routes_test),
+	KUNIT_CASE(fabric_t6030_clock_header_parity_test),
 	KUNIT_CASE(fabric_t6030_plan_test),
 	KUNIT_CASE(fabric_t6030_follow_test),
 	KUNIT_CASE(fabric_reclaim_transaction_test),

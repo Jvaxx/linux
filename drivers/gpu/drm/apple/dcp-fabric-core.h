@@ -77,9 +77,9 @@ enum dcp_fabric_wiring dcp_fabric_wiring(bool dpin0, bool dpin1, bool legacy,
 					 unsigned int endpoints);
 bool dcp_fabric_t6020_flow(bool usb4, bool soc_support, bool connector_wired);
 /*
- * T6030's even external sources feed DP IN0/1 through DPTX PCLK1/2. A local copy
- * of apple_dp_tunnel_t6030_pclk() (linux/soc/apple/dp-tunnel.h, 170-usb),
- * which the dp-tunnel.h this tree builds against does not have yet.
+ * T6030's even external sources feed DP IN0/1 through DPTX PCLK1/2. Keep this
+ * pure policy helper independent of OF/PHY header dependencies. The fabric
+ * tests check parity with apple_dp_tunnel_t6030_pclk() in dp-tunnel.h.
  */
 static inline int dcp_fabric_t6030_pclk(unsigned int source, unsigned int dpin)
 {
