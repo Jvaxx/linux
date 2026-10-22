@@ -240,6 +240,61 @@ static void apple_pmp_report_ready_work(struct work_struct *work)
 		 readq(rep->base + offs->status), want);
 }
 
+/* The unique, enabled and acknowledged T6030 display request (DISP, reg 7). */
+static struct device_node *apple_pmp_report_t6030_entry(struct device_node *report)
+{
+	struct device_node *child, *entry = NULL;
+	u32 reg;
+
+	for_each_child_of_node(report, child) {
+		if (of_property_read_u32(child, "reg", &reg) || reg != 7)
+			continue;
+		if (entry || of_property_count_u32_elems(child, "reg") != 1 ||
+		    !of_device_is_available(child) ||
+		    !of_device_is_compatible(child, "apple,t6000-pmp-v2-report-entry") ||
+		    of_property_read_bool(child, "apple,no-ack")) {
+			of_node_put(child);
+			of_node_put(entry);
+			return NULL;
+		}
+		entry = of_node_get(child);
+	}
+	return entry;
+}
+
+/* The normal entry consumer owns startup/removal and checks READY plus ACK. */
+static int apple_pmp_report_wait_t6030_14(struct device *supplier, unsigned int timeout_ms)
+{
+	struct device_node *np, *report = NULL, *pmp, *entry;
+	int ret;
+
+	if (!IS_ENABLED(CONFIG_APPLE_T6030_GPU_PMP_LINK) ||
+	    !of_machine_is_compatible("apple,t6030") ||
+	    !of_device_is_compatible(supplier->of_node, "apple,t6030-pmp-v2"))
+		return -ENODEV;
+	for_each_compatible_node(np, NULL, "apple,t6030-pmp-v2-report") {
+		if (report) {
+			of_node_put(np);
+			of_node_put(report);
+			return -ENODEV;
+		}
+		report = of_node_get(np);
+	}
+	if (!report || !of_device_is_available(report) ||
+	    of_property_count_u32_elems(report, "apple,pmp") != 1) {
+		of_node_put(report);
+		return -ENODEV;
+	}
+	pmp = of_parse_phandle(report, "apple,pmp", 0);
+	entry = apple_pmp_report_t6030_entry(report);
+	ret = pmp == supplier->of_node && entry ?
+		apple_pmp_report_wait_ready(entry, msecs_to_jiffies(timeout_ms)) : -ENODEV;
+	of_node_put(entry);
+	of_node_put(pmp);
+	of_node_put(report);
+	return ret;
+}
+
 /* The native 25G83 PMP starts through its supplier topology, after requests
  * are seeded. Its report is pinned against removal while readiness is read.
  */
@@ -251,6 +306,9 @@ int apple_pmp_report_wait_supplier_ready(struct device *supplier, unsigned int t
 	u64 status;
 	int ret;
 
+	/* A declared report always takes the existing native25 path below. */
+	if (!np && !of_property_present(supplier->of_node, "apple,pmp-report"))
+		return apple_pmp_report_wait_t6030_14(supplier, timeout_ms);
 	if (!np || !of_device_is_compatible(np, "apple,j613-25g83-pmp-report")) {
 		of_node_put(np);
 		return -ENODEV;
