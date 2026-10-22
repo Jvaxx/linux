@@ -31,7 +31,8 @@ struct of_changeset { int unused; };
 struct gate_soc { int id; };
 struct apple_pmp_report_offsets {
 	unsigned int status, actual, tgt_read, tgt_write;
-	bool starts_pmp;
+	bool starts_pmp, devices_ordered;
+	const char *name, *fallback, *pwrstate;
 };
 struct apple_pmp_report {
 	void *base;
@@ -40,11 +41,16 @@ struct apple_pmp_report {
 	void *start;
 	struct apple_pmp_report *next;
 };
+struct completion { bool done; };
 struct apple_pmp_start {
 	struct apple_pmp_report *rep;
 	struct apple_pmp_start *next;
 	bool stopping;
 	unsigned int waiters;
+	bool queued;
+	int result, work;
+	u64 ack;
+	struct completion started, waiters_done;
 };
 struct host_list { void *first; };
 static struct host_list apple_pmp_starts, apple_pmp_reports;
@@ -61,12 +67,14 @@ static int apple_pmp_report_bit(struct apple_pmp_start *st, struct device_node *
 	(void)st; *id = entry->reg; *record = false;
 	return 0;
 }
-static int apple_pmp_start_wait(struct apple_pmp_start *st, u32 id, unsigned long timeout)
-{
-	(void)st; (void)id; (void)timeout;
-	assert(!"startup path is outside this passive-report fixture");
-	return -EINVAL;
-}
+static struct apple_pmp_start managed_start;
+static int ready_result, start_calls;
+#define msecs_to_jiffies(n) (n)
+#define system_unbound_wq NULL
+static bool wait_for_completion_timeout(struct completion *c, unsigned long timeout)
+{ assert(timeout > 0); return c->done; }
+static void complete(struct completion *c) { c->done = true; }
+static void queue_work(void *wq, int *work);
 static const struct gate_soc gate_t6030 = {6030}, gate_t8122 = {8122}, other_soc = {0};
 static const struct gate_soc *gate_soc;
 static struct device_node supplier_node, other_node, gpu, extra_gpu;
@@ -80,7 +88,7 @@ static u64 status_word;
 static struct apple_pmp_report native_rep, passive_rep;
 static u64 passive_words[0x14000 / sizeof(u64)];
 static bool passive_present, passive_lockable, passive_data;
-static int passive_status_reads, transition_after;
+
 static const char *machine;
 static const void *pmp_data;
 static struct device *pmp_device;
@@ -230,16 +238,8 @@ static struct apple_pmp_report *platform_get_drvdata(struct platform_device *pde
 }
 static u64 readq(const void *address)
 {
-	if (device_locked == 2) {
-		assert(passive_report.dev.refs > 0 && passive_report.dev.bound);
-		assert(entry7.refs > 0 && report14.refs > 0 && supplier_node.refs > 0);
-		if (address == (char *)passive_rep.base + passive_rep.offsets->status) {
-			passive_status_reads++;
-			if (transition_after && passive_status_reads >= transition_after) {
-				passive_words[passive_rep.offsets->status / 8] = PMP_REPORT_READY;
-				passive_words[passive_rep.offsets->actual / 8] = BIT_ULL(7);
-			}
-		}
+	if (!device_locked) {
+		assert(apple_pmp_start_mutex && managed_start.waiters);
 	} else {
 		assert(device_locked == 1 && native_report.dev.refs > 0);
 	}
@@ -281,9 +281,17 @@ static void lock_drop(struct lock_guard *guard)
 static int apple_pmp_send_power_command(const void *data, u8 command, u16 id, u32 enabled)
 {
 	assert(data == pmp_data && command == 0x0f && id == 5 && enabled == 1);
-	assert(pmp_lock == 1 && (ready_calls == 1 || poll_calls == 1));
+	assert(pmp_lock == 1 && (start_calls == 1 || poll_calls == 1));
 	power_calls++;
 	return power_result;
+}
+static void queue_work(void *wq, int *work)
+{
+	assert(!wq && work == &managed_start.work && apple_pmp_start_mutex);
+	/* Firmware boundary: no READY is fabricated by the readiness reader. */
+	start_calls++;
+	managed_start.result = ready_result;
+	managed_start.started.done = true;
 }
 #include "t6030-pmp-production.h"
 
@@ -291,6 +299,7 @@ static void balanced(void)
 {
 	for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++)
 		assert(!nodes[i]->refs);
+	assert(!managed_start.waiters);
 	assert(!supplier.refs && !consumer.refs && !native_report.dev.refs && !passive_report.dev.refs);
 	assert(!apple_pmp_start_mutex && !rcu_depth);
 	assert(!pmp_lock && !device_locked);
@@ -322,8 +331,10 @@ static void reset(void)
 	passive_words[apple_pmp_offsets_t6030.status / 8] = PMP_REPORT_READY;
 	passive_words[apple_pmp_offsets_t6030.actual / 8] = BIT_ULL(7);
 	passive_present = passive_lockable = passive_data = true;
-	passive_status_reads = transition_after = 0;
-	apple_pmp_starts.first = NULL;
+	managed_start = (struct apple_pmp_start){.rep = &passive_rep, .ack = BIT_ULL(7)};
+	passive_rep.start = &managed_start;
+	apple_pmp_starts.first = CONFIG_APPLE_T6030_GPU_PMP_LINK ? &managed_start : NULL;
+	ready_result = start_calls = 0;
 	apple_pmp_reports.first = &passive_rep;
 	machine = "apple,t6030";
 	gate_soc = &gate_t6030;
@@ -347,37 +358,31 @@ int main(void)
 	memcpy(nodes, initial, sizeof(nodes));
 	/* Keep host boundary functions available when a mutant removes a call. */
 	(void)apple_pmp_report_wait_ready;
+	(void)complete;
 	(void)of_machine_is_compatible;
 	(void)of_property_read_bool;
 	(void)of_property_present;
 	(void)gate_find_one;
 	(void)apple_pmp_report_t6030_entry;
 	(void)apple_pmp_report_wait_t6030_14;
-	(void)apple_pmp_report_wait_t6030_bound;
 	reset();
-	assert(!passive_rep.start && !apple_pmp_offsets_t6030.starts_pmp);
-	assert(apple_pmp_report_wait_ready(&entry7, 10000) == -ENODEV);
-	balanced(); case_count++;
+	assert(apple_pmp_offsets_t6030.starts_pmp == !!CONFIG_APPLE_T6030_GPU_PMP_LINK);
 #if CONFIG_APPLE_T6030_GPU_PMP_LINK
-	RUN((void)0, 0, 1, 1);
-	RUN(report14.child = &entry7; entry7.sibling = &entry17; entry17.sibling = NULL, 0, 1, 1);
-	/* The modern report is passive: no managed start, READY and DISP ACK. */
-	RUN(passive_present = false, -EPROBE_DEFER, 0, 0);
-	RUN(passive_lockable = false, -EPROBE_DEFER, 0, 0);
-	RUN(passive_report.dev.bound = false, -EPROBE_DEFER, 0, 0);
-	RUN(passive_data = false, -EPROBE_DEFER, 0, 0);
-	RUN(passive_rep.dev = &native_report.dev, -ENODEV, 0, 0);
-	RUN(passive_report.dev.of_node = &report25, -ENODEV, 0, 0);
-	RUN(passive_rep.offsets = &native_offsets, -ENODEV, 0, 0);
-	RUN(passive_rep.start = (void *)1, -ENODEV, 0, 0);
-	RUN(passive_words[apple_pmp_offsets_t6030.status / 8] = 0, -ETIMEDOUT, 1, 0);
-	RUN(passive_words[apple_pmp_offsets_t6030.status / 8] = 3, -ETIMEDOUT, 1, 0);
-	RUN(passive_words[apple_pmp_offsets_t6030.actual / 8] = 0, -ETIMEDOUT, 1, 0);
-	RUN(passive_words[apple_pmp_offsets_t6030.actual / 8] = BIT_ULL(8), -ETIMEDOUT, 1, 0);
-	RUN(passive_words[apple_pmp_offsets_t6030.actual / 8] |= BIT_ULL(9), 0, 1, 1);
-	RUN(passive_words[apple_pmp_offsets_t6030.actual / 8] = 0; transition_after = 3, 0, 1, 1);
-	assert(passive_status_reads == 3);
-	RUN(power_result = -EIO, -EIO, 1, 1);
+	assert(apple_pmp_report_wait_ready(&entry7, 10000) == 0 && start_calls == 1);
+	balanced(); case_count++;
+	RUN((void)0, 0, 0, 1);
+	RUN(report14.child = &entry7; entry7.sibling = &entry17; entry17.sibling = NULL, 0, 0, 1);
+	RUN(apple_pmp_starts.first = NULL, -ENODEV, 0, 0);
+	RUN(apple_pmp_starts.first = NULL; apple_pmp_reports.first = NULL, -EPROBE_DEFER, 0, 0);
+	RUN(managed_start.stopping = true, -ENODEV, 0, 0);
+	RUN(ready_result = -ETIMEDOUT, -ETIMEDOUT, 0, 0);
+	RUN(ready_result = -EINVAL, -EINVAL, 0, 0);
+	RUN(passive_words[apple_pmp_offsets_t6030.status / 8] = 0, -EIO, 0, 0);
+	RUN(passive_words[apple_pmp_offsets_t6030.status / 8] = 3, -EIO, 0, 0);
+	RUN(passive_words[apple_pmp_offsets_t6030.actual / 8] = 0, -EIO, 0, 0);
+	RUN(passive_words[apple_pmp_offsets_t6030.actual / 8] = BIT_ULL(8), -EIO, 0, 0);
+	RUN(passive_words[apple_pmp_offsets_t6030.actual / 8] |= BIT_ULL(9), 0, 0, 1);
+	RUN(power_result = -EIO, -EIO, 0, 1);
 	RUN(machine = "apple,t8122", -ENODEV, 0, 0);
 	RUN(machine = "apple,t6031", -ENODEV, 0, 0);
 	RUN(machine = "apple,t8140", -ENODEV, 0, 0);

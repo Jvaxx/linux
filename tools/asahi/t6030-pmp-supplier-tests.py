@@ -4,8 +4,8 @@
 
 Actual selection, dispatch, device-link and serialized power functions are
 extracted. OF enumeration/property storage, device binding, MMIO polling,
-and locks are controlled host boundaries. The T6030 passive readiness reader
-is extracted too; it has no managed-start object in the positive control.
+and locks are controlled host boundaries. The T6030 managed entry wait
+and start wait are extracted too; the firmware/workqueue boundary is controlled.
 This models ownership/error handling, not real teardown concurrency or DMA.
 """
 import argparse
@@ -87,7 +87,6 @@ def main():
     assert "depends on APPLE_T6030_DISPLAY_GATE" in section
     parts = [function(gate, "static struct device_node *__init gate_find_one("),
              function(gate, "static int __init gate_gpu_pmp_link("),
-             function(report, "static int apple_pmp_report_wait_t6030_bound("),
              function(report, "static struct device_node *apple_pmp_report_t6030_entry("),
              function(report, "static int apple_pmp_report_wait_t6030_14("),
              function(report, "int apple_pmp_report_wait_supplier_ready("),
@@ -95,7 +94,7 @@ def main():
              function(export, "int apple_pmp_set_device_power(")]
     offsets = re.search(r'static const struct apple_pmp_report_offsets apple_pmp_offsets_t6030 = \{.*?\n\};', report, re.S)
     assert offsets
-    code = offsets.group() + "\n" + function(report, "int apple_pmp_report_wait_ready(") + "\n" + "\n".join(parts)
+    code = offsets.group() + "\n" + function(report, "static int apple_pmp_start_wait(") + "\n" + function(report, "int apple_pmp_report_wait_ready(") + "\n" + "\n".join(parts)
     # Existing managed-start consumers must remain byte-identical.
     consumers = ["int apple_pmp_report_wait_ready(", "static int apple_pmp_start_wait("]
     consumer_hashes = {name: digest(function(report, name)) for name in consumers}
@@ -131,27 +130,19 @@ def main():
             ("entry-compat", '!of_device_is_compatible(child, "apple,t6000-pmp-v2-report-entry") ||', "false ||"),
             ("entry-no-ack", 'of_property_read_bool(child, "apple,no-ack"))', "false)"),
             ("declared-report-fallback", '!np && !of_property_present(supplier->of_node, "apple,pmp-report")', "!np"),
-            ("readiness-error", "apple_pmp_report_wait_t6030_bound(report, timeout_ms) : -ENODEV;",
-             "(apple_pmp_report_wait_t6030_bound(report, timeout_ms), 0) : -ENODEV;"),
-            ("passive-ready", "status == PMP_REPORT_READY &&", "status != 0 &&"),
-            ("passive-ack", "(readq(rep->base + rep->offsets->actual) & BIT_ULL(7))", "true"),
-            ("passive-trylock", "if (!device_trylock(&pdev->dev)) {", "if (false) {"),
-            ("passive-bound", "rep = device_is_bound(&pdev->dev) ? platform_get_drvdata(pdev) : NULL;", "rep = platform_get_drvdata(pdev);"),
-            ("passive-offset-owner", "rep->offsets != &apple_pmp_offsets_t6030 ||", "false ||"),
-            ("passive-start-owner", "rep->offsets->starts_pmp || rep->start", "rep->offsets->starts_pmp"),
+            ("readiness-error", "apple_pmp_report_wait_ready(entry, msecs_to_jiffies(timeout_ms)) : -ENODEV;",
+             "(apple_pmp_report_wait_ready(entry, msecs_to_jiffies(timeout_ms)), 0) : -ENODEV;"),
+            ("managed-owner", '.starts_pmp = IS_ENABLED(CONFIG_APPLE_T6030_GPU_PMP_LINK)', '.starts_pmp = false'),
+            ("managed-ack", 'status == PMP_REPORT_READY && (ack & BIT_ULL(id))', '((void)ack, status == PMP_REPORT_READY)'),
+            ("managed-ready", 'status == PMP_REPORT_READY && (ack & BIT_ULL(id))', '((void)status, (ack & BIT_ULL(id)))'),
             ("entry-reference", "\tof_node_put(entry);\n\tof_node_put(pmp);", "\tof_node_put(pmp);"),
             ("gate-config", "IS_ENABLED(CONFIG_APPLE_T6030_GPU_PMP_LINK) && gate_soc == &gate_t6030", "gate_soc == &gate_t6030"),
             ("gate-phandle-shape", 'of_property_count_u32_elems(gpu, "apple,pmp") != 1', "false"),
             ("serialized-command", "\tguard(mutex)(&pmp_lock);", "\t(void)&pmp_lock;"),
         ]
         for name, old, new in mutations:
-            if name.startswith("passive-"):
-                bound = function(report, "static int apple_pmp_report_wait_t6030_bound(")
-                assert bound.count(old) == 1, (name, bound.count(old))
-                variants.append((name, code.replace(bound, bound.replace(old, new))))
-            else:
-                assert code.count(old) == 1, (name, code.count(old))
-                variants.append((name, code.replace(old, new)))
+            assert code.count(old) == 1, (name, code.count(old))
+            variants.append((name, code.replace(old, new)))
         variants.append(("control-after", code))
     results = [run(args.output, name, source, compiler) for name, source in variants]
     if baseline_code:
