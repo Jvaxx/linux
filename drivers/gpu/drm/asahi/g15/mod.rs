@@ -162,6 +162,7 @@ const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, &'static Config, 2> =
 /// `None` after a probe that failed once the firmware had been touched: the device stays bound
 /// (unbinding would detach and power off the GFX domain under the running firmware), the
 /// firmware session is retained until reboot and no DRM device exists.
+#[pin_data]
 pub(crate) struct Driver<'bound> {
     _driver: Option<crate::driver::AsahiPlatformDriverData<'bound>>,
 }
@@ -180,20 +181,27 @@ impl platform::Driver for Driver<'_> {
         pdev: &'bound platform::Device<Core<'_>>,
         info: Option<&'bound Self::IdInfo>,
     ) -> impl PinInit<Self::Data<'bound>, Error> + 'bound {
-        let cfg = *info.ok_or(ENODEV)?;
-        dev_info!(pdev.as_ref(), "G15: probing ({})\n", cfg.name);
-        match crate::driver::AsahiPlatformDriver::probe_g15(pdev, cfg) {
-            Ok(driver) => Ok(Driver { _driver: Some(driver) }),
-            Err(error) if boot::glue::retained() => {
-                dev_err!(
-                    pdev.as_ref(),
-                    "G15: probe failed after the firmware start ({:?}); device kept bound, firmware retained until reboot\n",
-                    error
-                );
-                Ok(Driver { _driver: None })
-            }
-            Err(error) => Err(error),
-        }
+        // `Device::set_drvdata` allocates its KBox before running this initializer.
+        // Keep every firmware-visible action inside it: otherwise an allocation failure
+        // after probe_g15 started firmware would return an unbound device.
+        try_pin_init!(Driver {
+            _driver: {
+                let cfg = *info.ok_or(ENODEV)?;
+                dev_info!(pdev.as_ref(), "G15: probing ({})\n", cfg.name);
+                match crate::driver::AsahiPlatformDriver::probe_g15(pdev, cfg) {
+                    Ok(driver) => Some(driver),
+                    Err(error) if boot::glue::retained() => {
+                        dev_err!(
+                            pdev.as_ref(),
+                            "G15: probe failed after the firmware start ({:?}); device kept bound, firmware retained until reboot\n",
+                            error
+                        );
+                        None
+                    }
+                    Err(error) => return Err(error),
+                }
+            },
+        })
     }
 
 }
