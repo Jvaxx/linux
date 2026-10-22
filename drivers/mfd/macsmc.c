@@ -464,6 +464,7 @@ static int apple_smc_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	mutex_init(&smc->mutex);
+	spin_lock_init(&smc->lock);
 	smc->dev = &pdev->dev;
 	smc->sram_base = devm_platform_get_and_ioremap_resource(pdev, 1, &smc->sram);
 	if (IS_ERR(smc->sram_base))
