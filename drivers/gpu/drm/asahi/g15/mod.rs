@@ -319,16 +319,20 @@ impl Shared {
     /// drained by the poll work.
     pub(crate) fn orphan(&self, orphan: boot::Orphan) {
         let mut slot = self.orphan.lock();
-        match KBox::new(orphan, GFP_KERNEL) {
-            Ok(orphan) => {
-                *slot = Some(orphan);
+        match KBox::<boot::Orphan>::new_uninit(GFP_KERNEL) {
+            Ok(storage) => {
+                *slot = Some(KBox::write(storage, orphan));
                 self.orphaned.store(true, Ordering::Release);
             }
-            // Without memory for the box, leak the parts as they are.
-            Err(_) => dev_err!(
-                self.dev.as_ref(),
-                "G15: cannot keep the failed session; leaked\n"
-            ),
+            Err(_) => {
+                // Allocation must not consume the live session: KBox::new would drop it
+                // on failure. Keep its mappings and backing even without ring draining.
+                core::mem::forget(orphan);
+                dev_err!(
+                    self.dev.as_ref(),
+                    "G15: cannot allocate failed-session storage; session leaked without ring draining\n"
+                );
+            }
         }
     }
 
@@ -426,7 +430,7 @@ impl Gpu {
         )
         .map_err(unretained)?;
         let booted = boot::start(admitted, dev, cfg, &shared).map_err(unretained)?;
-        let uat = booted.session.uat()?;
+        let uat = booted.session.uat();
         let (id, max_frequency_khz) = (booted.id, booted.max_frequency_khz);
         // The backend: graphs, slots, pools, engine, recovery and VM registry.
         let firmware = Firmware::start_backend(dev, cfg, booted, &shared)?;
@@ -506,10 +510,11 @@ impl Firmware {
             let graph = graph::Graphs::new(dev, &mut objects)?;
             let slots = slots::Slots::new(&mut objects)?;
             let pools = pools::Pools::new(dev, &mut objects)?;
+            let vms = vm::Registry::new()?;
             let slot = KBox::<Firmware>::new_uninit(GFP_KERNEL)?;
-            Ok((graph, slots, pools, slot))
+            Ok((graph, slots, pools, vms, slot))
         })();
-        let (graph, slots, pools, slot) = match backend {
+        let (graph, slots, pools, vms, slot) = match backend {
             Ok(backend) => backend,
             Err(e) => return Err(orphan(session, objects, channels, init, events, e)),
         };
@@ -527,7 +532,7 @@ impl Firmware {
                 engine: engine::Engine::new(),
                 recovery: recovery::Recovery::new(),
                 pools,
-                vms: vm::Registry::new()?,
+                vms,
             },
         );
         if let Err(e) = firmware.init_graphs() {

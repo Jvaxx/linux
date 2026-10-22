@@ -110,7 +110,7 @@ static RTKIT_OPS: u8 = 0;
 fn from_err_ptr(p: *mut c_void) -> Result<*mut c_void> { if (p as isize) < 0 { Err(p as isize as i32) } else { Ok(p) } }
 mod bindings {
     use super::*;
-    pub unsafe fn apple_rtkit_init(_dev: *mut c_void, cookie: *mut c_void, name: *const i8, index: u32, _ops: *const u8) -> *mut c_void {
+    pub unsafe fn apple_rtkit_init(_dev: *mut c_void, cookie: *mut c_void, name: *const core::ffi::c_char, index: u32, _ops: *const u8) -> *mut c_void {
         assert!(name.is_null(), "maintained DT mailbox must be selected by index");
         assert_eq!(index, 0);
         COOKIE.set(cookie.cast());

@@ -398,8 +398,8 @@ pub(crate) struct Session {
 
 impl Session {
     /// The adopted UAT (user VMs are created and bound through it).
-    pub(crate) fn uat(&self) -> Result<Arc<mmu::Uat>> {
-        Ok(self.uat.clone())
+    pub(crate) fn uat(&self) -> Arc<mmu::Uat> {
+        self.uat.clone()
     }
 
     /// The latched error, if any.
