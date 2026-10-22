@@ -82,6 +82,8 @@ struct audiosrv_data {
 	struct mutex open_lock;
 	struct apple_epic_service *open_srv;
 	u64 open_gen;
+	/* The instance the link was last prepared on (open_lock) */
+	u64 link_gen;
 #endif
 
 	struct dcp_av_audio_cmds cmds;
@@ -301,7 +303,9 @@ int dcp_audiosrv_open(struct device *dev)
 	return 0;
 }
 
-static void av_audiosrv_close(struct apple_dcp *dcp, struct audiosrv_data *asrv)
+/* @gen: only the client of that instance (NULL: whichever is open) */
+static void av_audiosrv_close(struct apple_dcp *dcp, struct audiosrv_data *asrv,
+			      const u64 *gen)
 {
 	struct apple_epic_service *srv;
 	u8 reply[16] = {};
@@ -309,6 +313,9 @@ static void av_audiosrv_close(struct apple_dcp *dcp, struct audiosrv_data *asrv)
 	int ret;
 
 	guard(mutex)(&asrv->open_lock);
+	/* Checked here, at the Close: a later instance may be open by now. */
+	if (gen && asrv->open_gen != *gen)
+		return;
 	srv = asrv->open_srv;
 	asrv->open_srv = NULL;
 	if (!srv)
@@ -332,7 +339,21 @@ void dcp_audiosrv_close(struct device *dev)
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
 	if (dcp->audiosrv)
-		av_audiosrv_close(dcp, dcp->audiosrv);
+		av_audiosrv_close(dcp, dcp->audiosrv, NULL);
+}
+
+bool dcp_audiosrv_link_on(struct device *dev, u64 gen)
+{
+	struct apple_dcp *dcp;
+	struct audiosrv_data *asrv;
+
+	KUNIT_STATIC_STUB_REDIRECT(dcp_audiosrv_link_on, dev, gen);
+	dcp = dev_get_drvdata(dev);
+	asrv = dcp->audiosrv;
+	if (!asrv)
+		return false;
+	guard(mutex)(&asrv->open_lock);
+	return asrv->open_srv && asrv->open_gen == gen && asrv->link_gen == gen;
 }
 
 /*
@@ -344,11 +365,15 @@ void dcp_audiosrv_close(struct device *dev)
 int dcp_audiosrv_link(struct device *dev, enum dcp_audio_link op,
 		      const struct dcp_sound_cookie *cookie)
 {
-	struct apple_dcp *dcp = dev_get_drvdata(dev);
-	struct audiosrv_data *asrv = dcp->audiosrv;
+	struct apple_dcp *dcp;
+	struct audiosrv_data *asrv;
 	u8 body[64] = {}, reply[64];
 	u32 command, status;
 	int ret;
+
+	KUNIT_STATIC_STUB_REDIRECT(dcp_audiosrv_link, dev, op, cookie);
+	dcp = dev_get_drvdata(dev);
+	asrv = dcp->audiosrv;
 
 	switch (op) {
 	case DCP_AUDIO_LINK_PREPARE:
@@ -372,8 +397,13 @@ int dcp_audiosrv_link(struct device *dev, enum dcp_audio_link op,
 	scoped_guard(mutex, &asrv->open_lock) {
 		if (!asrv->open_srv)
 			return -ENODEV;
+		/* A link ends on the instance it was prepared on; one gone took it along. */
+		if (op != DCP_AUDIO_LINK_PREPARE && asrv->link_gen != asrv->open_gen)
+			return -ENODEV;
 		ret = av_audiosrv_call(asrv->open_srv, command, body, sizeof(body), 0,
 				       reply, sizeof(reply));
+		if (!ret && op == DCP_AUDIO_LINK_PREPARE)
+			asrv->link_gen = asrv->open_gen;
 	}
 	if (ret)
 		return ret;
@@ -639,20 +669,33 @@ static void __av_service_disconnect(struct apple_dcp *dcp, const u64 *gen)
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
 	/* The 14.7 external role's card goes with the display, and an open PCM's service. */
 	if (dcp_is_v14_7_external(dcp)) {
-		struct platform_device *audio_dev;
+		struct platform_device *audio_dev = NULL;
+		bool published = true;
 
+		/*
+		 * Each step acts on instance @gen only, checked as it is taken:
+		 * a successor may be published and opened in between.
+		 */
 		scoped_guard(mutex, &asrv->plug_lock) {
-			audio_dev = asrv->audio_dev;
-			if (audio_dev)
-				dcpaud_disconnect(audio_dev);
+			if (gen) {
+				scoped_guard(rwsem_read, &asrv->srv_rwsem)
+					published = asrv->gen == *gen;
+			}
+			if (published) {
+				audio_dev = asrv->audio_dev;
+				if (audio_dev)
+					dcpaud_disconnect(audio_dev);
+			}
 		}
+		if (!published)
+			goto out;
 		/*
 		 * The open PCM's link ends on the service, before its Close;
 		 * outside plug_lock, which the endpoint's receive path takes.
 		 */
 		if (audio_dev)
-			dcpaud_release_link(audio_dev);
-		av_audiosrv_close(dcp, asrv);
+			dcpaud_release_link(audio_dev, gen);
+		av_audiosrv_close(dcp, asrv, gen);
 		goto out;
 	}
 #endif

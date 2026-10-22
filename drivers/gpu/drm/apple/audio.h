@@ -31,7 +31,10 @@ int dcp_audiosrv_open(struct device *dev);
 void dcp_audiosrv_close(struct device *dev);
 int dcp_audiosrv_link(struct device *dev, enum dcp_audio_link op,
 		      const struct dcp_sound_cookie *cookie);
-void dcpaud_release_link(struct platform_device *pdev);
+/* @gen: only a link prepared on that instance, still the open one (NULL: any) */
+void dcpaud_release_link(struct platform_device *pdev, const u64 *gen);
+/* Whether the link prepared last is on instance @gen, still the open one */
+bool dcp_audiosrv_link_on(struct device *dev, u64 gen);
 #endif
 
 #endif /* __AUDIO_H__ */

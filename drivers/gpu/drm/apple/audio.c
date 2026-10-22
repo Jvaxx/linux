@@ -11,6 +11,7 @@
 
 #define DEBUG
 
+#include <kunit/static_stub.h>
 #include <linux/component.h>
 #include <linux/debugfs.h>
 #include <linux/device.h>
@@ -793,14 +794,19 @@ static int dcp_pcm_native_sync_stop(struct snd_pcm_substream *substream)
  * completing it, and refuses every later link prepare of that service
  * (0xe00002ea), so every later open failed.
  */
-void dcpaud_release_link(struct platform_device *pdev)
+void dcpaud_release_link(struct platform_device *pdev, const u64 *gen)
 {
-	struct dcp_audio *dcpaud = platform_get_drvdata(pdev);
+	struct dcp_audio *dcpaud;
 
+	KUNIT_STATIC_STUB_REDIRECT(dcpaud_release_link, pdev, gen);
+	dcpaud = platform_get_drvdata(pdev);
 	if (!dcpaud->native_link)
 		return;
 	guard(mutex)(&dcpaud->link_lock);
 	if (!dcpaud->link_prepared && !dcpaud->link_started)
+		return;
+	/* Only that instance's link: a later instance's PCM keeps its own. */
+	if (gen && !dcp_audiosrv_link_on(dcpaud->dcp_dev, *gen))
 		return;
 	if (dcpaud->chan)
 		dmaengine_synchronize(dcpaud->chan);
@@ -993,8 +999,10 @@ void dcpaud_connect(struct platform_device *pdev, bool connected)
 
 void dcpaud_disconnect(struct platform_device *pdev)
 {
-	struct dcp_audio *dcpaud = platform_get_drvdata(pdev);
+	struct dcp_audio *dcpaud;
 
+	KUNIT_STATIC_STUB_REDIRECT(dcpaud_disconnect, pdev);
+	dcpaud = platform_get_drvdata(pdev);
 	mutex_lock(&dcpaud->data_lock);
 
 	dcpaud_report_hotplug(dcpaud, false);
@@ -1193,4 +1201,7 @@ void dcp_audio_unregister(void)
 
 #if IS_ENABLED(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST)
 #include "audio-no-sio-test.c"
+#if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T6030_AUDIO)
+#include "audio-link-test.c"
+#endif
 #endif

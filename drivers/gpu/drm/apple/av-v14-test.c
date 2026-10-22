@@ -21,6 +21,12 @@ struct av_v14_test {
 	u32 calls[8];
 	u64 call_gens[8];
 	unsigned int ncalls;
+	/* The card's disconnects, and link releases with the instance asked for */
+	unsigned int disconnects;
+	unsigned int releases;
+	u64 release_gen;
+	/* Within a link release: the old PCM closes, a successor is published and opened */
+	bool successor_during_release;
 };
 
 static struct av_v14_test *av_v14_current;
@@ -40,6 +46,27 @@ static int av_v14_call(struct apple_epic_service *srv, u32 command, const void *
 	if (command == t->asrv->cmds.open && reply_len >= 24)
 		put_unaligned_le64(1, reply + 16);
 	return 0;
+}
+
+static void av_v14_card_disconnect(struct platform_device *pdev)
+{
+	av_v14_current->disconnects++;
+}
+
+static void av_v14_replace(struct av_v14_test *t);
+
+static void av_v14_release_link(struct platform_device *pdev, const u64 *gen)
+{
+	struct av_v14_test *t = av_v14_current;
+
+	t->releases++;
+	t->release_gen = gen ? *gen : 0;
+	if (!t->successor_during_release)
+		return;
+	t->successor_during_release = false;
+	dcp_audiosrv_close(t->dcp->dev);
+	av_v14_replace(t);
+	KUNIT_EXPECT_EQ(kunit_get_current_test(), dcp_audiosrv_open(t->dcp->dev), 0);
 }
 
 static void av_v14_publish(struct av_v14_test *t)
@@ -110,6 +137,10 @@ static struct av_v14_test *av_v14_setup(struct kunit *test)
 	t->other.enabled = true;
 	av_v14_current = t;
 	kunit_activate_static_stub(test, av_audiosrv_call, av_v14_call);
+	kunit_activate_static_stub(test, dcpaud_disconnect, av_v14_card_disconnect);
+	kunit_activate_static_stub(test, dcpaud_release_link, av_v14_release_link);
+	/* A card, never dereferenced: its disconnect and link release are stubbed */
+	asrv->audio_dev = (struct platform_device *)t;
 	av_v14_publish(t);
 	return t;
 }
@@ -203,6 +234,82 @@ static void av_v14_republished(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, t->svc.users, 1U);
 }
 
+/*
+ * A Terminate's disconnect is past its instance check when, within its link
+ * release, the old PCM closes and a successor is published in the same slot
+ * and opened: the Terminate's final Close leaves the successor open.
+ */
+static void av_v14_successor_during_release(struct kunit *test)
+{
+	struct av_v14_test *t = av_v14_setup(test);
+	u64 old;
+
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_open(t->dcp->dev), 0);
+	old = t->asrv->gen;
+	av_v14_terminate(t, &t->svc);
+	t->successor_during_release = true;
+	av_v14_run_terminate_work(t);
+	/* The Terminate's, and the old instance's teardown's */
+	KUNIT_EXPECT_EQ(test, t->disconnects, 2U);
+	KUNIT_EXPECT_EQ(test, t->releases, 1U);
+	KUNIT_EXPECT_EQ(test, t->release_gen, old);
+	/* Open, the old PCM's Close, the successor's Open; no Close after it */
+	KUNIT_ASSERT_EQ(test, t->ncalls, 3U);
+	KUNIT_EXPECT_EQ(test, t->calls[1], t->asrv->cmds.close);
+	KUNIT_EXPECT_EQ(test, t->call_gens[1], old);
+	KUNIT_EXPECT_EQ(test, t->calls[2], t->asrv->cmds.open);
+	KUNIT_EXPECT_NE(test, t->call_gens[2], old);
+	KUNIT_EXPECT_PTR_EQ(test, t->asrv->open_srv, &t->svc);
+	KUNIT_EXPECT_EQ(test, t->asrv->open_gen, t->asrv->gen);
+	dcp_audiosrv_close(t->dcp->dev);
+	KUNIT_EXPECT_EQ(test, t->ncalls, 4U);
+	KUNIT_EXPECT_EQ(test, t->svc.users, 1U);
+}
+
+/* A Terminate that finds a successor published does nothing to it or the card. */
+static void av_v14_terminate_after_successor(struct kunit *test)
+{
+	struct av_v14_test *t = av_v14_setup(test);
+
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_open(t->dcp->dev), 0);
+	av_v14_terminate(t, &t->svc);
+	av_v14_replace(t);
+	av_v14_run_terminate_work(t);
+	/* The old instance's teardown's only */
+	KUNIT_EXPECT_EQ(test, t->disconnects, 1U);
+	KUNIT_EXPECT_EQ(test, t->releases, 0U);
+}
+
+/*
+ * A link ends on the instance it was prepared on: once a successor is open,
+ * the old link's stop and complete are not sent, and its link is not on any
+ * open instance; a link prepared on the successor is.
+ */
+static void av_v14_link_instance(struct kunit *test)
+{
+	struct av_v14_test *t = av_v14_setup(test);
+	struct dcp_sound_cookie cookie = {};
+	u64 old;
+
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_open(t->dcp->dev), 0);
+	old = t->asrv->gen;
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_PREPARE, &cookie), 0);
+	KUNIT_EXPECT_TRUE(test, dcp_audiosrv_link_on(t->dcp->dev, old));
+	av_v14_replace(t);
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_open(t->dcp->dev), 0);
+	KUNIT_ASSERT_EQ(test, t->ncalls, 3U);
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_STOP, &cookie), -ENODEV);
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_COMPLETE, &cookie),
+			-ENODEV);
+	KUNIT_EXPECT_EQ(test, t->ncalls, 3U);
+	KUNIT_EXPECT_FALSE(test, dcp_audiosrv_link_on(t->dcp->dev, old));
+	KUNIT_EXPECT_FALSE(test, dcp_audiosrv_link_on(t->dcp->dev, t->asrv->gen));
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_PREPARE, &cookie), 0);
+	KUNIT_EXPECT_TRUE(test, dcp_audiosrv_link_on(t->dcp->dev, t->asrv->gen));
+	KUNIT_EXPECT_EQ(test, dcp_audiosrv_link(t->dcp->dev, DCP_AUDIO_LINK_COMPLETE, &cookie), 0);
+	KUNIT_EXPECT_EQ(test, t->ncalls, 5U);
+}
+
 /* A Terminate from an instance that is not the published one does nothing. */
 static void av_v14_terminate_unpublished(struct kunit *test)
 {
@@ -223,6 +330,9 @@ static struct kunit_case av_v14_cases[] = {
 	KUNIT_CASE(av_v14_old_close_not_to_successor),
 	KUNIT_CASE(av_v14_old_terminate_vs_successor),
 	KUNIT_CASE(av_v14_republished),
+	KUNIT_CASE(av_v14_successor_during_release),
+	KUNIT_CASE(av_v14_terminate_after_successor),
+	KUNIT_CASE(av_v14_link_instance),
 	KUNIT_CASE(av_v14_terminate_unpublished),
 	{}
 };
