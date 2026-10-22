@@ -3707,8 +3707,10 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 		dcp->vblank_works_disabled = false;
 	}
 
-	if (dcp->external_prepared)
+	if (dcp->external_prepared) {
+		av_audiosrv_reports_restart(dcp);
 		return 0;
+	}
 
 	/* A timed-out prior session may still scan these mappings. */
 	mutex_lock(&dcp->swapped_out_fbs_lock);
@@ -3793,8 +3795,10 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 
 	if (dcp->fw_compat == DCP_FIRMWARE_V_26_6) {
 		ret = iomfb_v26_6_bind(dcp);
-		if (!ret)
+		if (!ret) {
 			enable_work(&dcp->dimensions_wq);
+			av_audiosrv_reports_restart(dcp);
+		}
 		return ret;
 	}
 
@@ -3808,15 +3812,19 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 			enable_delayed_work(&dcp->external_retry_wq);
 			enable_work(&dcp->dimensions_wq);
 			dcp_enable_typec_work(dcp);
+			av_audiosrv_reports_restart(dcp);
 			return 0;
 		}
-		if (dcp->external)
+		if (dcp->external) {
+			av_audiosrv_reports_restart(dcp);
 			return 0;
+		}
 		ret = iomfb_v14_7_bind(dcp);
 		/* Balances the disable at probe, as below. */
 		if (!ret) {
 			enable_work(&dcp->dimensions_wq);
 			dcp_enable_typec_work(dcp);
+			av_audiosrv_reports_restart(dcp);
 		}
 		return ret;
 	}
@@ -3923,6 +3931,7 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 	enable_work(&dcp->dimensions_wq);
 	schedule_work(&dcp->dimensions_wq);
 	dcp_enable_typec_work(dcp);
+	av_audiosrv_reports_restart(dcp);
 	return 0;
 
 err_piodma:
@@ -3959,7 +3968,17 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
-	if (!dcp || READ_ONCE(dcp->ext_dead))
+	if (!dcp)
+		return;
+	/*
+	 * Stop the native initializer before looking up its owner, including
+	 * the dead-session path. Owner allocation may have landed in an open
+	 * bind devres group; finish its RPC work while endpoint RX is alive.
+	 */
+	if (dcp->external_native)
+		disable_work_sync(&dcp->external_audio_work);
+	av_audiosrv_quiesce(dcp);
+	if (READ_ONCE(dcp->ext_dead))
 		return;
 
 	disable_work_sync(&dcp->dimensions_wq);
@@ -3976,7 +3995,6 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 			disable_delayed_work_sync(&dcp->external_retry_wq);
 			disable_delayed_work_sync(&dcp->swap_watchdog_wq);
 			disable_work_sync(&dcp->vblank_wq);
-			disable_work_sync(&dcp->external_audio_work);
 		} else if (!dcp->external) {
 			dcp_disable_typec_work(dcp, false);
 		}
@@ -4056,7 +4074,7 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 		}
 	}
 
-	if (dcp->avep) {
+	if (!IS_ERR_OR_NULL(dcp->avep)) {
 		av_service_disconnect(dcp);
 		afk_shutdown(dcp->avep);
 		dcp->avep = NULL;
@@ -4518,14 +4536,18 @@ fixed_done:
 		ret = dcp_comp_bind(dev, NULL, NULL);
 		if (ret) {
 			dcp_disable_typec_work(dcp, true);
+			av_audiosrv_quiesce(dcp);
 			return ret;
 		}
 		WRITE_ONCE(dcp->external_prepared, true);
 	}
 	if (dcp->external_native) {
 		ret = iomfb_v14_7_external_prepare(dcp);
-		if (ret)
+		if (ret) {
+			disable_work_sync(&dcp->external_audio_work);
+			av_audiosrv_quiesce(dcp);
 			return ret;
+		}
 		if (routes_failed)
 			iomfb_v14_7_external_refuse(dcp, "its Type-C display routes did not register");
 	}
@@ -4533,6 +4555,12 @@ fixed_done:
 	ret = component_add(&pdev->dev, &dcp_comp_ops);
 	if (ret && dcp->external_prepared) {
 		dcp_disable_typec_work(dcp, true);
+	}
+	/* component_add failure does not unbind. Stop owner work first. */
+	if (ret) {
+		if (dcp->external_native)
+			disable_work_sync(&dcp->external_audio_work);
+		av_audiosrv_quiesce(dcp);
 	}
 	if (ret && dcp->fw_compat == DCP_FIRMWARE_V_26_6)
 		iomfb_v26_6_unbind(dcp);
@@ -4655,13 +4683,21 @@ static void dcp_platform_remove(struct platform_device *pdev)
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
 
 	if (dcp && dcp->external && !dcp->external_native) {
-		/* Enabled for the external start at probe. */
+		/* Enabled for the external start at probe. No component unbind. */
 		disable_delayed_work_sync(&dcp->typec_reconnect_wq);
+		av_audiosrv_quiesce(dcp);
 		iomfb_v14_7_remove(dcp);
 		return;
 	}
 	if (dcp && dcp->external_native)
-		cancel_work_sync(&dcp->external_audio_work);
+		disable_work_sync(&dcp->external_audio_work);
+	/*
+	 * Finish audio RPCs before component_del's unbind flushes RX, and
+	 * before iomfb_v14_7_remove() clears v14->dcp. Unbind repeats the
+	 * helper; the second call does not disable the works again.
+	 */
+	if (dcp)
+		av_audiosrv_quiesce(dcp);
 	component_del(&pdev->dev, &dcp_comp_ops);
 	if (dcp && dcp->fw_compat == DCP_FIRMWARE_V_26_6)
 		iomfb_v26_6_unbind(dcp);

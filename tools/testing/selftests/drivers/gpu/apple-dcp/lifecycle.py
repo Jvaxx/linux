@@ -1373,11 +1373,18 @@ struct device { struct device_node *of_node; void *data; };
 struct platform_device { struct device dev; bool bound, registered; };
 /* The native T6030 14.7 backend is never selected in these scenarios. */
 enum dcp_firmware_version { DCP_FIRMWARE_UNKNOWN, DCP_FIRMWARE_V_14_7, DCP_FIRMWARE_V_14_7_TEMPLATE, DCP_FIRMWARE_V_26_6 };
+struct work_struct { int unused; };
 struct apple_dcp {
     bool external_prepared, quiescing, crashed, external_native, ext_dead;
     enum dcp_firmware_version fw_compat;
     struct { int iomfb_method_profile; } hw;
+    struct work_struct external_audio_work;
 };
+/* This readiness fixture has no AV owner or native audio initializer. */
+static void av_audiosrv_quiesce(struct apple_dcp *d)
+{ assert(!d->external_native); }
+static void disable_work_sync(struct work_struct *work)
+{ (void)work; assert(!"native audio work in a J700 readiness scenario"); }
 static void __attribute__((unused)) iomfb_v14_7_remove(struct apple_dcp *d)
 { (void)d; assert(!"14.7 backend on a non-14.7 DCP"); }
 /* Nor the J613 26.6 backend. */
