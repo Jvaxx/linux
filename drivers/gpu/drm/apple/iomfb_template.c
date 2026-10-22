@@ -471,7 +471,14 @@ static void iomfb_cb_pr_publish(struct apple_dcp *dcp, struct iomfb_property *pr
 {
 	switch (prop->id) {
 	case IOMFB_PROPERTY_NITS_V13_3:
+	/*
+	 * 13.x firmware publishes another property under the 14.7 ID, with
+	 * value 1, right before the panel level. Read as nits it is 0, and a
+	 * backlight registered from it starts at the lowest level.
+	 */
+#if DCP_FW_VERSION(14, 7, 0) <= DCP_FW_VER
 	case IOMFB_PROPERTY_NITS_V14_7:
+#endif
 	{
 #if DCP_FW_VERSION(26, 0, 0) <= DCP_FW_VER
 		/* The H17P takeover level comes from the powerlog hint interface. */
