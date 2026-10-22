@@ -1191,3 +1191,6 @@ void dcp_audio_unregister(void)
         platform_driver_unregister(&dcpaud_driver);
 }
 
+#if IS_ENABLED(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST)
+#include "audio-no-sio-test.c"
+#endif

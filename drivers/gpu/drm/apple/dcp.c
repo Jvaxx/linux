@@ -2579,6 +2579,17 @@ void dcp_external_audio_start(struct apple_dcp *dcp)
 	queue_work(system_freezable_wq, &dcp->external_audio_work);
 }
 
+/* Probe: the audio work, disabled until a native external pipe's bind. */
+static void dcp_external_audio_init(struct apple_dcp *dcp)
+{
+	INIT_WORK(&dcp->external_audio_work, dcp_external_audio_work);
+	/*
+	 * A native external pipe's bind enables it (its first EDID queues
+	 * it, through the connector); unbind and suspend disable it again.
+	 */
+	disable_work(&dcp->external_audio_work);
+}
+
 static void _dcp_poweroff(struct apple_dcp *dcp)
 {
 	switch (dcp->fw_compat) {
@@ -4210,12 +4221,7 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	dcp->ext_failsafe = of_device_is_compatible(dev->of_node, "apple,t8122-dcpext");
 	dcp->external = of_device_is_compatible(dev->of_node, "apple,t6030-dcpext");
 	dcp->external_native = dcp->external && dcp_t6030_ext_native(dev->of_node);
-	INIT_WORK(&dcp->external_audio_work, dcp_external_audio_work);
-	/*
-	 * A native external pipe's bind enables it (its first EDID queues
-	 * it, through the connector); unbind and suspend disable it again.
-	 */
-	disable_work(&dcp->external_audio_work);
+	dcp_external_audio_init(dcp);
 	dcp->dev = dev;
 	/*
 	 * Type-C and Thunderbolt routes can be activated as soon as they are
@@ -5078,3 +5084,7 @@ void dcp_unregister(void)
 {
 	platform_driver_unregister(&apple_platform_driver);
 }
+
+#if IS_ENABLED(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST)
+#include "dcp_external_audio_test.c"
+#endif
