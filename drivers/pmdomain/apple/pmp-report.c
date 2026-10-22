@@ -242,40 +242,6 @@ static void apple_pmp_report_ready_work(struct work_struct *work)
 		 readq(rep->base + offs->status), want);
 }
 
-/* The passive T6030 report belongs to its already-running PMP supplier. */
-static int apple_pmp_report_wait_t6030_bound(struct device_node *report,
-					     unsigned int timeout_ms)
-{
-	struct platform_device *pdev = of_find_device_by_node(report);
-	struct apple_pmp_report *rep;
-	u64 status;
-	int ret;
-
-	if (!pdev)
-		return -EPROBE_DEFER;
-	/* The AGX command mutex is held; never wait behind supplier removal. */
-	if (!device_trylock(&pdev->dev)) {
-		put_device(&pdev->dev);
-		return -EPROBE_DEFER;
-	}
-	rep = device_is_bound(&pdev->dev) ? platform_get_drvdata(pdev) : NULL;
-	if (!rep) {
-		ret = -EPROBE_DEFER;
-	} else if (rep->dev != &pdev->dev || rep->dev->of_node != report ||
-		   rep->offsets != &apple_pmp_offsets_t6030 ||
-		   rep->offsets->starts_pmp || rep->start) {
-		ret = -ENODEV;
-	} else {
-		ret = readq_poll_timeout(rep->base + rep->offsets->status, status,
-					 status == PMP_REPORT_READY &&
-					 (readq(rep->base + rep->offsets->actual) & BIT_ULL(7)),
-					 1000, (u64)timeout_ms * 1000);
-	}
-	device_unlock(&pdev->dev);
-	put_device(&pdev->dev);
-	return ret;
-}
-
 /* The unique, enabled and acknowledged T6030 display request (DISP, reg 7). */
 static struct device_node *apple_pmp_report_t6030_entry(struct device_node *report)
 {
@@ -324,7 +290,7 @@ static int apple_pmp_report_wait_t6030_14(struct device *supplier, unsigned int 
 	pmp = of_parse_phandle(report, "apple,pmp", 0);
 	entry = apple_pmp_report_t6030_entry(report);
 	ret = pmp == supplier->of_node && entry ?
-		apple_pmp_report_wait_t6030_bound(report, timeout_ms) : -ENODEV;
+		apple_pmp_report_wait_ready(entry, msecs_to_jiffies(timeout_ms)) : -ENODEV;
 	of_node_put(entry);
 	of_node_put(pmp);
 	of_node_put(report);
@@ -371,7 +337,7 @@ int apple_pmp_report_wait_supplier_ready(struct device *supplier, unsigned int t
 EXPORT_SYMBOL_GPL(apple_pmp_report_wait_supplier_ready);
 
 /*
- * Starting a halted PMP (T8122, T6031)
+ * Starting a halted PMP (T8122, T6031, opted-in T6030)
  *
  * On these SoCs iBoot leaves the PMP loaded but halted, and the DCP firmware
  * of the 14.x system needs it running. A display gate that admits the boot
@@ -1229,6 +1195,12 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t6030 = {
 	.tgt_write = 0x108c0,
 	.actual = 0x11c0,
 	.status = 0x10,
+	/* Native G15 explicitly opts into the gate's halted-PMP handoff. */
+	.starts_pmp = IS_ENABLED(CONFIG_APPLE_T6030_GPU_PMP_LINK),
+	.name = "T6030",
+	.fallback = "apple_t6030_display.enable=0",
+	.pwrstate = "apple,t6030-pmgr-pwrstate",
+	.devices_ordered = true,
 };
 
 static const struct apple_pmp_report_offsets apple_pmp_offsets_t8112 = {
