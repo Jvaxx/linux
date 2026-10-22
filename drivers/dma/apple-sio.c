@@ -270,8 +270,11 @@ static int sio_t6030_windows(struct device_node *np, struct sio_t6030_window *wi
 			phys_addr_t iova;
 			size_t length;
 
-			if (!owner)
-				break;
+			/* An entry whose owner does not resolve is malformed, as a short one is */
+			if (!owner) {
+				of_node_put(it.node);
+				return -EINVAL;
+			}
 			maps = of_translate_dma_region_checked(owner, maps, end - maps, &iova,
 							       &length);
 			if (!maps) {

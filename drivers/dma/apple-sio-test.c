@@ -261,6 +261,8 @@ static void sio_t6030_device_tree_test(struct kunit *test)
 		{ "/sio-t6030-test/sio-t6030-test-no-params", "refused" },
 		{ "/sio-t6030-test/sio-t6030-test-odd", "refused" },
 		{ "/sio-t6030-test/sio-t6030-test-bad-window", "refused" },
+		{ "/sio-t6030-test/sio-t6030-test-owner-none", "refused" },
+		{ "/sio-t6030-test/sio-t6030-test-owner-unknown", "refused" },
 		{ "/sio-t6030-test/sio-t6030-test-many-windows", "refused" },
 	};
 	unsigned int i;
