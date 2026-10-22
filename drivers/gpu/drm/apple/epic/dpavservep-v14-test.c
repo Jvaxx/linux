@@ -323,6 +323,49 @@ static void av14_terminate_opened(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, t->svc.users, 1U);
 }
 
+/*
+ * A Close (as before an HPD low) after a Terminate does not end the
+ * Terminate: whether it comes after the queued Close ran or before it, no
+ * EDID copy opens or reads the terminated instance again. The successor, a
+ * new epoch in the same slot, is opened.
+ */
+static void av14_terminate_then_close(struct kunit *test)
+{
+	struct av14_test *t = av14_setup(test, true);
+	u64 epoch;
+	int round;
+
+	for (round = 0; round < 2; round++) {
+		unsigned int calls = t->ncalls, reads = t->reads;
+
+		epoch = t->dcp->dcpavserv.epoch;
+		KUNIT_EXPECT_EQ(test, av14_copy(test, t), 0);
+		av14_terminate(t);
+		if (!round)
+			av14_run_close_work(t);
+		dcpavserv_v14_close(t->dcp);
+		if (round)
+			av14_run_close_work(t);
+		/* One Open, one Close, in this instance */
+		KUNIT_ASSERT_EQ(test, t->ncalls, calls + 2);
+		KUNIT_EXPECT_EQ(test, t->calls[calls], (u32)AV14_OPEN);
+		KUNIT_EXPECT_EQ(test, t->calls[calls + 1], (u32)AV14_CLOSE);
+		KUNIT_EXPECT_EQ(test, t->dcp->dcpavserv.terminated_epoch, epoch);
+		/* Not opened or read again */
+		KUNIT_EXPECT_EQ(test, av14_copy(test, t), -ENODEV);
+		KUNIT_EXPECT_EQ(test, av14_copy(test, t), -ENODEV);
+		KUNIT_EXPECT_EQ(test, t->ncalls, calls + 2);
+		KUNIT_EXPECT_EQ(test, t->reads, reads + 1);
+		/* Its successor in the same slot: a new epoch, opened */
+		av14_replace(t);
+		KUNIT_EXPECT_NE(test, t->dcp->dcpavserv.epoch, epoch);
+	}
+	KUNIT_EXPECT_EQ(test, av14_copy(test, t), 0);
+	KUNIT_EXPECT_EQ(test, t->calls[4], (u32)AV14_OPEN);
+	KUNIT_EXPECT_EQ(test, t->call_epochs[4], t->dcp->dcpavserv.epoch);
+	KUNIT_EXPECT_EQ(test, t->svc.users, 1U);
+}
+
 /* An HPD low's Close while the Open is on its way: its opener closes the client. */
 static void av14_open_vs_close(struct kunit *test)
 {
@@ -447,6 +490,7 @@ static struct kunit_case av14_cases[] = {
 	KUNIT_CASE(av14_edid_checked),
 	KUNIT_CASE(av14_close_opened_only),
 	KUNIT_CASE(av14_terminate_opened),
+	KUNIT_CASE(av14_terminate_then_close),
 	KUNIT_CASE(av14_open_vs_close),
 	KUNIT_CASE(av14_open_vs_terminate),
 	KUNIT_CASE(av14_open_vs_replaced),
