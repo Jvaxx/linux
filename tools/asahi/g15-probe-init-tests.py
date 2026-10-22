@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: GPL-2.0-only OR MIT
 """Exercise the actual G15 probe with the vendored pin-init crate and proc macro.
 
-Requires a kernel build directory containing the host pin_init_internal proc macro.
+Builds the actual vendored host proc macro without a kernel build or downloaded
+crates. An existing kernel-build macro may optionally be supplied for comparison.
 The G15 probe, platform callback's dispatch block, Device::set_drvdata and
 try_pin_init macro are extracted from production. GPU startup and the allocator
 are fault-injection models. KBox's actual source is checked to allocate before
@@ -258,13 +259,45 @@ fn main() {
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--kernel-build", type=Path, required=True)
+    p.add_argument("--kernel-build", type=Path, help="Use this existing host proc macro instead of compiling vendored host dependencies")
     p.add_argument("--output", type=Path)
     p.add_argument("--mutations", action="store_true")
     p.add_argument("--rustc", default=os.environ.get("HOSTRUSTC", "rustc"))
     a = p.parse_args()
     out = (a.output or Path(tempfile.mkdtemp(prefix="g15-probe-init-"))).resolve()
     out.mkdir(parents=True, exist_ok=True)
+    if a.kernel_build is None:
+        a.kernel_build = out / "host-deps"
+        dependencies = a.kernel_build / "rust"
+        dependencies.mkdir(parents=True, exist_ok=True)
+        crates = [
+            ("proc_macro2", "rust/proc-macro2/lib.rs", "2021", [],
+             ['feature="proc-macro"', "wrap_proc_macro", "proc_macro_span_file", "proc_macro_span_location"]),
+            ("quote", "rust/quote/lib.rs", "2018", ["proc_macro2"], ['feature="proc-macro"']),
+            ("syn", "rust/syn/lib.rs", "2021", ["proc_macro2", "quote"],
+             ['feature="' + feature + '"' for feature in ["clone-impls", "derive", "full", "parsing", "printing", "proc-macro", "visit", "visit-mut"]]),
+            ("pin_init_internal", "rust/pin-init/internal/src/lib.rs", "2021", ["proc_macro2", "quote", "syn"],
+             ["kernel", "USE_RUSTC_FEATURES"]),
+        ]
+        commands = []
+        for name, path, edition, external, cfgs in crates:
+            macro_crate = name == "pin_init_internal"
+            output = dependencies / ("lib" + name + (".so" if macro_crate else ".rlib"))
+            command = [a.rustc, "--edition=" + edition, "--crate-name=" + name,
+                       "--crate-type=" + ("proc-macro" if macro_crate else "rlib"),
+                       "--cap-lints=allow", str(ROOT / path), "-L", "dependency=" + str(dependencies), "-o", str(output)]
+            if macro_crate:
+                command += ["--extern", "proc_macro"]
+            for dependency in external:
+                command += ["--extern", dependency + "=" + str(dependencies / ("lib" + dependency + ".rlib"))]
+            for cfg in cfgs:
+                command += ["--cfg", cfg]
+            commands.append(command)
+            built = subprocess.run(command, capture_output=True, text=True)
+            (out / (name + "-build.log")).write_text(built.stdout + built.stderr)
+            if built.returncode:
+                raise RuntimeError("vendored host dependency failed: " + name + "\n" + built.stderr)
+        (out / "host-dependency-commands.json").write_text(json.dumps(commands, indent=2) + "\n")
     sources = {name: (ROOT / name).read_text() for name in [PROBE_PATH, "rust/kernel/platform.rs", "rust/kernel/device.rs", "rust/kernel/init.rs", "rust/kernel/alloc/kbox.rs", "drivers/gpu/drm/asahi/asahi_core.rs", "drivers/gpu/drm/asahi/g15/glue.c"]}
     probe = item(sources[PROBE_PATH], "    fn probe<'bound>(")
     driver = item(sources[PROBE_PATH], "#[pin_data]\npub(crate) struct Driver<'bound>").replace("pub(crate) ", "")
