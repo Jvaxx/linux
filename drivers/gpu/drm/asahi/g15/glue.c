@@ -75,18 +75,16 @@ bool asahi_g15_reserved_uat(u32 index, u64 start, u64 size)
  */
 int asahi_g15_pmp_prepare(struct device *dev)
 {
-	typeof(&apple_drm_t6030_link_device) link_display;
 	int ret;
 
 	if (!asahi_g15_board() || !dev->of_node ||
 	    !of_device_is_compatible(dev->of_node, "apple,agx-t6030"))
 		return -ENODEV;
 	/* DISP ACK alone does not prove the native DRM component set is up. */
-	link_display = symbol_get(apple_drm_t6030_link_device);
-	if (!link_display)
-		return -EPROBE_DEFER;
-	ret = link_display(dev);
-	symbol_put(apple_drm_t6030_link_device);
+	/* The direct import waits for the display module to become LIVE; a
+	 * symbol_get during its probe could defer without any post-LIVE retry.
+	 */
+	ret = apple_drm_t6030_link_device(dev);
 	if (ret)
 		return ret;
 	return apple_pmp_link_device(dev);

@@ -29,8 +29,8 @@ static struct device_node display_node = { "apple,t6030-display-subsystem" },
 			  other_node = { "apple,t6031-display-subsystem" };
 static struct device display, duplicate, gpu;
 static const char *machine = "apple,t6030";
-static int pmp_calls, link_calls, symbol_refs, pmp_result;
-static bool helper_available = true, link_ok = true;
+static int pmp_calls, link_calls, pmp_result;
+static bool link_ok = true;
 static atomic_bool pause_link, link_entered, release_link, withdrew;
 struct lock_guard {
 	pthread_mutex_t *lock;
@@ -103,12 +103,6 @@ static int apple_pmp_link_device(struct device *dev)
 	pmp_calls++;
 	return pmp_result;
 }
-#define symbol_get(name) (symbol_refs++, helper_available ? name : NULL)
-#define symbol_put(name)                  \
-	do {                              \
-		assert(symbol_refs == 1); \
-		symbol_refs--;            \
-	} while (0)
 #include "production.h"
 static void reset(void)
 {
@@ -116,8 +110,8 @@ static void reset(void)
 	display = (struct device){ .of_node = &display_node, .refs = 1 };
 	duplicate = (struct device){ .of_node = &display_node, .refs = 1 };
 	gpu = (struct device){ .of_node = &gpu_node, .refs = 1 };
-	pmp_calls = link_calls = symbol_refs = pmp_result = 0;
-	helper_available = link_ok = true;
+	pmp_calls = link_calls = pmp_result = 0;
+	link_ok = true;
 	machine = "apple,t6030";
 	atomic_store(&pause_link, false);
 	atomic_store(&link_entered, false);
@@ -143,21 +137,13 @@ int main(void)
 	(void)get_device;
 	(void)put_device;
 	reset();
-	helper_available = false;
-	assert(asahi_g15_pmp_prepare(&gpu) == -EPROBE_DEFER &&
-	       !pmp_calls); /* failed symbol_get does not retain a module */
-	symbol_refs = 0;
-	cases++;
-	helper_available = true;
-	assert(asahi_g15_pmp_prepare(&gpu) == -EPROBE_DEFER && !pmp_calls &&
-	       !symbol_refs);
+	assert(asahi_g15_pmp_prepare(&gpu) == -EPROBE_DEFER && !pmp_calls);
 	cases++;
 	/* Component platform bind alone never calls this publication. Retry succeeds only afterward. */
 	assert(apple_t6030_display_publish(&display) == 0 &&
 	       atomic_load(&display.refs) == 2);
 	cases++;
-	assert(asahi_g15_pmp_prepare(&gpu) == 0 && pmp_calls == 1 &&
-	       !symbol_refs);
+	assert(asahi_g15_pmp_prepare(&gpu) == 0 && pmp_calls == 1);
 	cases++;
 	assert(apple_t6030_display_publish(&display) == 0 &&
 	       atomic_load(&display.refs) == 2);
@@ -170,8 +156,7 @@ int main(void)
 	       atomic_load(&display.refs) == 2);
 	cases++;
 	link_ok = false;
-	assert(asahi_g15_pmp_prepare(&gpu) == -EINVAL && pmp_calls == 1 &&
-	       !symbol_refs);
+	assert(asahi_g15_pmp_prepare(&gpu) == -EINVAL && pmp_calls == 1);
 	cases++;
 	link_ok = true;
 	pmp_result = -EPROBE_DEFER;
