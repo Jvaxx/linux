@@ -3,7 +3,10 @@
 //! Logical queues: `crate::queue::Queue` for G15.
 //!
 //! Logical queues own no firmware state: they are independent scheduling entities over the one
-//! shared graph, executed in one total order across queues and VMs. QUEUE_CREATE validates
+//! shared graph, executed in one total order across queues and VMs. A device-wide host credit
+//! bounds live logical queues to the advertised MAX_QUEUES; it reserves no hardware graph or
+//! execution context. The native ABI hardware-reservation wording remains a compatibility limit.
+//! QUEUE_CREATE validates
 //! `usc_exec_base` (4 GiB aligned, the window inside the user range) and refuses a failed VM or
 //! GPU (EIO); HIGH/REALTIME are refused by the shared `file.rs`. Ray-query scratch layouts are
 //! refused by the shared default `reserve_render_scs` (RENDER_RAY_QUERY is never advertised).
@@ -49,6 +52,32 @@ pub(crate) struct QueueState {
     pub(crate) owned_index: AtomicU32,
 }
 
+/// One device-wide logical-queue credit, released after the queue scheduler drains.
+struct QueueCredit {
+    shared: Arc<Shared>,
+}
+
+impl QueueCredit {
+    fn acquire(shared: &Arc<Shared>) -> Result<Self> {
+        shared
+            .logical_queues
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < hw::sizes::MAX_QUEUES).then(|| count + 1)
+            })
+            .map_err(|_| ENOMEM)?;
+        Ok(Self {
+            shared: shared.clone(),
+        })
+    }
+}
+
+impl Drop for QueueCredit {
+    fn drop(&mut self) {
+        let previous = self.shared.logical_queues.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous != 0);
+    }
+}
+
 /// A G15 logical queue.
 pub(crate) struct Queue {
     // Dropped first: QUEUE_DESTROY drains the scheduler before anything else goes.
@@ -59,6 +88,8 @@ pub(crate) struct Queue {
     vm: Arc<VmState>,
     shared: Arc<Shared>,
     timeline: Arc<Timeline>,
+    // Last field: all preceding fields (especially scheduler) drop before capacity returns.
+    _credit: QueueCredit,
 }
 
 impl Drop for Queue {
@@ -92,6 +123,7 @@ impl Queue {
         if vm_state.status.get() != 0 {
             return Err(EIO);
         }
+        let credit = QueueCredit::acquire(&gpu.shared)?;
         let timeline = Timeline::new()?;
         let scheduler = Scheduler::new(&gpu.shared.dev)?;
         let state = Arc::new(
@@ -111,6 +143,7 @@ impl Queue {
             vm: vm_state,
             shared: gpu.shared.clone(),
             timeline,
+            _credit: credit,
         })
     }
 

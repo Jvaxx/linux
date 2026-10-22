@@ -77,7 +77,7 @@ mod wire;
 
 use core::any::Any;
 use core::ops::Range;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use kernel::{
     c_str,
@@ -228,6 +228,8 @@ const POLL_WORK: u64 = 0;
 /// Device state shared with the RTKit callbacks and the poll work.
 #[pin_data]
 pub(crate) struct Shared {
+    /// Reserved host logical queues, shared across every file and VM on this GPU.
+    pub(crate) logical_queues: AtomicU32,
     pub(crate) dev: ARef<device::Device>,
     /// Latched fail-stop: every VM fails with EIO until reboot.
     pub(crate) crashed: AtomicBool,
@@ -400,6 +402,7 @@ impl Gpu {
         let data = admitted.adt.data.clone();
         let shared = Arc::pin_init(
             pin_init!(Shared {
+                logical_queues: AtomicU32::new(0),
                 dev: dev.as_ref().as_ref().into(),
                 crashed: AtomicBool::new(false),
                 evented: AtomicBool::new(false),
