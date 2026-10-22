@@ -52,6 +52,8 @@ struct DriverModule {
     #[pin]
     _driver: kernel::driver::Registration<kernel::platform::Adapter<driver::AsahiPlatformDriver>>,
     _cleanup: cleanup::QueueOwner,
+    #[cfg(CONFIG_DRM_ASAHI_G15)]
+    _g15_ready: (),
 }
 
 impl kernel::InPlaceModule for DriverModule {
@@ -65,6 +67,9 @@ impl kernel::InPlaceModule for DriverModule {
                 <Self as kernel::ModuleMetadata>::NAME,
                 module,
             ),
+            // All fallible fields are initialized. This final unit initializer cannot fail.
+            #[cfg(CONFIG_DRM_ASAHI_G15)]
+            _g15_ready: g15::activate(),
         })
     }
 }

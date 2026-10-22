@@ -186,6 +186,9 @@ impl platform::Driver for Driver<'_> {
         // after probe_g15 started firmware would return an unbound device.
         try_pin_init!(Driver {
             _driver: {
+                if !MODULE_READY.load(Ordering::Acquire) {
+                    return Err(EPROBE_DEFER);
+                }
                 let cfg = *info.ok_or(ENODEV)?;
                 dev_info!(pdev.as_ref(), "G15: probing ({})\n", cfg.name);
                 match crate::driver::AsahiPlatformDriver::probe_g15(pdev, cfg) {
@@ -204,6 +207,19 @@ impl platform::Driver for Driver<'_> {
         })
     }
 
+}
+
+/// Firmware starts only after every fallible module/driver registration has succeeded.
+/// A deferred probe racing the final activation sees the Release/Acquire publication.
+static MODULE_READY: AtomicBool = AtomicBool::new(false);
+
+/// Last, infallible module initializer: enable native probes and retry this adapter.
+/// No fallible module initialization may follow this call.
+pub(crate) fn activate() {
+    MODULE_READY.store(true, Ordering::Release);
+    // SAFETY: Both pinned platform registrations are fully initialized and remain owned
+    // by DriverModule. The C helper borrows their live driver pointer only for this call.
+    unsafe { boot::glue::asahi_g15_reprobe() };
 }
 
 /// Work item ID of the poll work.

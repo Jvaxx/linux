@@ -5,6 +5,8 @@
  */
 #include <crypto/sha2.h>
 #include <linux/device.h>
+#include <linux/device/driver.h>
+#include <linux/platform_device.h>
 #include <linux/dma-map-ops.h>
 #include <linux/io.h>
 #include <linux/ioport.h>
@@ -24,6 +26,7 @@ bool asahi_g15_machine(const char *compatible);
 void asahi_g15_hold_power(struct device *dev);
 void asahi_g15_release_power(struct device *dev);
 void asahi_g15_module_get(void);
+void asahi_g15_reprobe(void);
 int asahi_g15_adt_phram(u64 *start, u64 *size);
 bool asahi_g15_ram_disjoint(u64 start, u64 size);
 bool asahi_g15_ram_within(u64 start, u64 size);
@@ -240,4 +243,27 @@ unsigned int asahi_g15_memory_mode(u64 start, u64 size)
 void __iomem *asahi_g15_ioremap_wc(u64 start, size_t size)
 {
 	return ioremap_wc(start, size);
+}
+
+/*
+ * Called only by the final infallible DriverModule initializer, after both
+ * platform registrations have completed. driver_find() returns a borrowed
+ * pointer, not an owned reference. The pinned registration is still owned by
+ * DriverModule throughout this call; module exit cannot race its initialization.
+ * No put_driver() is appropriate. A failed attach must not fail module init:
+ * another device in this pass may already have started retained firmware.
+ */
+void asahi_g15_reprobe(void)
+{
+	const struct device_driver *drv;
+	int ret;
+
+	drv = driver_find("asahi-g15", &platform_bus_type);
+	if (!drv) {
+		pr_err("asahi-g15: registered adapter not found for activation\n");
+		return;
+	}
+	ret = driver_attach(drv);
+	if (ret)
+		pr_err("asahi-g15: activation attach failed: %d\n", ret);
 }

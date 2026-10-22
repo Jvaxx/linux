@@ -56,12 +56,13 @@ def item(text, marker):
 PREFIX = r'''
 #![allow(dead_code, unused_variables)]
 extern crate self as kernel;
-use std::{cell::Cell, marker::PhantomData, pin::Pin};
+use std::{cell::Cell, marker::PhantomData, pin::Pin, sync::atomic::{AtomicBool, Ordering}};
 use pin_init::{pin_data, PinInit, InPlaceWrite};
 pub mod error { pub type Error = i32; }
 use error::Error;
 type Result<T = ()> = std::result::Result<T, Error>;
 const ENODEV: i32 = -19;
+const EPROBE_DEFER: i32 = -517;
 const GFP_KERNEL: u32 = 0;
 macro_rules! dev_info { ($($x:tt)*) => {{}}; }
 macro_rules! dev_err { ($($x:tt)*) => {{}}; }
@@ -71,6 +72,10 @@ thread_local! {
     static PROBES: Cell<u32> = const { Cell::new(0) };
     static TOUCH: Cell<bool> = const { Cell::new(false) };
     static RETAINED: Cell<bool> = const { Cell::new(false) };
+    static FAIL_REGISTRATION: Cell<u8> = const { Cell::new(0) };
+    static COMPLETED_REGISTRATION: Cell<u8> = const { Cell::new(0) };
+    static ACTIVATED: Cell<bool> = const { Cell::new(false) };
+    static ATTACH_ERROR: Cell<bool> = const { Cell::new(false) };
     static PROBE_ERROR: Cell<i32> = const { Cell::new(0) };
 }
 struct Core<'a>(PhantomData<&'a ()>);
@@ -105,6 +110,9 @@ impl KBox {
 mod platform {
     use super::*;
     pub struct Device<Ctx> { pub base: super::Device, pub ctx: PhantomData<Ctx> }
+    // The fixture runs serially on one thread; this only permits a static probe target.
+    unsafe impl<Ctx> Sync for Device<Ctx> {}
+    pub struct Adapter<T>(pub PhantomData<T>);
     impl<Ctx> AsRef<super::Device> for Device<Ctx> {
         fn as_ref(&self) -> &super::Device { &self.base }
     }
@@ -118,8 +126,35 @@ mod platform {
     }
 }
 struct Config { name: &'static str }
+pub struct ThisModule;
+pub trait ModuleMetadata { const NAME: &'static std::ffi::CStr; }
+pub trait InPlaceModule: Sized {
+    fn init(module: &'static ThisModule) -> impl PinInit<Self, Error>;
+}
+mod cleanup {
+    pub struct QueueOwner;
+    impl QueueOwner { pub fn new() -> crate::Result<Self> { Ok(Self) } }
+}
 mod driver {
     use super::*;
+    #[pin_data]
+    pub struct Registration<T> { stage: u8, marker: PhantomData<T> }
+    impl<T: 'static> Registration<T> {
+        pub fn new(name: &'static std::ffi::CStr, _module: &'static ThisModule) -> impl PinInit<Self, Error> {
+            try_pin_init!(Self {
+                stage: {
+                    let stage = if name.to_bytes() == b"asahi-g15" { 1 } else { 2 };
+                    // Model driver_attach and a late driver_add_groups failure. A deferred
+                    // worker can also retry G15 while the other registration is in progress.
+                    let _ = callback::<Driver<'static>>(&PDEV, Some(&&CFG));
+                    if FAIL_REGISTRATION.get() == stage { return Err(-5); }
+                    COMPLETED_REGISTRATION.set(stage);
+                    stage
+                },
+                marker: PhantomData,
+            })
+        }
+    }
     pub struct AsahiPlatformDriverData<'bound> { value: u8, bound: PhantomData<&'bound ()> }
     pub struct AsahiPlatformDriver;
     impl AsahiPlatformDriver {
@@ -137,6 +172,7 @@ mod driver {
 }
 mod boot { pub mod glue {
     pub fn retained() -> bool { crate::RETAINED.with(core::cell::Cell::get) }
+    pub unsafe fn asahi_g15_reprobe() { crate::activation_reprobe(); }
 }}
 '''
 
@@ -148,11 +184,50 @@ fn callback<'bound, T: platform::Driver>(
     // CALLBACK
 }
 fn reset(fail_alloc: bool, touch: bool, error: i32) {
+    MODULE_READY.store(true, Ordering::Release);
     FAIL_ALLOC.set(fail_alloc); TOUCH.set(touch); PROBE_ERROR.set(error);
     RETAINED.set(false); ALLOCS.set(0); PROBES.set(0);
 }
+static CFG: Config = Config { name: "test" };
+static PDEV: platform::Device<Core<'static>> = platform::Device {
+    base: Device { data: Cell::new(core::ptr::null_mut()) }, ctx: PhantomData,
+};
+fn activation_reprobe() {
+    assert_eq!(COMPLETED_REGISTRATION.get(), 2, "activation before all registrations completed");
+    ACTIVATED.set(true);
+    let _ = callback::<Driver<'static>>(&PDEV, Some(&&CFG));
+    // An attach pass may fail after another device starts. Its error is logged, not returned
+    // to module initialization. The actual helper's void signature is checked separately.
+    if ATTACH_ERROR.get() { println!("attach failure after probe was not propagated"); }
+}
+fn module_cases() {
+    static MODULE: ThisModule = ThisModule;
+    for failure in [1, 2, 0] {
+        reset(false, true, 0);
+        PDEV.base.data.set(core::ptr::null_mut());
+        MODULE_READY.store(false, Ordering::Release);
+        COMPLETED_REGISTRATION.set(0); FAIL_REGISTRATION.set(failure);
+        ACTIVATED.set(false); ATTACH_ERROR.set(failure == 0);
+        let init = <DriverModule as InPlaceModule>::init(&MODULE);
+        assert_eq!(PROBES.get(), 0, "module initializer eagerly started firmware");
+        let result = KBox::pin_init(init, GFP_KERNEL);
+        if failure != 0 {
+            assert!(result.is_err(), "late registration failure must fail module init");
+            assert_eq!(PROBES.get(), 0, "late registration failure started firmware");
+            assert!(!MODULE_READY.load(Ordering::Acquire));
+            assert!(!ACTIVATED.get());
+        } else {
+            assert!(result.is_ok(), "attach failure must not unwind a live session");
+            assert_eq!(PROBES.get(), 1);
+            assert!(MODULE_READY.load(Ordering::Acquire));
+            assert!(ACTIVATED.get());
+            assert!(!PDEV.base.data.get().is_null());
+            unsafe { drop(Box::from_raw(PDEV.base.data.get().cast::<Driver<'_>>())); }
+        }
+        println!("module-registration-{failure}: PASS");
+    }
+}
 fn main() {
-    static CFG: Config = Config { name: "test" };
     let cfg = &CFG;
     for (name, allocation_fails, touched, error, expected, bound, calls) in [
         ("allocation-before-start", true, true, 0, Err(-12), false, 0),
@@ -176,6 +251,7 @@ fn main() {
         }
         println!("{name}: PASS");
     }
+    module_cases();
 }
 '''
 
@@ -189,7 +265,7 @@ def main():
     a = p.parse_args()
     out = (a.output or Path(tempfile.mkdtemp(prefix="g15-probe-init-"))).resolve()
     out.mkdir(parents=True, exist_ok=True)
-    sources = {name: (ROOT / name).read_text() for name in [PROBE_PATH, "rust/kernel/platform.rs", "rust/kernel/device.rs", "rust/kernel/init.rs", "rust/kernel/alloc/kbox.rs"]}
+    sources = {name: (ROOT / name).read_text() for name in [PROBE_PATH, "rust/kernel/platform.rs", "rust/kernel/device.rs", "rust/kernel/init.rs", "rust/kernel/alloc/kbox.rs", "drivers/gpu/drm/asahi/asahi_core.rs", "drivers/gpu/drm/asahi/g15/glue.c"]}
     probe = item(sources[PROBE_PATH], "    fn probe<'bound>(")
     driver = item(sources[PROBE_PATH], "#[pin_data]\npub(crate) struct Driver<'bound>").replace("pub(crate) ", "")
     macro = item(sources["rust/kernel/init.rs"], "macro_rules! try_pin_init")
@@ -197,12 +273,56 @@ def main():
     callback = sources["rust/kernel/platform.rs"]
     callback = callback[callback.index("            let data = T::probe(pdev, info);"):]
     callback = callback[:callback.index("            Ok(0)") + len("            Ok(0)")]
+    ready = "static MODULE_READY: AtomicBool = AtomicBool::new(false);"
+    assert ready in sources[PROBE_PATH]
+    activate = item(sources[PROBE_PATH], "pub(crate) fn activate()")
+    core = sources["drivers/gpu/drm/asahi/asahi_core.rs"]
+    module_struct = item(core, "#[pin_data]\nstruct DriverModule")
+    module_init = item(core, "    fn init(module:")
+    module_code = module_struct + "\nimpl InPlaceModule for DriverModule {\n" + module_init + "\n}\nimpl ModuleMetadata for DriverModule { const NAME: &'static std::ffi::CStr = c\"asahi\"; }\n"
     kbox = item(sources["rust/kernel/alloc/kbox.rs"], "    fn try_pin_init<E>(")
     assert "Box::<_, A>::new_uninit(flags)?.write_pin_init(init)" in kbox
+    reprobe = item(sources["drivers/gpu/drm/asahi/g15/glue.c"], "void asahi_g15_reprobe(void)\n{")
+    c_prefix = r'''
+#include <assert.h>
+#include <stdbool.h>
+#include <errno.h>
+struct device_driver { int unused; };
+static struct device_driver driver;
+static int platform_bus_type;
+static bool present;
+static int attach_result, finds, attaches, logs, started;
+#define pr_err(...) ((void)++logs)
+static const struct device_driver *driver_find(const char *name, const int *bus) {
+    (void)name; assert(bus == &platform_bus_type); finds++;
+    return present ? &driver : 0;
+}
+static int driver_attach(const struct device_driver *drv) {
+    assert(drv == &driver); attaches++; started++; return attach_result;
+}
+'''
+    c_suffix = r'''
+int main(void) {
+    for (int test = 0; test < 3; test++) {
+        present = test != 0; attach_result = test == 2 ? -ENOMEM : 0;
+        finds = attaches = logs = started = 0;
+        asahi_g15_reprobe();
+        assert(finds == 1);
+        assert(attaches == (test != 0));
+        assert(started == (test != 0));
+        assert(logs == (test == 0 || test == 2));
+    }
+}
+'''
+    c_source = out / "actual-activation.c"
+    c_source.write_text(c_prefix + reprobe + c_suffix)
+    c_binary = out / "actual-activation"
+    subprocess.run([os.environ.get("HOSTCC", "cc"), "-std=c11", "-Wall", "-Wextra", "-Werror", str(c_source), "-o", str(c_binary)], check=True)
+    subprocess.run([str(c_binary)], check=True)
     library = out / "libpin_init.rlib"
     subprocess.run([a.rustc, "--edition=2021", "--crate-type=rlib", "--crate-name=pin_init", "--cfg", 'feature="std"', str(ROOT / "rust/pin-init/src/lib.rs"), "--extern", f"pin_init_internal={a.kernel_build / 'rust/libpin_init_internal.so'}", "-L", f"dependency={a.kernel_build / 'rust'}", "-o", str(library)], check=True)
-    receipt = {"rustc": subprocess.check_output([a.rustc, "--version"], text=True).strip(), "pin_init_source_sha256": {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in (ROOT / "rust/pin-init").rglob("*.rs")}, "proc_macro_sha256": hashlib.sha256((a.kernel_build / "rust/libpin_init_internal.so").read_bytes()).hexdigest(), "source_sha256": {n: hashlib.sha256(s.encode()).hexdigest() for n, s in sources.items()}, "cases": 6, "mutants": {}, "scope": __doc__}
-    variants = {"actual": probe}
+    receipt = {"rustc": subprocess.check_output([a.rustc, "--version"], text=True).strip(), "pin_init_source_sha256": {str(p.relative_to(ROOT)): hashlib.sha256(p.read_bytes()).hexdigest() for p in (ROOT / "rust/pin-init").rglob("*.rs")}, "proc_macro_sha256": hashlib.sha256((a.kernel_build / "rust/libpin_init_internal.so").read_bytes()).hexdigest(), "source_sha256": {n: hashlib.sha256(s.encode()).hexdigest() for n, s in sources.items()}, "cases": 9, "actual_C_activation_cases": 3, "mutants": {}, "scope": __doc__}
+    variants = {"actual": (probe, module_code)}
     if a.mutations:
         try:
             old = subprocess.check_output(["git", "show", f"{OLD_REF}:{PROBE_PATH}"], cwd=ROOT, text=True, stderr=subprocess.DEVNULL)
@@ -210,24 +330,37 @@ def main():
             receipt["old_reference_checked_against_git"] = True
         except subprocess.CalledProcessError:
             receipt["old_reference_checked_against_git"] = False
-        variants["eager-probe-before-allocation"] = OLD_PROBE
+        variants["eager-probe-before-allocation"] = (OLD_PROBE, module_code)
         needle = "                        None\n"
         assert probe.count(needle) == 1
-        variants["retained-error-unbinds"] = probe.replace(needle, "                        return Err(error);\n")
-    for name, method in variants.items():
-        source = PREFIX.replace("    // SET_DRVDATA", set_data) + macro + "\n" + driver + "\nimpl platform::Driver for Driver<'_> {\n    type IdInfo = &'static Config;\n    type Data<'bound> = Driver<'bound>;\n" + method + "\n}\n" + SUFFIX.replace("    // CALLBACK", callback)
+        variants["retained-error-unbinds"] = (probe.replace(needle, "                        return Err(error);\n"), module_code)
+        gate = "                if !MODULE_READY.load(Ordering::Acquire) {\n                    return Err(EPROBE_DEFER);\n                }\n"
+        assert probe.count(gate) == 1
+        variants["no-registration-readiness-gate"] = (probe.replace(gate, ""), module_code)
+        late = "            #[cfg(CONFIG_DRM_ASAHI_G15)]\n            _g15_ready: g15::activate(),\n"
+        assert module_code.count(late) == 1
+        early = module_code.replace(late, "").replace("            _driver <-", late + "            _driver <-", 1)
+        variants["activation-before-last-registration"] = (probe, early)
+    for name, (method, module_variant) in variants.items():
+        # Macro definitions precede the fake registration, just as kernel prelude exports them.
+        source = macro + "\n" + PREFIX.replace("#![allow(dead_code, unused_variables)]\n", "").replace("    // SET_DRVDATA", set_data) + "\n" + ready + "\n" + driver + "\nimpl platform::Driver for Driver<'_> {\n    type IdInfo = &'static Config;\n    type Data<'bound> = Driver<'bound>;\n" + method + "\n}\nmod g15 { use super::*; pub type Driver<'a> = super::Driver<'a>; " + activate + "\n}\ntype G15Registration = driver::Registration<platform::Adapter<g15::Driver<'static>>>;\n" + module_variant + "\n" + SUFFIX.replace("    // CALLBACK", callback)
+        source = "#![allow(dead_code, unused_variables, private_bounds, private_interfaces)]\n" + source
         src = out / (name + ".rs"); src.write_text(source)
         binary = out / name
-        subprocess.run([a.rustc, "--edition=2021", str(src), "--extern", f"pin_init={library}", "-L", f"dependency={a.kernel_build / 'rust'}", "-o", str(binary)], check=True)
+        subprocess.run([a.rustc, "--edition=2021", "--cfg", "CONFIG_DRM_ASAHI_G15", str(src), "--extern", f"pin_init={library}", "-L", f"dependency={a.kernel_build / 'rust'}", "-o", str(binary)], check=True)
         r = subprocess.run([str(binary)], capture_output=True, text=True)
         receipt["mutants" if name != "actual" else "control"] = receipt.get("mutants" if name != "actual" else "control", {})
         result = {"exit": r.returncode, "stdout": r.stdout, "stderr": r.stderr}
         if name == "actual":
             receipt["control"] = result
             if r.returncode: raise SystemExit(r.stderr)
+            if r.stdout.count(": PASS\n") != 9: raise SystemExit("control did not run every case")
         else:
             receipt["mutants"][name] = result
             if r.returncode == 0: raise SystemExit("SURVIVED: " + name)
+            intended = {"eager-probe-before-allocation": "allocation-before-start: firmware probe before drvdata allocation", "retained-error-unbinds": "retained-start-failure-binds: callback result", "no-registration-readiness-gate": "late registration failure started firmware", "activation-before-last-registration": "activation before all registrations completed"}[name]
+            result["intended_failure"] = intended in r.stderr
+            if not result["intended_failure"]: raise SystemExit("INVALID unrelated failure: " + name + "\n" + r.stderr)
     (out / "result.json").write_text(json.dumps(receipt, indent=2) + "\n")
     print(json.dumps(receipt, indent=2))
 
