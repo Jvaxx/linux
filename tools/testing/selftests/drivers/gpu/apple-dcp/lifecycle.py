@@ -1001,14 +1001,16 @@ def teardown(root):
     decls.append(files['atc'][start:end])
 
     names = {
-        'atc': ('atcphy_pipehandler_lock', 'atcphy_pipehandler_unlock',
+        'atc': ('atcphy_pipehandler_lock', 'atcphy_pipehandler_lock_live',
+                'atcphy_pipehandler_unlock',
                 'atcphy_pipehandler_check', 'atcphy_pipehandler_set_mux',
                 'atcphy_clear_nonselected_phy_reset',
                 'atcphy_configure_pipehandler_usb3_host_t8103',
                 'atcphy_configure_pipehandler_usb3_host_t8122',
                 'atcphy_configure_pipehandler_usb3', 'atcphy_configure_pipehandler_usb4',
                 'atcphy_enable_dummy_phy', 'atcphy_pipe_live', 'atcphy_needs_dummy_phy', 'atcphy_configure_pipehandler_dummy',
-                'atcphy_configure_pipehandler', 'atcphy_park_pipehandler',
+                'atcphy_configure_pipehandler', 'atcphy_park_live_t8103_pipehandler',
+                'atcphy_park_pipehandler',
                 'atcphy_get_mode_config', 'atcphy_dp_configure',
                 'j700_field_update', 'j700_aux_disable', 'atcphy_disable_dp_aux',
                 'atcphy_power_off', 'atcphy_power_on', *ATC_POST_TUNABLE, 'atcphy_configure', 'atcphy_restore_after_pd_off',
