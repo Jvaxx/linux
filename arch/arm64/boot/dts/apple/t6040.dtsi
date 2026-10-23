@@ -1,0 +1,570 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple T6040 "M4 Pro" SoC
+ *
+ * Unit addresses are the Apple Device Tree's /arm-io addresses plus the
+ * 0x2_00000000 arm-io base. The nodes sit at the root, not under a
+ * simple-bus: the boot loader edits several of them by path. The blocks
+ * known to need non-posted writes carry nonposted-mmio themselves.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/apple-aic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+#include <dt-bindings/pinctrl/apple.h>
+#include <dt-bindings/spmi/spmi.h>
+
+/ {
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	cpus {
+		#address-cells = <2>;
+		#size-cells = <0>;
+
+		/*
+		 * The clusters are MPIDR Aff1, which are also the L2 groups.
+		 * capacity-dmips-mhz comes from pinned single-core throughput
+		 * at the lowest p-state (E 1018 MHz, P 1257 MHz): E/P is 0.652
+		 * per MHz, so E 668 and P 1024.
+		 */
+		cpu-map {
+			cluster0 {
+				core0 {
+					cpu = <&cpu_e0>;
+				};
+				core1 {
+					cpu = <&cpu_e1>;
+				};
+				core2 {
+					cpu = <&cpu_e2>;
+				};
+				core3 {
+					cpu = <&cpu_e3>;
+				};
+			};
+
+			cluster1 {
+				core0 {
+					cpu = <&cpu_p00>;
+				};
+				core1 {
+					cpu = <&cpu_p01>;
+				};
+				core2 {
+					cpu = <&cpu_p02>;
+				};
+				core3 {
+					cpu = <&cpu_p03>;
+				};
+				core4 {
+					cpu = <&cpu_p04>;
+				};
+			};
+
+			cluster2 {
+				core0 {
+					cpu = <&cpu_p10>;
+				};
+				core1 {
+					cpu = <&cpu_p11>;
+				};
+				core2 {
+					cpu = <&cpu_p12>;
+				};
+				core3 {
+					cpu = <&cpu_p13>;
+				};
+				core4 {
+					cpu = <&cpu_p14>;
+				};
+			};
+		};
+
+		cpu_e0: cpu@0 {
+			compatible = "apple,brava-e";
+			device_type = "cpu";
+			reg = <0x0 0x0>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* To be filled by loader */
+			next-level-cache = <&l2_cache_e>;
+			capacity-dmips-mhz = <668>;
+		};
+
+		cpu_e1: cpu@1 {
+			compatible = "apple,brava-e";
+			device_type = "cpu";
+			reg = <0x0 0x1>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* To be filled by loader */
+			next-level-cache = <&l2_cache_e>;
+			capacity-dmips-mhz = <668>;
+		};
+
+		cpu_e2: cpu@2 {
+			compatible = "apple,brava-e";
+			device_type = "cpu";
+			reg = <0x0 0x2>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* To be filled by loader */
+			next-level-cache = <&l2_cache_e>;
+			capacity-dmips-mhz = <668>;
+		};
+
+		cpu_e3: cpu@3 {
+			compatible = "apple,brava-e";
+			device_type = "cpu";
+			reg = <0x0 0x3>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* To be filled by loader */
+			next-level-cache = <&l2_cache_e>;
+			capacity-dmips-mhz = <668>;
+		};
+
+		/* The boot CPU: the boot loader enters the kernel on it. */
+		cpu_p00: cpu@10100 {
+			compatible = "apple,brava-p";
+			device_type = "cpu";
+			reg = <0x0 0x10100>;
+			next-level-cache = <&l2_cache_p0>;
+			capacity-dmips-mhz = <1024>;
+		};
+
+		cpu_p01: cpu@10101 {
+			compatible = "apple,brava-p";
+			device_type = "cpu";
+			reg = <0x0 0x10101>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* To be filled by loader */
+			next-level-cache = <&l2_cache_p0>;
+			capacity-dmips-mhz = <1024>;
+		};
+
+		cpu_p02: cpu@10102 {
+			compatible = "apple,brava-p";
+			device_type = "cpu";
+			reg = <0x0 0x10102>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* To be filled by loader */
+			next-level-cache = <&l2_cache_p0>;
+			capacity-dmips-mhz = <1024>;
+		};
+
+		cpu_p03: cpu@10103 {
+			compatible = "apple,brava-p";
+			device_type = "cpu";
+			reg = <0x0 0x10103>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* To be filled by loader */
+			next-level-cache = <&l2_cache_p0>;
+			capacity-dmips-mhz = <1024>;
+		};
+
+		cpu_p04: cpu@10104 {
+			compatible = "apple,brava-p";
+			device_type = "cpu";
+			reg = <0x0 0x10104>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* To be filled by loader */
+			next-level-cache = <&l2_cache_p0>;
+			capacity-dmips-mhz = <1024>;
+		};
+
+		cpu_p10: cpu@10200 {
+			compatible = "apple,brava-p";
+			device_type = "cpu";
+			reg = <0x0 0x10200>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* To be filled by loader */
+			next-level-cache = <&l2_cache_p1>;
+			capacity-dmips-mhz = <1024>;
+		};
+
+		cpu_p11: cpu@10201 {
+			compatible = "apple,brava-p";
+			device_type = "cpu";
+			reg = <0x0 0x10201>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* To be filled by loader */
+			next-level-cache = <&l2_cache_p1>;
+			capacity-dmips-mhz = <1024>;
+		};
+
+		cpu_p12: cpu@10202 {
+			compatible = "apple,brava-p";
+			device_type = "cpu";
+			reg = <0x0 0x10202>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* To be filled by loader */
+			next-level-cache = <&l2_cache_p1>;
+			capacity-dmips-mhz = <1024>;
+		};
+
+		cpu_p13: cpu@10203 {
+			compatible = "apple,brava-p";
+			device_type = "cpu";
+			reg = <0x0 0x10203>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* To be filled by loader */
+			next-level-cache = <&l2_cache_p1>;
+			capacity-dmips-mhz = <1024>;
+		};
+
+		cpu_p14: cpu@10204 {
+			compatible = "apple,brava-p";
+			device_type = "cpu";
+			reg = <0x0 0x10204>;
+			enable-method = "spin-table";
+			cpu-release-addr = <0 0>; /* To be filled by loader */
+			next-level-cache = <&l2_cache_p1>;
+			capacity-dmips-mhz = <1024>;
+		};
+	};
+
+	l2_cache_e: l2-cache-cluster0 {
+		compatible = "cache";
+		cache-level = <2>;
+		cache-unified;
+		cache-size = <0x400000>;
+	};
+
+	l2_cache_p0: l2-cache-cluster1 {
+		compatible = "cache";
+		cache-level = <2>;
+		cache-unified;
+		cache-size = <0x1000000>;
+	};
+
+	l2_cache_p1: l2-cache-cluster2 {
+		compatible = "cache";
+		cache-level = <2>;
+		cache-unified;
+		cache-size = <0x1000000>;
+	};
+
+	timer {
+		compatible = "arm,armv8-timer";
+		interrupt-parent = <&aic>;
+		interrupt-names = "phys", "virt", "hyp-phys", "hyp-virt";
+		interrupts = <AIC_FIQ AIC_TMR_GUEST_PHYS IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_FIQ AIC_TMR_GUEST_VIRT IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_FIQ AIC_TMR_HV_PHYS IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_FIQ AIC_TMR_HV_VIRT IRQ_TYPE_LEVEL_HIGH>;
+	};
+
+	/* The 24 MHz reference clock (ADT clock-ids 4) of the I2C, PWM and watchdog blocks */
+	clkref: clock-ref {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <24000000>;
+		clock-output-names = "clkref";
+	};
+
+	/* iBoot leaves the I2C gates on and the pins muxed to I2C. */
+	i2c1: i2c@429014000 {
+		compatible = "apple,t6041-i2c", "apple,t8103-i2c";
+		reg = <0x4 0x29014000 0x0 0x4000>;
+		clocks = <&clkref>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1576 IRQ_TYPE_LEVEL_HIGH>;
+		pinctrl-0 = <&i2c1_pins>;
+		pinctrl-names = "default";
+		power-domains = <&ps_i2c1>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	i2c2: i2c@429018000 {
+		compatible = "apple,t6041-i2c", "apple,t8103-i2c";
+		reg = <0x4 0x29018000 0x0 0x4000>;
+		clocks = <&clkref>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1577 IRQ_TYPE_LEVEL_HIGH>;
+		pinctrl-0 = <&i2c2_pins>;
+		pinctrl-names = "default";
+		power-domains = <&ps_i2c2>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	i2c3: i2c@42901c000 {
+		compatible = "apple,t6041-i2c", "apple,t8103-i2c";
+		reg = <0x4 0x2901c000 0x0 0x4000>;
+		clocks = <&clkref>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1578 IRQ_TYPE_LEVEL_HIGH>;
+		pinctrl-0 = <&i2c3_pins>;
+		pinctrl-names = "default";
+		power-domains = <&ps_i2c3>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	i2c4: i2c@429020000 {
+		compatible = "apple,t6041-i2c", "apple,t8103-i2c";
+		reg = <0x4 0x29020000 0x0 0x4000>;
+		clocks = <&clkref>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1579 IRQ_TYPE_LEVEL_HIGH>;
+		pinctrl-0 = <&i2c4_pins>;
+		pinctrl-names = "default";
+		power-domains = <&ps_i2c4>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	i2c6: i2c@429028000 {
+		compatible = "apple,t6041-i2c", "apple,t8103-i2c";
+		reg = <0x4 0x29028000 0x0 0x4000>;
+		clocks = <&clkref>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1581 IRQ_TYPE_LEVEL_HIGH>;
+		pinctrl-0 = <&i2c6_pins>;
+		pinctrl-names = "default";
+		power-domains = <&ps_i2c6>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	i2c8: i2c@429030000 {
+		compatible = "apple,t6041-i2c", "apple,t8103-i2c";
+		reg = <0x4 0x29030000 0x0 0x4000>;
+		clocks = <&clkref>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1583 IRQ_TYPE_LEVEL_HIGH>;
+		pinctrl-0 = <&i2c8_pins>;
+		pinctrl-names = "default";
+		power-domains = <&ps_i2c8>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+	};
+
+	fpwm0: pwm@429040000 {
+		compatible = "apple,t6041-fpwm", "apple,s5l-fpwm";
+		reg = <0x4 0x29040000 0x0 0x4000>;
+		clocks = <&clkref>;
+		power-domains = <&ps_fpwm0>;
+		#pwm-cells = <2>;
+		status = "disabled";
+	};
+
+	pmgr: power-management@502280000 {
+		compatible = "apple,t6041-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		reg = <0x5 0x02280000 0x0 0x4000>;
+		/* child nodes are added in t6040-pmgr.dtsi */
+	};
+
+	aic: interrupt-controller@502400000 {
+		compatible = "apple,t6041-aic3", "apple,t8122-aic3";
+		#interrupt-cells = <3>;
+		interrupt-controller;
+		reg = <0x5 0x02400000 0x0 0x184000>,
+		      <0x5 0x02440000 0x0 0x4>;
+		reg-names = "core", "event";
+	};
+
+	pmgr_aux: power-management@502800000 {
+		compatible = "apple,t6041-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		reg = <0x5 0x02800000 0x0 0x4000>;
+		/* child nodes are added in t6040-pmgr.dtsi */
+	};
+
+	/*
+	 * The always-on GPIO bank (ADT /arm-io/nub-gpio0, 61 pins). Its power
+	 * state is in the always-on PMGR.
+	 */
+	pinctrl_nub: pinctrl@5081e4000 {
+		compatible = "apple,t6041-pinctrl", "apple,t8103-pinctrl";
+		reg = <0x5 0x081e4000 0x0 0x4000>;
+		power-domains = <&ps_nub_gpio>;
+
+		gpio-controller;
+		#gpio-cells = <2>;
+		gpio-ranges = <&pinctrl_nub 0 0 61>;
+		apple,npins = <61>;
+
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 819 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 820 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 821 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 822 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 823 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 824 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 825 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	pmgr_mini: power-management@508300000 {
+		compatible = "apple,t6041-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		reg = <0x5 0x08300000 0x0 0x4000>;
+		/* child nodes are added in t6040-pmgr.dtsi */
+	};
+
+	/*
+	 * The driver arms the reset only when userspace opens /dev/watchdog
+	 * or the firmware left it running; it also provides restart.
+	 */
+	wdt: watchdog@50836c000 {
+		compatible = "apple,t6041-wdt", "apple,t8103-wdt";
+		reg = <0x5 0x0836c000 0x0 0x4000>;
+		clocks = <&clkref>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 827 IRQ_TYPE_LEVEL_HIGH>;
+	};
+
+	nub_spmi0: spmi@509014000 {
+		compatible = "apple,t6041-spmi", "apple,t8103-spmi";
+		reg = <0x5 0x09014000 0x0 0x100>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		status = "disabled";
+
+		pmic@e {
+			compatible = "apple,abbey-pmic", "apple,spmi-nvmem";
+			reg = <0xe SPMI_USID>;
+
+			nvmem-layout {
+				compatible = "fixed-layout";
+				#address-cells = <1>;
+				#size-cells = <1>;
+
+				rtc_offset: rtc-offset@2100 {
+					reg = <0x2100 0x6>;
+				};
+
+				boot_stage: boot-stage@f801 {
+					reg = <0xf801 0x1>;
+				};
+
+				boot_error_count: boot-error-count@f802,0 {
+					reg = <0xf802 0x1>;
+					bits = <0 4>;
+				};
+
+				panic_count: panic-count@f802,4 {
+					reg = <0xf802 0x1>;
+					bits = <4 4>;
+				};
+
+				shutdown_flag: shutdown-flag@f80f,3 {
+					reg = <0xf80f 0x1>;
+					bits = <3 1>;
+				};
+			};
+		};
+	};
+
+	smc: smc@50c600000 {
+		compatible = "apple,t6041-smc", "apple,t8103-smc", "apple,smc";
+		reg = <0x5 0x0c600000 0x0 0x4000>,
+		      <0x5 0x0de70000 0x0 0x100000>;
+		reg-names = "smc", "sram";
+		mboxes = <&smc_mbox>;
+		status = "disabled";
+
+		smc_gpio: gpio {
+			compatible = "apple,smc-gpio";
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		smc_reboot: reboot {
+			compatible = "apple,smc-reboot";
+			nvmem-cells = <&shutdown_flag>, <&boot_stage>,
+				      <&boot_error_count>, <&panic_count>;
+			nvmem-cell-names = "shutdown_flag", "boot_stage",
+					   "boot_error_count", "panic_count";
+		};
+
+		smc_rtc: rtc {
+			compatible = "apple,smc-rtc";
+			nvmem-cells = <&rtc_offset>;
+			nvmem-cell-names = "rtc_offset";
+		};
+	};
+
+	smc_mbox: mailbox@50c608000 {
+		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x5 0x0c608000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 996 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 997 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 998 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 999 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
+	pinctrl: pinctrl@51c000000 {
+		compatible = "apple,t6041-pinctrl", "apple,t8103-pinctrl";
+		reg = <0x5 0x1c000000 0x0 0x4000>;
+
+		gpio-controller;
+		#gpio-cells = <2>;
+		gpio-ranges = <&pinctrl 0 0 200>;
+		apple,npins = <200>;
+
+		interrupt-controller;
+		#interrupt-cells = <2>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 478 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 479 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 480 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 481 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 482 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 483 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 484 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+
+		/* I2C is function 1 (ADT gpio-iic_scl/sda) */
+		i2c1_pins: i2c1-pins {
+			pinmux = <APPLE_PINMUX(58, 1)>,
+				 <APPLE_PINMUX(59, 1)>;
+		};
+
+		i2c2_pins: i2c2-pins {
+			pinmux = <APPLE_PINMUX(60, 1)>,
+				 <APPLE_PINMUX(61, 1)>;
+		};
+
+		i2c3_pins: i2c3-pins {
+			pinmux = <APPLE_PINMUX(62, 1)>,
+				 <APPLE_PINMUX(63, 1)>;
+		};
+
+		i2c4_pins: i2c4-pins {
+			pinmux = <APPLE_PINMUX(64, 1)>,
+				 <APPLE_PINMUX(65, 1)>;
+		};
+
+		i2c6_pins: i2c6-pins {
+			pinmux = <APPLE_PINMUX(68, 1)>,
+				 <APPLE_PINMUX(69, 1)>;
+		};
+
+		i2c8_pins: i2c8-pins {
+			pinmux = <APPLE_PINMUX(72, 1)>,
+				 <APPLE_PINMUX(73, 1)>;
+		};
+	};
+};
+
+#include "t6040-pmgr.dtsi"

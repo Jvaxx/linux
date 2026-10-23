@@ -1,0 +1,116 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * PMGR power domains for the Apple T6040 "M4 Pro" SoC
+ *
+ * From the J616s ADT /arm-io/pmgr devices and their parents.
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+&pmgr {
+	ps_fab3_soc: power-controller@118 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x118 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "fab3_soc";
+		power-domains = <&ps_afc>;
+		apple,always-on;
+	};
+
+	ps_sio: power-controller@120 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x120 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "sio";
+		power-domains = <&ps_fab3_soc>;
+		apple,always-on;
+	};
+
+	ps_fpwm0: power-controller@138 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x138 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "fpwm0";
+		power-domains = <&ps_sio>;
+	};
+
+	ps_i2c1: power-controller@158 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x158 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "i2c1";
+		power-domains = <&ps_sio>;
+	};
+
+	ps_i2c2: power-controller@160 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x160 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "i2c2";
+		power-domains = <&ps_sio>;
+	};
+
+	ps_i2c3: power-controller@168 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x168 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "i2c3";
+		power-domains = <&ps_sio>;
+	};
+
+	ps_i2c4: power-controller@170 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x170 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "i2c4";
+		power-domains = <&ps_sio>;
+	};
+
+	ps_i2c6: power-controller@180 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x180 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "i2c6";
+		power-domains = <&ps_sio>;
+	};
+
+	ps_i2c8: power-controller@190 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x190 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "i2c8";
+		power-domains = <&ps_sio>;
+	};
+};
+
+&pmgr_aux {
+	ps_afc: power-controller@178 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x178 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "afc";
+		apple,always-on;
+	};
+};
+
+&pmgr_mini {
+	/* ADT pmgr device NUB_GPIO (0x11a), no parent */
+	ps_nub_gpio: power-controller@90 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x90 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "nub_gpio";
+		apple,always-on;
+	};
+};

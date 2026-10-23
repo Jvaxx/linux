@@ -1,0 +1,94 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * MacBook Pro (16-inch, M4 Pro, Nov 2024)
+ *
+ * target-type: J616s
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/dts-v1/;
+
+#include "t6040.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/leds/common.h>
+
+/ {
+	compatible = "apple,j616s", "apple,t6040", "apple,arm-platform";
+	model = "Apple MacBook Pro (16-inch, M4 Pro, Nov 2024)";
+	chassis-type = "laptop";
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		framebuffer0: framebuffer@0 {
+			compatible = "apple,simple-framebuffer", "simple-framebuffer";
+			reg = <0 0 0 0>; /* To be filled by loader */
+			/* Format properties will be added by loader */
+			status = "disabled";
+		};
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		/* The loader adds its own reservations */
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0 0 0 0>; /* To be filled by loader */
+	};
+
+	led-controller {
+		compatible = "pwm-leds";
+
+		led-0 {
+			pwms = <&fpwm0 0 40000>;
+			label = "apple::kbd_backlight";
+			function = LED_FUNCTION_KBD_BACKLIGHT;
+			color = <LED_COLOR_ID_WHITE>;
+			max-brightness = <255>;
+		};
+	};
+};
+
+&smc {
+	status = "okay";
+};
+
+&smc_mbox {
+	status = "okay";
+};
+
+&nub_spmi0 {
+	status = "okay";
+};
+
+&pinctrl {
+	status = "okay";
+};
+
+/*
+ * The AP takes none of the always-on bank's interrupts: the AOP firmware
+ * owns some of its pins and interrupt registers, and a chained handler here
+ * would see their pending bits without a handler of ours.
+ */
+&pinctrl_nub {
+	status = "okay";
+	/delete-property/ interrupt-controller;
+	/delete-property/ #interrupt-cells;
+	/delete-property/ interrupts;
+};
+
+&fpwm0 {
+	status = "okay";
+};
+
+/* The Type-C retimers (ADT atcrt at 0x18/0x19/0x1a) sit on this bus; no driver yet. */
+&i2c6 {
+	status = "okay";
+};
