@@ -62,6 +62,7 @@ pub(crate) fn new_dummy_object(ddev: &TyrDrmDevice) -> Result<ARef<Bo>> {
         shmem::ObjectConfig {
             map_wc: true,
             parent_resv_obj: None,
+            ..Default::default()
         },
         BoCreateArgs { flags: 0 },
     )?;
@@ -121,6 +122,7 @@ impl<'drm> KernelBo<'drm> {
             shmem::ObjectConfig {
                 map_wc: true,
                 parent_resv_obj: None,
+                ..Default::default()
             },
             BoCreateArgs { flags: 0 },
         )?;
