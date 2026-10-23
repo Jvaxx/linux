@@ -123,7 +123,7 @@ static void gpiod_set_value_cansleep(void *p,int v) { (void)p;assert(v==1);gpio_
  # atcphy_mux_set_locked() also reports whether a SuperSpeed port may come back up.
  split=[atc_function(atc,name) for name in ('atcphy_usb3_port_ready','atcphy_mux_check','atcphy_mux_park','atcphy_mux_switch')]
  functions+=block(core,'static '+('void' if parent else 'int')+' tps6598x_disconnect(')+'\n'+block(core,'static '+('void' if parent else 'int')+' cd321x_remove(')+'\n'+block(core,'void tipd_remove(')+'\n'
- ordinary_phy=r'''
+ ordinary_phy=block(atc, 'enum atcphy_generation {') + ';\n' + r'''
 /* Actual ordinary-port ATC power-off, mux recheck and USB2 init; MMIO leaves. */
 #undef WARN_ON_ONCE
 #define WARN_ON_ONCE(x) ({ bool hit=(x);phy_warns+=hit;hit; })
@@ -134,8 +134,9 @@ enum atcphy_mode { APPLE_ATCPHY_MODE_OFF, APPLE_ATCPHY_MODE_USB2,
  APPLE_ATCPHY_MODE_TBT, APPLE_ATCPHY_MODE_USB4 };
 enum atcphy_pipehandler_state { ATCPHY_PIPEHANDLER_STATE_DUMMY, ATCPHY_PIPEHANDLER_STATE_USB3 };
 struct apple_atcphy {
+ struct { void *usb3_dp; } tunables;
  void *dev; int lock;
- const struct { bool has_usb4,has_t8140_dp,dp_t8122; } *hw;
+ const struct { unsigned int gen; bool has_usb4,has_t8140_dp,dp_t8122; u32 usb2phy_sig_host; } *hw;
  struct { void *usb2phy; } regs;
  bool fixed_usb2,host_active,mode_dirty,pipe_pending,usb_off_pending,ss_tunables,dp_tunables;
  bool usb3_port_off,park_owed,dp_only,pd_was_off;

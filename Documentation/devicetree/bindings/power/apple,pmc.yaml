@@ -26,6 +26,7 @@ properties:
   compatible:
     enum:
       - apple,t6041-pmc
+      - apple,t8132-pmc
       - apple,t8140-pmc
 
   reg:
@@ -55,6 +56,10 @@ properties:
 
   '#size-cells':
     const: 0
+
+  apple,pmp:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: PMP firmware owner that initializes the voter interface.
 
   apple,static-voters:
     $ref: /schemas/types.yaml#/definitions/uint32-array
@@ -114,6 +119,7 @@ patternProperties:
       compatible:
         enum:
           - apple,t6041-clpc
+          - apple,t8132-clpc
           - apple,t8140-clpc
 
       reg:

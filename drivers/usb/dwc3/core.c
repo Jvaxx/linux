@@ -2283,6 +2283,40 @@ static void dwc3_get_usb_power_supply(struct dwc3 *dwc)
 	spin_unlock_irqrestore(&dwc->lock, flags);
 }
 
+/* A glue-owned role must reach hardware before role-dependent core reset. */
+static int dwc3_core_set_initial_role(const struct dwc3_probe_data *data)
+{
+	struct dwc3 *dwc = data->dwc;
+	unsigned long flags;
+	u32 mode;
+
+	if (data->initial_role == USB_ROLE_NONE)
+		return 0;
+	if (!data->skip_core_init_mode)
+		return -EINVAL;
+
+	switch (data->initial_role) {
+	case USB_ROLE_HOST:
+		if (dwc->dr_mode == USB_DR_MODE_PERIPHERAL)
+			return -EINVAL;
+		mode = DWC3_GCTL_PRTCAP_HOST;
+		break;
+	case USB_ROLE_DEVICE:
+		if (dwc->dr_mode == USB_DR_MODE_HOST)
+			return -EINVAL;
+		mode = DWC3_GCTL_PRTCAP_DEVICE;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	spin_lock_irqsave(&dwc->lock, flags);
+	dwc3_set_prtcap(dwc, mode, false);
+	spin_unlock_irqrestore(&dwc->lock, flags);
+
+	return 0;
+}
+
 int dwc3_core_probe(const struct dwc3_probe_data *data)
 {
 	struct dwc3		*dwc = data->dwc;
@@ -2406,6 +2440,10 @@ int dwc3_core_probe(const struct dwc3_probe_data *data)
 	}
 
 	ret = dwc3_get_dr_mode(dwc);
+	if (ret)
+		goto err_free_event_buffers;
+
+	ret = dwc3_core_set_initial_role(data);
 	if (ret)
 		goto err_free_event_buffers;
 

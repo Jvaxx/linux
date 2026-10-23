@@ -249,9 +249,12 @@ int apple_pmp_report_wait_supplier_ready(struct device *supplier, unsigned int t
 	struct platform_device *pdev;
 	struct apple_pmp_report *rep;
 	u64 status;
+	bool t8132 = of_machine_is_compatible("apple,j713") &&
+		of_device_is_compatible(supplier->of_node, "apple,t8132-pmp-v2");
 	int ret;
 
-	if (!np || !of_device_is_compatible(np, "apple,j613-25g83-pmp-report")) {
+	if (!np || !of_device_is_compatible(np, t8132 ?
+		"apple,t8132-pmp-v2-report" : "apple,j613-25g83-pmp-report")) {
 		of_node_put(np);
 		return -ENODEV;
 	}
@@ -269,7 +272,8 @@ int apple_pmp_report_wait_supplier_ready(struct device *supplier, unsigned int t
 		ret = -EPROBE_DEFER;
 	else
 		ret = readq_poll_timeout(rep->base + rep->offsets->status, status,
-					status == PMP_REPORT_READY, 1000, timeout_ms * 1000);
+					t8132 ? (status & PMP_REPORT_READY) : status == PMP_REPORT_READY,
+					1000, timeout_ms * 1000);
 	device_unlock(&pdev->dev);
 	put_device(&pdev->dev);
 	return ret;
@@ -1214,6 +1218,14 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t6041 = {
 	.defer_requests = true,
 };
 
+static const struct apple_pmp_report_offsets apple_pmp_offsets_t8132 = {
+	.tgt_read = 0x1880,
+	.tgt_write = 0x10c40,
+	.actual = 0x1900,
+	.status = 0x10,
+	/* No qualified fast-die effort on this generation. */
+};
+
 static const struct of_device_id apple_pmp_report_of_match[] = {
 	{ .compatible = "apple,j613-25g83-pmp-report", .data = &apple_pmp_offsets_j613_25g83 },
 	{ .compatible = "apple,t6000-pmp-v2-report", .data = &apple_pmp_offsets_t600x },
@@ -1223,6 +1235,7 @@ static const struct of_device_id apple_pmp_report_of_match[] = {
 	{ .compatible = "apple,t6041-pmp-v2-report", .data = &apple_pmp_offsets_t6041 },
 	{ .compatible = "apple,t8112-pmp-v2-report", .data = &apple_pmp_offsets_t8112 },
 	{ .compatible = "apple,t8122-pmp-v2-report", .data = &apple_pmp_offsets_t8122 },
+	{ .compatible = "apple,t8132-pmp-v2-report", .data = &apple_pmp_offsets_t8132 },
 	{ .compatible = "apple,t8140-pmp-v2-report", .data = &apple_pmp_offsets_t8140 },
 	{}
 };

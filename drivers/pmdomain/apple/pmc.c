@@ -28,6 +28,7 @@
 #include <linux/bits.h>
 #include <linux/debugfs.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_platform.h>
@@ -78,6 +79,7 @@ struct apple_pmc_hw {
 	u32 dcs_max;
 	u32 agent_rails;
 	u32 ap_agent;
+	bool has_pending;
 };
 
 struct apple_pmc {
@@ -295,6 +297,11 @@ int apple_pmc_floor_update(struct device *dev, unsigned int agent, u32 mask,
 
 	reg = pmc->voters + agent * pmc->hw->agent_stride;
 	raw_spin_lock_irqsave(&pmc->lock, flags);
+	if (pmc->hw->has_pending) {
+		ret = readl_poll_timeout_atomic(reg + 4, old, !(old & BIT(agent)), 1, 1000);
+		if (ret)
+			goto unlock;
+	}
 	old = readl(reg);
 	val = (old & ~mask) | (value & mask);
 	if (val != old) {
@@ -302,6 +309,9 @@ int apple_pmc_floor_update(struct device *dev, unsigned int agent, u32 mask,
 		if ((readl(reg) & mask) != (value & mask))
 			ret = -EIO;
 	}
+	if (!ret && pmc->hw->has_pending)
+		ret = readl_poll_timeout_atomic(reg + 4, old, !(old & BIT(agent)), 1, 1000);
+unlock:
 	raw_spin_unlock_irqrestore(&pmc->lock, flags);
 
 	return ret;
@@ -716,6 +726,23 @@ static int apple_pmc_probe(struct platform_device *pdev)
 	struct apple_pmc *pmc;
 	unsigned int rail;
 	int count, i, ret;
+	struct device_node *pmp_node;
+	struct platform_device *pmp;
+	struct device_link *link;
+
+	pmp_node = of_parse_phandle(np, "apple,pmp", 0);
+	if (pmp_node) {
+		pmp = of_find_device_by_node(pmp_node);
+		of_node_put(pmp_node);
+		if (!pmp)
+			return -EPROBE_DEFER;
+		link = device_link_add(dev, &pmp->dev, DL_FLAG_AUTOREMOVE_CONSUMER);
+		put_device(&pmp->dev);
+		if (!link)
+			return -EINVAL;
+		if (link->supplier->links.status != DL_DEV_DRIVER_BOUND)
+			return -EPROBE_DEFER;
+	}
 
 	pmc = devm_kzalloc(dev, sizeof(*pmc), GFP_KERNEL);
 	if (!pmc)
@@ -806,6 +833,18 @@ static int apple_pmc_probe(struct platform_device *pdev)
 	return 0;
 }
 
+static const struct apple_pmc_hw apple_pmc_hw_t8132 = {
+	.agent_stride = 0x4000,
+	.agents = 4,
+	.rails = 2,
+	.agent_state = 0x0,
+	.rail_enable = 0x2000,
+	.dcs_rail = 0,
+	.dcs_max = 5,
+	.ap_agent = 3,
+	.has_pending = true,
+};
+
 static const struct apple_pmc_hw apple_pmc_hw_t8140 = {
 	.agent_stride = 0x4000,
 	.agents = 4,
@@ -837,6 +876,7 @@ static const struct apple_pmc_hw apple_pmc_hw_t6040 = {
 };
 
 static const struct of_device_id apple_pmc_of_match[] = {
+	{ .compatible = "apple,t8132-pmc", .data = &apple_pmc_hw_t8132 },
 	{ .compatible = "apple,t8140-pmc", .data = &apple_pmc_hw_t8140 },
 	{ .compatible = "apple,t6041-pmc", .data = &apple_pmc_hw_t6040 },
 	{}

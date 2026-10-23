@@ -15,6 +15,15 @@ description:
 
 allOf:
   - $ref: snps,dwc3-common.yaml#
+  - if:
+      properties:
+        compatible:
+          not:
+            contains:
+              const: apple,t8132-dwc3
+    then:
+      required:
+        - power-domains
 
 properties:
   compatible:
@@ -28,6 +37,7 @@ properties:
               - apple,t8142-dwc3
           - const: apple,t8103-dwc3
       - const: apple,t8103-dwc3
+      - const: apple,t8132-dwc3
 
   reg:
     items:
@@ -58,7 +68,6 @@ required:
   - interrupts
   - iommus
   - resets
-  - power-domains
   - usb-role-switch
 
 unevaluatedProperties: false

@@ -31,6 +31,11 @@ PREFIX = r'''
 #include <stdio.h>
 #include <errno.h>
 typedef uint8_t u8; typedef uint32_t u32; typedef uint64_t u64;
+typedef uint64_t resource_size_t;
+struct device_node { const char *compatible; };
+static const char *machine;
+static bool of_device_is_compatible(struct device_node *node,const char *compat){return !strcmp(node->compatible,compat);}
+static bool of_machine_is_compatible(const char *compat){return !strcmp(machine,compat);}
 #define EOPNOTSUPP 95
 #define GFP_KERNEL 0
 #define ARRAY_SIZE(a) (sizeof(a)/sizeof((a)[0]))
@@ -131,6 +136,18 @@ static void arm(void){runtime_ready=true;assert(!apple_qspi_set_read_only("N",&p
 static bool sent(unsigned int o){for(unsigned int i=0;i<wire_count;i++)if(wire[i]==o)return true;return false;}
 static void denied(struct spi_mem_op o){wire_count=0;assert(apple_qspi_exec_op(&mem,&o)<0);assert(!wire_count);}
 int main(void){
+ const char *boards[]={"apple,j613","apple,j713","apple,j714"};
+ const char *controllers[]={"apple,t8122-qspi","apple,t8132-qspi","apple,t8140-qspi"};
+ const u64 bases[]={0x2a1118000ULL,0x3ad118000ULL,0x385110000ULL,0xad118000ULL,0x3ad118004ULL};
+ for(unsigned int b=0;b<ARRAY_SIZE(boards);b++){
+  machine=boards[b];
+  for(unsigned int c=0;c<ARRAY_SIZE(controllers);c++){
+   struct device_node node={controllers[c]};
+   for(unsigned int a=0;a<ARRAY_SIZE(bases);a++)
+    assert(apple_qspi_nvram_write_board(&node,bases[a])==((b==0&&c==0&&a==0)||(b==1&&c==1&&a==1)));
+  }
+ }
+ puts("PASS J613/J713 board, controller and full-width aperture qualification (45 combinations)");
  u8 data[256];memset(data,0x55,sizeof(data));reset();
  struct spi_mem_op wren=SPI_MEM_OP(SPI_MEM_OP_CMD(0x06,1),SPI_MEM_OP_NO_ADDR,SPI_MEM_OP_NO_DUMMY,SPI_MEM_OP_NO_DATA);
  /* T8140 uses a separate nvram window while the J613 gate stays read-only.
@@ -228,6 +245,7 @@ def main():
     source = (ROOT / 'drivers/spi/spi-apple-qspi.c').read_text()
     policy = (ROOT / 'drivers/spi/spi-apple-qspi-policy.h').read_text()
     signatures = ['static int apple_qspi_set_read_only(', 'static int apple_qspi_get_read_only(',
+                  'static bool apple_qspi_nvram_write_board(',
                   'static bool apple_qspi_opcode_is_read(', 'static int apple_qspi_width_mode(',
                   'static int apple_qspi_shape_op(', 'static bool apple_qspi_supports_op(',
                   'static int apple_qspi_read_register(', 'static int apple_qspi_command(',
@@ -243,6 +261,8 @@ def main():
         if current.returncode:
             raise SystemExit(current.stderr)
         for name, old, new in [
+            ('j713-board', 'of_machine_is_compatible("apple,j713")', 'true'),
+            ('j713-aperture', 'base == 0x3ad118000ULL', 'base != 0'),
             ('t8140-window', 'start <= first && last <= end', 'start <= first'),
             ('range', 'addr >= APPLE_QSPI_NVRAM_START', 'addr >= 1'),
             ('read-only', 'read_only || !qspi->nvram_write_candidate || qspi->write_fault',

@@ -3,9 +3,13 @@
 
 //! Apple PMP driver
 //!
+//! The Rust owner of the PMP RTKit session. It is linked into the pmp module
+//! together with the retained J713 power-vote bridge and read-only telemetry.
+//!
 //! Copyright (C) The Asahi Linux Contributors
 
 use core::mem;
+use core::sync::atomic::{fence, AtomicI32, AtomicPtr, Ordering};
 
 mod pmp_bootargs;
 mod pmp_power;
@@ -23,16 +27,21 @@ use kernel::{
         Device as _,
         DmaMask, //
     },
+    error::to_result,
     io::{
+        mem::DevresIoMem,
         Io,
+        IoBackend,
         IoBase,
         IoSysMap,
         Mmio,
+        MmioBackend,
         Region, //
     },
     kvec,
     module_platform_driver,
-    new_condvar, new_mutex,
+    new_condvar,
+    new_mutex,
     of,
     platform,
     prelude::*,
@@ -44,7 +53,8 @@ use kernel::{
     sync::{
         aref::ARef,
         Arc,
-        CondVar, CondVarTimeoutResult,
+        CondVar,
+        CondVarTimeoutResult,
         Mutex, //
     },
     transmute::{
@@ -145,6 +155,8 @@ impl PmpState {
 #[pin_data]
 struct PmpData {
     dev: ARef<device::Device>,
+    pmp_mmio: DevresIoMem<PMP_MIN_MMIO_SIZE>,
+    asc_mmio: DevresIoMem<ASC_MMIO_SIZE>,
     #[pin]
     rtkit: Mutex<Option<rtkit::RtKit<PmpData>>>,
     #[pin]
@@ -153,10 +165,18 @@ struct PmpData {
     power_command: Mutex<Command>,
     #[pin]
     power_reply: CondVar,
+    /// The C power-vote bridge, published once and retained until reboot.
+    display: AtomicPtr<bindings::apple_pmp_display>,
+    /// The first failure seen before or after the bridge was published.
+    display_error: AtomicI32,
 }
 
 impl PmpData {
     fn new(dev: &platform::Device<Core<'_>>) -> Result<Arc<PmpData>> {
+        let pmp_req = dev.io_request_by_name(c"pmp").ok_or(EINVAL)?;
+        let pmp_mmio = pmp_req.iomap_sized::<PMP_MIN_MMIO_SIZE>()?.into_devres()?;
+        let asc_req = dev.io_request_by_name(c"asc").ok_or(EINVAL)?;
+        let asc_mmio = asc_req.iomap_sized::<ASC_MMIO_SIZE>()?.into_devres()?;
         Arc::pin_init(
             try_pin_init!(
                 PmpData {
@@ -165,6 +185,10 @@ impl PmpData {
                     state <- new_mutex!(PmpState::new()?),
                     power_command <- new_mutex!(Command::Idle),
                     power_reply <- new_condvar!(),
+                    pmp_mmio,
+                    asc_mmio,
+                    display: AtomicPtr::new(core::ptr::null_mut()),
+                    display_error: AtomicI32::new(0),
                 }
             ),
             GFP_KERNEL,
@@ -391,15 +415,45 @@ impl PmpData {
         let msg = (OPC_SET_IOREG | OPC_ACK_MASK) << OPC_SHIFT | len;
         Ok(msg)
     }
+    fn fail_display(&self, error: Error) {
+        // Publish failure before looking up either lazily registered consumer.
+        // Pair with the post-registration fence below: registration cannot miss
+        // the error while this path also misses the newly published provider.
+        let _ = self.display_error.compare_exchange(
+            0,
+            error.to_errno(),
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        fence(Ordering::SeqCst);
+        // SAFETY: a published telemetry provider is retained by this PMP device.
+        unsafe { bindings::apple_pmp_telemetry_stop(self.dev.as_raw()) };
+        *self.power_command.lock() = Command::Failed;
+        self.power_reply.notify_all();
+        // SAFETY: NULL is accepted, and a published bridge is never freed in this epoch.
+        unsafe {
+            bindings::apple_pmp_display_fail(
+                self.display.load(Ordering::SeqCst),
+                self.display_error.load(Ordering::SeqCst),
+            )
+        };
+    }
     fn recv_message(&self, msg: u64) -> Result<()> {
         let pm_command = (msg >> PM_COMMAND_SHIFT) & 0xff;
         if msg & PM_COMMAND_MARKER != 0 && (pm_command == 0x0f || pm_command == 0x10) {
             let mut state = self.power_command.lock();
             state.reply(msg);
             if *state == Command::Failed {
-                dev_err!(self.dev, "Unexpected PMP device-state reply {:#018x}; power commands disabled", msg);
+                dev_err!(
+                    self.dev,
+                    "Unexpected PMP device-state reply {:#018x}; power commands disabled",
+                    msg
+                );
+                drop(state);
+                self.fail_display(EPROTO);
+            } else {
+                self.power_reply.notify_all();
             }
-            self.power_reply.notify_all();
             return Ok(());
         }
         let opc = (msg >> OPC_SHIFT) & 0xFF;
@@ -423,6 +477,58 @@ impl PmpData {
         rtk.send_message(PMP_ENDPOINT, reply)?;
         Ok(())
     }
+}
+
+unsafe extern "C" fn display_send(cookie: *const kernel::ffi::c_void, word: u64) -> i32 {
+    // SAFETY: the C bridge holds this Arc's foreign reference until reboot.
+    let _data = unsafe { Arc::<PmpData>::borrow(cookie.cast_mut()) };
+    // Use the shared, serialized PMP command path for all power consumers.
+    // It validates supplier readiness and consumes the exact untagged reply.
+    match word {
+        0x0020f50100000000 => unsafe { bindings::apple_pmp_set_device_power(0x0f, 5, 1) },
+        0x0020f80100000000 => unsafe { bindings::apple_pmp_set_device_power(0x0f, 8, 1) },
+        _ => EINVAL.to_errno(),
+    }
+}
+
+/// Private bridge entry: resolve typed data only after the PMP provider has bound.
+///
+/// # Safety
+/// `raw` is a live, fully bound device with its device lock held by the caller.
+#[kernel::macros::export]
+unsafe extern "C" fn apple_pmp_display_bound_owner(
+    raw: *mut bindings::device,
+) -> *mut bindings::apple_pmp_display {
+    // SAFETY: guaranteed by the C caller under the supplier device lock.
+    let dev = unsafe { device::Device::<device::Normal>::from_raw(raw) };
+    // SAFETY: the C caller checked the bound PMP driver and holds its device lock.
+    let ptr = dev.get_drvdata::<PmpDriver>();
+    if ptr.is_null() {
+        return core::ptr::null_mut();
+    }
+    // SAFETY: the checked PMP driver stored this pinned PmpDriver, and the
+    // device lock excludes unbind for the entire read-only borrow.
+    let driver = unsafe { &*ptr };
+    let data = &driver.0;
+    let existing = data.display.load(Ordering::Acquire);
+    if !existing.is_null() {
+        return existing;
+    }
+    let cookie = data.clone().into_foreign();
+    // SAFETY: callback borrows this Arc; registration validates identity and sends nothing.
+    let display = unsafe { bindings::apple_pmp_display_register(raw, cookie, Some(display_send)) };
+    if display.is_null() {
+        // SAFETY: registration did not take ownership of the foreign reference.
+        drop(unsafe { Arc::<PmpData>::from_foreign(cookie) });
+    } else {
+        data.display.store(display, Ordering::SeqCst);
+        let error = data.display_error.load(Ordering::SeqCst);
+        if error != 0 {
+            // SAFETY: the bridge is now retained and must inherit earlier failures.
+            unsafe { bindings::apple_pmp_display_fail(display, error) };
+        }
+    }
+    display
 }
 
 unsafe impl Send for PmpData {}
@@ -462,11 +568,13 @@ pub unsafe extern "C" fn apple_pmp_send_power_command(
     let mut state = data.power_command.lock();
     if let Err(error) = sent {
         *state = Command::Failed;
+        drop(state);
+        data.fail_display(error);
         return error.to_errno();
     }
     let mut remaining = kernel::time::msecs_to_jiffies(1000);
     while matches!(*state, Command::Pending(_)) {
-        match data.power_reply.wait_interruptible_timeout(&mut state, remaining) {
+        match data.power_reply.wait_timeout(&mut state, remaining) {
             CondVarTimeoutResult::Woken { jiffies } => remaining = jiffies,
             CondVarTimeoutResult::Timeout | CondVarTimeoutResult::Signal { .. } => {
                 // A reply may have arrived while the waiter reacquired its
@@ -474,17 +582,30 @@ pub unsafe extern "C" fn apple_pmp_send_power_command(
                 // untagged stream after an ambiguous wait.
                 if *state != Command::Complete {
                     *state = Command::Failed;
-                    dev_err!(data.dev, "PMP device-power request {:#018x} did not complete", message);
+                    dev_err!(
+                        data.dev,
+                        "PMP device-power request {:#018x} did not complete",
+                        message
+                    );
+                    drop(state);
+                    data.fail_display(ETIMEDOUT);
                     return ETIMEDOUT.to_errno();
                 }
             }
         }
     }
     if *state != Command::Complete {
+        drop(state);
+        data.fail_display(EIO);
         return EIO.to_errno();
     }
     *state = Command::Idle;
-    dev_dbg!(data.dev, "PMP device={} enabled={} acknowledged", device_id, enabled);
+    dev_dbg!(
+        data.dev,
+        "PMP device={} enabled={} acknowledged",
+        device_id,
+        enabled
+    );
     0
 }
 
@@ -506,13 +627,18 @@ impl rtkit::Operations for PmpData {
     fn recv_message(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, _ep: u8, msg: u64) {
         let ret = data.recv_message(msg);
         if let Err(e) = ret {
+            // Only the retained J713 bridge latches a message it cannot
+            // handle as fatal. Other boards log it and keep power commands.
+            // SAFETY: read-only board identity check.
+            if unsafe { bindings::apple_pmp_display_retained_board() } {
+                data.fail_display(e);
+            }
             dev_err!(data.dev, "Failed to handle rtkit message, error: {:?}", e);
         }
     }
 
     fn crashed(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, _crashlog: Option<&[u8]>) {
-        *data.power_command.lock() = Command::Failed;
-        data.power_reply.notify_all();
+        data.fail_display(EIO);
         dev_err!(data.dev, "PMP firmware crashed");
     }
 }
@@ -528,17 +654,20 @@ struct PmpHwConfig {
     /// Check the firmware's `uuid` header before trusting the boot argument
     /// block it points to.
     check_bootargs_uuid: bool,
+    coreanalytics: bool,
 }
 
 const HW_CFG_DEFAULT: PmpHwConfig = PmpHwConfig {
     dma_mask: None,
     check_bootargs_uuid: false,
+    coreanalytics: false,
 };
 
 /// T8140: the DART translates 42 bits and its DMA window starts at 1 TiB.
 const HW_CFG_T8140: PmpHwConfig = PmpHwConfig {
     dma_mask: Some(DmaMask::new::<42>()),
     check_bootargs_uuid: false,
+    coreanalytics: false,
 };
 
 /// T6041: the DART window starts at 1 TiB; the boot argument header is
@@ -546,6 +675,13 @@ const HW_CFG_T8140: PmpHwConfig = PmpHwConfig {
 const HW_CFG_T6041: PmpHwConfig = PmpHwConfig {
     dma_mask: Some(DmaMask::new::<42>()),
     check_bootargs_uuid: true,
+    coreanalytics: false,
+};
+
+const HW_CFG_T8132: PmpHwConfig = PmpHwConfig {
+    dma_mask: None,
+    check_bootargs_uuid: false,
+    coreanalytics: true,
 };
 
 impl Drop for PmpDriver {
@@ -559,6 +695,7 @@ kernel::of_device_table!(
     OF_TABLE,
     <PmpDriver as platform::Driver>::IdInfo,
     [
+        (of::DeviceId::new(c"apple,t8132-pmp-v2"), &HW_CFG_T8132),
         (of::DeviceId::new(c"apple,t8140-pmp-v2"), &HW_CFG_T8140),
         (of::DeviceId::new(c"apple,t6041-pmp-v2"), &HW_CFG_T6041),
         (of::DeviceId::new(c"apple,t6000-pmp-v2"), &HW_CFG_DEFAULT),
@@ -568,6 +705,12 @@ kernel::of_device_table!(
 impl platform::Driver for PmpDriver {
     type IdInfo = &'static PmpHwConfig;
     type Data<'bound> = PmpDriver;
+
+    fn suppress_bind_attrs() -> bool {
+        // Retained J713 power votes have no teardown path.
+        // SAFETY: read-only board identity check; other boards remain unchanged.
+        unsafe { bindings::apple_pmp_display_retained_board() }
+    }
 
     const OF_ID_TABLE: Option<of::IdTable<Self::IdInfo>> = Some(&OF_TABLE);
 
@@ -582,13 +725,9 @@ impl platform::Driver for PmpDriver {
             // yet.
             unsafe { pdev.dma_set_mask_and_coherent(mask)? };
         }
-        let pmp_req = pdev.io_request_by_name(c"pmp").ok_or(EINVAL)?;
-        let pmp_mmio = pmp_req.iomap_sized::<PMP_MIN_MMIO_SIZE>()?;
-        let pmp_mmio = pmp_mmio.as_view();
-        let asc_req = pdev.io_request_by_name(c"asc").ok_or(EINVAL)?;
-        let asc_mmio = asc_req.iomap_sized::<ASC_MMIO_SIZE>()?;
-        let asc_mmio = asc_mmio.as_view().relaxed();
         let data = PmpData::new(pdev)?;
+        let pmp_mmio = data.pmp_mmio.access(pdev.as_ref())?.as_view();
+        let asc_mmio = data.asc_mmio.access(pdev.as_ref())?.as_view();
         let node = dev.fwnode().ok_or(EIO)?;
         let dvid = node
             .property_read(c"apple,dram-vendor-id")
@@ -608,10 +747,35 @@ impl platform::Driver for PmpDriver {
             patches.push((from_fourcc(b"PMCB"), (v >> 3) & 1), GFP_KERNEL)?;
         }
         data.patch_bootargs(&pmp_mmio, &patches, cfg.check_bootargs_uuid)?;
-        let rtkit = rtkit::RtKit::<PmpData>::new(&dev, None, 0, data.clone())?;
+        // EP7 is a qualified startup dependency only on the retained J713 PMP.
+        // SAFETY: the predicate only reads machine compatibility.
+        let needs_coreanalytics =
+            cfg.coreanalytics && unsafe { bindings::apple_pmp_telemetry_retained_board() };
+        let rtkit = if needs_coreanalytics {
+            rtkit::RtKit::<PmpData>::new_with_coreanalytics(&dev, None, 0, data.clone())?
+        } else {
+            rtkit::RtKit::<PmpData>::new(&dev, None, 0, data.clone())?
+        };
         data.rtkit.lock().as_mut().set(Some(rtkit));
-        asc_mmio.update(ASC_CPU_CONTROL, |r| r.with_const_cpu_run::<1>());
+        asc_mmio
+            .relaxed()
+            .update(ASC_CPU_CONTROL, |r| r.with_const_cpu_run::<1>());
         data.start()?;
+        // SAFETY: the PMP owner retains both Devres mappings; managed child
+        // teardown and provider cleanup precede device mapping revocation.
+        to_result(unsafe {
+            bindings::apple_pmp_telemetry_register(
+                dev.as_raw(),
+                MmioBackend::as_ptr(pmp_mmio).cast(),
+                pmp_mmio.size(),
+                MmioBackend::as_ptr(asc_mmio).cast(),
+            )
+        })?;
+        fence(Ordering::SeqCst);
+        if data.display_error.load(Ordering::SeqCst) != 0 {
+            // SAFETY: registration returned the live managed provider.
+            unsafe { bindings::apple_pmp_telemetry_stop(dev.as_raw()) };
+        }
         dev_info!(dev, "PMP firmware and endpoint ready");
         // SAFETY: PmpDriver retains this Arc and unregisters it before dropping it.
         let ret = unsafe { bindings::apple_pmp_register(dev.as_raw(), Arc::as_ptr(&data).cast()) };
@@ -619,6 +783,10 @@ impl platform::Driver for PmpDriver {
             return Err(Error::from_errno(ret));
         }
         Ok(PmpDriver(data))
+    }
+
+    fn unbind<'bound>(_dev: &'bound platform::Device<Core<'_>>, this: Pin<&Self::Data<'bound>>) {
+        this.0.fail_display(ENODEV);
     }
 }
 

@@ -2697,6 +2697,7 @@ W:	https://asahilinux.org
 B:	https://github.com/AsahiLinux/linux/issues
 C:	irc://irc.oftc.net/asahi-dev
 T:	git https://github.com/AsahiLinux/linux.git
+F:	Documentation/ABI/testing/sysfs-driver-apple-dart
 F:	Documentation/devicetree/bindings/arm/apple.yaml
 F:	Documentation/devicetree/bindings/arm/apple/*
 F:	Documentation/devicetree/bindings/clock/apple,nco.yaml
@@ -2772,6 +2773,7 @@ F:	tools/asahi/pmp-bootargs-tests.rs
 F:	drivers/spi/spi-apple-test.c
 F:	drivers/spi/spi-apple.c
 F:	drivers/spmi/spmi-apple-controller.c
+F:	drivers/thermal/apple-pmp*
 F:	drivers/thunderbolt/.kunitconfig.apple-dpin
 F:	drivers/thunderbolt/apple-dpin*
 F:	drivers/thunderbolt/apple.c
@@ -2789,6 +2791,7 @@ F:	include/uapi/drm/asahi_drm.h
 F:	include/uapi/linux/apple-sep.h
 F:	net/bluetooth/brcm.c
 F:	net/bluetooth/brcm.h
+F:	tools/testing/selftests/drivers/apple/
 
 ARM/APPLE QSPIMC DRIVER
 M:	Ryan Murray <ryan@aurorasilicon.org>

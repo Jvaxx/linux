@@ -15,6 +15,7 @@
 #include <linux/platform_device.h>
 #include <linux/slab.h>
 #include <linux/soc/apple/dockchannel.h>
+#include <linux/soc/apple/rtkit-helper.h>
 #include <linux/string.h>
 #include <linux/unaligned.h>
 #include <linux/of.h>
@@ -185,6 +186,7 @@ struct dockchannel_hid {
 	struct dockchannel *dc;
 	struct device_link *helper_link;
 	bool stopping;
+	bool inherited_mtp;
 
 	/* Held from probe on when the multi-touch interface uses power method 2 */
 	struct gpio_desc *afe_reset;
@@ -620,6 +622,18 @@ static int dchid_start_interface(struct dchid_iface *iface)
 
 		/* Send firmware to the device */
 		dev_dbg(iface->dchid->dev, "Sending firmware for %s\n", iface->name);
+		/* Retained MTP must see AFE reset throughout firmware upload. */
+		if (iface->dchid->inherited_mtp &&
+		    iface->power_method == DCHID_POWER_METHOD_2) {
+			if (iface->firmware_managed_reset) {
+				ret = -EINVAL;
+				goto err;
+			}
+			ret = gpiod_set_value_cansleep(iface->dchid->afe_reset, 1);
+			if (ret < 0)
+				goto err;
+			fsleep(50 * USEC_PER_MSEC);
+		}
 		ret = dchid_send_firmware(iface, fw, size);
 		if (ret < 0) {
 			dev_err(iface->dchid->dev, "Failed to send %s firmware\n", iface->name);
@@ -629,9 +643,12 @@ static int dchid_start_interface(struct dchid_iface *iface)
 		/* After loading firmware, multi-touch needs a reset */
 		dev_dbg(iface->dchid->dev, "Resetting %s\n", iface->name);
 		if (iface->power_method == DCHID_POWER_METHOD_2) {
-			ret = dchid_pm2_set_power(iface, DCHID_POWER_STATE_OFF);
-			if (ret < 0)
-				goto err;
+			/* The retained session is already off while reset is asserted. */
+			if (!iface->dchid->inherited_mtp) {
+				ret = dchid_pm2_set_power(iface, DCHID_POWER_STATE_OFF);
+				if (ret < 0)
+					goto err;
+			}
 			ret = dchid_pm2_set_power(iface, DCHID_POWER_STATE_ON);
 			if (ret < 0)
 				goto err;
@@ -1381,6 +1398,8 @@ static int dockchannel_hid_probe(struct platform_device *pdev)
 
 	if (dchid->helper_link->supplier->links.status != DL_DEV_DRIVER_BOUND)
 		return -EPROBE_DEFER;
+	dchid->inherited_mtp =
+		apple_rtkit_helper_preserves_input(dchid->helper_link->supplier);
 
 	/* Now it is safe to begin initializing */
 	dchid->dc = dockchannel_init(pdev);

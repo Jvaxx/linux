@@ -22,6 +22,7 @@ properties:
       - items:
           - enum:
               - apple,t6041-pmp-v2
+              - apple,t8132-pmp-v2
               - apple,t8140-pmp-v2
           - const: apple,t6000-pmp-v2
 
@@ -46,6 +47,10 @@ properties:
 
   power-domains:
     maxItems: 1
+
+  apple,pmp-report:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: Report provider whose running state qualifies device-power requests.
 
   apple,board-id:
     $ref: /schemas/types.yaml#/definitions/uint32

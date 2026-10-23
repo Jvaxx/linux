@@ -21,6 +21,9 @@ properties:
           - const: apple,t8103-nvme-ans2
       - const: apple,t8132-nvme-ans2
       - items:
+          - const: apple,t8132-nvme-ans2
+          - const: apple,t8103-nvme-ans2
+      - items:
           - const: apple,t8140-nvme-ans2
           - const: apple,t8132-nvme-ans2
       - items:
@@ -41,11 +44,16 @@ properties:
           on T604x)
 
   reg-names:
-    minItems: 2
-    items:
-      - const: nvme
-      - const: ans
-      - const: nvmmu
+    oneOf:
+      - minItems: 2
+        items:
+          - const: nvme
+          - const: ans
+          - const: nvmmu
+      - items:
+          - const: nvme
+          - const: nvmmu
+          - const: ans
 
   resets:
     maxItems: 1
@@ -87,7 +95,28 @@ properties:
 
       The SART address filter is documented in iommu/apple,sart.yaml.
 
+  apple,rtkit-handoff:
+    $ref: /schemas/types.yaml#/definitions/string
+    const: nvme-disabled-v1
+    description: |
+      Added at boot when the bootloader leaves the ANS firmware running,
+      with the NVMe controller disabled and its queues drained. The kernel
+      adopts that RTKit session without renegotiating it. Shared firmware
+      buffers must remain reserved and protected by the SART.
+
 allOf:
+  - if:
+      properties:
+        compatible:
+          not:
+            contains:
+              enum:
+                - apple,t8132-nvme-ans2
+                - apple,t8140-nvme-ans2
+    then:
+      properties:
+        apple,rtkit-handoff: false
+
   - if:
       properties:
         compatible:

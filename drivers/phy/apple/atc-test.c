@@ -14,6 +14,7 @@ static struct apple_atcphy *atcphy_test_alloc(struct kunit *test, bool fixed_usb
 
 	atcphy = kunit_kzalloc(test, sizeof(*atcphy), GFP_KERNEL);
 	KUNIT_ASSERT_NOT_NULL(test, atcphy);
+	atcphy->hw = &atcphy_hw_t8103;
 	atcphy->fixed_usb2 = fixed_usb2;
 	atcphy->mode = APPLE_ATCPHY_MODE_USB3_DP;
 	atcphy->pipe_state = ATCPHY_PIPEHANDLER_STATE_USB3;
@@ -73,6 +74,22 @@ static void atcphy_test_target_mode_fixed_hub(struct kunit *test)
 	state.mode = TYPEC_DP_STATE_D;
 	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state),
 			APPLE_ATCPHY_MODE_USB3_DP);
+}
+
+static void atcphy_test_target_mode_t8132(struct kunit *test)
+{
+	struct typec_altmode dp = { .svid = USB_TYPEC_DP_SID };
+	struct typec_mux_state state = { .mode = TYPEC_STATE_USB };
+	struct apple_atcphy *atcphy = atcphy_test_alloc_dev(test, false);
+
+	atcphy->hw = &atcphy_hw_t8132;
+	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB2);
+	state.alt = &dp;
+	state.mode = TYPEC_DP_STATE_D;
+	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_USB2);
+	state.alt = NULL;
+	state.mode = TYPEC_STATE_SAFE;
+	KUNIT_EXPECT_EQ(test, atcphy_typec_target_mode(atcphy, &state), APPLE_ATCPHY_MODE_OFF);
 }
 
 static void atcphy_test_noop_same_mode(struct kunit *test)
@@ -994,6 +1011,7 @@ static void atcphy_test_usb2_init_after_safe(struct kunit *test)
 static struct kunit_case atcphy_mux_test_cases[] = {
 	KUNIT_CASE(atcphy_test_target_mode),
 	KUNIT_CASE(atcphy_test_target_mode_fixed_hub),
+	KUNIT_CASE(atcphy_test_target_mode_t8132),
 	KUNIT_CASE(atcphy_test_noop_same_mode),
 	KUNIT_CASE(atcphy_test_noop_needs_work),
 	KUNIT_CASE(atcphy_test_usb3_port_ready),
