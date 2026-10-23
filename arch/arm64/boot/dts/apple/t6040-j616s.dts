@@ -174,6 +174,31 @@
 			};
 		};
 	};
+
+	/*
+	 * The headphone jack: the AOP audio component's jack back-end (DAI 4)
+	 * to the CS42L84. A card of its own, so a codec that does not answer
+	 * costs the jack only, never the speakers.
+	 */
+	sound_jack: sound-jack {
+		compatible = "apple,j616-macaudio-jack", "apple,macaudio";
+		model = "MacBook Pro J616 Jack";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Headphone Jack";
+
+			cpu {
+				sound-dai = <&aop_audio 4>;
+			};
+
+			codec {
+				sound-dai = <&jack_codec>;
+			};
+		};
+	};
 };
 
 &cpuidle {
@@ -494,5 +519,24 @@
 		interrupts-extended = <&pinctrl 55 IRQ_TYPE_LEVEL_LOW>;
 		ti,imon-slot-no = <20>;
 		ti,vmon-slot-no = <22>;
+	};
+};
+
+/*
+ * The CS42L84 headphone codec (ADT /arm-io/i2c2/audio-codec-output@4B). Its
+ * reset line is nub GPIO pin 58, driven high to run the codec (the driver's
+ * "reset" is an enable, as on the J514/J516); its interrupt is AP pin 106,
+ * level low. The AOP firmware runs the jack's stream on MCA cluster 2.
+ */
+&i2c2 {
+	status = "okay";
+
+	jack_codec: codec@4b {
+		compatible = "cirrus,cs42l84";
+		reg = <0x4b>;
+		reset-gpios = <&pinctrl_nub 58 GPIO_ACTIVE_HIGH>;
+		#sound-dai-cells = <0>;
+		interrupts-extended = <&pinctrl 106 IRQ_TYPE_LEVEL_LOW>;
+		sound-name-prefix = "Jack";
 	};
 };
