@@ -130,7 +130,7 @@ static int avd_wait_submission_queue(struct avd_ctx *ctx, int vp)
 	}
 
 	if (cur >= max / 2) {
-		if (avd->variant->quirks & AVD_QUIRK_HEVC_V5_HEADER)
+		if (avd->variant->quirks & AVD_QUIRK_V5_QUEUE_PACING)
 			usleep_range(100, 150);
 		else
 			usleep_range(500, 650);
@@ -201,7 +201,7 @@ int avd_submit_job(struct avd_ctx *ctx)
 		seg = &segments[idx];
 		for (i = 0; i < seg->num; i++)
 			writel(seg->instructions[i], reg);
-		if ((!(avd->variant->quirks & AVD_QUIRK_HEVC_V5_HEADER) ||
+		if ((!(avd->variant->quirks & AVD_QUIRK_V5_QUEUE_PACING) ||
 		     sub->codec == AVD_CODEC_HEVC) &&
 		    avd_wait_submission_queue(ctx, vp))
 			break;
@@ -779,7 +779,7 @@ static const struct avd_variant avd_t8140_variant = {
 	.submit_offset = 0x40,
 	.submit_queue_max_offset = 0x44,
 	.submit_queue_status_offset = 0x7c,
-	.quirks = AVD_QUIRK_HEVC_V5_HEADER,
+	.quirks = AVD_QUIRK_HEVC_V5_HEADER | AVD_QUIRK_V5_QUEUE_PACING,
 };
 
 static const struct avd_variant avd_t8132_variant = {
@@ -803,6 +803,34 @@ static const struct avd_variant avd_t8132_variant = {
 	.submit_queue_status_offset = 0x7c,
 };
 
+/*
+ * T6040 (M4 Pro): the T8132 decoder. Its first HEVC job stalled the VP when
+ * it was sent the pre-v5 header (no DMA configuration words, no reserved
+ * scratch slot); T6040 runs the same v5 firmware generation as T8140, so it
+ * gets the v5 header. HEVC stays hidden from V4L2 clients until that is
+ * verified on the hardware.
+ */
+static const struct avd_variant avd_t6040_variant = {
+	.vp_slots = {
+		[AVD_CODEC_HEVC] = 4,
+		[AVD_CODEC_H264] = 4,
+		[AVD_CODEC_VP9] = 1,
+		[AVD_CODEC_AV1] = 3,
+	},
+	.fifo_slots = 15,
+	.configure_stream = t8122_configure_stream,
+	.capabilities = AVD_CAPABILITY_H264 |
+			AVD_CAPABILITY_VP9 |
+			AVD_CAPABILITY_AV1,
+	.fw_name = "apple/avd-fw-v5-t1.bin",
+	.revision = 4,
+	.vp_slot_offset = 0xc,
+	.submit_offset = 0x40,
+	.submit_queue_max_offset = 0x44,
+	.submit_queue_status_offset = 0x7c,
+	.quirks = AVD_QUIRK_HEVC_V5_HEADER,
+};
+
 /* can also be derived from a version register */
 static const struct of_device_id avd_of_match[] = {
 	{
@@ -824,6 +852,10 @@ static const struct of_device_id avd_of_match[] = {
 	{
 		.compatible = "apple,t8122-avd",
 		.data = &avd_t8122_variant
+	},
+	{
+		.compatible = "apple,t6041-avd",
+		.data = &avd_t6040_variant
 	},
 	{
 		.compatible = "apple,t8132-avd",

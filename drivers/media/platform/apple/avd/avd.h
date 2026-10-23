@@ -34,6 +34,8 @@
 #define AVD_QUIRK_NO_PIPE_STATE	 BIT(1)
 /* HEVC DMA configuration and extended scratch-address table. */
 #define AVD_QUIRK_HEVC_V5_HEADER	BIT(2)
+/* T8140: pace only HEVC submissions, with a shorter back-off. */
+#define AVD_QUIRK_V5_QUEUE_PACING	BIT(3)
 
 #define VP_SLOT_NONE		255
 #define INST_FIFO_SLOT_NONE	255
@@ -97,6 +99,7 @@ struct avd_av1_decoded_buffer_info {
 	u8 ref_frame_idx[V4L2_AV1_REFS_PER_FRAME];
 	bool intrabc;
 	size_t color_size;
+	size_t seg_size;
 };
 
 struct avd_hevc_decoded_buffer_info {
