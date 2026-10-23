@@ -1072,7 +1072,7 @@
 	};
 
 	smc: smc@50c600000 {
-		compatible = "apple,t6041-smc", "apple,t8103-smc", "apple,smc";
+		compatible = "apple,t6041-smc", "apple,t8103-smc";
 		reg = <0x5 0x0c600000 0x0 0x4000>,
 		      <0x5 0x0de70000 0x0 0x100000>;
 		reg-names = "smc", "sram";
