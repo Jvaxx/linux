@@ -125,6 +125,55 @@
 			};
 		};
 	};
+
+	/*
+	 * The speaker amps' shared shutdown line (SDZ, AP pin 54, low =
+	 * shutdown). One fixed regulator, the SDZ supply of all six, not
+	 * per-amp shutdown-gpios: with GPIO_SHARED six references become a
+	 * vote, and one amp driving the line low would not shut the other
+	 * five down.
+	 */
+	speaker_sdz: regulator-sn012776-sdz {
+		compatible = "regulator-fixed";
+		regulator-name = "sn012776-sdz";
+		gpios = <&pinctrl 54 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+
+	/*
+	 * The AOP firmware runs the stream (MCA cluster 0, one serializer for
+	 * all six amps); the J616 variant of macaudio links the AOP audio
+	 * component's speaker back-end (DAI 3) to the amps. The codecs are
+	 * listed in the ADT provider order, so each gets its native playback
+	 * slot (LW1 0, RW1 1, LW2 2, RW2 3, LT 4, RT 5). The idle masks are the
+	 * ADT amp-tx-zd-config rows 0 and 1: LW1 drives zeros in the right
+	 * amps' sense slots, RW1 in the left amps'.
+	 */
+	sound: sound {
+		compatible = "apple,j616-macaudio", "apple,macaudio";
+		model = "MacBook Pro J616";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Speakers";
+			dai-tdm-idle-mode-0 = "zero";
+			dai-tdm-idle-mode-1 = "zero";
+			dai-tdm-slot-tx-idle-mask-0 = <0xf0f0f0>;
+			dai-tdm-slot-tx-idle-mask-1 = <0x0f0f0f>;
+
+			cpu {
+				sound-dai = <&aop_audio 3>;
+			};
+
+			codec {
+				sound-dai = <&speaker_left_woof1>, <&speaker_right_woof1>,
+					    <&speaker_left_woof2>, <&speaker_right_woof2>,
+					    <&speaker_left_tweet>, <&speaker_right_tweet>;
+			};
+		};
+	};
 };
 
 &cpuidle {
@@ -357,4 +406,93 @@
 &aop_audio {
 	apple,chassis-name = "J616";
 	apple,machine-kind = "MacBook Pro";
+};
+
+/*
+ * The six SN012776 speaker amps, held in hardware shutdown until a sound
+ * card enables them (ADT /arm-io/i2c1/audio-speaker@38): one interrupt line
+ * on AP pin 55, level low; sense slots from speaker-config (speaker i at RX
+ * bytes 4i and 4i + 2, order LW1 RW1 LW2 RW2 LT RT). Names as on the J314
+ * and J316, which speakersafetyd's profile uses. Every amp joins the SDZ
+ * fail-closed group: an over-temperature or over-current fault on any one
+ * forces the shared shutdown line low.
+ */
+&i2c1 {
+	status = "okay";
+
+	speaker_left_woof1: codec@38 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x38>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 1";
+		interrupts-extended = <&pinctrl 55 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <0>;
+		ti,vmon-slot-no = <2>;
+	};
+
+	speaker_left_woof2: codec@39 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x39>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 2";
+		interrupts-extended = <&pinctrl 55 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <8>;
+		ti,vmon-slot-no = <10>;
+	};
+
+	speaker_left_tweet: codec@3a {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3a>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Tweeter";
+		interrupts-extended = <&pinctrl 55 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <16>;
+		ti,vmon-slot-no = <18>;
+	};
+};
+
+&i2c3 {
+	status = "okay";
+
+	speaker_right_woof1: codec@3b {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3b>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 1";
+		interrupts-extended = <&pinctrl 55 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <4>;
+		ti,vmon-slot-no = <6>;
+	};
+
+	speaker_right_woof2: codec@3c {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3c>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 2";
+		interrupts-extended = <&pinctrl 55 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <12>;
+		ti,vmon-slot-no = <14>;
+	};
+
+	speaker_right_tweet: codec@3d {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3d>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Tweeter";
+		interrupts-extended = <&pinctrl 55 IRQ_TYPE_LEVEL_LOW>;
+		ti,imon-slot-no = <20>;
+		ti,vmon-slot-no = <22>;
+	};
 };
