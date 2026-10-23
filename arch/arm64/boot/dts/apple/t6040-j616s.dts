@@ -852,3 +852,5 @@
 		};
 	};
 };
+
+#include "t6040-j616s-usb3.dtsi"
