@@ -1111,6 +1111,95 @@
 		status = "disabled";
 	};
 
+	/*
+	 * AOP (always-on processor). The boot loader loads its RTKit firmware
+	 * and leaves it stopped; Linux starts it.
+	 */
+	aop: aop@510600000 {
+		compatible = "apple,t6041-aop";
+		reg = <0x5 0x10c10000 0x0 0x2e0000>,
+		      <0x5 0x10600000 0x0 0x88000>,
+		      <0x5 0x10050000 0x0 0x4000>,
+		      <0x5 0x08328000 0x0 0x24>;
+		reg-names = "firmware", "asc", "asc-aux", "config";
+		mboxes = <&aop_mbox>;
+		mbox-names = "mbox";
+		iommus = <&aop_dart 0>;
+		status = "disabled";
+
+		/*
+		 * "dma" is the microphones' LEAP ADMAC channel; "spkr" and
+		 * "sense" are the speaker stream's base-ns ADMAC channels 0 and
+		 * 1 (ADT audio-speaker dma-channels), "cout" and "cin" the
+		 * headphone jack's channels 4 and 5 (TX2 and RX2, ADT
+		 * audio-codec-output and audio-codec-input).
+		 */
+		aop_audio: audio {
+			compatible = "apple,t6041-aop-audio", "apple,t6030-aop-audio";
+			dmas = <&admac0 1>, <&admac1 0>, <&admac1 1>, <&admac1 4>,
+			       <&admac1 5>;
+			dma-names = "dma", "spkr", "sense", "cout", "cin";
+			#sound-dai-cells = <1>;
+		};
+
+		aop_als: als {
+			compatible = "apple,t6041-aop-als", "apple,aop-als";
+		};
+
+		aop_las: las {
+			compatible = "apple,t6041-aop-las", "apple,aop-las";
+		};
+	};
+
+	/* ADT lists the interrupts as 1, 0, 3, 2 of the block: send-empty is the lowest. */
+	aop_mbox: mailbox@510608000 {
+		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x5 0x10608000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 710 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 711 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 712 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 713 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		status = "disabled";
+	};
+
+	aop_dart: iommu@510f00000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x5 0x10f00000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 734 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	/* The audio fabric's ADMACs: admac-leap-ns (DART stream 10) and admac-base-ns (stream 8) */
+	admac0: dma-controller@513300000 {
+		compatible = "apple,t6041-admac", "apple,t8132-admac";
+		reg = <0x5 0x13300000 0x0 0x34000>;
+		#dma-cells = <1>;
+		dma-channels = <18>;
+		/* the ADT gives the first of the four outputs */
+		interrupts-extended = <&aic AIC_IRQ 757 IRQ_TYPE_LEVEL_HIGH>,
+				      <0>, <0>, <0>;
+		iommus = <&aop_dart 10>;
+		status = "disabled";
+	};
+
+	admac1: dma-controller@513800000 {
+		compatible = "apple,t6041-admac", "apple,t8132-admac";
+		reg = <0x5 0x13800000 0x0 0x34000>;
+		#dma-cells = <1>;
+		dma-channels = <13>;
+		/* the ADT gives the first of the four outputs */
+		interrupts-extended = <&aic AIC_IRQ 754 IRQ_TYPE_LEVEL_HIGH>,
+				      <0>, <0>, <0>;
+		iommus = <&aop_dart 8>;
+		status = "disabled";
+	};
+
 	mtp: mtp@514600000 {
 		compatible = "apple,t6041-mtp", "apple,t6041-rtk-helper-asc4",
 			     "apple,mtp", "apple,rtk-helper-asc4";

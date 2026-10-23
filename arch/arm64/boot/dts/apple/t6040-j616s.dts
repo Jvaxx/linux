@@ -333,3 +333,28 @@
 &mcc {
 	status = "okay";
 };
+
+&aop {
+	status = "okay";
+};
+
+&aop_mbox {
+	status = "okay";
+};
+
+&aop_dart {
+	status = "okay";
+};
+
+&admac0 {
+	status = "okay";
+};
+
+&admac1 {
+	status = "okay";
+};
+
+&aop_audio {
+	apple,chassis-name = "J616";
+	apple,machine-kind = "MacBook Pro";
+};
