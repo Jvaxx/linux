@@ -43,6 +43,8 @@ def main():
              'static void apple_pmp_report_entry_free(', 'static int apple_pmp_report_entry_probe(',
              'static int apple_pmp_report_probe(', 'static struct device_node *apple_pmp_report_t6030_entry(',
              'static int apple_pmp_report_wait_t6030_14(', 'int apple_pmp_report_wait_supplier_ready(']
+    if 'static bool apple_pmp_report_running(' in source:
+        names.insert(0, 'static bool apple_pmp_report_running(')
     if 'static int apple_pmp_report_wait_t6030_bound(' in source:
         names.insert(names.index('static struct device_node *apple_pmp_report_t6030_entry('), 'static int apple_pmp_report_wait_t6030_bound(')
     offsets = re.search(r'static const struct apple_pmp_report_offsets apple_pmp_offsets_t6030 = \{.*?\n\};', source, re.S)[0]

@@ -68,6 +68,8 @@ struct apple_pmp_report_offsets {
 	bool starts_pmp;
 	const char *name, *fallback, *pwrstate;
 	bool devices_ordered;
+	/* Request deferral (unused by T6030): any status bit means running. */
+	bool running_any, defer_requests;
 };
 struct list_head {
 	struct list_head *next, *prev;
@@ -94,6 +96,13 @@ static void list_del(struct list_head *n)
 	     cursor = cursor->next)
 #define list_for_each_entry_rcu list_for_each_entry
 struct apple_pmp_start;
+struct work_struct {
+	void (*func)(struct work_struct *);
+	bool pending;
+};
+struct delayed_work {
+	struct work_struct work;
+};
 struct apple_pmp_report {
 	struct device *dev;
 	const struct apple_pmp_report_offsets *offsets;
@@ -102,13 +111,14 @@ struct apple_pmp_report {
 	struct list_head list;
 	void *debugfs;
 	struct apple_pmp_start *start;
+	/* Requests held until the PMP runs; T6030 does not defer them. */
+	u64 shadow, known;
+	bool defer;
+	unsigned int polls;
+	struct delayed_work ready_work;
 };
 struct completion {
 	bool done;
-};
-struct work_struct {
-	void (*func)(struct work_struct *);
-	bool pending;
 };
 typedef struct {
 	u8 b[16];
@@ -262,6 +272,22 @@ static void complete_all(struct completion *c)
 #define complete complete_all
 #define INIT_WORK(w, f) ((w)->func = (f), (w)->pending = false)
 #define system_unbound_wq NULL
+/* Deferred requests are not part of the T6030 graph: never queued here. */
+#define INIT_DELAYED_WORK(w, f) INIT_WORK(&(w)->work, f)
+#define system_freezable_power_efficient_wq NULL
+static void apple_pmp_report_ready_work(struct work_struct *w)
+{
+	(void)w;
+	assert(!"T6030 reports do not defer requests");
+}
+static bool queue_delayed_work(void *q, struct delayed_work *w, unsigned long d)
+{
+	(void)q;
+	(void)w;
+	(void)d;
+	assert(!"T6030 reports do not defer requests");
+	return false;
+}
 static bool queue_work(void *q, struct work_struct *w)
 {
 	assert(!q && !pending);
