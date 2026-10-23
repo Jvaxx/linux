@@ -62,6 +62,19 @@ static void apple_pmc_test_agent_enable(struct kunit *test)
 				rail ? 0 : BIT(0));
 }
 
+/* A T6040 agent is enabled on the DCS and SOC rails only. */
+static void apple_pmc_test_agent_rails(struct kunit *test)
+{
+	struct apple_pmc *pmc = apple_pmc_test_alloc(test);
+	unsigned int rail;
+
+	pmc->hw = &apple_pmc_hw_t6040;
+	KUNIT_ASSERT_EQ(test, apple_pmc_agent_enable(pmc, 1, true), 0);
+	for (rail = 0; rail < pmc->hw->rails; rail++)
+		KUNIT_EXPECT_EQ(test, apple_pmc_enable_read(pmc, rail),
+				rail < 2 ? BIT(1) : 0);
+}
+
 /* Lifting a DCS limit gives the AP's agent back its own vote, not 0. */
 static void apple_pmc_test_dcs_limit_restores_ap_vote(struct kunit *test)
 {
@@ -156,6 +169,7 @@ static struct kunit_case apple_pmc_test_cases[] = {
 	KUNIT_CASE(apple_pmc_test_partial_enable),
 	KUNIT_CASE(apple_pmc_test_release_restores_ap_vote),
 	KUNIT_CASE(apple_pmc_test_agent_enable),
+	KUNIT_CASE(apple_pmc_test_agent_rails),
 	KUNIT_CASE(apple_pmc_test_dcs_limit_restores_ap_vote),
 	{}
 };
