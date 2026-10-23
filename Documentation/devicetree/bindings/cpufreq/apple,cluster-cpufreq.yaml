@@ -39,7 +39,9 @@ properties:
       - const: apple,t8142-cluster-cpufreq
       - const: apple,t8152-cluster-cpufreq
       - items:
-          - const: apple,t6020-cluster-cpufreq
+          - enum:
+              - apple,t6020-cluster-cpufreq
+              - apple,t6041-cluster-cpufreq
           - const: apple,t8112-cluster-cpufreq
 
   reg:
@@ -54,8 +56,9 @@ properties:
     items:
       - items:
           - description: PMP report region
-          - description: Cluster lane (0 for E, 1 for P on T8140)
-            enum: [0, 1]
+          - description: Cluster lane (0 for E, 1 for P on T8140; 0 for
+              E, 1 for P0, 2 for P1 on T6041)
+            enum: [0, 1, 2]
 
   '#performance-domain-cells':
     const: 0
