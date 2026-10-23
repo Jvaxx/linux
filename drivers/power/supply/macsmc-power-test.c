@@ -316,12 +316,12 @@ static void macsmc_charge_end_threshold_test(struct kunit *test)
 		{ 0x0150, 99, 0x0163 },
 		{ 0x0000, 5, 0x000a },	/* below the minimum: the minimum */
 		{ 0x0150, 0, 0x010a },
-		{ 0x0000, -1, 0x000a },
 		{ 0x0350, 60, 0x013c },	/* other high bits are not kept */
 		{ 0x0150, 100, 0x0000 },	/* no limit ends auto-discharge */
 		{ 0x0050, 100, 0x0000 },
-		{ 0x0150, 150, 0x0000 },
 	};
+	/* Outside 0..100: refused before any key is read or written. */
+	static const int refused[] = { -1, 101, 150 };
 	struct macsmc_charge_test *t = test->priv;
 	unsigned int i;
 
@@ -338,6 +338,17 @@ static void macsmc_charge_end_threshold_test(struct kunit *test)
 		KUNIT_EXPECT_EQ_MSG(test, t->nops, 2U, "case %u", i);
 		charge_test_expect_op(test, t, 0, SMC_KEY(CHLS), false, 0);
 		charge_test_expect_op(test, t, 1, SMC_KEY(CHLS), true, cases[i].after);
+	}
+
+	for (i = 0; i < ARRAY_SIZE(refused); i++) {
+		t->chls = 0x0150;
+		t->nops = 0;
+		KUNIT_EXPECT_EQ_MSG(test,
+				    charge_test_set(t, POWER_SUPPLY_PROP_CHARGE_CONTROL_END_THRESHOLD,
+						    refused[i]),
+				    -EINVAL, "threshold %d", refused[i]);
+		KUNIT_EXPECT_EQ_MSG(test, t->chls, 0x0150, "threshold %d", refused[i]);
+		KUNIT_EXPECT_EQ_MSG(test, t->nops, 0U, "threshold %d", refused[i]);
 	}
 }
 
