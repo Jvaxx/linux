@@ -36,6 +36,16 @@ properties:
   interrupts:
     maxItems: 1
 
+  apple,channel:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 0
+    maximum: 15
+    default: 0
+    description:
+      Index of this channel within its DockChannel block. Channel n owns
+      bits 2n (TX) and 2n + 1 (RX) of the shared interrupt mask and flag
+      registers.
+
 required:
   - compatible
   - reg
