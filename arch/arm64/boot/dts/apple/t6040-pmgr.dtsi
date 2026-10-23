@@ -8,6 +8,24 @@
  */
 
 &pmgr {
+	ps_apcie_st0: power-controller@108 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x108 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "apcie_st0";
+		apple,always-on;
+	};
+
+	ps_apcie_st1: power-controller@110 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x110 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "apcie_st1";
+		apple,always-on;
+	};
+
 	ps_fab3_soc: power-controller@118 {
 		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x118 4>;
@@ -89,6 +107,36 @@
 		#reset-cells = <0>;
 		label = "i2c8";
 		power-domains = <&ps_sio>;
+	};
+
+	ps_ans: power-controller@370 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x370 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ans";
+		power-domains = <&ps_fab3_soc>;
+		apple,always-on;
+	};
+
+	ps_apcie_sys_st0: power-controller@380 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x380 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "apcie_sys_st0";
+		power-domains = <&ps_ans>, <&ps_apcie_st0>;
+		apple,always-on;
+	};
+
+	ps_apcie_sys_st1: power-controller@388 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x388 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "apcie_sys_st1";
+		power-domains = <&ps_ans>, <&ps_apcie_st1>;
+		apple,always-on;
 	};
 };
 
