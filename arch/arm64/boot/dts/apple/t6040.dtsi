@@ -866,15 +866,17 @@
 
 		/*
 		 * The GPU (soc-device 13). Without it the running PMP treats
-		 * the GPU as off and holds it at its lowest state.
+		 * the GPU as off and holds it at its lowest state, but claiming
+		 * it while nothing powers the GPU crashes the PMP firmware
+		 * (SError) right after it starts. The GPU node takes it as a
+		 * power domain, so it is on only while the GPU driver runs.
 		 */
-		report@d {
+		pmp_gfx: report@d {
 			compatible = "apple,t6041-pmp-v2-report-entry",
 				     "apple,t6000-pmp-v2-report-entry";
 			reg = <0xd>;
 			label = "pmp-gfx";
 			#power-domain-cells = <0>;
-			apple,always-on;
 		};
 	};
 
