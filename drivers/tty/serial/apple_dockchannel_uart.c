@@ -18,8 +18,13 @@
 
 #define IRQ_MASK          0x0
 #define IRQ_FLAG          0x4
-#define IRQ_TX            BIT(0)
-#define IRQ_RX            BIT(1)
+/*
+ * The interrupt window is shared by all channels of the block: channel n
+ * owns bit 2n (TX) and bit 2n + 1 (RX) of both registers.
+ */
+#define IRQ_TX(ch)        BIT(2 * (ch))
+#define IRQ_RX(ch)        BIT(2 * (ch) + 1)
+#define MAX_CHANNELS      16
 
 #define CONFIG_TX_THRESH  0x0
 #define CONFIG_RX_THRESH  0x4
@@ -38,7 +43,8 @@ struct dcuart_port {
 	struct uart_port port;
 	void __iomem *config_base;
 	void __iomem *irq_base;
-	u32 irq_mask;
+	u32 irq_tx;
+	u32 irq_rx;
 	/* Serializes IRQ mask updates and RX FIFO draining. */
 	spinlock_t lock;
 };
@@ -54,11 +60,14 @@ static inline struct dcuart_port *port_to_dc(struct uart_port *port)
 static void dcuart_irq_update(struct dcuart_port *dcuart,
 			      u32 bits, bool enable)
 {
+	u32 mask = readl_relaxed(dcuart->irq_base + IRQ_MASK);
+
+	/* Leave the bits of the other channels alone. */
 	if (enable)
-		dcuart->irq_mask |= bits;
+		mask |= bits;
 	else
-		dcuart->irq_mask &= ~bits;
-	writel_relaxed(dcuart->irq_mask, dcuart->irq_base + IRQ_MASK);
+		mask &= ~bits;
+	writel_relaxed(mask, dcuart->irq_base + IRQ_MASK);
 }
 
 static void dcuart_irq_enable(struct dcuart_port *dcuart, u32 bits)
@@ -134,12 +143,13 @@ static irqreturn_t dcuart_interrupt(int irq, void *data)
 	u32 pending = readl_relaxed(dcuart->irq_base + IRQ_FLAG);
 	u32 handled = 0;
 
-	if (!(pending & (IRQ_TX | IRQ_RX)))
+	pending &= dcuart->irq_tx | dcuart->irq_rx;
+	if (!pending)
 		return IRQ_NONE;
 
 	spin_lock(&dcuart->lock);
 
-	if (pending & IRQ_RX) {
+	if (pending & dcuart->irq_rx) {
 		int left;
 
 		while ((left = readl_relaxed(dcuart->port.membase + DATA_RX_COUNT))) {
@@ -157,10 +167,10 @@ static irqreturn_t dcuart_interrupt(int irq, void *data)
 				left--;
 			}
 		}
-		handled |= IRQ_RX;
+		handled |= dcuart->irq_rx;
 	}
 
-	if (handled & IRQ_RX)
+	if (handled & dcuart->irq_rx)
 		tty_flip_buffer_push(&dcuart->port.state->port);
 	writel_relaxed(handled, dcuart->irq_base + IRQ_FLAG);
 	spin_unlock(&dcuart->lock);
@@ -198,7 +208,7 @@ static void dcuart_stop_rx(struct uart_port *port)
 	unsigned long flags;
 
 	spin_lock_irqsave(&dcuart->lock, flags);
-	dcuart_irq_disable(dcuart, IRQ_RX);
+	dcuart_irq_disable(dcuart, dcuart->irq_rx);
 	spin_unlock_irqrestore(&dcuart->lock, flags);
 }
 
@@ -214,10 +224,10 @@ static int dcuart_startup(struct uart_port *port)
 	unsigned long flags;
 
 	spin_lock_irqsave(&dcuart->lock, flags);
-	dcuart_irq_disable(dcuart, IRQ_TX | IRQ_RX);
+	dcuart_irq_disable(dcuart, dcuart->irq_tx | dcuart->irq_rx);
 	writel_relaxed(1, dcuart->config_base + CONFIG_RX_THRESH);
 	writel_relaxed(FIFO_SIZE, dcuart->config_base + CONFIG_TX_THRESH);
-	dcuart_irq_enable(dcuart, IRQ_RX);
+	dcuart_irq_enable(dcuart, dcuart->irq_rx);
 	spin_unlock_irqrestore(&dcuart->lock, flags);
 
 	enable_irq(port->irq);
@@ -232,7 +242,7 @@ static void dcuart_shutdown(struct uart_port *port)
 	disable_irq(port->irq);
 
 	spin_lock_irqsave(&dcuart->lock, flags);
-	dcuart_irq_disable(dcuart, IRQ_TX | IRQ_RX);
+	dcuart_irq_disable(dcuart, dcuart->irq_tx | dcuart->irq_rx);
 	spin_unlock_irqrestore(&dcuart->lock, flags);
 }
 
@@ -296,6 +306,7 @@ static int dcuart_probe(struct platform_device *pdev)
 	int ret, index;
 	struct dcuart_port *dcuart;
 	struct resource *data_res;
+	u32 channel = 0;
 
 	for (index = 0; index < MAX_PORTS; index += 1) {
 		if (!dcuart_ports[index])
@@ -315,6 +326,14 @@ static int dcuart_probe(struct platform_device *pdev)
 	dcuart->port.iotype = UPIO_MEM32;
 	dcuart->port.flags = UPF_BOOT_AUTOCONF;
 	spin_lock_init(&dcuart->lock);
+
+	of_property_read_u32(pdev->dev.of_node, "apple,channel", &channel);
+	if (channel >= MAX_CHANNELS)
+		return dev_err_probe(&pdev->dev, -EINVAL,
+				     "invalid DockChannel channel %u\n", channel);
+	dcuart->irq_tx = IRQ_TX(channel);
+	dcuart->irq_rx = IRQ_RX(channel);
+
 	dcuart->irq_base = devm_platform_ioremap_resource_byname(pdev, "irq");
 	if (IS_ERR(dcuart->irq_base))
 		return PTR_ERR(dcuart->irq_base);
@@ -330,8 +349,9 @@ static int dcuart_probe(struct platform_device *pdev)
 		return -EINVAL;
 	dcuart->port.mapbase = data_res->start;
 
-	writel_relaxed(0, dcuart->irq_base + IRQ_MASK);
-	writel_relaxed(~0, dcuart->irq_base + IRQ_FLAG);
+	dcuart_irq_disable(dcuart, dcuart->irq_tx | dcuart->irq_rx);
+	writel_relaxed(dcuart->irq_tx | dcuart->irq_rx,
+		       dcuart->irq_base + IRQ_FLAG);
 
 	dcuart->port.irq = platform_get_irq(pdev, 0);
 	if (dcuart->port.irq < 0)
