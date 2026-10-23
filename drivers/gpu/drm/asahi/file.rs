@@ -382,8 +382,11 @@ impl File {
             return Err(ENODEV);
         }
 
+        let memory_limits = memacct::LEDGER.limits();
         let mut params = uapi::drm_asahi_params_global {
             features: 0,
+            memory_limit: memory_limits.device,
+            client_memory_limit: memory_limits.client,
 
             vm_start: file.inner().user_range.start,
             vm_end: file.inner().user_range.end,
@@ -661,7 +664,16 @@ impl File {
                 size
             );
         })?;
-        let gem = gem::new_object(device, size, data.flags, resv_obj, reclaim_cpu, commit)?;
+        // Large G17 user objects are populated in full by the first VM_BIND.
+        // Do not multiply direct reclaim/compaction latency by their folio
+        // count. Userspace can evict its BO cache and retry after ENOMEM.
+        let pages_no_reclaim = gem::user_pages_no_reclaim(
+            size,
+            _reg_data.gpu.as_any().is::<crate::g17::Gpu>(),
+        );
+        let gem = gem::new_object(
+            device, size, data.flags, resv_obj, reclaim_cpu, pages_no_reclaim, commit,
+        )?;
 
         let handle = gem.create_handle(file)?;
         data.handle = handle;
