@@ -12,7 +12,12 @@ maintainers:
 allOf:
   - $ref: power-domain.yaml#
   - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8132-pmgr-pwrstate
       required:
+        - compatible
         - apple,inherited-on
     then:
       properties:
