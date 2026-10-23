@@ -72,7 +72,7 @@ properties:
     description: Link to the SuperSpeed lanes of the Type-C connector.
 
 patternProperties:
-  "^apple,tunable-(axi2af|axi2af-lioa|fabric|common-cfg|lane0|lane1|aus40cmn-shm|auspll|cio4pll|pipehandler)$":
+  "^apple,tunable-(axi2af|axi2af-lioa|fabric|common-cfg|lane0|lane1|aus40cmn-shm|auspll|cio4pll|pipehandler|usb2-host)$":
     $ref: /schemas/types.yaml#/definitions/uint32-matrix
     minItems: 1
     maxItems: 512

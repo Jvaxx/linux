@@ -209,6 +209,8 @@ struct t6040_usb2_phy {
 	struct resource *cpu_data;
 	struct apple_tunable *tunables[T6040_USB3_NR_TUNABLES];
 	struct apple_tunable *tunable_pipehandler;
+	/* ADT tunable_USB2PHY_HOST, applied after the signal setup. */
+	struct apple_tunable *tunable_usb2_host;
 	struct apple_rtkit *rtk;
 	struct completion app_reply;
 	enum typec_orientation orientation;
@@ -252,10 +254,27 @@ static int t6040_usb2_set_mode(struct phy *phy, enum phy_mode mode, int submode)
 	return 0;
 }
 
+/* The five signal bits the init sequence sets, as the host tunable leaves them. */
+#define T6040_USB2_SIG_INIT	(T6040_USB2_SIG_HOST_0 | T6040_USB2_SIG_HOST_1 | \
+				 T6040_USB2_SIG_HOST_2 | T6040_USB2_SIG_VBUSDET_FORCE_VAL | \
+				 T6040_USB2_SIG_VBUSDET_FORCE_EN)
+
+static u32 t6040_usb2_sig_want(struct t6040_usb2_phy *tphy)
+{
+	struct apple_tunable *t = tphy->tunable_usb2_host;
+	u32 want = T6040_USB2_SIG_INIT;
+	size_t i;
+
+	for (i = 0; t && i < t->sz; i++)
+		if (t->values[i].offset == T6040_USB2_SIG)
+			want = (want & ~t->values[i].mask) | t->values[i].value;
+	return want & T6040_USB2_SIG_INIT;
+}
+
 static int t6040_usb2_power_on(struct phy *phy)
 {
 	struct t6040_usb2_phy *tphy = phy_get_drvdata(phy);
-	u32 status, ctl, sig, tune, mode;
+	u32 status, ctl, sig, tune, mode, sig_want;
 
 	guard(mutex)(&tphy->lock);
 	if (tphy->shutdown_failed)
@@ -281,6 +300,14 @@ static int t6040_usb2_power_on(struct phy *phy)
 			 T6040_USB2_SIG_VBUSDET_FORCE_VAL);
 	t6040_usb2_set32(tphy->usb2 + T6040_USB2_SIG,
 			 T6040_USB2_SIG_VBUSDET_FORCE_EN);
+
+	/*
+	 * The host tunable then sets the signal fields for host mode: on the
+	 * J616s it clears SIG[14:12] again (mask 0x7003, value 0x3). Left at
+	 * their init values, which are the device-mode ones, the USB2 port
+	 * never sees a connect.
+	 */
+	apple_tunable_apply(tphy->usb2, tphy->tunable_usb2_host);
 
 	msleep(10);
 
@@ -315,6 +342,7 @@ static int t6040_usb2_power_on(struct phy *phy)
 			  T6040_USB2_USBCTL_MODE_HOST);
 
 	/* Confirm the programmed fields before the core can start the host. */
+	sig_want = t6040_usb2_sig_want(tphy);
 	ctl = readl(tphy->usb2 + T6040_USB2_CTL);
 	sig = readl(tphy->usb2 + T6040_USB2_SIG);
 	tune = readl(tphy->usb2 + T6040_USB2_MISCTUNE);
@@ -325,12 +353,7 @@ static int t6040_usb2_power_on(struct phy *phy)
 	    (ctl & (T6040_USB2_CTL_RESET | T6040_USB2_CTL_PORT_RESET |
 		    T6040_USB2_CTL_SIDDQ | T6040_USB2_CTL_APB_RESET_N)) !=
 		   T6040_USB2_CTL_APB_RESET_N ||
-	    (sig & (T6040_USB2_SIG_HOST_0 | T6040_USB2_SIG_HOST_1 |
-		    T6040_USB2_SIG_HOST_2 | T6040_USB2_SIG_VBUSDET_FORCE_VAL |
-		    T6040_USB2_SIG_VBUSDET_FORCE_EN)) !=
-		   (T6040_USB2_SIG_HOST_0 | T6040_USB2_SIG_HOST_1 |
-		    T6040_USB2_SIG_HOST_2 | T6040_USB2_SIG_VBUSDET_FORCE_VAL |
-		    T6040_USB2_SIG_VBUSDET_FORCE_EN) ||
+	    (sig & T6040_USB2_SIG_INIT) != sig_want ||
 	    (tune & (T6040_USB2_MISCTUNE_APBCLK_GATE_OFF |
 		     T6040_USB2_MISCTUNE_REFCLK_GATE_OFF)) ||
 	    (mode & T6040_USB2_USBCTL_MODE) != T6040_USB2_USBCTL_MODE_HOST ||
@@ -1153,6 +1176,16 @@ static int t6040_usb2_probe(struct platform_device *pdev)
 	if (IS_ERR(tphy->usb2))
 		return dev_err_probe(dev, PTR_ERR(tphy->usb2),
 				     "failed to map USB2 bank 0\n");
+
+	if (of_property_present(dev->of_node, "apple,tunable-usb2-host")) {
+		tphy->tunable_usb2_host =
+			devm_apple_tunable_parse(dev, dev->of_node, "apple,tunable-usb2-host",
+						 platform_get_resource_byname(pdev, IORESOURCE_MEM,
+									      "bank0"));
+		if (IS_ERR(tphy->tunable_usb2_host))
+			return dev_err_probe(dev, PTR_ERR(tphy->tunable_usb2_host),
+					     "invalid apple,tunable-usb2-host\n");
+	}
 
 	tphy->evt = devm_platform_ioremap_resource_byname(pdev, "bank1");
 	if (IS_ERR(tphy->evt))

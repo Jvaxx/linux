@@ -181,6 +181,8 @@
 		<0x3ab0 0x00700000 0x00300000>,
 		<0x3ae8 0x00060000 0x00020000>;
 	apple,tunable-pipehandler = <0x44 0x4 0x4>;
+	/* ADT tunable_USB2PHY_HOST, relative to USB2 bank 0. */
+	apple,tunable-usb2-host = <0x8 0x7003 0x3>;
 };
 
 &atcphy1 {
@@ -358,6 +360,8 @@
 		<0x3ab0 0x00700000 0x00300000>,
 		<0x3ae8 0x00060000 0x00020000>;
 	apple,tunable-pipehandler = <0x44 0x4 0x4>;
+	/* ADT tunable_USB2PHY_HOST, relative to USB2 bank 0. */
+	apple,tunable-usb2-host = <0x8 0x7003 0x3>;
 };
 
 &atcphy2 {
@@ -535,6 +539,8 @@
 		<0x3ab0 0x00700000 0x00300000>,
 		<0x3ae8 0x00060000 0x00020000>;
 	apple,tunable-pipehandler = <0x44 0x4 0x4>;
+	/* ADT tunable_USB2PHY_HOST, relative to USB2 bank 0. */
+	apple,tunable-usb2-host = <0x8 0x7003 0x3>;
 };
 
 &usb_drd0 {
