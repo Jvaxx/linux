@@ -52,7 +52,7 @@ _Static_assert(offsetof(struct domain,cm)==sizeof(struct tb),"mock private stora
 struct kref {int count;};
 struct tb_path {bool reserved;};
 enum {TB_TUNNEL_DP,TB_TUNNEL_USB3};
-struct tb_tunnel {struct kref kref;struct tb*tb;struct tb_port*src_port,*dst_port;int npaths;void(*destroy)(struct tb_tunnel*);struct list_head list;int type;bool dprx_started,dprx_canceled;void(*callback)(struct tb_tunnel*);struct tb_path*paths[3];};
+struct tb_tunnel {struct kref kref;struct tb*tb;struct tb_port*src_port,*dst_port;int npaths;void(*destroy)(struct tb_tunnel*);struct list_head list;int type;bool dprx_started,dprx_canceled;void(*callback)(struct tb_tunnel*,void*);void*callback_data;struct tb_path*paths[3];};
 static int tb_tunnel_lock,occupied,alloc_calls,alloc_failures,alloc_successes,freed;
 static int domain_refs,pm_refs,pm_calls,pm_error,stop_during_pm,requeue_once,lock_depth;
 static int restore_calls,scan_calls,unplugged_xdomains;
@@ -124,7 +124,7 @@ static void tb_tunnel_dp(struct tb*t){
 FOOTER = r'''
 static struct tb_tunnel*new_tunnel(struct tb*tb,struct tb_port*in,struct tb_port*out){
  struct tb_tunnel*t=calloc(1,sizeof(*t));CHECK(t);t->tb=tb;t->src_port=in;t->dst_port=out;t->type=TB_TUNNEL_DP;t->kref.count=1;t->npaths=1;
- t->paths[0]=calloc(1,sizeof(struct tb_path));CHECK(t->paths[0]);t->paths[0]->reserved=true;occupied++;t->callback=tb_dp_tunnel_active;current=t;return t;
+ t->paths[0]=calloc(1,sizeof(struct tb_path));CHECK(t->paths[0]);t->paths[0]->reserved=true;occupied++;t->callback=tb_dp_tunnel_active;t->callback_data=tb;current=t;return t;
 }
 static void flush_queue(void){
  unsigned n=0;
@@ -290,11 +290,11 @@ def main():
                                       cwd=ROOT, text=True)
         parts['tb_complete'] = function(old, 'tb_complete')
     worker = function(tunnel, 'tb_dp_dprx_work')
-    marker = '\ttunnel->callback(tunnel);'
+    marker = '\ttunnel->callback(tunnel, tunnel->callback_data);'
     if worker.count(marker) != 1:
         raise ValueError('DPRX completion tail changed; review extraction')
     tail = worker[worker.index(marker):].rstrip()[:-1]
-    if tail.strip() != 'tunnel->callback(tunnel);\n\ttb_tunnel_put(tunnel);\n\ttb_domain_put(tb);':
+    if tail.strip() != 'tunnel->callback(tunnel, tunnel->callback_data);\n\ttb_tunnel_put(tunnel);\n\ttb_domain_put(tb);':
         raise ValueError('DPRX reference-release order changed; review extraction')
     production = '\n'.join(parts.values())
     probe = (ROOT / 'drivers/thunderbolt/tb.c').read_text()
