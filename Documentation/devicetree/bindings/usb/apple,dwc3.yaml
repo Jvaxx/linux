@@ -32,6 +32,7 @@ properties:
           - enum:
               - apple,t6000-dwc3
               - apple,t6020-dwc3
+              - apple,t6040-dwc3
               - apple,t8112-dwc3
               - apple,t8140-dwc3
               - apple,t8142-dwc3
@@ -40,14 +41,18 @@ properties:
       - const: apple,t8132-dwc3
 
   reg:
+    minItems: 2
     items:
       - description: Core DWC3 region
       - description: Apple-specific DWC3 region
+      - description: Controller configuration block (T6040)
 
   reg-names:
+    minItems: 2
     items:
       - const: dwc3-core
       - const: dwc3-apple
+      - const: drd-cfg
 
   interrupts:
     maxItems: 1
@@ -60,6 +65,20 @@ properties:
 
   power-domains:
     maxItems: 1
+
+patternProperties:
+  "^apple,tunable-(gbl-default|gbl-host|dbg|cfg-host|link)$":
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    minItems: 1
+    maxItems: 512
+    items:
+      items:
+        - description: Register offset
+        - description: Mask to be applied to the register value
+        - description: Bits to be set after applying the mask
+    description: >
+      Controller tables from the device's Apple device tree, applied after
+      every core reset (T6040).
 
 required:
   - compatible
