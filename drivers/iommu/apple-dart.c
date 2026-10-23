@@ -483,7 +483,11 @@ static void __iomem *apple_dart_retained_ioremap(struct apple_dart *dart,
 						resource_size(res), dev_name(dart->dev));
 	if (ret)
 		return IOMEM_ERR_PTR(ret);
-	ptr = ioremap(res->start, resource_size(res));
+	/* Match devm_ioremap_resource(): Apple SoC MMIO is non-posted. */
+	if (res->flags & IORESOURCE_MEM_NONPOSTED)
+		ptr = ioremap_np(res->start, resource_size(res));
+	else
+		ptr = ioremap(res->start, resource_size(res));
 	if (!ptr || apple_dart_manage_retained_resource(dart, (__force void *)ptr,
 				resource_size(res), apple_dart_unmap_retained_mmio))
 		return IOMEM_ERR_PTR(-ENOMEM);
