@@ -919,6 +919,14 @@
 		/* child nodes are added in t6040-pmgr.dtsi */
 	};
 
+	pmgr_isp: power-management@502284000 {
+		compatible = "apple,t6041-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+		#address-cells = <1>;
+		#size-cells = <1>;
+		reg = <0x5 0x02284000 0x0 0x4000>;
+		/* child nodes are added in t6040-pmgr.dtsi */
+	};
+
 	aic: interrupt-controller@502400000 {
 		compatible = "apple,t6041-aic3", "apple,t8122-aic3";
 		#interrupt-cells = <3>;
@@ -1320,6 +1328,68 @@
 			pinmux = <APPLE_PINMUX(72, 1)>,
 				 <APPLE_PINMUX(73, 1)>;
 		};
+	};
+
+	/*
+	 * ISP (ADT isp0, firmware loaded by iBoot). "coproc" is the
+	 * coprocessor up to its control block; "mbox", "gpio" and "mbox2" are
+	 * the interrupt words, the firmware handshake words and the doorbell
+	 * of its mailbox at +0x2924000. The first of the ADT's four
+	 * interrupts carries the mailbox.
+	 */
+	isp: isp@580000000 {
+		compatible = "apple,t6041-isp", "apple,isp";
+		reg = <0x5 0x80000000 0x0 0x1604000>,
+		      <0x5 0x82924000 0x0 0x40>,
+		      <0x5 0x829241d0 0x0 0x20>,
+		      <0x5 0x82924464 0x0 0x10>;
+		reg-names = "coproc", "mbox", "gpio", "mbox2";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 646 IRQ_TYPE_LEVEL_HIGH>;
+		iommus = <&isp_dart0 0>, <&isp_dart1 0>, <&isp_dart2 0>;
+		power-domains = <&ps_isp_sys>, <&ps_isp_cpu>, <&ps_isp_fe>,
+				<&ps_isp_dprx>, <&ps_isp_secure>, <&ps_isp_be>,
+				<&ps_isp_clr>, <&ps_ispsens0>;
+		/* the shared memory window above the firmware's 32 MiB */
+		apple,dart-vm-size = /bits/ 64 <0xde600000>;
+		status = "disabled";
+	};
+
+	/*
+	 * ADT dart-isp0: three instances on one interrupt; ADT "remap": streams
+	 * 1, 6, 7, 10 and 11 are stream 0.
+	 */
+	isp_dart0: iommu@5828c0000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x5 0x828c0000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 664 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_isp_sys>;
+		apple,remap-streams = <1 0>, <6 0>, <7 0>, <10 0>, <11 0>;
+		status = "disabled";
+	};
+
+	isp_dart1: iommu@5828e0000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x5 0x828e0000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 664 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_isp_sys>;
+		apple,remap-streams = <1 0>, <6 0>, <7 0>, <10 0>, <11 0>;
+		status = "disabled";
+	};
+
+	isp_dart2: iommu@582900000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x5 0x82900000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 664 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_isp_sys>;
+		apple,remap-streams = <1 0>, <6 0>, <7 0>, <10 0>, <11 0>;
+		status = "disabled";
 	};
 };
 

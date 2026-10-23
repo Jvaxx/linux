@@ -8,6 +8,14 @@
  */
 
 &pmgr {
+	ps_ispsens0: power-controller@0 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "ispsens0";
+	};
+
 	ps_apcie_st0: power-controller@108 {
 		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x108 4>;
@@ -119,6 +127,15 @@
 		apple,always-on;
 	};
 
+	ps_isp_sys: power-controller@378 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x378 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_sys";
+		power-domains = <&ps_fab6_soc>;
+	};
+
 	ps_apcie_sys_st0: power-controller@380 {
 		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x380 4>;
@@ -140,6 +157,69 @@
 	};
 };
 
+/*
+ * The ISP's own power states at PMGR +0x4000 (ADT isp0 reg[1]). The ADT
+ * gives addresses only for ISP_CPU and ISP_FE; the other slots follow
+ * T8140's order (CPU, FE, DPRX, SECURE, BE, CLR) without the blocks T6040
+ * lacks. With only CPU and FE on, the firmware takes an SError while it
+ * loads its tunables.
+ */
+&pmgr_isp {
+	ps_isp_cpu: power-controller@0 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_cpu";
+		power-domains = <&ps_isp_sys>;
+	};
+
+	ps_isp_fe: power-controller@8 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_fe";
+		power-domains = <&ps_isp_sys>;
+	};
+
+	ps_isp_dprx: power-controller@10 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x10 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_dprx";
+		power-domains = <&ps_isp_fe>;
+	};
+
+	ps_isp_secure: power-controller@18 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x18 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_secure";
+		power-domains = <&ps_isp_fe>;
+	};
+
+	ps_isp_be: power-controller@20 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x20 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_be";
+		power-domains = <&ps_isp_fe>;
+	};
+
+	ps_isp_clr: power-controller@28 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x28 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "isp_clr";
+		power-domains = <&ps_isp_be>;
+	};
+};
+
 &pmgr_aux {
 	ps_pms: power-controller@100 {
 		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
@@ -147,6 +227,16 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "pms";
+		apple,always-on;
+	};
+
+	/* fabric parent of isp_sys, on from boot */
+	ps_afi: power-controller@110 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x110 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "afi";
 		apple,always-on;
 	};
 
@@ -182,6 +272,16 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "pms_sram";
+		apple,always-on;
+	};
+
+	ps_fab6_soc: power-controller@480 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x480 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "fab6_soc";
+		power-domains = <&ps_afi>;
 		apple,always-on;
 	};
 };
