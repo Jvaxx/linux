@@ -654,34 +654,48 @@ struct PmpHwConfig {
     /// Check the firmware's `uuid` header before trusting the boot argument
     /// block it points to.
     check_bootargs_uuid: bool,
-    coreanalytics: bool,
+    /// When the firmware needs system endpoint 7 (CoreAnalytics) started
+    /// and given its buffer before it acknowledges the IOP power state.
+    coreanalytics: Ep7,
+}
+
+/// Whether a PMP firmware needs endpoint 7 to finish its RTKit boot.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ep7 {
+    /// Never started.
+    No,
+    /// Only on the retained J713 board.
+    RetainedBoard,
+    /// On every board with this SoC.
+    Always,
 }
 
 const HW_CFG_DEFAULT: PmpHwConfig = PmpHwConfig {
     dma_mask: None,
     check_bootargs_uuid: false,
-    coreanalytics: false,
+    coreanalytics: Ep7::No,
 };
 
 /// T8140: the DART translates 42 bits and its DMA window starts at 1 TiB.
 const HW_CFG_T8140: PmpHwConfig = PmpHwConfig {
     dma_mask: Some(DmaMask::new::<42>()),
     check_bootargs_uuid: false,
-    coreanalytics: false,
+    coreanalytics: Ep7::No,
 };
 
 /// T6041: the DART window starts at 1 TiB; the boot argument header is
-/// version 5.
+/// version 5. The firmware advertises endpoint 7 and does not acknowledge
+/// the IOP power state (-ETIME) until it is started and has its buffer.
 const HW_CFG_T6041: PmpHwConfig = PmpHwConfig {
     dma_mask: Some(DmaMask::new::<42>()),
     check_bootargs_uuid: true,
-    coreanalytics: false,
+    coreanalytics: Ep7::Always,
 };
 
 const HW_CFG_T8132: PmpHwConfig = PmpHwConfig {
     dma_mask: None,
     check_bootargs_uuid: false,
-    coreanalytics: true,
+    coreanalytics: Ep7::RetainedBoard,
 };
 
 impl Drop for PmpDriver {
@@ -747,10 +761,14 @@ impl platform::Driver for PmpDriver {
             patches.push((from_fourcc(b"PMCB"), (v >> 3) & 1), GFP_KERNEL)?;
         }
         data.patch_bootargs(&pmp_mmio, &patches, cfg.check_bootargs_uuid)?;
-        // EP7 is a qualified startup dependency only on the retained J713 PMP.
-        // SAFETY: the predicate only reads machine compatibility.
-        let needs_coreanalytics =
-            cfg.coreanalytics && unsafe { bindings::apple_pmp_telemetry_retained_board() };
+        // EP7 is a startup dependency on every T6041 PMP, and on the
+        // retained J713 PMP among the T8132 boards.
+        let needs_coreanalytics = match cfg.coreanalytics {
+            Ep7::No => false,
+            Ep7::Always => true,
+            // SAFETY: the predicate only reads machine compatibility.
+            Ep7::RetainedBoard => unsafe { bindings::apple_pmp_telemetry_retained_board() },
+        };
         let rtkit = if needs_coreanalytics {
             rtkit::RtKit::<PmpData>::new_with_coreanalytics(&dev, None, 0, data.clone())?
         } else {
