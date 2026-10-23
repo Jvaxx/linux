@@ -29,7 +29,11 @@ description: |
 
 properties:
   compatible:
-    const: apple,dockchannel-hid
+    oneOf:
+      - const: apple,dockchannel-hid
+      - items:
+          - const: apple,t6041-dockchannel-hid
+          - const: apple,dockchannel-hid
 
   reg:
     minItems: 4
