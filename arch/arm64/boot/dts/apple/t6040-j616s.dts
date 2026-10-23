@@ -618,3 +618,237 @@
 &isp_dart2 {
 	status = "okay";
 };
+
+/*
+ * The Type-C ports (ADT nub-spmi-a0 hpm0/hpm1, nub-spmi-a1 hpm2). The ADT
+ * lists the event, sleep and wake interrupts; select is event + 2.
+ */
+&nub_spmi_a0 {
+	status = "okay";
+
+	hpm0: usb-pd@c {
+		compatible = "apple,sn201202x";
+		reg = <0xc SPMI_USID>;
+		interrupts = <11 IRQ_TYPE_EDGE_RISING>,
+			     <13 IRQ_TYPE_EDGE_RISING>,
+			     <17 IRQ_TYPE_EDGE_RISING>,
+			     <19 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "select", "sleep", "wake";
+
+		typec0: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Left Back";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					typec0_con_hs: endpoint {
+						remote-endpoint = <&usb_drd0_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					typec0_con_ss: endpoint {
+						remote-endpoint = <&atcphy0_ss>;
+					};
+				};
+			};
+		};
+	};
+
+	hpm1: usb-pd@a {
+		compatible = "apple,sn201202x";
+		reg = <0xa SPMI_USID>;
+		interrupts = <37 IRQ_TYPE_EDGE_RISING>,
+			     <39 IRQ_TYPE_EDGE_RISING>,
+			     <43 IRQ_TYPE_EDGE_RISING>,
+			     <45 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "select", "sleep", "wake";
+
+		typec1: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Left Front";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					typec1_con_hs: endpoint {
+						remote-endpoint = <&usb_drd1_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					typec1_con_ss: endpoint {
+						remote-endpoint = <&atcphy1_ss>;
+					};
+				};
+			};
+		};
+	};
+};
+
+&nub_spmi_a1 {
+	status = "okay";
+
+	hpm2: usb-pd@c {
+		compatible = "apple,sn201202x";
+		reg = <0xc SPMI_USID>;
+		interrupts = <11 IRQ_TYPE_EDGE_RISING>,
+			     <13 IRQ_TYPE_EDGE_RISING>,
+			     <17 IRQ_TYPE_EDGE_RISING>,
+			     <19 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "select", "sleep", "wake";
+
+		typec2: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Right";
+			power-role = "dual";
+			data-role = "dual";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					typec2_con_hs: endpoint {
+						remote-endpoint = <&usb_drd2_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					typec2_con_ss: endpoint {
+						remote-endpoint = <&atcphy2_ss>;
+					};
+				};
+			};
+		};
+	};
+};
+
+&atcphy0 {
+	status = "okay";
+
+	port {
+		atcphy0_ss: endpoint {
+			remote-endpoint = <&typec0_con_ss>;
+		};
+	};
+};
+
+&atcphy0_mbox {
+	status = "okay";
+};
+
+&usb_drd0_dart_0 {
+	status = "okay";
+};
+
+&usb_drd0_dart_1 {
+	status = "okay";
+};
+
+&usb_drd0 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			usb_drd0_hs: endpoint {
+				remote-endpoint = <&typec0_con_hs>;
+			};
+		};
+	};
+};
+
+&atcphy1 {
+	status = "okay";
+
+	port {
+		atcphy1_ss: endpoint {
+			remote-endpoint = <&typec1_con_ss>;
+		};
+	};
+};
+
+&atcphy1_mbox {
+	status = "okay";
+};
+
+&usb_drd1_dart_0 {
+	status = "okay";
+};
+
+&usb_drd1_dart_1 {
+	status = "okay";
+};
+
+&usb_drd1 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			usb_drd1_hs: endpoint {
+				remote-endpoint = <&typec1_con_hs>;
+			};
+		};
+	};
+};
+
+&atcphy2 {
+	status = "okay";
+
+	port {
+		atcphy2_ss: endpoint {
+			remote-endpoint = <&typec2_con_ss>;
+		};
+	};
+};
+
+&atcphy2_mbox {
+	status = "okay";
+};
+
+&usb_drd2_dart_0 {
+	status = "okay";
+};
+
+&usb_drd2_dart_1 {
+	status = "okay";
+};
+
+&usb_drd2 {
+	status = "okay";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port@0 {
+			reg = <0>;
+			usb_drd2_hs: endpoint {
+				remote-endpoint = <&typec2_con_hs>;
+			};
+		};
+	};
+};
