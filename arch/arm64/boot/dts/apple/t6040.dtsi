@@ -535,6 +535,15 @@
 		#performance-domain-cells = <0>;
 	};
 
+	pcie_dart: iommu@410000000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x4 0x10000000 0x0 0x20000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1724 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
 	/* iBoot leaves the I2C gates on and the pins muxed to I2C. */
 	i2c1: i2c@429014000 {
 		compatible = "apple,t6041-i2c", "apple,t8103-i2c";

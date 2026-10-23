@@ -21,6 +21,8 @@
 
 	aliases {
 		keyboard = &keyboard;
+		wifi0 = "/pcie@1cb0000000/pci@0,0/wifi@0,0";
+		bluetooth0 = "/pcie@1cb0000000/pci@0,0/bluetooth@0,1";
 	};
 
 	chosen {
@@ -140,6 +142,10 @@
 
 &pinctrl {
 	status = "okay";
+
+	wifi_clkreq: wifi-clkreq {
+		pinmux = <APPLE_PINMUX(0, 1)>;
+	};
 };
 
 /*
@@ -218,3 +224,64 @@
 #include "hwmon-common.dtsi"
 #include "hwmon-fan-dual.dtsi"
 #include "hwmon-laptop.dtsi"
+
+&pcie_dart {
+	status = "okay";
+};
+
+/*
+ * Wi-Fi and Bluetooth (BCM4388). The boot loader adds the per-unit
+ * calibration and Bluetooth address to these nodes, and its Bluetooth
+ * admission depends on this node exactly as it is; it is kept as the
+ * booted tree has it.
+ */
+/ {
+	pcie0: pcie@1cb0000000 {
+		compatible = "apple,t6041-pcie", "apple,t6020-pcie";
+		reg = <0x1c 0xb0000000 0 0x1000000 4 0x14000000 0 0x4000 4 0x10028000 0 0x4000 4 0x17020000 0 0x4000>;
+		reg-names = "config", "rc", "port0", "phy0";
+		ranges = <0x43000000 0xb 0xc0000000 0xb 0xc0000000 0 0x20000000 0x2000000 0 0x80000000 0xb 0x80000000 0 0x40000000>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&wifi_clkreq>;
+		#size-cells = <2>;
+		#address-cells = <3>;
+		bus-range = <0 1>;
+		iommu-map-mask = <0xffff>;
+		iommu-map = <0x100 &pcie_dart 1 2>;
+		msi-ranges = <&aic AIC_IRQ 2071 IRQ_TYPE_EDGE_RISING 32>;
+		msi-parent = <&pcie0>;
+		msi-controller;
+		interrupts = <0 0x6bb 4>;
+		interrupt-parent = <&aic>;
+		device_type = "pci";
+
+		port00: pci@0,0 {
+			compatible = "pciclass,0604";
+			reg = <0 0 0 0 0>;
+			ranges;
+			interrupt-map = <0 0 0 1 &port00 0 0 0 0 0 0 0 2 &port00 0 0 0 1 0 0 0 3 &port00 0 0 0 2 0 0 0 4 &port00 0 0 0 3>;
+			interrupt-map-mask = <0 0 0 7>;
+			#interrupt-cells = <1>;
+			interrupt-controller;
+			#size-cells = <2>;
+			#address-cells = <3>;
+			pwren-gpios = <&smc_gpio 0x13 0>;
+			reset-gpios = <&pinctrl 4 1>;
+			device_type = "pci";
+
+			bluetooth@0,1 {
+				compatible = "pci14e4,5f72";
+				reg = <0x100 0 0 0 0>;
+				brcm,board-type = "apple,hostomel";
+				status = "okay";
+			};
+
+			wifi@0,0 {
+				compatible = "brcm,bcm4329-fmac";
+				reg = <0 0 0 0 0>;
+				brcm,ccode-map-trivial;
+				brcm,board-type = "apple,hostomel";
+			};
+		};
+	};
+};
