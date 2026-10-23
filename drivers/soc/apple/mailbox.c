@@ -958,6 +958,6 @@ MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("Sven Peter <sven@svenpeter.dev>");
 MODULE_DESCRIPTION("Apple Mailbox driver");
 
-#if IS_ENABLED(CONFIG_KUNIT)
+#if IS_REACHABLE(CONFIG_KUNIT)
 #include "mailbox-g17-test.h"
 #endif
