@@ -77,4 +77,5 @@ static struct kunit_suite t8132_platform_suite = {
 };
 
 kunit_test_suite(t8132_platform_suite);
+MODULE_DESCRIPTION("KUnit tests for the Apple T8132 platform descriptions");
 MODULE_LICENSE("Dual MIT/GPL");

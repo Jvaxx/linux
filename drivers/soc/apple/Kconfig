@@ -208,7 +208,7 @@ config APPLE_T8132_PLATFORM_HANDOFF
 	  probing; kernels using the complete J713 DT do not require this adapter.
 
 config APPLE_T8132_PLATFORM_KUNIT_TEST
-	bool "KUnit tests for T8132 platform descriptions" if !KUNIT_ALL_TESTS
+	tristate "KUnit tests for T8132 platform descriptions" if !KUNIT_ALL_TESTS
 	depends on KUNIT && APPLE_T8132_PLATFORM_HANDOFF
 	default KUNIT_ALL_TESTS
 	help
