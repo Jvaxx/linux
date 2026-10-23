@@ -627,7 +627,12 @@ impl rtkit::Operations for PmpData {
     fn recv_message(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, _ep: u8, msg: u64) {
         let ret = data.recv_message(msg);
         if let Err(e) = ret {
-            data.fail_display(e);
+            // Only the retained J713 bridge latches a message it cannot
+            // handle as fatal. Other boards log it and keep power commands.
+            // SAFETY: read-only board identity check.
+            if unsafe { bindings::apple_pmp_display_retained_board() } {
+                data.fail_display(e);
+            }
             dev_err!(data.dev, "Failed to handle rtkit message, error: {:?}", e);
         }
     }
