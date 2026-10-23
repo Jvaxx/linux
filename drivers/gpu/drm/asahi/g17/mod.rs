@@ -1133,6 +1133,15 @@ impl gpu::Gpu for Gpu {
         true
     }
 
+    /// The G17 runtime never programs fault_control into the firmware, so unmapped reads are not
+    /// guaranteed to return zero. Advertising soft faults made Mesa point out-of-bounds vec3/vec4
+    /// vertex fetches at address 0 and skip bounds checks on bounded loads; on T6040 those reads
+    /// returned non-zero data (2026-10-19: every robustness2 rgba32 vertex_attribute_fetch case
+    /// failed; all pass with soft faults off).
+    fn supports_soft_faults(&self) -> bool {
+        false
+    }
+
     fn queue_limits(&self) -> Option<uapi::drm_asahi_queue_limits> {
         Some(uapi::drm_asahi_queue_limits {
             max_queues: mmu::MAX_EXECUTION_CONTEXTS,
@@ -1230,10 +1239,11 @@ impl gpu::Gpu for Gpu {
 }
 
 /// Scheduling profile of a new logical queue. `file.rs` passes
-/// `DRM_ASAHI_PRIORITY_REALTIME - priority` and refuses HIGH and REALTIME, so
-/// MEDIUM arrives as 2 and LOW as 3.
+/// `DRM_ASAHI_PRIORITY_REALTIME - priority` and refuses REALTIME, so HIGH
+/// arrives as 1, MEDIUM as 2 and LOW as 3.
 fn scheduling_policy(priority: u32) -> Result<fw::queue::Policy> {
     match priority {
+        1 => Ok(hw::t8140::scheduling::HIGH),
         2 => Ok(hw::t8140::scheduling::MEDIUM),
         3 => Ok(hw::t8140::scheduling::LOW),
         _ => Err(EINVAL),
