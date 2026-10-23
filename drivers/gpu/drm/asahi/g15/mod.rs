@@ -143,11 +143,11 @@ const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, &'static Config, 2> =
     kernel::device_id::IdArray::new([
         (
             of::DeviceId::new(c_str!("apple,agx-t6030")),
-            &hw::t6030::CONFIG,
+            &&hw::t6030::CONFIG,
         ),
         (
             of::DeviceId::new(c_str!("apple,agx-t6031")),
-            &hw::t6031::CONFIG,
+            &&hw::t6031::CONFIG,
         ),
     ]);
 
@@ -156,9 +156,8 @@ const OF_TABLE: kernel::device_id::IdArray<of::DeviceId, &'static Config, 2> =
 // display-order admission gate.
 kernel::of_device_table!(
     AUTOLOAD_OF_TABLE,
-    MODULE_OF_TABLE_G15,
-    (),
-    [(of::DeviceId::new(c_str!("apple,agx-t6030")), ())]
+    @none,
+    [of::DeviceId::new(c_str!("apple,agx-t6030"))]
 );
 
 /// The G15 platform adapter: the shared DRM registration probed through
