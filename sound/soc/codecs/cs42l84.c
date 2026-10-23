@@ -93,8 +93,14 @@ static int cs42l84_put_dac_vol(struct snd_kcontrol *kctl,
 {
 	struct snd_soc_component *component = snd_kcontrol_chip(kctl);
 	struct soc_mixer_control *mc = (struct soc_mixer_control *) kctl->private_value;
+	long range = mc->max - mc->min;
 	int vola, volb;
 	int ret, ret2, updated = 0;
+
+	/* Check the user values as longs, before they are narrowed to int. */
+	if (val->value.integer.value[0] < 0 || val->value.integer.value[0] > range ||
+	    val->value.integer.value[1] < 0 || val->value.integer.value[1] > range)
+		return -EINVAL;
 
 	vola = val->value.integer.value[0] + mc->min;
 	volb = val->value.integer.value[1] + mc->min;
