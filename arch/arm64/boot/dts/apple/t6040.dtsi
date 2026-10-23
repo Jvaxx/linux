@@ -535,6 +535,36 @@
 		#performance-domain-cells = <0>;
 	};
 
+	/*
+	 * The decoder firmware programs the T8122/T8132 register family, so
+	 * the driver binds through its T8132 entry. The ADT gives the whole
+	 * block (0x2_80000000, 0x1404000); the windows follow the T6030/T8140
+	 * layout, with the CM3 SRAM between its code and the mailbox.
+	 */
+	avd: avd@280000000 {
+		compatible = "apple,t6041-avd", "apple,t8132-avd";
+		reg = <0x2 0x81080000 0x0 0x14000>,
+		      <0x2 0x81094000 0x0 0x14000>,
+		      <0x2 0x810a8000 0x0 0x4000>,
+		      <0x2 0x81100000 0x0 0x10000>;
+		reg-names = "code", "sram", "mbox", "ctrl";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1442 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1443 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_avd_sys>;
+		resets = <&ps_avd_sys>;
+		iommus = <&avd_dart 0>;
+	};
+
+	avd_dart: iommu@281020000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x2 0x81020000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1449 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_avd_sys>;
+	};
+
 	ans_mbox: mailbox@409608000 {
 		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
 		reg = <0x4 0x09608000 0x0 0x4000>;
