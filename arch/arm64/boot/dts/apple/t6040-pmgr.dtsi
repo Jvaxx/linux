@@ -319,3 +319,161 @@
 		apple,always-on;
 	};
 };
+
+&pmgr_aux {
+	/* Always on: the firmware leaves ATCn_USB on below it, and genpd refuses an active child under a parent it would turn off. */
+	ps_atc0_common: power-controller@390 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x390 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc0_common";
+		apple,always-on;
+	};
+
+	ps_atc1_common: power-controller@3b8 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3b8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc1_common";
+		apple,always-on;
+	};
+
+	ps_atc2_common: power-controller@3e0 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3e0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc2_common";
+		apple,always-on;
+	};
+};
+
+&pmgr_mini {
+	ps_nub_spmi_a0: power-controller@68 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x68 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "nub_spmi_a0";
+		apple,always-on;
+	};
+
+	ps_nub_spmi_a1: power-controller@70 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x70 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "nub_spmi_a1";
+		apple,always-on;
+	};
+
+	ps_atc0_usb_aon: power-controller@c8 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0xc8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc0_usb_aon";
+		apple,always-on;
+	};
+
+	ps_atc0_usb: power-controller@118 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x118 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc0_usb";
+		power-domains = <&ps_atc0_common>, <&ps_atc0_usb_aon>;
+	};
+
+	ps_atc0_phymxwrap: power-controller@150 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x150 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc0_phymxwrap";
+		power-domains = <&ps_atc0_common>, <&ps_atc0_usb_aon>;
+	};
+
+	ps_atc0_common_dp: power-controller@a0 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0xa0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc0_common_dp";
+		power-domains = <&ps_atc0_phymxwrap>;
+	};
+
+	ps_atc1_usb_aon: power-controller@d0 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0xd0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc1_usb_aon";
+		apple,always-on;
+	};
+
+	ps_atc1_usb: power-controller@120 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x120 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc1_usb";
+		power-domains = <&ps_atc1_common>, <&ps_atc1_usb_aon>;
+	};
+
+	ps_atc1_phymxwrap: power-controller@158 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x158 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc1_phymxwrap";
+		power-domains = <&ps_atc1_common>, <&ps_atc1_usb_aon>;
+	};
+
+	ps_atc1_common_dp: power-controller@a8 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0xa8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc1_common_dp";
+		power-domains = <&ps_atc1_phymxwrap>;
+	};
+
+	ps_atc2_usb_aon: power-controller@d8 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0xd8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc2_usb_aon";
+		apple,always-on;
+	};
+
+	ps_atc2_usb: power-controller@140 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x140 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc2_usb";
+		power-domains = <&ps_atc2_common>, <&ps_atc2_usb_aon>;
+	};
+
+	ps_atc2_phymxwrap: power-controller@160 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x160 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc2_phymxwrap";
+		power-domains = <&ps_atc2_common>, <&ps_atc2_usb_aon>;
+	};
+
+	ps_atc2_common_dp: power-controller@b0 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0xb0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc2_common_dp";
+		power-domains = <&ps_atc2_phymxwrap>;
+	};
+};

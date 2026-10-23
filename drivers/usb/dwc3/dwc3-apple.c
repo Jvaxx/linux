@@ -8,17 +8,21 @@
  *  - dwc3-of-simple.c Copyright (c) 2015 Texas Instruments Incorporated - https://www.ti.com
  */
 
+#include <linux/delay.h>
 #include <linux/of.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/phy/phy.h>
 #include <linux/platform_device.h>
+#include <linux/pm_runtime.h>
 #include <linux/pm_wakeup.h>
 #include <linux/reset.h>
+#include <linux/soc/apple/tunable.h>
 #include <linux/usb/phy.h>
 
 #include "dwc3-apple-state.h"
 #include "glue.h"
+#include "io.h"
 
 /*
  * This platform requires a very specific sequence of operations to bring up dwc3 and its USB3 PHY:
@@ -86,8 +90,15 @@
  * dwc3_apple_init(). In host mode xHCI then keeps running in suspend-to-idle when a USB device
  * may wake the system, as a halted xHC could not signal the wakeup.
  *
+ * Runtime PM (T6040 only, see dwc3_apple_core_probe()): the glue holds a reference from the
+ * reset deassert to the end of the shutdown, so with no cable the controller can runtime-suspend
+ * and its power domain drop, its DARTs (which save and restore their state) and, through the
+ * device link of its phys, the PHY with it.
+ *
  * enum dwc3_apple_state is defined in dwc3-apple-state.h.
  */
+
+#define DWC3_APPLE_NR_TUNABLES 5
 
 /**
  * struct dwc3_apple - Apple-specific DWC3 USB controller
@@ -101,6 +112,7 @@
  * @usb3_phy: USB3 PHY, configured after the core is brought up
  * @role_sw: USB role switch
  * @fixed_hub: A fixed hub sits on the controller's USB2 port, the controller stays in host mode
+ * @host_only: The controller must never enter DWC3_APPLE_DEVICE, see dwc3_apple_host_only()
  * @lock: Mutex for synchronizing access
  * @state: Current state of the controller, see enum dwc3_apple_state and the comment above
  * @core_active: Core still owns initialized PHYs
@@ -109,6 +121,10 @@
  * @reset_pending: Controller reset must complete before another start
  * @usb2_power_off_pending: Core-owned USB2 references still to release
  * @usb3_power_off_pending: Core-owned USB3 references still to release
+ * @idle_rpm: Let the controller runtime-suspend while the core is down
+ * @rpm_held: The glue holds a runtime PM reference for the running core
+ * @drd_cfg: The controller's configuration block (optional, for its tunable)
+ * @tunables: Controller tunables from the device tree, see dwc3_apple_tunable_list
  */
 struct dwc3_apple {
 	struct dwc3 dwc;
@@ -122,6 +138,7 @@ struct dwc3_apple {
 	struct phy *usb3_phy;
 	struct usb_role_switch *role_sw;
 	bool fixed_hub;
+	bool host_only;
 
 	struct mutex lock;
 
@@ -132,6 +149,11 @@ struct dwc3_apple {
 	bool reset_pending;
 	unsigned long usb2_power_off_pending;
 	unsigned long usb3_power_off_pending;
+	bool idle_rpm;
+	bool rpm_held;
+
+	void __iomem *drd_cfg;
+	struct apple_tunable *tunables[DWC3_APPLE_NR_TUNABLES];
 };
 
 #define to_dwc3_apple(d) container_of((d), struct dwc3_apple, dwc)
@@ -193,6 +215,101 @@ static void dwc3_apple_setup_cio(struct dwc3_apple *appledwc)
 	dwc3_apple_mask(appledwc, APPLE_DWC3_CIO_LINK_TIMER, APPLE_DWC3_CIO_PM_ENTRY_TIMER,
 			FIELD_PREP(APPLE_DWC3_CIO_PM_ENTRY_TIMER,
 				   APPLE_DWC3_CIO_PM_ENTRY_TIMER_VALUE));
+}
+
+/*
+ * The controller tunables of the ADT (macOS applyAllTunables after its controller reset), by
+ * the register block their offsets are relative to. The core's soft reset undoes them, so they
+ * are applied after every core init.
+ */
+enum dwc3_apple_tunable_block {
+	DWC3_APPLE_TUNABLE_GLOBALS,	/* DWC3_GLOBALS_REGS_START */
+	DWC3_APPLE_TUNABLE_LINK,	/* dwc3-core + 0xd000 */
+	DWC3_APPLE_TUNABLE_DBG,		/* dwc3-core + 0xd800 */
+	DWC3_APPLE_TUNABLE_DRD_CFG,	/* drd-cfg */
+};
+
+#define DWC3_APPLE_LINK_REGS_START	0xd000
+#define DWC3_APPLE_DBG_REGS_START	0xd800
+#define DWC3_APPLE_LINK_DBG_SIZE	0x800
+
+static const struct {
+	const char *prop;
+	enum dwc3_apple_tunable_block block;
+} dwc3_apple_tunable_list[] = {
+	{ "apple,tunable-gbl-default", DWC3_APPLE_TUNABLE_GLOBALS },
+	{ "apple,tunable-gbl-host", DWC3_APPLE_TUNABLE_GLOBALS },
+	{ "apple,tunable-dbg", DWC3_APPLE_TUNABLE_DBG },
+	{ "apple,tunable-cfg-host", DWC3_APPLE_TUNABLE_DRD_CFG },
+	{ "apple,tunable-link", DWC3_APPLE_TUNABLE_LINK },
+};
+
+static_assert(ARRAY_SIZE(dwc3_apple_tunable_list) == DWC3_APPLE_NR_TUNABLES);
+
+static void __iomem *dwc3_apple_tunable_base(struct dwc3_apple *appledwc,
+					     enum dwc3_apple_tunable_block block)
+{
+	switch (block) {
+	case DWC3_APPLE_TUNABLE_GLOBALS:
+		return appledwc->dwc.regs;
+	case DWC3_APPLE_TUNABLE_LINK:
+		return appledwc->apple_regs + DWC3_APPLE_LINK_REGS_START - APPLE_DWC3_REGS_START;
+	case DWC3_APPLE_TUNABLE_DBG:
+		return appledwc->apple_regs + DWC3_APPLE_DBG_REGS_START - APPLE_DWC3_REGS_START;
+	case DWC3_APPLE_TUNABLE_DRD_CFG:
+		return appledwc->drd_cfg;
+	}
+	return NULL;
+}
+
+static void dwc3_apple_apply_tunables(struct dwc3_apple *appledwc)
+{
+	int i;
+
+	for (i = 0; i < ARRAY_SIZE(dwc3_apple_tunable_list); i++)
+		apple_tunable_apply(dwc3_apple_tunable_base(appledwc,
+							    dwc3_apple_tunable_list[i].block),
+				    appledwc->tunables[i]);
+}
+
+/* The tunables are optional; a malformed one fails the probe. */
+static int dwc3_apple_parse_tunables(struct dwc3_apple *appledwc, struct platform_device *pdev)
+{
+	struct resource *core = appledwc->mmio_resource, *drd_cfg;
+	struct resource blocks[] = {
+		[DWC3_APPLE_TUNABLE_GLOBALS] = DEFINE_RES_MEM(core->start + DWC3_GLOBALS_REGS_START,
+							      DWC3_GLOBALS_REGS_END -
+							      DWC3_GLOBALS_REGS_START + 1),
+		[DWC3_APPLE_TUNABLE_LINK] = DEFINE_RES_MEM(core->start + DWC3_APPLE_LINK_REGS_START,
+							   DWC3_APPLE_LINK_DBG_SIZE),
+		[DWC3_APPLE_TUNABLE_DBG] = DEFINE_RES_MEM(core->start + DWC3_APPLE_DBG_REGS_START,
+							  DWC3_APPLE_LINK_DBG_SIZE),
+		[DWC3_APPLE_TUNABLE_DRD_CFG] = DEFINE_RES_MEM(0, 0),
+	};
+	struct device *dev = appledwc->dev;
+	int i;
+
+	drd_cfg = platform_get_resource_byname(pdev, IORESOURCE_MEM, "drd-cfg");
+	if (drd_cfg) {
+		appledwc->drd_cfg = devm_ioremap_resource(dev, drd_cfg);
+		if (IS_ERR(appledwc->drd_cfg))
+			return PTR_ERR(appledwc->drd_cfg);
+		blocks[DWC3_APPLE_TUNABLE_DRD_CFG] = *drd_cfg;
+	}
+
+	for (i = 0; i < ARRAY_SIZE(dwc3_apple_tunable_list); i++) {
+		const char *prop = dwc3_apple_tunable_list[i].prop;
+		struct apple_tunable *t;
+
+		if (!of_property_present(dev->of_node, prop))
+			continue;
+		t = devm_apple_tunable_parse(dev, dev->of_node, prop,
+					     &blocks[dwc3_apple_tunable_list[i].block]);
+		if (IS_ERR(t))
+			return dev_err_probe(dev, PTR_ERR(t), "Invalid %s\n", prop);
+		appledwc->tunables[i] = t;
+	}
+	return 0;
 }
 
 static void dwc3_apple_set_ptrcap(struct dwc3_apple *appledwc, u32 mode)
@@ -258,6 +375,17 @@ static int dwc3_apple_core_probe(struct dwc3_apple *appledwc, enum dwc3_apple_st
 		return ret;
 	}
 	devres_remove_group(appledwc->dev, group);
+
+	/*
+	 * dwc3_core_probe() enabled runtime PM with the device active and forbade it, for the
+	 * dwc3 platform driver's own callbacks, which this glue does not use. The core is being
+	 * brought up now, so take the glue's reference (see dwc3_apple_core_start()) and, where
+	 * that is tested, allow runtime PM so the reference alone decides.
+	 */
+	pm_runtime_get_noresume(appledwc->dev);
+	appledwc->rpm_held = true;
+	if (appledwc->idle_rpm)
+		pm_runtime_allow(appledwc->dev);
 
 	appledwc->state = DWC3_APPLE_NO_CABLE;
 	return 0;
@@ -337,6 +465,11 @@ static int dwc3_apple_core_stop(struct dwc3_apple *appledwc)
 		appledwc->reset_pending = false;
 	}
 	dev_pm_syscore_device(appledwc->dev, false);
+	if (appledwc->rpm_held) {
+		appledwc->rpm_held = false;
+		pm_runtime_mark_last_busy(appledwc->dev);
+		pm_runtime_put_autosuspend(appledwc->dev);
+	}
 
 	return 0;
 }
@@ -390,9 +523,24 @@ static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_st
 		}
 	}
 
+	/*
+	 * Before the first core probe runtime PM is not enabled yet and the controller stays
+	 * powered; dwc3_apple_core_probe() takes the reference then.
+	 */
+	if (appledwc->state != DWC3_APPLE_PROBE_PENDING && !appledwc->rpm_held) {
+		ret = pm_runtime_resume_and_get(appledwc->dev);
+		if (ret)
+			return ret;
+		appledwc->rpm_held = true;
+	}
+
 	ret = reset_control_deassert(appledwc->reset);
 	if (ret) {
 		dev_err(appledwc->dev, "Failed to deassert reset, err=%d\n", ret);
+		/* Nothing was started: drop the reference again. */
+		ret_reset = dwc3_apple_core_stop(appledwc);
+		if (ret_reset)
+			dev_warn(appledwc->dev, "Failed to finish core shutdown, err=%d\n", ret_reset);
 		return ret;
 	}
 
@@ -415,11 +563,28 @@ static int dwc3_apple_core_start(struct dwc3_apple *appledwc, enum dwc3_apple_st
 	if (!of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3") ||
 	    dwc3_apple_host_before_core_init(appledwc, state))
 		dwc3_apple_setup_cio(appledwc);
+	dwc3_apple_apply_tunables(appledwc);
 	appledwc->core_active = true;
 	appledwc->usb2_power_off_pending = BIT(appledwc->dwc.num_usb2_ports) - 1;
 	appledwc->usb3_power_off_pending = BIT(appledwc->dwc.num_usb3_ports) - 1;
 
 	return 0;
+}
+
+/*
+ * The T6040 core came up against the dummy PHY: reset its USB3 PIPE side once the PIPE has
+ * moved, as the tested bring-up does (USB2 is not affected).
+ */
+static void dwc3_apple_usb3_pipe_reset(struct dwc3_apple *appledwc)
+{
+	struct dwc3 *dwc = &appledwc->dwc;
+	u32 reg;
+
+	reg = dwc3_readl(dwc, DWC3_GUSB3PIPECTL(0));
+	dwc3_writel(dwc, DWC3_GUSB3PIPECTL(0), reg | DWC3_GUSB3PIPECTL_PHYSOFTRST);
+	usleep_range(1000, 1500);
+	dwc3_writel(dwc, DWC3_GUSB3PIPECTL(0), reg & ~DWC3_GUSB3PIPECTL_PHYSOFTRST);
+	msleep(100);
 }
 
 /* Select the role in the core and route the USB3 PHY, before xhci or the gadget is started */
@@ -445,8 +610,26 @@ static int dwc3_apple_set_role(struct dwc3_apple *appledwc, enum dwc3_apple_stat
 		if (of_device_is_compatible(appledwc->dev->of_node, "apple,t8132-dwc3"))
 			return ret;
 		dev_warn(appledwc->dev, "USB3 PHY setup failed, USB2 only, err=%d\n", ret);
+	} else if (appledwc->usb3_phy &&
+		   of_device_is_compatible(appledwc->dev->of_node, "apple,t6040-dwc3")) {
+		dwc3_apple_usb3_pipe_reset(appledwc);
 	}
 	return 0;
+}
+
+/*
+ * No device mode: the T6040 USB2 PHY implements host mode only (phy-apple-t6040-usb2), and a
+ * kernel built without gadget support turns dwc3_gadget_init() into a stub that succeeds. Such a
+ * controller must not follow a USB_ROLE_DEVICE request from the Type-C port controller (a charger
+ * or a host on the other end), or the core would end up in device mode on top of a PHY powered
+ * in host mode.
+ */
+static bool dwc3_apple_host_only(struct device *dev)
+{
+	if (!IS_ENABLED(CONFIG_USB_DWC3_GADGET) && !IS_ENABLED(CONFIG_USB_DWC3_DUAL_ROLE))
+		return true;
+
+	return of_device_is_compatible(dev->of_node, "apple,t6040-dwc3");
 }
 
 static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state state)
@@ -454,6 +637,14 @@ static int dwc3_apple_init(struct dwc3_apple *appledwc, enum dwc3_apple_state st
 	int ret, ret_reset;
 
 	lockdep_assert_held(&appledwc->lock);
+
+	/*
+	 * A host-only controller starts as a host: mark the role before the core comes up so that
+	 * dwc3_core_soft_reset() leaves the unused gadget side alone. A failed first core probe
+	 * zeroes the struct, so this is done on every start.
+	 */
+	if (state == DWC3_APPLE_HOST && appledwc->host_only)
+		appledwc->dwc.current_dr_role = DWC3_GCTL_PRTCAP_HOST;
 
 	ret = dwc3_apple_core_start(appledwc, state);
 	if (ret)
@@ -542,6 +733,15 @@ static int dwc3_usb_role_switch_set(struct usb_role_switch *sw, enum usb_role ro
 	/* A controller behind a fixed hub is a host regardless of the connectors */
 	if (appledwc->fixed_hub)
 		return 0;
+
+	/*
+	 * Stay off instead of starting device mode (see dwc3_apple_host_only()). Reporting success
+	 * keeps the port controller from retrying: get() then reports USB_ROLE_NONE.
+	 */
+	if (role == USB_ROLE_DEVICE && appledwc->host_only) {
+		dev_info_ratelimited(appledwc->dev, "No device mode on this port: staying off\n");
+		role = USB_ROLE_NONE;
+	}
 
 	/*
 	 * Skip role switches if appledwc is already in the desired state. The
@@ -638,6 +838,9 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 
 	appledwc->dev = &pdev->dev;
 	appledwc->fixed_hub = dwc3_apple_has_fixed_hub(dev);
+	appledwc->host_only = dwc3_apple_host_only(dev);
+	/* Tested on T6040 only, where the PHY driver and the DARTs follow runtime PM. */
+	appledwc->idle_rpm = of_device_is_compatible(dev->of_node, "apple,t6040-dwc3");
 	mutex_init(&appledwc->lock);
 	/* A never-connected port has no generic core probe to publish this. */
 	appledwc->dwc.dev = dev;
@@ -653,8 +856,12 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 		return dev_err_probe(dev, PTR_ERR(appledwc->usb2_phy),
 				     "Failed to get the USB2 PHY\n");
 
-	/* Older T8132 device trees expose only USB2; a NULL PHY is a no-op. */
-	if (of_device_is_compatible(dev->of_node, "apple,t8132-dwc3"))
+	/*
+	 * Older T8132 device trees and the T6040 ports without a USB3 PHY
+	 * expose only USB2; a NULL PHY is a no-op.
+	 */
+	if (of_device_is_compatible(dev->of_node, "apple,t8132-dwc3") ||
+	    of_device_is_compatible(dev->of_node, "apple,t6040-dwc3"))
 		appledwc->usb3_phy = devm_phy_optional_get(dev, "usb3-phy");
 	else
 		appledwc->usb3_phy = devm_phy_get(dev, "usb3-phy");
@@ -678,6 +885,10 @@ static int dwc3_apple_probe(struct platform_device *pdev)
 	if (IS_ERR(appledwc->apple_regs))
 		return dev_err_probe(dev, PTR_ERR(appledwc->apple_regs),
 				     "Failed to map Apple-specific MMIO\n");
+
+	ret = dwc3_apple_parse_tunables(appledwc, pdev);
+	if (ret)
+		return ret;
 
 	/*
 	 * Like a PCI xHCI controller, allow USB devices to wake the system by default. This has

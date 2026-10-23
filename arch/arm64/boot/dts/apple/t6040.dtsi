@@ -14,6 +14,7 @@
 #include <dt-bindings/interrupt-controller/apple-aic.h>
 #include <dt-bindings/interrupt-controller/irq.h>
 #include <dt-bindings/pinctrl/apple.h>
+#include <dt-bindings/phy/phy.h>
 #include <dt-bindings/spmi/spmi.h>
 
 / {
@@ -1427,6 +1428,288 @@
 		interrupts = <AIC_IRQ 664 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_isp_sys>;
 		apple,remap-streams = <1 0>, <6 0>, <7 0>, <10 0>, <11 0>;
+		status = "disabled";
+	};
+
+	/*
+	 * The three Type-C ports (ADT usb-drdN, atc-phyN, dart-usbN,
+	 * acio-phy-cpuN) and the SPMI buses of their PD controllers.
+	 */
+	nub_spmi_a0: spmi@509188000 {
+		compatible = "apple,t6041-spmi", "apple,t8103-spmi";
+		reg = <0x5 0x09188000 0x0 0x100>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		#interrupt-cells = <2>;
+		interrupt-controller;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 866 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_nub_spmi_a0>;
+		status = "disabled";
+	};
+
+	nub_spmi_a1: spmi@509198000 {
+		compatible = "apple,t6041-spmi", "apple,t8103-spmi";
+		reg = <0x5 0x09198000 0x0 0x100>;
+		#address-cells = <2>;
+		#size-cells = <0>;
+		#interrupt-cells = <2>;
+		interrupt-controller;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 868 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_nub_spmi_a1>;
+		status = "disabled";
+	};
+
+	atcphy0: phy@382a90000 {
+		compatible = "apple,t6040-atcphy";
+		reg = <0x3 0x82a90000 0x0 0x4000>,
+		      <0x3 0x82800000 0x0 0x4000>,
+		      <0x3 0x82a84000 0x0 0x4000>,
+		      <0x3 0x83000000 0x0 0x30000>,
+		      <0x3 0x83200000 0x0 0x4000>,
+		      <0x3 0x83140000 0x0 0x4000>,
+		      <0x3 0x830c0000 0x0 0x10000>,
+		      <0x3 0x80000000 0x0 0x8000>,
+		      <0x3 0x80020000 0x0 0x4000>,
+		      <0x3 0x83244000 0x0 0x4000>,
+		      <0x3 0x83250000 0x0 0x4000>;
+		reg-names = "bank0", "bank1", "pipehandler", "core", "cfg", "cpu",
+			    "cpu-data", "axi2af", "axi2af-lioa", "fabric", "common-cfg";
+		#phy-cells = <1>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc0_common_dp>;
+		mboxes = <&atcphy0_mbox>;
+		mbox-names = "phy-cpu";
+		nonposted-mmio;
+		orientation-switch;
+		status = "disabled";
+	};
+
+	atcphy0_mbox: mailbox@383148000 {
+		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x83148000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 938 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 939 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 940 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 941 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_atc0_phymxwrap>;
+		status = "disabled";
+	};
+
+	usb_drd0_dart_0: iommu@382f00000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x3 0x82f00000 0x0 0xc000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1623 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_atc0_usb>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	usb_drd0_dart_1: iommu@382f80000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x3 0x82f80000 0x0 0xc000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1623 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_atc0_usb>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	usb_drd0: usb@382280000 {
+		compatible = "apple,t6040-dwc3", "apple,t8103-dwc3";
+		reg = <0x3 0x82280000 0x0 0xcd00>,
+		      <0x3 0x8228cd00 0x0 0x3200>,
+		      <0x3 0x82200000 0x0 0x4000>;
+		reg-names = "dwc3-core", "dwc3-apple", "drd-cfg";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1619 IRQ_TYPE_LEVEL_HIGH>;
+		/*
+		 * A role switch rather than a fixed host: the PD controller
+		 * resets the eUSB2 repeater on every connect, so the PHY and
+		 * the core start after the attach and stop on detach.
+		 */
+		dr_mode = "otg";
+		usb-role-switch;
+		role-switch-default-mode = "host";
+		iommus = <&usb_drd0_dart_0 0>, <&usb_drd0_dart_1 1>;
+		power-domains = <&ps_atc0_usb>;
+		resets = <&atcphy0>;
+		phys = <&atcphy0 PHY_TYPE_USB2>, <&atcphy0 PHY_TYPE_USB3>;
+		phy-names = "usb2-phy", "usb3-phy";
+		status = "disabled";
+	};
+
+	atcphy1: phy@38aa90000 {
+		compatible = "apple,t6040-atcphy";
+		reg = <0x3 0x8aa90000 0x0 0x4000>,
+		      <0x3 0x8a800000 0x0 0x4000>,
+		      <0x3 0x8aa84000 0x0 0x4000>,
+		      <0x3 0x8b000000 0x0 0x30000>,
+		      <0x3 0x8b200000 0x0 0x4000>,
+		      <0x3 0x8b140000 0x0 0x4000>,
+		      <0x3 0x8b0c0000 0x0 0x10000>,
+		      <0x3 0x88000000 0x0 0x8000>,
+		      <0x3 0x88020000 0x0 0x4000>,
+		      <0x3 0x8b244000 0x0 0x4000>,
+		      <0x3 0x8b250000 0x0 0x4000>;
+		reg-names = "bank0", "bank1", "pipehandler", "core", "cfg", "cpu",
+			    "cpu-data", "axi2af", "axi2af-lioa", "fabric", "common-cfg";
+		#phy-cells = <1>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc1_common_dp>;
+		mboxes = <&atcphy1_mbox>;
+		mbox-names = "phy-cpu";
+		nonposted-mmio;
+		orientation-switch;
+		status = "disabled";
+	};
+
+	atcphy1_mbox: mailbox@38b148000 {
+		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x8b148000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 948 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 949 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 950 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 951 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_atc1_phymxwrap>;
+		status = "disabled";
+	};
+
+	usb_drd1_dart_0: iommu@38af00000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x3 0x8af00000 0x0 0xc000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1655 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_atc1_usb>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	usb_drd1_dart_1: iommu@38af80000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x3 0x8af80000 0x0 0xc000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1655 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_atc1_usb>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	usb_drd1: usb@38a280000 {
+		compatible = "apple,t6040-dwc3", "apple,t8103-dwc3";
+		reg = <0x3 0x8a280000 0x0 0xcd00>,
+		      <0x3 0x8a28cd00 0x0 0x3200>,
+		      <0x3 0x8a200000 0x0 0x4000>;
+		reg-names = "dwc3-core", "dwc3-apple", "drd-cfg";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1651 IRQ_TYPE_LEVEL_HIGH>;
+		/*
+		 * A role switch rather than a fixed host: the PD controller
+		 * resets the eUSB2 repeater on every connect, so the PHY and
+		 * the core start after the attach and stop on detach.
+		 */
+		dr_mode = "otg";
+		usb-role-switch;
+		role-switch-default-mode = "host";
+		iommus = <&usb_drd1_dart_0 0>, <&usb_drd1_dart_1 1>;
+		power-domains = <&ps_atc1_usb>;
+		resets = <&atcphy1>;
+		phys = <&atcphy1 PHY_TYPE_USB2>, <&atcphy1 PHY_TYPE_USB3>;
+		phy-names = "usb2-phy", "usb3-phy";
+		status = "disabled";
+	};
+
+	atcphy2: phy@392a90000 {
+		compatible = "apple,t6040-atcphy";
+		reg = <0x3 0x92a90000 0x0 0x4000>,
+		      <0x3 0x92800000 0x0 0x4000>,
+		      <0x3 0x92a84000 0x0 0x4000>,
+		      <0x3 0x93000000 0x0 0x30000>,
+		      <0x3 0x93200000 0x0 0x4000>,
+		      <0x3 0x93140000 0x0 0x4000>,
+		      <0x3 0x930c0000 0x0 0x10000>,
+		      <0x3 0x90000000 0x0 0x8000>,
+		      <0x3 0x90020000 0x0 0x4000>,
+		      <0x3 0x93244000 0x0 0x4000>,
+		      <0x3 0x93250000 0x0 0x4000>;
+		reg-names = "bank0", "bank1", "pipehandler", "core", "cfg", "cpu",
+			    "cpu-data", "axi2af", "axi2af-lioa", "fabric", "common-cfg";
+		#phy-cells = <1>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc2_common_dp>;
+		mboxes = <&atcphy2_mbox>;
+		mbox-names = "phy-cpu";
+		nonposted-mmio;
+		orientation-switch;
+		status = "disabled";
+	};
+
+	atcphy2_mbox: mailbox@393148000 {
+		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x93148000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 958 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 959 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 960 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 961 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_atc2_phymxwrap>;
+		status = "disabled";
+	};
+
+	usb_drd2_dart_0: iommu@392f00000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x3 0x92f00000 0x0 0xc000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1687 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_atc2_usb>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	usb_drd2_dart_1: iommu@392f80000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x3 0x92f80000 0x0 0xc000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1687 IRQ_TYPE_LEVEL_HIGH>;
+		power-domains = <&ps_atc2_usb>;
+		#iommu-cells = <1>;
+		status = "disabled";
+	};
+
+	usb_drd2: usb@392280000 {
+		compatible = "apple,t6040-dwc3", "apple,t8103-dwc3";
+		reg = <0x3 0x92280000 0x0 0xcd00>,
+		      <0x3 0x9228cd00 0x0 0x3200>,
+		      <0x3 0x92200000 0x0 0x4000>;
+		reg-names = "dwc3-core", "dwc3-apple", "drd-cfg";
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1683 IRQ_TYPE_LEVEL_HIGH>;
+		/*
+		 * A role switch rather than a fixed host: the PD controller
+		 * resets the eUSB2 repeater on every connect, so the PHY and
+		 * the core start after the attach and stop on detach.
+		 */
+		dr_mode = "otg";
+		usb-role-switch;
+		role-switch-default-mode = "host";
+		iommus = <&usb_drd2_dart_0 0>, <&usb_drd2_dart_1 1>;
+		power-domains = <&ps_atc2_usb>;
+		resets = <&atcphy2>;
+		phys = <&atcphy2 PHY_TYPE_USB2>, <&atcphy2 PHY_TYPE_USB3>;
+		phy-names = "usb2-phy", "usb3-phy";
 		status = "disabled";
 	};
 };
