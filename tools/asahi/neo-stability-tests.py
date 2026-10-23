@@ -32,6 +32,8 @@ PREFIX = r'''
 #include <string.h>
 #include <errno.h>
 #include <stdio.h>
+#include <ctype.h>
+#define SHA256_DIGEST_SIZE 32
 typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32; typedef int32_t s32;
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x,v) ((x)=(v))
