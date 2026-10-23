@@ -60,6 +60,10 @@
 	};
 };
 
+&cpuidle {
+	status = "okay";
+};
+
 &smc {
 	status = "okay";
 };
