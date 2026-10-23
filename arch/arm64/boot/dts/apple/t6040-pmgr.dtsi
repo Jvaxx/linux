@@ -141,6 +141,15 @@
 };
 
 &pmgr_aux {
+	ps_pms: power-controller@100 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x100 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "pms";
+		apple,always-on;
+	};
+
 	ps_avd_sys: power-controller@170 {
 		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x170 4>;
@@ -155,6 +164,24 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "afc";
+		apple,always-on;
+	};
+
+	ps_pmp: power-controller@410 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x410 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "pmp";
+		apple,always-on;
+	};
+
+	ps_pms_sram: power-controller@418 {
+		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x418 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "pms_sram";
 		apple,always-on;
 	};
 };

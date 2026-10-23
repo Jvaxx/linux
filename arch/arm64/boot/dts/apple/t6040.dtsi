@@ -519,6 +519,8 @@
 		reg = <0x2 0x10e20000 0x0 0x1000>;
 		nonposted-mmio;
 		#performance-domain-cells = <0>;
+		/* PMP fast die-temperature effort, byte 0 of FAST-DIE-CE */
+		apple,fast-die-effort = <&pmp_report 0>;
 	};
 
 	cpufreq_p0: cpufreq@211e20000 {
@@ -526,6 +528,7 @@
 		reg = <0x2 0x11e20000 0x0 0x1000>;
 		nonposted-mmio;
 		#performance-domain-cells = <0>;
+		apple,fast-die-effort = <&pmp_report 1>;
 	};
 
 	cpufreq_p1: cpufreq@212e20000 {
@@ -533,6 +536,7 @@
 		reg = <0x2 0x12e20000 0x0 0x1000>;
 		nonposted-mmio;
 		#performance-domain-cells = <0>;
+		apple,fast-die-effort = <&pmp_report 2>;
 	};
 
 	/*
@@ -704,6 +708,114 @@
 				<&ps_apcie_sys_st1>;
 		power-domain-names = "ans", "apcie0", "apcie1";
 		resets = <&ps_ans>;
+		status = "disabled";
+	};
+
+	/*
+	 * PMP (power management coprocessor). iBoot locks its DART (PROTECT
+	 * 0x1e7, SIDs 0 and 1 translating): apple-dart adopts iBoot's SID 0
+	 * table and leaves SID 1 alone. apple,dma-range keeps Linux's IOVAs
+	 * in the ADT window (vm-base 0x100_0000_0000, 64 GiB). The DART's
+	 * second ADT range is the SoC's shared clock-protection block, not
+	 * part of the DART.
+	 */
+	pmp_dart: iommu@500300000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x5 0x00300000 0x0 0xc000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 389 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0x0 0x10 0x0>;
+		power-domains = <&ps_pmp>;
+		status = "disabled";
+	};
+
+	/*
+	 * Report (PTD) region: reads 16 bytes per entry at +0x0, writes 8
+	 * bytes per entry at +0x10000. Entries are PMP soc-devices; every
+	 * entry reads 0 while the PMP is stopped.
+	 */
+	pmp_report: pmp-report@5003c0000 {
+		compatible = "apple,t6041-pmp-v2-report";
+		reg = <0x5 0x003c0000 0x0 0x20000>;
+		nonposted-mmio;
+		power-domains = <&ps_pms_sram>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		status = "disabled";
+
+		/* The CPU clusters, for their fast die-temperature loops */
+		report@a {
+			compatible = "apple,t6041-pmp-v2-report-entry",
+				     "apple,t6000-pmp-v2-report-entry";
+			reg = <0xa>;
+			label = "pmp-eacc0";
+			#power-domain-cells = <0>;
+			apple,always-on;
+		};
+
+		report@b {
+			compatible = "apple,t6041-pmp-v2-report-entry",
+				     "apple,t6000-pmp-v2-report-entry";
+			reg = <0xb>;
+			label = "pmp-pacc0";
+			#power-domain-cells = <0>;
+			apple,always-on;
+		};
+
+		report@c {
+			compatible = "apple,t6041-pmp-v2-report-entry",
+				     "apple,t6000-pmp-v2-report-entry";
+			reg = <0xc>;
+			label = "pmp-pacc1";
+			#power-domain-cells = <0>;
+			apple,always-on;
+		};
+
+		/*
+		 * The GPU (soc-device 13). Without it the running PMP treats
+		 * the GPU as off and holds it at its lowest state.
+		 */
+		report@d {
+			compatible = "apple,t6041-pmp-v2-report-entry",
+				     "apple,t6000-pmp-v2-report-entry";
+			reg = <0xd>;
+			label = "pmp-gfx";
+			#power-domain-cells = <0>;
+			apple,always-on;
+		};
+	};
+
+	/*
+	 * The boot loader adds the per-unit properties (board, DRAM) and the
+	 * firmware tunables the driver needs before it starts the PMP.
+	 */
+	pmp: pmp@500700000 {
+		compatible = "apple,t6041-pmp-v2", "apple,t6000-pmp-v2";
+		reg = <0x5 0x00700000 0x0 0xe0000>,
+		      <0x5 0x00e00000 0x0 0x4000>;
+		reg-names = "pmp", "asc";
+		mboxes = <&pmp_mbox>;
+		mbox-names = "mbox";
+		iommus = <&pmp_dart 0>;
+		power-domains = <&ps_pmp>;
+		apple,pmc = <1>;
+		apple,pmc-pmgr = <0x3f>;
+		status = "disabled";
+	};
+
+	pmp_mbox: mailbox@500e08000 {
+		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x5 0x00e08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 414 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 415 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 416 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 417 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		power-domains = <&ps_pmp>, <&ps_pms_sram>;
+		#mbox-cells = <0>;
 		status = "disabled";
 	};
 

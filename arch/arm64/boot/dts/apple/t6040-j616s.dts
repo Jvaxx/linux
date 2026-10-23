@@ -297,3 +297,19 @@
 &nvme {
 	status = "okay";
 };
+
+&pmp_dart {
+	status = "okay";
+};
+
+&pmp_report {
+	status = "okay";
+};
+
+&pmp {
+	status = "okay";
+};
+
+&pmp_mbox {
+	status = "okay";
+};
