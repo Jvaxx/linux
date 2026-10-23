@@ -325,3 +325,11 @@
 		status = "disabled";
 	};
 };
+
+&pmc {
+	status = "okay";
+};
+
+&mcc {
+	status = "okay";
+};
