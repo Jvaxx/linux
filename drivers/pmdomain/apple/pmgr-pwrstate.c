@@ -435,7 +435,12 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	 * vote and never read, reset or change the hardware state.
 	 */
 	ps->firmware_owned = of_property_read_bool(node, "apple,firmware-owned");
-	ps->inherited_on = of_property_read_bool(node, "apple,inherited-on");
+	/*
+	 * Only T8132 hands over inherited-on domains with this contract. Older
+	 * M3 device trees carry the property with another meaning; keep them
+	 * as they were.
+	 */
+	ps->inherited_on = t8132 && of_property_read_bool(node, "apple,inherited-on");
 	if (ps->inherited_on &&
 	    (ps->firmware_owned || of_property_present(node, "apple,min-state") ||
 	     of_property_present(node, "apple,always-on") ||
