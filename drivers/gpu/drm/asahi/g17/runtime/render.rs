@@ -46,7 +46,13 @@ struct Entry {
     pending_owner_closed: bool,
     borrowed_active: bool,
     borrowed_dependencies: Option<crate::g17::queue::render::Dependencies>,
+    /// `Pair::switch_in_flight` of a borrowed pair. A borrowed pair publishes
+    /// nothing, so the snapshot can only be stale towards an older switch.
+    borrowed_switch: Option<u64>,
     event_masks: [u64; 2],
+    /// A completion event for this pair arrived while it was borrowed. Event
+    /// passes skip borrowed pairs, so the returning borrower requests another.
+    missed_event: bool,
     closed: bool,
     pending_error: Option<(Arc<crate::g17::status::VmStatus>, Error)>,
     pending_timeout: bool,
@@ -130,6 +136,14 @@ impl RenderState {
             .ok_or(EIO)
     }
 
+    /// Whether a completion event arrived while the pair in `slot` was
+    /// borrowed; clears the record. The returned pair is installed again, so
+    /// the next event pass observes it.
+    fn take_missed_event(&mut self, slot: u8) -> bool {
+        self.entry_mut(slot)
+            .is_ok_and(|entry| core::mem::take(&mut entry.missed_event))
+    }
+
     fn reserved(&mut self, reservation: Reservation) -> Result<&mut Entry> {
         let entry = self.entry_mut(reservation.slot)?;
         if entry.reservation.ids != reservation.ids
@@ -163,6 +177,7 @@ impl RenderState {
         }
         entry.borrowed_active = pair.published_in_flight();
         entry.borrowed_dependencies = Some(pair.dependency_snapshot());
+        entry.borrowed_switch = pair.switch_in_flight();
         entry.preparing = Some(packet.clone());
         entry.pair.take().ok_or(EIO)
     }
@@ -182,6 +197,7 @@ impl RenderState {
         }
         entry.pair = pair.take();
         entry.borrowed_dependencies = None;
+        entry.borrowed_switch = None;
         entry.preparing = None;
         Ok(())
     }
@@ -341,7 +357,9 @@ impl Registry {
                 pending_owner_closed: false,
                 borrowed_active: false,
                 borrowed_dependencies: None,
+                borrowed_switch: None,
                 event_masks: [0; 2],
+                missed_event: false,
                 closed: false,
                 pending_error: None,
                 pending_timeout: false,
@@ -872,9 +890,19 @@ impl Registry {
     }
     pub(in crate::g17) fn retain_render_completions(&mut self, masks: [u64; 2]) {
         for entry in self.render.entries.iter_mut().flatten() {
+            let mut hit = false;
             for id in entry.reservation.ids {
                 let qid = usize::from(id.qid());
-                entry.event_masks[qid / 64] |= masks[qid / 64] & (1u64 << (qid % 64));
+                let bit = masks[qid / 64] & (1u64 << (qid % 64));
+                entry.event_masks[qid / 64] |= bit;
+                hit |= bit != 0;
+            }
+            // Event passes skip a pair while preparation, growth or an
+            // observation has borrowed it. Without a record, a completion
+            // that arrived meanwhile waits for an unrelated later event or the
+            // one-millisecond rescan.
+            if hit && (entry.preparing.is_some() || entry.growing) {
+                entry.missed_event = true;
             }
         }
     }
