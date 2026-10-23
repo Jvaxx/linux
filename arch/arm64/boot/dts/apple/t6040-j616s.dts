@@ -23,6 +23,9 @@
 		keyboard = &keyboard;
 		wifi0 = "/pcie@1cb0000000/pci@0,0/wifi@0,0";
 		bluetooth0 = "/pcie@1cb0000000/pci@0,0/bluetooth@0,1";
+		/* used by the loader to hand over the display */
+		dcp = &dcp;
+		disp0 = &display;
 	};
 
 	chosen {
@@ -312,4 +315,13 @@
 
 &pmp_mbox {
 	status = "okay";
+};
+
+&dcp {
+	panel {
+		compatible = "apple,panel-j616", "apple,panel-mini-led", "apple,panel";
+		width-mm = <345>;
+		height-mm = <223>;
+		status = "disabled";
+	};
 };

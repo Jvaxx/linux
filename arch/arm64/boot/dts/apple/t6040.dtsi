@@ -514,6 +514,17 @@
 		clock-output-names = "clkref";
 	};
 
+	/*
+	 * Display component master. It has no registers; the boot loader
+	 * enables it with the DCP when it hands the display over.
+	 */
+	display: display-subsystem {
+		compatible = "apple,display-subsystem";
+		iommus = <&disp0_dart 0>;
+		dma-noncoherent;
+		status = "disabled";
+	};
+
 	cpufreq_e: cpufreq@210e20000 {
 		compatible = "apple,t6041-cluster-cpufreq", "apple,t8112-cluster-cpufreq";
 		reg = <0x2 0x10e20000 0x0 0x1000>;
@@ -567,6 +578,59 @@
 		interrupt-parent = <&aic>;
 		interrupts = <AIC_IRQ 1449 IRQ_TYPE_LEVEL_HIGH>;
 		power-domains = <&ps_avd_sys>;
+	};
+
+	disp0_dart: iommu@402300000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x4 0x02300000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1090 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	dcp_dart: iommu@402340000 {
+		compatible = "apple,t6041-dart", "apple,t8110-dart";
+		reg = <0x4 0x02340000 0x0 0x20000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1090 IRQ_TYPE_LEVEL_HIGH>;
+		status = "disabled";
+	};
+
+	dcp: dcp@402e00000 {
+		compatible = "apple,t6041-dcp", "apple,dcp";
+		reg = <0x4 0x02e00000 0x0 0x4000>,
+		      <0x4 0x00000000 0x0 0x4000000>,
+		      <0x4 0x02240000 0x0 0x10000>,
+		      <0x4 0x023a8000 0x0 0x4000>,
+		      <0x4 0x02800000 0x0 0x800000>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3";
+		mboxes = <&dcp_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dcp_dart 23>;
+		apple,bw-scratch = <&pmgr_dcp 0 4 0x20000>;
+		apple,iomfb-surfaces = <1 1 0 0>;
+		/* the boot loader enables it when it hands the display over */
+		status = "disabled";
+
+		disp0_piodma: piodma {
+			iommus = <&disp0_dart 16>;
+		};
+	};
+
+	dcp_mbox: mailbox@402e08000 {
+		compatible = "apple,t6041-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x4 0x02e08000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1143 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1144 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1145 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 1146 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		status = "disabled";
 	};
 
 	ans_mbox: mailbox@409608000 {
@@ -842,6 +906,16 @@
 		#size-cells = <1>;
 		reg = <0x5 0x02800000 0x0 0x4000>;
 		/* child nodes are added in t6040-pmgr.dtsi */
+	};
+
+	/*
+	 * The PMGR range the DCP driver hands to its firmware; apple,bw-scratch
+	 * points into it.
+	 */
+	pmgr_dcp: power-management@504800000 {
+		reg = <0x5 0x04800000 0x0 0xbc000>;
+		reg-names = "dcp-fw-pmgr";
+		#apple,bw-scratch-cells = <3>;
 	};
 
 	/*
