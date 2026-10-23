@@ -33,6 +33,11 @@ struct apple_rtkit_helper {
 	bool adopted;
 	/* The producer already began the J713 DockChannel input session. */
 	bool preserved;
+	/*
+	 * The adopted session has a buffer inventory: requests for buffers
+	 * it does not list must not replace storage the firmware still owns.
+	 */
+	bool strict_buffers;
 
 	void __iomem *asc_base;
 
@@ -63,7 +68,7 @@ static int apple_rtkit_helper_shmem_setup(void *cookie, struct apple_rtkit_shmem
 	 * allocation, or an unrecorded request from a legacy producer, does not
 	 * authorize replacing storage the firmware may still use.
 	 */
-	if (helper->adopted)
+	if (helper->adopted && helper->strict_buffers)
 		return -ENODATA;
 
 	if (!bfr->iova) {
@@ -309,8 +314,14 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 	}
 
 	if (live) {
-		/* Set before RX starts: no new buffer allocation is safe here. */
+		/*
+		 * Set before RX starts: with an inventory, or on T8132, no new
+		 * buffer allocation is safe here. Producers that predate the
+		 * inventory (T8140) keep mapping IOVAs inside the SRAM region.
+		 */
 		helper->adopted = true;
+		helper->strict_buffers = count > 0 ||
+			of_device_is_compatible(dev->of_node, "apple,t8132-mtp");
 		helper->rtk = apple_rtkit_init_adopted_with_buffers(
 			dev, helper, NULL, 0, &apple_rtkit_helper_ops, buffers, count);
 		if (IS_ERR(helper->rtk))
