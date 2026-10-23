@@ -12,6 +12,7 @@
 #include "t6040.dtsi"
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/leds/common.h>
+#include <dt-bindings/thermal/thermal.h>
 
 / {
 	compatible = "apple,j616s", "apple,t6040", "apple,arm-platform";
@@ -56,6 +57,67 @@
 			function = LED_FUNCTION_KBD_BACKLIGHT;
 			color = <LED_COLOR_ID_WHITE>;
 			max-brightness = <255>;
+		};
+	};
+
+	/*
+	 * CPU die temperature: SMC key TCMz (CPU die max), sensor 0 of
+	 * smc_hwmon. The PMP's fast die-temperature limit regulates (TCMz
+	 * settles near 111 C); this zone is the backstop above it: passive at
+	 * 113 C, critical (orderly shutdown) at 118 C, polled once a second as
+	 * the SMC refreshes TCMz. The cpufreq cooling device sits on a
+	 * cluster's policy CPU, so each map lists every CPU of its cluster.
+	 */
+	thermal-zones {
+		cpu-die-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <1000>;
+			thermal-sensors = <&smc_hwmon 0>;	/* TCMz */
+
+			trips {
+				cpu_die_passive: cpu-die-passive {
+					temperature = <113000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				cpu-die-critical {
+					temperature = <118000>;
+					hysteresis = <0>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map-e {
+					trip = <&cpu_die_passive>;
+					cooling-device =
+						<&cpu_e0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e1 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e2 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_e3 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-p0 {
+					trip = <&cpu_die_passive>;
+					cooling-device =
+						<&cpu_p00 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p01 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p02 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p03 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p04 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+
+				map-p1 {
+					trip = <&cpu_die_passive>;
+					cooling-device =
+						<&cpu_p10 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p11 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p12 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p13 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+						<&cpu_p14 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
 		};
 	};
 };
@@ -139,3 +201,20 @@
 	mtp {
 	};
 };
+
+&smc_hwmon {
+	/*
+	 * TCMz must stay the first temperature child: the thermal zone names
+	 * the sensor by its index, so the shared hwmon includes below only
+	 * append after it.
+	 */
+	temperature-TCMz {
+		apple,key-id = "TCMz";
+		label = "CPU Die Max";
+	};
+};
+
+/* Read-only fan speeds and more SMC sensors; every key exists on this machine's SMC. */
+#include "hwmon-common.dtsi"
+#include "hwmon-fan-dual.dtsi"
+#include "hwmon-laptop.dtsi"
