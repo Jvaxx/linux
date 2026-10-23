@@ -157,12 +157,12 @@ one-shot deployment are maintained outside the kernel source tree.
 Building on basic bring-up
 -------------------------
 
-This series is stacked on the basic J713 platform support. Build a base arm64
-``defconfig``, then merge ``asahi.config``, ``j713-basic.config`` and
-``j713-graphics.config`` from ``arch/arm64/configs`` in that order. Run
-``olddefconfig`` before building ``Image modules dtbs``. The graphics fragment
-adds the modular Rust Asahi GPU and common Apple display drivers without
-replacing the basic platform or userspace configuration.
+This series is stacked on the basic J713 platform support. Like every other
+Apple machine, J713 builds from the shared configuration: ``make defconfig
+asahi.config``, then ``olddefconfig`` before building ``Image modules dtbs``.
+``asahi.config`` enables the G16 backend, the T8132 DCP backend and the
+retained J713 display DART next to the modular Rust Asahi GPU and Apple
+display drivers.
 
 Linux 7.2 uses flat render/compute UAPI declarations. G16 reads their existing
 wire offsets and rejects unsupported ray-query and scratch tails. Regression
