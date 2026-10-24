@@ -25,7 +25,9 @@ pub(crate) struct ParkedPair {
     slot: u8,
     ordinal: u64,
     clusters: u32,
+    deflake: crate::g17::fw::render::Deflake,
     descriptor_flags: [u32; 2],
+    variant: &'static crate::g17::fw::Variant,
     installed: [bool; 2],
     recovery_generation: u64,
     registered: Option<u8>,
@@ -90,7 +92,9 @@ impl Pair {
             slot: self.slot,
             ordinal: self.ordinal,
             clusters: self.clusters,
+            deflake: self.deflake,
             descriptor_flags: self.descriptor_flags,
+            variant: self.variant,
             installed: self.installed,
             recovery_generation: self.recovery_generation,
             registered: self.registered,
@@ -151,7 +155,7 @@ impl ParkedPair {
             return Err(EINVAL);
         }
         alloc.uat.vm_context_mask(context.vm())?;
-        let layout = target::Layout::new(pass, self.clusters)?;
+        let layout = target::Layout::new(pass, self.clusters, self.variant.programs)?;
         let aliases = [
             kicks[0].prepare_client_alias(context.vm())?,
             kicks[1].prepare_client_alias(context.vm())?,
@@ -167,6 +171,7 @@ impl ParkedPair {
             pm_generation,
             self.ordinal,
             word,
+            self.variant,
         )?;
         Ok(Prepared {
             memory: Some(memory),
@@ -229,7 +234,9 @@ impl ParkedPair {
             ordinal: self.ordinal,
             initial_packet: next.initial_packet,
             clusters: self.clusters,
+            deflake: self.deflake,
             descriptor_flags: self.descriptor_flags,
+            variant: self.variant,
             installed: self.installed,
             configs: [None; 2],
             cursors: [0; 2],

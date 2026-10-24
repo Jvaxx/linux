@@ -158,7 +158,9 @@ pub(crate) struct Pair {
     initial_packet: u64,
     graph_started: bool,
     clusters: u32,
+    deflake: abi::Deflake,
     descriptor_flags: [u32; 2],
+    variant: &'static crate::g17::fw::Variant,
     installed: [bool; 2],
     configs: [Option<crate::g17::fw::queue::QueueConfig>; 2],
     cursors: [u32; 2],
@@ -205,7 +207,9 @@ impl Pair {
         pm_generation: u64,
         first: &Arc<Packet>,
         clusters: u32,
+        deflake: abi::Deflake,
         descriptor_flags: [u32; 2],
+        variant: &'static crate::g17::fw::Variant,
     ) -> Result<KBox<Self>> {
         if slot == 0
             || usize::from(slot) >= queues::RENDER_SLOTS
@@ -230,7 +234,7 @@ impl Pair {
         if word == u32::MAX {
             return Err(EINVAL);
         }
-        let layout = target::Layout::new(pass, clusters)?;
+        let layout = target::Layout::new(pass, clusters, variant.programs)?;
         let storage = KBox::<Self>::new_uninit(GFP_KERNEL)?;
         let (tiling, ta_alias) = kick::Queue::render(alloc, ids[0], context.vm(), rings)?;
         let (fragment, fragment_alias) =
@@ -246,6 +250,7 @@ impl Pair {
             pm_generation,
             0,
             word,
+            variant,
         )?;
         storage.write_init(kernel::try_init!(Self {
             kick_aliases: Some([ta_alias, fragment_alias]),
@@ -261,7 +266,9 @@ impl Pair {
             initial_packet: first.id,
             graph_started: false,
             clusters,
+            deflake,
             descriptor_flags,
+            variant,
             installed: [false; 2],
             configs: [None; 2],
             cursors: [0; 2],
@@ -364,14 +371,17 @@ impl Pair {
         let work = packet.completion.work_state()?;
         let node = work.node_va()?;
         let word = work.word();
-        let layout = target::Layout::new(pass, self.clusters)?;
+        let layout = target::Layout::new(pass, self.clusters, self.variant.programs)?;
+        let deflake_layout = self.deflake;
         let owners = self.memory.owners();
         self.memory
             .target
             .ensure_capacity(alloc.dev, packet.context.vm(), &layout, &owners)?;
         let target = self.memory.target.prepare(ordinal, &layout)?;
         let scene = self.memory.manager.prepare_scene(ordinal)?;
-        self.memory.generation(ordinal)?.prepare(ordinal, pass)?;
+        self.memory
+            .generation(ordinal)?
+            .prepare(ordinal, pass, deflake_layout.viewport)?;
         let [deflake, ta_status, fragment_status, fragment_fw, auxiliary] =
             self.memory.generation(ordinal)?.addresses();
         let lifecycle = if ordinal != 0 || packet.id != self.initial_packet {
@@ -401,6 +411,7 @@ impl Pair {
             heapmeta_va: target.heap,
             tpc_va: self.memory.target.tpc_va(),
             tpc_size: layout.tpc_size as u64,
+            gtp_va: self.memory.target.gtp_va(&layout)?,
             deflake_va: deflake,
             ta_status_va: ta_status,
             fragment_status_va: fragment_status,
@@ -432,11 +443,18 @@ impl Pair {
                 stamp_va: addresses.stamps[1][0],
                 aux_stamp_va: addresses.stamps[1][1],
             },
+            programs: self.variant.programs,
+            deflake: deflake_layout,
         };
         self.memory.graph.claim(ordinal)?;
+        // Without an MCache table kick-entry bit 58 stays clear.
+        let attachments = match self.variant.mcache {
+            true => attachments[1].as_slice(),
+            false => &[][..],
+        };
         let result = self.memory.write_descriptors(
             &args,
-            attachments[1].as_slice(),
+            attachments,
             packet.context.id().try_into()?,
         );
         let mcache = match result {
@@ -555,6 +573,13 @@ impl Pair {
         let covered = stamps.map(|stamp| retirement::stamp_covers(stamp, ordinal));
         self.memory
             .completion_links(ordinal, kicks, payload, !covered[1])?;
+        let leads = match self.variant.lead_commands {
+            true => {
+                let init_manager = !self.memory.manager.initialized();
+                self.memory.write_leads(ordinal, kicks[0], init_manager)?
+            }
+            false => [false; 2],
+        };
         let context = &packet.context;
         let ring = 1u8 << policy.priority();
         let qos = context.qos_id();
@@ -657,6 +682,7 @@ impl Pair {
             abi::TaDescriptor::register_bindings(
                 self.memory.graph.descriptor_client(0, ordinal),
                 ray_query[0].scratch.enabled(),
+                self.variant.programs,
             )?,
             None,
         );
@@ -666,6 +692,7 @@ impl Pair {
             abi::FragmentDescriptor::register_bindings(
                 self.memory.graph.descriptor_client(1, ordinal),
                 ray_query[1].scratch.enabled(),
+                self.variant.programs,
             )?,
             mcache,
         );
@@ -687,6 +714,7 @@ impl Pair {
                 configs[0],
                 present[0],
                 kicks[0],
+                leads[0],
             )?,
             publication::Lane::new(
                 &memory.graph,
@@ -696,6 +724,7 @@ impl Pair {
                 configs[1],
                 present[1],
                 kicks[1],
+                leads[1],
             )?,
         ];
         let windows = [lanes[0].window, lanes[1].window];
@@ -784,7 +813,12 @@ impl Pair {
             )
         })();
         let outer_next = match result {
-            Ok(next) => next,
+            Ok(next) => {
+                if leads[0] {
+                    self.memory.manager.mark_initialized();
+                }
+                next
+            }
             Err(error) => {
                 self.quarantined = true;
                 if !packet.completion.spared() && self.terminal.is_none() {
@@ -1013,7 +1047,7 @@ impl Pair {
         let Validated::Render { pass, .. } = &packet.command else {
             return Err(EINVAL);
         };
-        let required = target::Layout::new(pass, self.clusters)?.tvb_blocks;
+        let required = target::Layout::new(pass, self.clusters, self.variant.programs)?.tvb_blocks;
         self.memory.manager.note_required(required, crate::g17::now_ns());
         if self.in_flight() {
             return Ok(None);
@@ -1826,7 +1860,7 @@ impl Pair {
             let Validated::Render { pass, .. } = &first.command else {
                 return Err(EINVAL);
             };
-            let layout = target::Layout::new(pass, self.clusters)?;
+            let layout = target::Layout::new(pass, self.clusters, self.variant.programs)?;
             let aliases = [
                 self.kicks[0].prepare_client_alias(context.vm())?,
                 self.kicks[1].prepare_client_alias(context.vm())?,
@@ -1842,6 +1876,7 @@ impl Pair {
                 pm_generation,
                 self.ordinal,
                 first.completion.work_state()?.word(),
+                self.variant,
             )?;
             (Some(memory), Some(persistent), Some(aliases))
         };

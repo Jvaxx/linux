@@ -18,7 +18,8 @@ use kernel::{
     addr::PhysicalAddr,
     error::Result,
     page::Page,
-    prelude::*, //
+    prelude::*,
+    sync::Arc, //
 };
 
 use crate::debug::*;
@@ -96,7 +97,6 @@ pub(crate) fn clean_poc(ptr: *const u8, len: usize) {
 /// Cleans and invalidates the CPU data cache lines covering `len` bytes at `ptr` to the point of
 /// coherency, so that later CPU reads observe what a non-snooping agent wrote. Lines the CPU wrote
 /// are written back first. [`poc_barrier`] completes the maintenance.
-#[cfg(CONFIG_DRM_ASAHI_G16)]
 pub(crate) fn clean_invalidate_poc(ptr: *const u8, len: usize) {
     if len == 0 {
         return;
@@ -123,14 +123,108 @@ pub(crate) fn poc_barrier() {
     unsafe { core::arch::asm!("dsb sy", options(nostack, preserves_flags)) };
 }
 
+/// Page tables in bootloader-reserved memory that the kernel does not map ("no-map"), reached
+/// through a write-back mapping instead of `struct page` (the `pagetables` and `l2-pagetables`
+/// regions, where the firmware builds its root and kernel-window tables).
+pub(crate) struct ReservedTables {
+    regions: KVec<kernel::io::mem::Mem>,
+    starts: KVec<PhysicalAddr>,
+}
+
+// SAFETY: The mappings are plain write-back memory owned for the lifetime of this object; table
+// entries are only accessed as atomics.
+unsafe impl Send for ReservedTables {}
+// SAFETY: As above.
+unsafe impl Sync for ReservedTables {}
+
+impl ReservedTables {
+    pub(crate) fn new() -> Self {
+        Self {
+            regions: KVec::new(),
+            starts: KVec::new(),
+        }
+    }
+
+    /// Adds a reserved region, mapped write-back.
+    ///
+    /// # Safety
+    ///
+    /// `res` must be a bootloader-reserved region outside System RAM that stays reserved.
+    pub(crate) unsafe fn add(&mut self, res: kernel::io::resource::Resource) -> Result {
+        let start = res.start();
+        // SAFETY: The caller guarantees the region; write-back matches how the firmware maps it.
+        let map = unsafe {
+            kernel::io::mem::Mem::try_new(res, kernel::io::mem::MemFlag::WB.into())?
+        };
+        self.starts.push(start, GFP_KERNEL)?;
+        self.regions.push(map, GFP_KERNEL)?;
+        Ok(())
+    }
+
+    /// The CPU address of a page-table page in one of the regions.
+    fn lookup(&self, phys: PhysicalAddr) -> Option<*mut u8> {
+        for (start, map) in self.starts.iter().zip(self.regions.iter()) {
+            let Some(offset) = phys.checked_sub(*start) else {
+                continue;
+            };
+            let offset = offset as usize;
+            if offset + UAT_PGSZ <= map.size() {
+                // SAFETY: The offset and one page lie inside the mapping.
+                return Some(unsafe { map.ptr().add(offset) });
+            }
+        }
+        None
+    }
+
+    /// Whether `phys` is a page of one of the regions.
+    pub(crate) fn contains(&self, phys: PhysicalAddr) -> bool {
+        self.lookup(phys).is_some()
+    }
+
+    /// Drops the CPU's cached lines of every region, so that later reads see what the firmware
+    /// wrote while booting. Lines the host dirtied are written back first, never discarded.
+    pub(crate) fn invalidate(&self) {
+        for map in self.regions.iter() {
+            clean_invalidate_poc(map.ptr(), map.size());
+        }
+        poc_barrier();
+    }
+}
+
+/// Runs `f` on a pointer to `len` bytes at `offset` in the page-table page at `phys`, through the
+/// reserved mapping when the page lies in a reserved region, else through `struct page`.
+///
+/// # Safety
+///
+/// `phys` must be a page-table page that stays allocated while `f` runs.
+unsafe fn with_table<T>(
+    reserved: Option<&ReservedTables>,
+    phys: PhysicalAddr,
+    offset: usize,
+    len: usize,
+    f: impl FnOnce(*mut u8) -> Result<T>,
+) -> Result<T> {
+    if let Some(base) = reserved.and_then(|r| r.lookup(phys)) {
+        if offset.checked_add(len).ok_or(EINVAL)? > UAT_PGSZ {
+            return Err(EINVAL);
+        }
+        // SAFETY: lookup() checked that the whole page is mapped.
+        return f(unsafe { base.add(offset) });
+    }
+    // SAFETY: The caller guarantees an allocated page-table page in RAM.
+    let page = unsafe { Page::borrow_phys_unchecked(&phys) };
+    page.with_pointer_into_page(offset, len, f)
+}
+
 /// Runs `f` on the first `count` top-level entries of the root page table at `ttb`.
 ///
 /// # Safety
 ///
-/// `ttb` must be the physical address of a page table root in RAM that stays allocated while `f`
-/// runs. Other agents (the GPU firmware) may access the entries concurrently, which is why they
-/// are only exposed as atomics.
+/// `ttb` must be the physical address of a page table root, in RAM or in one of the `reserved`
+/// regions, that stays allocated while `f` runs. Other agents (the GPU firmware) may access the
+/// entries concurrently, which is why they are only exposed as atomics.
 pub(crate) unsafe fn with_root_entries<R>(
+    reserved: Option<&ReservedTables>,
     ttb: PhysicalAddr,
     count: usize,
     f: impl FnOnce(&[AtomicU64]) -> R,
@@ -138,15 +232,18 @@ pub(crate) unsafe fn with_root_entries<R>(
     if count > UAT_NPTE {
         return Err(EINVAL);
     }
-    // SAFETY: The caller guarantees that `ttb` is an allocated page in RAM.
-    let page = unsafe { Page::borrow_phys(&ttb) }.ok_or(EIO)?;
-    page.with_pointer_into_page(0, count * PTE_SIZE, |p| {
-        // SAFETY: with_pointer_into_page() ensures the pointer is valid for `count` PTEs, and page
-        // table entries are naturally aligned.
-        Ok(f(unsafe {
-            core::slice::from_raw_parts(p as *const AtomicU64, count)
-        }))
-    })
+    // SAFETY: A root outside the reserved regions must have a struct page.
+    if !reserved.is_some_and(|r| r.contains(ttb)) && unsafe { Page::borrow_phys(&ttb) }.is_none() {
+        return Err(EIO);
+    }
+    // SAFETY: The caller guarantees an allocated root page, in RAM or in a reserved region.
+    unsafe {
+        with_table(reserved, ttb, 0, count * PTE_SIZE, |p| {
+            // SAFETY: with_table() checked that `count` entries are mapped, and page table entries
+            // are naturally aligned.
+            Ok(f(core::slice::from_raw_parts(p as *const AtomicU64, count)))
+        })
+    }
 }
 
 const PTE_TYPE_BITS: u64 = 3;
@@ -281,6 +378,22 @@ impl Prot {
         (!need_read || readable) && (!need_write || writable)
     }
 
+    /// The native form of a GPU-only permission: AP 0 with the access in PXN (read) and UXN
+    /// (write), as [`Self::allows_gpu`] reads AP 0. The logical selectors RO, WO, RW, NA map to
+    /// the native RO, WO, RW, NA. Firmware permissions are returned unchanged.
+    const fn native_gpu(self) -> Self {
+        if self.ap != AP_GPU {
+            return self;
+        }
+        let selector = (self.high_bits >> 1) & 3;
+        Self {
+            ap: AP_FW_GPU,
+            high_bits: (self.high_bits & !(HIGH_BITS_PXN | HIGH_BITS_UXN))
+                | (((selector + 1) & 3) << 1),
+            ..self
+        }
+    }
+
     pub(crate) const fn is_cached_noncoherent(&self) -> bool {
         self.ap != AP_GPU && self.memattr == MEMATTR_CACHED
     }
@@ -301,6 +414,10 @@ pub(crate) struct UatPageTable {
     ttb_owned: bool,
     /// Ownership could not be relinquished to firmware; physical tables remain until reboot.
     retained: bool,
+    /// Reserved regions holding tables this page table may reach.
+    reserved: Option<Arc<ReservedTables>>,
+    /// Store GPU-only permissions in the native AP 0 form ([`Prot::native_gpu`]).
+    native_gpu: bool,
     /// Tables below a root the driver did not allocate may belong to the bootloader or the
     /// firmware, so only the tables recorded here are ever freed. `None` if the driver owns the
     /// tables below the root, as with the handoff firmware interface.
@@ -310,7 +427,6 @@ pub(crate) struct UatPageTable {
     oas_mask: u64,
     /// Clean new tables and changed entries to the point of coherency, for a UAT walker that does
     /// not snoop the CPU caches ([`Self::enable_clean_poc`]).
-    #[cfg(CONFIG_DRM_ASAHI_G16)]
     clean_poc: bool,
 }
 
@@ -323,45 +439,48 @@ impl UatPageTable {
             ttb,
             ttb_owned: true,
             retained: false,
+            reserved: None,
+            native_gpu: false,
             driver_tables: None,
             va_range: 0..(1u64 << ias),
             ias_mask: (1u64 << ias) - 1,
             oas_mask: (1u64 << oas) - 1,
-            #[cfg(CONFIG_DRM_ASAHI_G16)]
             clean_poc: false,
         })
     }
 
     /// Makes every later change of this page table visible to a UAT walker that does not snoop the
-    /// CPU caches (G16), and cleans the root, which was zeroed through the cacheable linear map.
+    /// CPU caches (G16, and `UatQuirks::clean_tables`), and cleans the root, which may have been
+    /// zeroed through the cacheable linear map.
     ///
     /// From now on, a new table page is cleaned before its parent descriptor names it, a changed
     /// table or leaf descriptor is cleaned after the store, and every mutating walk ends with a
     /// `dsb sy`. Call it before anything is mapped and before any context names the root.
-    #[cfg(CONFIG_DRM_ASAHI_G16)]
     pub(crate) fn enable_clean_poc(&mut self) -> Result {
         self.clean_poc = true;
-        // SAFETY: The root is a RAM page owned or borrowed by this page table for its lifetime.
-        let root = unsafe { Page::borrow_phys(&self.ttb) }.ok_or(EIO)?;
-        root.with_pointer_into_page(0, UAT_PGSZ, |p| {
-            clean_poc(p, UAT_PGSZ);
-            Ok(())
-        })?;
+        // SAFETY: The root is owned or borrowed by this page table for its lifetime, in RAM or in
+        // a reserved region.
+        unsafe {
+            with_table(self.reserved.as_deref(), self.ttb, 0, UAT_PGSZ, |p| {
+                clean_poc(p, UAT_PGSZ);
+                Ok(())
+            })
+        }?;
         poc_barrier();
         Ok(())
     }
 
-    /// Whether changes are cleaned to the point of coherency (always false without G16 support).
+    /// Whether changes are cleaned to the point of coherency.
     #[inline(always)]
     fn cleans_poc(&self) -> bool {
-        #[cfg(CONFIG_DRM_ASAHI_G16)]
-        {
-            self.clean_poc
-        }
-        #[cfg(not(CONFIG_DRM_ASAHI_G16))]
-        {
-            false
-        }
+        self.clean_poc
+    }
+
+    /// Stores GPU-only permissions of this (client or kernel-lower) table in the native AP 0 form
+    /// (`UatQuirks::native_gpu_permissions`). Firmware roots never hold GPU-only mappings.
+    pub(crate) fn with_native_gpu(mut self, native_gpu: bool) -> Self {
+        self.native_gpu = native_gpu;
+        self
     }
 
     /// Borrow a root; track individual child ownership only when other agents
@@ -372,6 +491,7 @@ impl UatPageTable {
         ias: u32,
         oas: u32,
         shared_tables: bool,
+        reserved: Option<Arc<ReservedTables>>,
     ) -> Result<Self> {
         mod_pr_debug!(
             "UATPageTable::new_with_ttb: ttb={:#x} range={:#x?} ias={} oas={}\n",
@@ -387,7 +507,9 @@ impl UatPageTable {
             return Err(EINVAL);
         }
         // SAFETY: The bootloader-managed root stays valid while this page table exists.
-        if unsafe { Page::borrow_phys(&ttb) }.is_none() {
+        let reachable = reserved.as_ref().is_some_and(|r| r.contains(ttb))
+            || unsafe { Page::borrow_phys(&ttb) }.is_some();
+        if !reachable {
             pr_err!(
                 "UATPageTable::new_with_ttb: ttb at {:#x} is not mapped (DT using no-map?)\n",
                 ttb
@@ -399,11 +521,12 @@ impl UatPageTable {
             ttb,
             ttb_owned: false,
             retained: false,
+            reserved,
+            native_gpu: false,
             driver_tables: shared_tables.then(KVec::new),
             va_range,
             ias_mask: (1u64 << ias) - 1,
             oas_mask: (1u64 << oas) - 1,
-            #[cfg(CONFIG_DRM_ASAHI_G16)]
             clean_poc: false,
         })
     }
@@ -483,6 +606,7 @@ impl UatPageTable {
         // Handle the case where iova_range.end is just at the top boundary of the IAS
         let end = ((iova_range.end - 1) & self.ias_mask) + 1;
 
+        let reserved = self.reserved.clone();
         let mut pt_addr: [Option<PhysicalAddr>; UAT_LEVELS] = Default::default();
         // For every child table, retain the parent page and entry that names it.
         // Children are detached before their parents are freed, so these borrowed
@@ -526,55 +650,58 @@ impl UatPageTable {
                     );
                     let upidx = ((iova >> (UAT_PGBIT + (level + 1) * UAT_LVBIT) as u64) & UAT_LVMSK)
                         as usize;
-                    // SAFETY: Page table addresses are either allocated by us, or
-                    // firmware-managed and safe to borrow a struct page from.
-                    let upt = unsafe { Page::borrow_phys_unchecked(&phys) };
                     mod_pr_debug!("UATPageTable::with_pages: borrowed phys {:#x}\n", phys);
-                    pt_addr[level] =
-                        upt.with_pointer_into_page(upidx * PTE_SIZE, PTE_SIZE, |p| {
-                            let uptep = p as *const _ as *const Pte;
-                            // SAFETY: with_pointer_into_page() ensures the pointer is valid,
-                            // and our index is aligned so it is safe to deref as an AtomicU64.
-                            let upte = unsafe { &*uptep };
-                            let mut upte_val = upte.load(Ordering::Relaxed);
-                            // Allocate if requested
-                            if upte_val == 0 && alloc {
-                                let pt_page = Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?;
-                                mod_pr_debug!("UATPageTable::with_pages: alloc PT at {:#x}\n", pt_page.phys());
-                                if clean {
-                                    // A non-snooping walker must never follow a parent to a
-                                    // table whose zeroes are still in the CPU caches.
-                                    pt_page.with_pointer_into_page(0, UAT_PGSZ, |p| {
-                                        clean_poc(p, UAT_PGSZ);
-                                        Ok(())
-                                    })?;
-                                }
-                                if let Some(tables) = self.driver_tables.as_mut() {
-                                    tables.push(pt_page.phys(), GFP_KERNEL)?;
-                                }
-                                let pt_paddr = Page::into_phys(pt_page);
-                                upte_val = pt_paddr | PTE_TYPE_LEAF_TABLE;
-                                // Complete child-table initialization before a
-                                // concurrent device walk can follow its parent.
-                                // A later mapping/TLBI barrier cannot order an
-                                // already-visible parent against earlier clears.
-                                crate::mem::sync();
-                                upte.store(upte_val, Ordering::Relaxed);
-                                if clean {
-                                    clean_poc(uptep.cast(), PTE_SIZE);
-                                }
+                    let driver_tables = &mut self.driver_tables;
+                    let oas_mask = self.oas_mask;
+                    let entry = |p: *mut u8| -> Result<Option<PhysicalAddr>> {
+                        let uptep = p as *const _ as *const Pte;
+                        // SAFETY: with_table() ensures the pointer is valid, and our index is
+                        // aligned so it is safe to deref as an AtomicU64.
+                        let upte = unsafe { &*uptep };
+                        let mut upte_val = upte.load(Ordering::Relaxed);
+                        // Allocate if requested
+                        if upte_val == 0 && alloc {
+                            let pt_page = Page::alloc_page(GFP_KERNEL | __GFP_ZERO)?;
+                            mod_pr_debug!("UATPageTable::with_pages: alloc PT at {:#x}\n", pt_page.phys());
+                            if clean {
+                                // A non-snooping walker must never follow a parent to a
+                                // table whose zeroes are still in the CPU caches.
+                                pt_page.with_pointer_into_page(0, UAT_PGSZ, |p| {
+                                    clean_poc(p, UAT_PGSZ);
+                                    Ok(())
+                                })?;
                             }
-                            if upte_val & PTE_TYPE_BITS == PTE_TYPE_LEAF_TABLE {
-                                Ok(Some(upte_val & self.oas_mask & (!UAT_PGMSK as u64)))
-                            } else if upte_val == 0 || (!alloc && !free) {
-                                mod_pr_debug!("UATPageTable::with_pages: no level {}\n", level);
-                                Ok(None)
-                            } else {
-                                pr_err!("UATPageTable::with_pages: Unexpected Table PTE value {:#x} at iova {:#x} index {} phys {:#x}\n", upte_val,
-                                        iova, level + 1, phys + ((upidx * PTE_SIZE) as PhysicalAddr));
-                                Ok(None)
+                            if let Some(tables) = driver_tables.as_mut() {
+                                tables.push(pt_page.phys(), GFP_KERNEL)?;
                             }
-                        })?;
+                            let pt_paddr = Page::into_phys(pt_page);
+                            upte_val = pt_paddr | PTE_TYPE_LEAF_TABLE;
+                            // Complete child-table initialization before a
+                            // concurrent device walk can follow its parent.
+                            // A later mapping/TLBI barrier cannot order an
+                            // already-visible parent against earlier clears.
+                            crate::mem::sync();
+                            upte.store(upte_val, Ordering::Relaxed);
+                            if clean {
+                                clean_poc(uptep.cast(), PTE_SIZE);
+                            }
+                        }
+                        if upte_val & PTE_TYPE_BITS == PTE_TYPE_LEAF_TABLE {
+                            Ok(Some(upte_val & oas_mask & (!UAT_PGMSK as u64)))
+                        } else if upte_val == 0 || (!alloc && !free) {
+                            mod_pr_debug!("UATPageTable::with_pages: no level {}\n", level);
+                            Ok(None)
+                        } else {
+                            pr_err!("UATPageTable::with_pages: Unexpected Table PTE value {:#x} at iova {:#x} index {} phys {:#x}\n", upte_val,
+                                    iova, level + 1, phys + ((upidx * PTE_SIZE) as PhysicalAddr));
+                            Ok(None)
+                        }
+                    };
+                    // SAFETY: Page table addresses are either allocated by us, or
+                    // firmware-managed tables in RAM or in a reserved region.
+                    pt_addr[level] = unsafe {
+                        with_table(reserved.as_deref(), phys, upidx * PTE_SIZE, PTE_SIZE, entry)
+                    }?;
                     if pt_addr[level].is_some() {
                         pt_parent[level] = Some((phys, upidx));
                     }
@@ -610,13 +737,10 @@ impl UatPageTable {
                 count,
                 iova
             );
-            // SAFETY: Page table addresses are either allocated by us, or
-            // firmware-managed and safe to borrow a struct page from.
-            let pt = unsafe { Page::borrow_phys_unchecked(&phys) };
-            pt.with_pointer_into_page(idx * PTE_SIZE, count * PTE_SIZE, |p| {
+            let leaves = |p: *mut u8| -> Result {
                 let ptep = p as *const _ as *const Pte;
                 // SAFETY: We know this is a valid pointer to PTEs and the range is valid and
-                // checked by with_pointer_into_page().
+                // checked by with_table().
                 let ptes = unsafe { core::slice::from_raw_parts(ptep, count) };
                 let result = cb(iova, ptes);
                 if clean && mutate {
@@ -624,7 +748,12 @@ impl UatPageTable {
                     clean_poc(p, count * PTE_SIZE);
                 }
                 result
-            })?;
+            };
+            // SAFETY: Page table addresses are either allocated by us, or
+            // firmware-managed tables in RAM or in a reserved region.
+            unsafe {
+                with_table(reserved.as_deref(), phys, idx * PTE_SIZE, count * PTE_SIZE, leaves)
+            }?;
 
             let block = 1 << (UAT_PGBIT + UAT_LVBIT);
             iova = align(iova + 1, block);
@@ -659,27 +788,34 @@ impl UatPageTable {
             return Ok(());
         }
         if let Some((parent_phys, parent_index)) = parent {
+            let oas_mask = self.oas_mask;
+            let in_reserved = self.reserved.as_ref().is_some_and(|r| r.contains(parent_phys));
+            // SAFETY: Only looks the page up; nothing is accessed through it.
+            if !in_reserved && unsafe { Page::borrow_phys(&parent_phys) }.is_none() {
+                return Err(EIO);
+            }
+            let reserved = self.reserved.as_deref();
+            let cleans = self.cleans_poc();
+            let detach = |p: *mut u8| -> Result {
+                // SAFETY: The live page-table page contains aligned u64 PTEs, and with_table()
+                // bounds this access to one PTE.
+                let pte = unsafe { &*(p as *const AtomicU64) };
+                let current = pte.load(Ordering::Acquire);
+                let expected = phys & oas_mask & (!UAT_PGMSK as u64);
+                if current & oas_mask & (!UAT_PGMSK as u64) != expected {
+                    return Err(EIO);
+                }
+                pte.store(0, Ordering::Release);
+                if cleans {
+                    clean_poc(p, PTE_SIZE);
+                }
+                Ok(())
+            };
             // SAFETY: The bottom-up traversal keeps the parent allocated while
             // its child descriptor is detached. A changed descriptor indicates
             // an ownership violation; fail closed instead of freeing a table
             // that may still be reachable.
-            let page = unsafe { Page::borrow_phys(&parent_phys) }.ok_or(EIO)?;
-            page.with_pointer_into_page(parent_index * PTE_SIZE, PTE_SIZE, |p| {
-                // SAFETY: The live page-table page contains aligned u64 PTEs.
-                // with_pointer_into_page bounds this access to one PTE, and
-                // the parent remains allocated throughout the traversal.
-                let pte = unsafe { &*(p as *const AtomicU64) };
-                let current = pte.load(Ordering::Acquire);
-                let expected = phys & self.oas_mask & (!UAT_PGMSK as u64);
-                if current & self.oas_mask & (!UAT_PGMSK as u64) != expected {
-                    return Err(EIO);
-                }
-                pte.store(0, Ordering::Release);
-                if self.cleans_poc() {
-                    clean_poc(p, PTE_SIZE);
-                }
-                Ok(())
-            })?;
+            unsafe { with_table(reserved, parent_phys, parent_index * PTE_SIZE, PTE_SIZE, detach) }?;
         }
         if let Some(tables) = self.driver_tables.as_mut() {
             let index = tables.iter().position(|&table| table == phys).ok_or(EIO)?;
@@ -780,6 +916,15 @@ impl UatPageTable {
         }
     }
 
+    /// The permission bits as this table stores them.
+    fn stored(&self, prot: Prot) -> Prot {
+        if self.native_gpu {
+            prot.native_gpu()
+        } else {
+            prot
+        }
+    }
+
     pub(crate) fn map_pages(
         &mut self,
         iova_range: Range<u64>,
@@ -799,6 +944,7 @@ impl UatPageTable {
         }
 
         let pte_bits = self.pte_bits();
+        let prot = self.stored(prot);
 
         self.walk(iova_range, true, false, true, |iova, ptes| {
             for (idx, pte) in ptes.iter().enumerate() {
@@ -825,6 +971,7 @@ impl UatPageTable {
             iova_range,
             prot
         );
+        let prot = self.stored(prot);
         self.walk(iova_range, true, false, true, |iova, ptes| {
             for (idx, pte) in ptes.iter().enumerate() {
                 let ptev = pte.load(Ordering::Relaxed);
