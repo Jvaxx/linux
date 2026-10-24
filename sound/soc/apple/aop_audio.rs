@@ -839,6 +839,13 @@ unsafe extern "C" fn aop_pcm_open(substream: *mut bindings::snd_pcm_substream) -
         dev_err!(data.dev, "Unable to refine hwparams");
         return ret;
     }
+    // The refinement adds every format whose sample width the DMA channel can move, but the
+    // AOP always delivers 32-bit floats: keep only those.
+    hwparams.formats &= bindings::BINDINGS_SNDRV_PCM_FMTBIT_FLOAT_LE;
+    if hwparams.formats == 0 {
+        dev_err!(data.dev, "The DMA channel cannot carry 32-bit samples");
+        return EINVAL.to_errno();
+    }
     unsafe { (*(*substream).runtime).hw = hwparams };
     let ret = unsafe { bindings::snd_dmaengine_pcm_open(substream, dma_chan) };
     if ret < 0 {
