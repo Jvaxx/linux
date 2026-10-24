@@ -13,10 +13,8 @@ description:
   The Always-On Processor provides audio and sensor services through firmware
   loaded by the bootloader. The application processor patches the firmware's
   boot arguments in the AOP SRAM, starts it through RTKit over one mailbox and
-  reaches its services through the RTKit endpoints. The bootloader reserves
-  the firmware's external code and log segments as /reserved-memory nodes
-  named aop-etext and aop-oslog; no mapping of them survives the reset of the
-  AOP's DART, so the operating system maps them again before the start.
+  reaches its services through the RTKit endpoints. The firmware's external
+  code and log segments live in DRAM, and the bootloader reserves them.
 
 properties:
   compatible:
@@ -46,6 +44,14 @@ properties:
 
   iommus:
     maxItems: 1
+
+  memory-region:
+    minItems: 1
+    maxItems: 4
+    description:
+      The firmware segments in DRAM (its external code and its log), filled in
+      by the bootloader from the ADT. The iommu-addresses property of each
+      region gives the address the firmware uses for it.
 
   audio:
     type: object
@@ -105,6 +111,7 @@ examples:
             mboxes = <&aop_mbox>;
             mbox-names = "mbox";
             iommus = <&aop_dart 0>;
+            memory-region = <&aop_etext>, <&aop_oslog>; /* Filled by the bootloader */
 
             als {
                 compatible = "apple,t6041-aop-als", "apple,aop-als";
