@@ -557,6 +557,9 @@ impl crate::g17::queue::render::Host for Host<'_> {
     fn publish_qid(&mut self, id: kick::Id) -> Result {
         self.firmware.queues.qids.publish(id)
     }
+    fn next_publication(&mut self) -> Result<u64> {
+        self.firmware.queues.qids.next_publication()
+    }
     fn publish_outer_pair(
         &mut self,
         priority: u8,
@@ -687,6 +690,44 @@ impl crate::g17::Firmware {
                 Err(error) if error == EAGAIN => break,
                 result => result?,
             }
+        }
+        Ok(())
+    }
+
+    /// A final retirement pass before a render watchdog attributes its timeout, as compute runs
+    /// scan_compute() first: a head that finished but whose completion the event worker has not
+    /// processed yet must not defer another VM's timeout. Pairs lent out, or holding a deferred
+    /// timeout or error, stay with the worker, which observes and settles them in its order.
+    pub(in crate::g17::runtime) fn scan_renders(&mut self, deferred: &mut DeferredBatch) -> Result {
+        if self.recovery.pending()
+            || self
+                .primary
+                .state
+                .shared
+                .crashed
+                .load(core::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
+        for slot in 1..self.queues.render.entries.len() {
+            if !self.queues.render.entries[slot]
+                .as_ref()
+                .is_some_and(|entry| {
+                    entry
+                        .pair
+                        .as_ref()
+                        .is_some_and(|pair| pair.published_in_flight())
+                        && entry.preparing.is_none()
+                        && !entry.growing
+                        && !entry.pending_timeout
+                        && entry.pending_error.is_none()
+                })
+            {
+                continue;
+            }
+            self.retire_render_slot(slot, None, deferred)?;
+            self.queues.render.collect_retired(slot)?;
+            self.settle_render_terminal(slot, deferred)?;
         }
         Ok(())
     }
@@ -963,6 +1004,52 @@ impl Registry {
         packet.completion.defer_timeout(error);
         entry.pending_timeout = true;
         true
+    }
+
+    /// The oldest published group of every render pair, for cross-VM timeout attribution
+    /// (crate::g17::timeout).
+    pub(in crate::g17) fn render_timeout_heads(
+        &self,
+    ) -> impl Iterator<Item = crate::g17::timeout::Head> + '_ {
+        self.render
+            .entries
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.pair.as_ref())
+            .filter_map(|pair| pair.timeout_head())
+    }
+
+    /// A render watchdog blocked behind another VM's older unfinished work gets the same
+    /// bounded grace as compute; the oldest unfinished work is never excused. When the GPU
+    /// stalls on one client, the others' renders then outlive the culprit's teardown instead
+    /// of all timing out together.
+    pub(in crate::g17) fn render_timeout_decision(
+        &self,
+        packet: &Arc<Packet>,
+        renewals: u8,
+    ) -> Option<crate::g17::timeout::Verdict> {
+        let own = self
+            .render
+            .entries
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.pair.as_ref())
+            .find(|pair| pair.contains_packet(packet))
+            .and_then(|pair| pair.timeout_head());
+        let computes = self
+            .compute
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+            .filter_map(|queue| queue.timeout_head());
+        // Without a head of its own the timeout is its own.
+        own.map(|own| {
+            crate::g17::timeout::attribute(
+                own,
+                renewals,
+                Iterator::chain(self.render_timeout_heads(), computes),
+            )
+        })
     }
 }
 

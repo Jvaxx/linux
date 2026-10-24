@@ -242,6 +242,9 @@ impl Drop for PooledTimestamps {
     }
 }
 
+/// Republications of one command whose earlier publications firmware dropped unexecuted.
+pub(crate) const MAX_REPLAYS: u8 = 3;
+
 #[pin_data]
 pub(crate) struct Completion {
     status: Arc<VmStatus>,
@@ -261,6 +264,9 @@ pub(crate) struct Completion {
     timeout_error: AtomicI32,
     replays: AtomicU8,
     replay_timeout: AtomicBool,
+    /// A recovery blamed this command. Unlike `class`, which a later
+    /// classification can change, this never clears.
+    blamed: AtomicBool,
     firmware_consumer: AtomicBool,
     class: AtomicU8,
 }
@@ -315,6 +321,7 @@ impl Completion {
                 timeout_error: AtomicI32::new(0),
                 replays: AtomicU8::new(0),
                 replay_timeout: AtomicBool::new(false),
+                blamed: AtomicBool::new(false),
                 firmware_consumer: AtomicBool::new(false),
                 class: AtomicU8::new(0),
             }),
@@ -385,7 +392,7 @@ impl Completion {
         let accepted = self
             .replays
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                (count < 3).then_some(count + 1)
+                (count < MAX_REPLAYS).then_some(count + 1)
             })
             .is_ok();
         if accepted {
@@ -464,6 +471,20 @@ impl Completion {
         self.class.load(Ordering::Acquire) == 1
     }
 
+    pub(crate) fn guilty(&self) -> bool {
+        self.class.load(Ordering::Acquire) == 2
+    }
+
+    /// A recovery blamed this command, whatever class it keeps: it may have caused the fault,
+    /// so it is never published again.
+    pub(crate) fn note_blamed(&self) {
+        self.blamed.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn blamed(&self) -> bool {
+        self.blamed.load(Ordering::Acquire)
+    }
+
     /// Installed before the first firmware-visible prefix. Cancellation takes
     /// the same lock after claiming the signal, so it cannot miss a late lease.
     pub(crate) fn attach_render_lease(
@@ -497,7 +518,7 @@ impl Completion {
     /// Called under the device mutex before deferring the error signal.
     pub(crate) fn quarantine_render(&self) {
         if let Some(lease) = self.render.lock().as_ref() {
-            lease.quarantine();
+            lease.quarantine(self.spared());
         }
     }
 
@@ -528,8 +549,11 @@ impl Completion {
             feed.note_render_pass(ticks[2], ticks[3]);
         }
         if let Err(error) = result {
+            // Spared work cancelled after another VM's recovery is not this client's device loss.
             if self.spared() {
-                self.status.report_failure(error);
+                if error != ECANCELED {
+                    self.status.report_failure(error);
+                }
             } else if error != ECANCELED {
                 self.status.record(error);
             }

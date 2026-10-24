@@ -146,4 +146,5 @@ static struct kunit_suite apple_pmp_policy_suite = {
 	.test_cases = apple_pmp_policy_cases,
 };
 kunit_test_suite(apple_pmp_policy_suite);
+MODULE_DESCRIPTION("KUnit tests for the Apple PMP thermal policy");
 MODULE_LICENSE("Dual MIT/GPL");
