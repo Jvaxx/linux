@@ -1223,10 +1223,12 @@ impl Pair {
         let groups = self.active.iter().map(|active| {
             let innocent =
                 active.outer_published && !active.failed && !active.packet.completion.guilty();
+            let blamed = active.packet.completion.blamed();
             let exhausted =
                 active.packet.completion.replay_count() >= crate::g17::completion::MAX_REPLAYS;
             // decide() stops at the first group that is not abandoned, an error included.
             let abandoned = innocent
+                && !blamed
                 && (|| -> Result<bool> {
                     let mut observer = Observer {
                         memory,
@@ -1249,6 +1251,7 @@ impl Pair {
                 });
             Group {
                 innocent,
+                blamed,
                 abandoned,
                 exhausted,
             }
