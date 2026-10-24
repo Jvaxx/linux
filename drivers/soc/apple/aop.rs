@@ -91,17 +91,10 @@ const AOP_MMIO_SIZE: usize = 0x1e0000;
 const ASC_MMIO_SIZE: usize = 0x4000;
 const BOOTARGS_OFFSET: usize = 0x22c;
 const BOOTARGS_SIZE: usize = 0x230;
-/// On the T6040 the bootloader reserves the firmware's external code segment
-/// (`__ETEXT`, from the ADT) as `/reserved-memory/aop-etext@<phys>`. No
-/// mapping of it survives the DART reset, so this driver maps it itself.
-const ETEXT_NODE_PREFIX: &CStr = c_str!("aop-etext");
-/// The firmware's log segment (`__OS_LOG`), reserved the same way as
-/// `/reserved-memory/aop-oslog@<phys>` and used by the firmware at its
-/// physical address. Without it the firmware stops within a second on a DART
-/// fault storm.
-const OSLOG_NODE_PREFIX: &CStr = c_str!("aop-oslog");
-const ETEXT_MAX_SIZE: u64 = 0x10_0000;
-const ETEXT_PAGE: u64 = 0x4000;
+/// The largest firmware segment the bootloader reserves in DRAM (T6040).
+const FW_REGION_MAX_SIZE: u64 = 0x10_0000;
+/// The DART page size the firmware segments are mapped with.
+const FW_REGION_PAGE: u64 = 0x4000;
 const AFK_ENDPOINT_START: u8 = 0x20;
 const AFK_ENDPOINT_COUNT: u8 = 0xf;
 const AFK_OPC_GET_BUF: u64 = 0x89;
@@ -1195,18 +1188,6 @@ impl ChildDevice {
     }
 }
 
-/// The IOVA mapping of the firmware's external code, owned by this driver
-/// (T6040 only).
-struct EtextMapping {
-    domain: *mut bindings::iommu_domain,
-    iova: u64,
-    size: usize,
-}
-
-// SAFETY: The domain pointer is only passed to `iommu_unmap()`, which may be
-// called from any thread; the domain outlives the device's binding.
-unsafe impl Send for EtextMapping {}
-
 #[pin_data]
 struct AopData {
     dev: ARef<device::Device>,
@@ -1225,9 +1206,6 @@ struct AopData {
     /// The co-processor was started; only then is there anything to shut
     /// down and to retain.
     cpu_started: Atomic<bool>,
-    /// The firmware mappings made by `map_reserved()`.
-    #[pin]
-    etext: Mutex<KVec<EtextMapping>>,
     /// Shut the co-processor down on removal, and if that cannot be
     /// confirmed, retain everything it may still DMA to.
     quiesce_on_unbind: bool,
@@ -1375,7 +1353,6 @@ impl AopData {
                     removing: Atomic::new(false),
                     transport_closing: Atomic::new(false),
                     cpu_started: Atomic::new(false),
-                    etext <- new_mutex!(KVec::new()),
                     quiesce_on_unbind: cfg.quiesce_on_unbind,
                     required_endpoints: cfg.required_endpoints,
                     setup_queue,
@@ -1576,124 +1553,184 @@ impl AopData {
         Ok(())
     }
 
-    /// The physical range of the one `/reserved-memory/<prefix>@*` node.
-    fn find_reserved(prefix: &CStr) -> Result<(u64, u64)> {
-        // SAFETY: The path is NUL-terminated. The node reference is released
-        // below (OF_DYNAMIC is on since 7.3: pmdomain/apple selects it).
-        let resv = unsafe {
-            bindings::of_find_node_opts_by_path(
-                c_str!("/reserved-memory").as_char_ptr(),
-                ptr::null_mut(),
-            )
-        };
-        if resv.is_null() {
-            return Err(ENODEV);
+    /// The physical address, IOVA and size of the `idx`-th `memory-region` of
+    /// `np`. The IOVA comes from the region's `iommu-addresses` entry for
+    /// `np`.
+    fn fw_region(np: *mut bindings::device_node, idx: c_int) -> Result<(u64, u64, u64)> {
+        // SAFETY: `np` is a valid node and the name is NUL-terminated.
+        let region =
+            unsafe { bindings::of_parse_phandle(np, c_str!("memory-region").as_char_ptr(), idx) };
+        if region.is_null() {
+            return Err(EINVAL);
         }
-        let mut found: Result<Option<(u64, u64)>> = Ok(None);
-        let mut child: *mut bindings::device_node = ptr::null_mut();
-        loop {
-            // SAFETY: `resv` is a valid node; `child` is null or its previous
-            // child, whose reference this call drops.
-            child = unsafe { bindings::of_get_next_child(resv, child) };
-            if child.is_null() {
-                break;
-            }
-            // SAFETY: `child` is a valid node and the prefix is NUL-terminated.
-            if !unsafe { bindings::of_node_name_prefix(child, prefix.as_char_ptr()) } {
-                continue;
-            }
-            let mut res = mem::MaybeUninit::<bindings::resource>::zeroed();
-            // SAFETY: `res` is writable storage for one resource.
-            if unsafe { bindings::of_address_to_resource(child, 0, res.as_mut_ptr()) } != 0 {
-                found = Err(EINVAL);
-                break;
-            }
-            // SAFETY: of_address_to_resource() succeeded and filled it in.
-            let res = unsafe { res.assume_init() };
-            if !matches!(found, Ok(None)) || res.end < res.start {
-                found = Err(EINVAL);
-                break;
-            }
-            found = Ok(Some((res.start as u64, (res.end - res.start) as u64 + 1)));
+        // SAFETY: of_parse_phandle() returned a reference on `region`.
+        let _put = ScopeGuard::new(|| unsafe { bindings::of_node_put(region) });
+        let mut res = mem::MaybeUninit::<bindings::resource>::zeroed();
+        // SAFETY: `region` is a valid node and `res` is writable storage for
+        // one resource.
+        if unsafe { bindings::of_address_to_resource(region, 0, res.as_mut_ptr()) } != 0 {
+            return Err(EINVAL);
         }
-        // SAFETY: Both are null or node references taken above; of_node_put()
-        // accepts null.
-        unsafe {
-            bindings::of_node_put(child);
-            bindings::of_node_put(resv);
+        // SAFETY: of_address_to_resource() succeeded and filled it in.
+        let res = unsafe { res.assume_init() };
+        if res.end < res.start {
+            return Err(EINVAL);
         }
-        found?.ok_or(ENOENT)
+        let phys = res.start as u64;
+        let size = (res.end - res.start) as u64 + 1;
+
+        let mut len: c_int = 0;
+        // SAFETY: `region` is a valid node and the name is NUL-terminated.
+        let prop = unsafe {
+            bindings::of_get_property(region, c_str!("iommu-addresses").as_char_ptr(), &mut len)
+        }
+        .cast::<u32>();
+        let len = usize::try_from(len).map_err(|_| EINVAL)?;
+        if prop.is_null() || len == 0 || len % mem::size_of::<u32>() != 0 {
+            return Err(ENOENT);
+        }
+        let cells = len / mem::size_of::<u32>();
+        // SAFETY: `np` is a valid node.
+        let own = unsafe { (*np).phandle };
+        let mut found = None;
+        let mut pos = 0;
+        // Each entry is an owner phandle and an address and size in the
+        // owner's DMA address space.
+        while pos < cells {
+            // SAFETY: `pos` is below `cells`, inside the property.
+            let phandle = u32::from_be(unsafe { prop.add(pos).read_unaligned() });
+            pos += 1;
+            if own != 0 && phandle == own {
+                let mut iova: bindings::phys_addr_t = 0;
+                let mut length: usize = 0;
+                // SAFETY: `cells - pos` cells are left in the property, which
+                // bounds the tuple.
+                let next = unsafe {
+                    bindings::of_translate_dma_region_checked(
+                        np,
+                        prop.add(pos),
+                        cells - pos,
+                        &mut iova,
+                        &mut length,
+                    )
+                };
+                if next.is_null() || found.is_some() {
+                    return Err(EINVAL);
+                }
+                found = Some((iova as u64, length as u64));
+                // SAFETY: `next` points into the same property, past `pos`.
+                pos = usize::try_from(unsafe { next.offset_from(prop) }).map_err(|_| EINVAL)?;
+            } else {
+                // Another device's entry: skip it by its owner's cell count.
+                // SAFETY: A lookup; the reference is dropped right below.
+                let owner = unsafe { bindings::of_find_node_by_phandle(phandle) };
+                if owner.is_null() {
+                    return Err(EINVAL);
+                }
+                // SAFETY: `owner` is a valid node reference.
+                let n = unsafe { bindings::of_dma_region_cells(owner) };
+                // SAFETY: The reference taken by of_find_node_by_phandle().
+                unsafe { bindings::of_node_put(owner) };
+                let n = usize::try_from(n).map_err(|_| EINVAL)?;
+                if n > cells - pos {
+                    return Err(EINVAL);
+                }
+                pos += n;
+            }
+        }
+        let (iova, length) = found.ok_or(ENOENT)?;
+        if length != size {
+            return Err(EINVAL);
+        }
+        Ok((phys, iova, size))
     }
 
-    /// Maps the `/reserved-memory/<prefix>@*` segment into this device's DART
-    /// domain at `iova`, or at its physical address when `iova` is `None`.
-    /// Nothing is mapped unless every check passes.
-    fn map_reserved(&self, dev: &device::Device, prefix: &CStr, iova: Option<u64>) -> Result<()> {
-        let (phys, size) = Self::find_reserved(prefix)?;
-        let iova = iova.unwrap_or(phys);
-        if phys % ETEXT_PAGE != 0
-            || size == 0
-            || size % ETEXT_PAGE != 0
-            || size > ETEXT_MAX_SIZE
-            || iova % ETEXT_PAGE != 0
-            || iova.checked_add(size).is_none()
-            || phys.checked_add(size).is_none()
-        {
-            return Err(EINVAL);
+    /// Checks the firmware segments the AOP runs from DRAM (T6040). The
+    /// bootloader reserves them and lists them in `memory-region`, and each
+    /// one's `iommu-addresses` gives the IOVA the firmware uses for it. The
+    /// IOMMU core maps them in the default domain when the device is added
+    /// (one to one when the IOVA is the physical address, translated
+    /// otherwise), so they are only checked here. Every page has to be mapped
+    /// where the DT says, the external code (`__ETEXT`) at `ec0p` and any
+    /// other segment (`__OS_LOG`) at its physical address.
+    fn check_fw_regions(dev: &device::Device, ec0p: u64) -> Result<()> {
+        // SAFETY: `dev` is a live device being probed.
+        let np = unsafe { (*dev.as_raw()).of_node };
+        if np.is_null() {
+            return Err(ENODEV);
+        }
+        // SAFETY: `np` is the device's node, valid while it is bound.
+        let count = unsafe { bindings::of_reserved_mem_region_count(np) };
+        if count <= 0 {
+            dev_err!(dev, "No firmware memory-region from the bootloader");
+            return Err(ENOENT);
         }
         // SAFETY: `dev` is a live device being probed.
         let domain = unsafe { bindings::iommu_get_domain_for_dev(dev.as_raw()) };
-        if domain.is_null() {
-            return Err(ENODEV);
-        }
-        // SAFETY: `domain` is the non-null domain returned above.
-        let ty = unsafe { (*domain).type_ };
+        let ty = if domain.is_null() {
+            bindings::IOMMU_DOMAIN_BLOCKED
+        } else {
+            // SAFETY: `domain` is the non-null domain returned above.
+            unsafe { (*domain).type_ }
+        };
         if ty == bindings::IOMMU_DOMAIN_IDENTITY || ty == bindings::IOMMU_DOMAIN_BLOCKED {
+            dev_err!(dev, "No translated IOMMU domain for the firmware");
             return Err(ENODEV);
         }
-        let size_us = usize::try_from(size).map_err(|_| EOVERFLOW)?;
-        // SAFETY: The range was checked above; the DART domain validates the
-        // IOVA itself.
-        let ret = unsafe {
-            bindings::iommu_map(
-                domain,
-                iova as _,
-                phys as _,
-                size_us,
-                (bindings::IOMMU_READ | bindings::IOMMU_WRITE) as _,
-                bindings::GFP_KERNEL,
-            )
-        };
-        if ret != 0 {
-            return Err(Error::from_errno(ret));
+        let mut etext = false;
+        for idx in 0..count {
+            let (phys, iova, size) = Self::fw_region(np, idx).inspect_err(|e| {
+                dev_err!(dev, "Invalid firmware memory-region {} ({:?})", idx, e);
+            })?;
+            if phys % FW_REGION_PAGE != 0
+                || size % FW_REGION_PAGE != 0
+                || size > FW_REGION_MAX_SIZE
+                || iova % FW_REGION_PAGE != 0
+                || iova.checked_add(size).is_none()
+                || phys.checked_add(size).is_none()
+            {
+                dev_err!(dev, "Invalid firmware memory-region {}", idx);
+                return Err(EINVAL);
+            }
+            if iova == ec0p {
+                if etext {
+                    dev_err!(dev, "Two firmware memory-regions at EC0p {:#x}", ec0p);
+                    return Err(EINVAL);
+                }
+                etext = true;
+            } else if iova != phys {
+                dev_err!(
+                    dev,
+                    "Firmware memory-region {} at IOVA {:#x}, neither EC0p {:#x} nor its physical address",
+                    idx,
+                    iova,
+                    ec0p
+                );
+                return Err(EINVAL);
+            }
+            let mut off = 0;
+            while off < size {
+                // SAFETY: `domain` is the device's domain, live while it is
+                // bound.
+                let back =
+                    unsafe { bindings::iommu_iova_to_phys(domain, (iova + off) as _) } as u64;
+                if back != phys + off {
+                    dev_err!(
+                        dev,
+                        "Firmware memory-region {} is not mapped at IOVA {:#x}",
+                        idx,
+                        iova + off
+                    );
+                    return Err(EIO);
+                }
+                off += FW_REGION_PAGE;
+            }
         }
-        // SAFETY: as above.
-        let back = unsafe { bindings::iommu_iova_to_phys(domain, iova as _) } as u64;
-        if back != phys {
-            // SAFETY: The range was mapped just above.
-            unsafe { bindings::iommu_unmap(domain, iova as _, size_us) };
-            return Err(EIO);
-        }
-        let map = EtextMapping {
-            domain,
-            iova,
-            size: size_us,
-        };
-        if self.etext.lock().push(map, GFP_KERNEL).is_err() {
-            // SAFETY: The range was mapped just above.
-            unsafe { bindings::iommu_unmap(domain, iova as _, size_us) };
-            return Err(ENOMEM);
+        if !etext {
+            dev_err!(dev, "No firmware memory-region at EC0p {:#x}", ec0p);
+            return Err(ENOENT);
         }
         Ok(())
-    }
-
-    /// Undoes `map_reserved()`; only once the firmware no longer runs.
-    fn unmap_etext(&self) {
-        let mut maps = self.etext.lock();
-        while let Some(map) = maps.pop() {
-            // SAFETY: The mapping was created by map_reserved() on this domain.
-            unsafe { bindings::iommu_unmap(map.domain, map.iova as _, map.size) };
-        }
     }
 
     /// Leaks every allocation the firmware may still access. Called when the
@@ -1955,9 +1992,6 @@ impl AOP for AopData {
             );
             return;
         }
-        // The firmware is stopped or was never started: it no longer fetches
-        // its external code.
-        self.unmap_etext();
         let arena = self.setup.lock().arena.take();
         drop(arena);
         // The ring is DMA of the audio child; free it while the child is
@@ -2413,10 +2447,10 @@ struct AopHwConfig {
     quiesce_on_unbind: bool,
     /// The endpoints that have to start; empty means all advertised ones.
     required_endpoints: &'static [u8],
-    /// Map the firmware's external code at `ec0p` and its `__OS_LOG` at its
-    /// physical address before starting it: no bootloader mapping survives
-    /// the DART reset (T6040).
-    map_etext: bool,
+    /// The firmware runs segments from DRAM, which the bootloader reserves
+    /// and lists in `memory-region`; check their IOMMU mappings before
+    /// starting it (T6040).
+    fw_regions: bool,
     /// Halt the co-processor again when its start fails (T6040).
     halt_on_failed_start: bool,
 }
@@ -2430,7 +2464,7 @@ const HW_CFG_T8103: AopHwConfig = AopHwConfig {
     setup_port: false,
     quiesce_on_unbind: false,
     required_endpoints: &[],
-    map_etext: false,
+    fw_regions: false,
     halt_on_failed_start: false,
 };
 const HW_CFG_T8112: AopHwConfig = AopHwConfig {
@@ -2442,7 +2476,7 @@ const HW_CFG_T8112: AopHwConfig = AopHwConfig {
     setup_port: false,
     quiesce_on_unbind: false,
     required_endpoints: &[],
-    map_etext: false,
+    fw_regions: false,
     halt_on_failed_start: false,
 };
 const HW_CFG_T6000: AopHwConfig = AopHwConfig {
@@ -2454,7 +2488,7 @@ const HW_CFG_T6000: AopHwConfig = AopHwConfig {
     setup_port: false,
     quiesce_on_unbind: false,
     required_endpoints: &[],
-    map_etext: false,
+    fw_regions: false,
     halt_on_failed_start: false,
 };
 const HW_CFG_T6020: AopHwConfig = AopHwConfig {
@@ -2466,13 +2500,13 @@ const HW_CFG_T6020: AopHwConfig = AopHwConfig {
     setup_port: false,
     quiesce_on_unbind: false,
     required_endpoints: &[],
-    map_etext: false,
+    fw_regions: false,
     halt_on_failed_start: false,
 };
 /// T6040 (J616s): macOS writes the same four boot arguments as for the
-/// T6020. The bootloader's mapping of the external code does not survive the
-/// DART reset, so it is mapped here; the RTKit firmware is shut down on
-/// unbind.
+/// T6020. The firmware's external code and log live in DRAM, mapped through
+/// the reserved regions the bootloader describes; the RTKit firmware is shut
+/// down on unbind.
 const HW_CFG_T6040: AopHwConfig = AopHwConfig {
     ec0p: 0x0100_00000000,
     aopt: 0,
@@ -2482,7 +2516,7 @@ const HW_CFG_T6040: AopHwConfig = AopHwConfig {
     setup_port: false,
     quiesce_on_unbind: true,
     required_endpoints: &[],
-    map_etext: true,
+    fw_regions: true,
     halt_on_failed_start: true,
 };
 /// T8140: the firmware is started with the boot arguments the bootloader
@@ -2499,7 +2533,7 @@ const HW_CFG_T8140: AopHwConfig = AopHwConfig {
     setup_port: true,
     quiesce_on_unbind: true,
     required_endpoints: &[0x20, 0x21, 0x22, 0x23, 0x2b],
-    map_etext: false,
+    fw_regions: false,
     halt_on_failed_start: false,
 };
 
@@ -2541,23 +2575,15 @@ impl platform::Driver for AopDriver {
         let asc_req = pdev.io_request_by_index(1).ok_or(EINVAL)?;
         let asc_mmio = asc_req.iomap_sized::<ASC_MMIO_SIZE>()?;
         let asc_mmio = asc_mmio.as_view().relaxed();
+        if cfg.fw_regions {
+            // Before anything is written to the AOP: no mapping, no start.
+            AopData::check_fw_regions(pdev.as_ref(), cfg.ec0p)?;
+        }
         let data = AopData::new(pdev, cfg)?;
         // Whatever fails below leaves the AOP running and its children
         // registering; the same teardown as unbind's cleans that up.
         let probe_guard = ScopeGuard::new_with_data(data.clone(), |data| data.remove());
         let aop_mmio = aop_mmio.as_view();
-        if cfg.map_etext {
-            // Before anything is written to the AOP: no mapping, no start.
-            for (prefix, iova) in [
-                (ETEXT_NODE_PREFIX, Some(cfg.ec0p)),
-                (OSLOG_NODE_PREFIX, None),
-            ] {
-                if let Err(e) = data.map_reserved(pdev.as_ref(), prefix, iova) {
-                    dev_err!(pdev.as_ref(), "Failed to map {:?} ({:?})", prefix, e);
-                    return Err(e);
-                }
-            }
-        }
         if cfg.patch_bootargs {
             data.patch_bootargs(
                 &aop_mmio,
