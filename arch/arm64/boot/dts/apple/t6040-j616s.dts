@@ -620,8 +620,9 @@
 };
 
 /*
- * The Type-C ports (ADT nub-spmi-a0 hpm0/hpm1, nub-spmi-a1 hpm2). The ADT
- * lists the event, sleep and wake interrupts; select is event + 2.
+ * The Type-C ports (ADT nub-spmi-a0 hpm0/hpm1, nub-spmi-a1 hpm2) and the
+ * MagSafe controller (nub-spmi-a0 hpm5). The ADT lists the event, sleep and
+ * wake interrupts; select is event + 2.
  */
 &nub_spmi_a0 {
 	status = "okay";
@@ -696,6 +697,17 @@
 				};
 			};
 		};
+	};
+
+	/* MagSafe port */
+	hpm5: usb-pd@8 {
+		compatible = "apple,sn201202x";
+		reg = <0x8 SPMI_USID>;
+		interrupts = <63 IRQ_TYPE_EDGE_RISING>,
+			     <65 IRQ_TYPE_EDGE_RISING>,
+			     <69 IRQ_TYPE_EDGE_RISING>,
+			     <71 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "irq", "select", "sleep", "wake";
 	};
 };
 
