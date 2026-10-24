@@ -523,10 +523,9 @@
 };
 
 /*
- * Wi-Fi and Bluetooth (BCM4388). The boot loader adds the per-unit
- * calibration and Bluetooth address to these nodes, and its Bluetooth
- * admission depends on this node exactly as it is; it is kept as the
- * booted tree has it.
+ * Wi-Fi and Bluetooth (BCM4388). The boot loader finds these nodes by
+ * the paths in the wifi0 and bluetooth0 aliases and adds the per-unit
+ * calibration, the antenna SKU and the addresses to them.
  */
 / {
 	pcie0: pcie@1cb0000000 {
@@ -576,6 +575,8 @@
 			bluetooth@0,1 {
 				compatible = "pci14e4,5f72";
 				reg = <0x100 0 0 0 0>;
+				/* To be filled by the loader */
+				local-bd-address = [00 00 00 00 00 00];
 				brcm,board-type = "apple,hostomel";
 				status = "okay";
 			};
