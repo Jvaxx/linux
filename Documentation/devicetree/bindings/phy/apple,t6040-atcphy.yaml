@@ -16,6 +16,20 @@ description: >
   line of the attached DWC3 controller and acts as the Type-C orientation
   switch.
 
+$defs:
+  apple,tunable:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    minItems: 1
+    maxItems: 512
+    items:
+      items:
+        - description: Register offset
+        - description: Mask to be applied to the register value
+        - description: Bits to be set after applying the mask
+    description: >
+      Calibration table from the device's Apple device tree, applied at every
+      USB3 power-on.
+
 properties:
   compatible:
     const: apple,t6040-atcphy
@@ -71,19 +85,49 @@ properties:
     $ref: /schemas/graph.yaml#/properties/port
     description: Link to the SuperSpeed lanes of the Type-C connector.
 
-patternProperties:
-  "^apple,tunable-(axi2af|axi2af-lioa|fabric|common-cfg|lane0|lane1|aus40cmn-shm|auspll|cio4pll|pipehandler|usb2-host)$":
-    $ref: /schemas/types.yaml#/definitions/uint32-matrix
-    minItems: 1
-    maxItems: 512
-    items:
-      items:
-        - description: Register offset
-        - description: Mask to be applied to the register value
-        - description: Bits to be set after applying the mask
-    description: >
-      Calibration tables from the device's Apple device tree, applied at
-      every USB3 power-on to the region the name refers to.
+  apple,tunable-axi2af:
+    $ref: "#/$defs/apple,tunable"
+    description: Tunables applied to the axi2af region.
+
+  apple,tunable-fabric:
+    $ref: "#/$defs/apple,tunable"
+    description: Tunables applied to the fabric region.
+
+  apple,tunable-common-cfg:
+    $ref: "#/$defs/apple,tunable"
+    description: Tunables applied to the common-cfg region.
+
+  apple,tunable-axi2af-lioa:
+    $ref: "#/$defs/apple,tunable"
+    description: Tunables applied to the axi2af-lioa region.
+
+  apple,tunable-lane0:
+    $ref: "#/$defs/apple,tunable"
+    description: Lane 0 tunables, applied to the core region.
+
+  apple,tunable-lane1:
+    $ref: "#/$defs/apple,tunable"
+    description: Lane 1 tunables, applied to the core region.
+
+  apple,tunable-aus40cmn-shm:
+    $ref: "#/$defs/apple,tunable"
+    description: AUS40CMN_SHM tunables, applied to the core region.
+
+  apple,tunable-auspll:
+    $ref: "#/$defs/apple,tunable"
+    description: AUSPLL tunables, applied to the core region.
+
+  apple,tunable-cio4pll:
+    $ref: "#/$defs/apple,tunable"
+    description: CIO4PLL tunables, applied to the core region.
+
+  apple,tunable-pipehandler:
+    $ref: "#/$defs/apple,tunable"
+    description: Tunables applied to the pipehandler region.
+
+  apple,tunable-usb2-host:
+    $ref: "#/$defs/apple,tunable"
+    description: USB2 host tunables, applied to the bank0 region.
 
 required:
   - compatible
