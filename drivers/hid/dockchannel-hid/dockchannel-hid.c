@@ -453,7 +453,6 @@ static int dchid_reset_interface(struct dchid_iface *iface, int state)
 {
 	u8 msg[DCHID_PM1_CMD_SIZE];
 	u8 msg2[DCHID_PM2_CMD_SIZE];
-	bool afe = iface->dchid->afe_smc && iface->index == 1;
 	int ret;
 
 	if (!iface->dchid->use_ring) {
@@ -472,7 +471,7 @@ static int dchid_reset_interface(struct dchid_iface *iface, int state)
 		return ret;
 
 #if IS_REACHABLE(CONFIG_MFD_MACSMC)
-	if (afe) {
+	if (iface->dchid->afe_smc && iface->index == 1) {
 		/*
 		 * J616s macOS power sequence: gp1c high + 50 ms when turning
 		 * off, low with no added delay when turning on. These are
