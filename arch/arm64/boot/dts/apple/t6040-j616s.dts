@@ -433,7 +433,7 @@
 &pinctrl {
 	status = "okay";
 
-	wifi_clkreq: wifi-clkreq {
+	wifi_clkreq_pins: wifi-clkreq-pins {
 		pinmux = <APPLE_PINMUX(0, 1)>;
 	};
 };
@@ -545,7 +545,7 @@
 			    "phy0", "phy1", "phy2", "phy3";
 		ranges = <0x43000000 0xb 0xc0000000 0xb 0xc0000000 0 0x20000000 0x2000000 0 0x80000000 0xb 0x80000000 0 0x40000000>;
 		pinctrl-names = "default";
-		pinctrl-0 = <&wifi_clkreq>;
+		pinctrl-0 = <&wifi_clkreq_pins>;
 		#size-cells = <2>;
 		#address-cells = <3>;
 		bus-range = <0 1>;
