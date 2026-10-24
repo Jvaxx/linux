@@ -48,6 +48,8 @@ properties:
   reg:
     maxItems: 1
 
+  nonposted-mmio: true
+
   apple,fast-die-effort:
     $ref: /schemas/types.yaml#/definitions/phandle-array
     description: |

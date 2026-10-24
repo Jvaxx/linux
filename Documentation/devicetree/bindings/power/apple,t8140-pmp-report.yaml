@@ -27,6 +27,8 @@ properties:
   reg:
     maxItems: 1
 
+  nonposted-mmio: true
+
   power-domains:
     maxItems: 1
 

@@ -193,6 +193,20 @@ properties:
     additionalProperties: false
     description: The trackpad accelerometer.
 
+  tp-accel:
+    type: object
+    additionalProperties: false
+    description:
+      The trackpad accelerometer, under the name that the T6041 coprocessor
+      firmware announces.
+
+  mtp:
+    type: object
+    additionalProperties: false
+    description:
+      A vendor HID interface of the coprocessor, announced by the T6041
+      firmware.
+
 required:
   - compatible
   - reg
