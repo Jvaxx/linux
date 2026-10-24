@@ -328,8 +328,8 @@ impl AudioAttachDevice {
     }
 }
 
-// macOS IOPAudioLPMicDevice::sendChannelControlInfoToIOP sets node property 300 with the three
-// masks of the ADT node /product/audio (supportedChannels, enabledChannels, historyChannels).
+// macOS sets node property 300 to the three channel masks of the ADT node /product/audio
+// (supportedChannels, enabledChannels, historyChannels).
 #[repr(C, packed(4))]
 #[derive(Clone, Copy, Default)]
 struct LpaiChannelControl {
@@ -518,7 +518,7 @@ impl<T: Zeroable> AudioSetDeviceProp<T> {
 struct SndSocAopHwConfig {
     bytes_per_sample: u32,
     hf_decimator: bool,
-    // The T6040 firmware follows macOS's IOPAudioLPMicDevice flow. LPAI property 301 is the
+    // The T6040 firmware takes the microphone setup macOS sends. LPAI property 301 is the
     // read-only stream description; the channel masks are property 300 (12 bytes). A refusal of
     // any of the configuration steps is logged and not fatal, so the next step's answer is seen.
     t6040_flow: bool,

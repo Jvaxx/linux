@@ -20,6 +20,16 @@ description: |
   The headset jack's channels are optional: a node without them has no jack
   streams.
 
+# Only select T6041 nodes: other AOP audio nodes carry the
+# apple,t6030-aop-audio fallback too and have a different set of streams.
+select:
+  properties:
+    compatible:
+      contains:
+        const: apple,t6041-aop-audio
+  required:
+    - compatible
+
 allOf:
   - $ref: dai-common.yaml#
 
