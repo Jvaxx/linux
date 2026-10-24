@@ -621,6 +621,7 @@ impl Queue {
             vm: Arc::as_ptr(active.packet.completion.status()) as usize,
             published: active.published,
             finished: active.observed.is_some(),
+            failed: self.quarantined,
         })
     }
 
