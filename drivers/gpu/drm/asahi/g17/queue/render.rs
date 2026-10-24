@@ -966,18 +966,19 @@ impl Pair {
                 .all(|qid| masks[usize::from(qid) / 64] & (1u64 << (qid % 64)) != 0)
         })
     }
-    /// The oldest published group, for cross-VM timeout attribution (crate::g17::timeout).
-    /// The oldest published group still running. A quarantined pair's work holds the GPU until
-    /// the firmware drains it, so it stays visible to other VMs' watchdogs, as compute does.
+    /// The oldest published group still running, for cross-VM timeout attribution
+    /// (crate::g17::timeout). A quarantined pair's work holds the GPU until the firmware drains
+    /// it, so it stays visible to other VMs' watchdogs, as compute does, marked as failed.
     pub(crate) fn timeout_head(&self) -> Option<crate::g17::timeout::Head> {
         self.active
             .iter()
             .filter(|active| active.outer_published)
             .find(|active| active.drained_result.is_none())
             .map(|active| crate::g17::timeout::Head {
-                vm: Arc::as_ptr(active.packet.completion.status()) as usize,
+                vm: active.packet.context.vm().id(),
                 published: active.published,
                 finished: false,
+                failed: self.quarantined,
             })
     }
 
@@ -1199,13 +1200,16 @@ impl Pair {
 
     /// Every retained group was retired and unlinked by firmware without
     /// executing (job list empty, stamps cover it, no recovery, fragment end
-    /// never written): after another VM's recovery the 25G83 firmware drops an
-    /// innocent pair's queued groups this way. Nothing of them reached their
-    /// attachments, so the same commands are published again, in order, instead
-    /// of failing their owners. Only the whole set is replayed; a replayed prefix
-    /// would run after a live successor. `grace` asks for the strict witness
-    /// twice ABANDON_GRACE_NS apart (worker polling); the render timeout, long
-    /// after publication, takes it once as its retirement does.
+    /// never written): after another VM's recovery the firmware drops an
+    /// innocent pair's queued groups this way (seen on 25G83 and 26A428).
+    /// Nothing of them reached their attachments, so the same commands are
+    /// published again, in order, instead of failing their owners. Only the
+    /// whole set is replayed; a replayed prefix would run after a live
+    /// successor. `grace` asks for the strict witness twice ABANDON_GRACE_NS
+    /// apart (worker polling); the render timeout, long after publication,
+    /// takes it once as its retirement does. A single sample can still
+    /// straddle a firmware update of the fragment end record; the cost is
+    /// that a group which did execute runs a second time (blending twice).
     fn replay_abandoned(
         &mut self,
         host: &mut impl Host,
@@ -1223,10 +1227,12 @@ impl Pair {
         let groups = self.active.iter().map(|active| {
             let innocent =
                 active.outer_published && !active.failed && !active.packet.completion.guilty();
+            let blamed = active.packet.completion.blamed();
             let exhausted =
                 active.packet.completion.replay_count() >= crate::g17::completion::MAX_REPLAYS;
             // decide() stops at the first group that is not abandoned, an error included.
             let abandoned = innocent
+                && !blamed
                 && (|| -> Result<bool> {
                     let mut observer = Observer {
                         memory,
@@ -1249,6 +1255,7 @@ impl Pair {
                 });
             Group {
                 innocent,
+                blamed,
                 abandoned,
                 exhausted,
             }
@@ -1276,7 +1283,18 @@ impl Pair {
                 return Ok(false);
             }
         }
-        if !grace || crate::debug::debug_enabled(crate::debug::DebugFlags::VerboseFaults) {
+        // decide() lets only the front be exhausted. An exhausted front fails, and its
+        // successors, which consume its output, fail with it rather than run without it.
+        let mut failing = self.active.front().is_some_and(|front| {
+            front.packet.completion.replay_count() >= crate::g17::completion::MAX_REPLAYS
+        });
+        if failing {
+            pr_warn!(
+                "G17: render slot {}: {} groups retired without execution; replay limit reached, failing them\n",
+                self.slot,
+                self.active.len()
+            );
+        } else if !grace || crate::debug::debug_enabled(crate::debug::DebugFlags::VerboseFaults) {
             pr_warn!(
                 "G17: render slot {}: {} groups retired without execution; replaying\n",
                 self.slot,
@@ -1301,7 +1319,8 @@ impl Pair {
             }
             let ordinal = front.ticket.ordinal;
             let packet = front.packet.clone();
-            if !packet.completion.begin_replay() {
+            failing = failing || !packet.completion.begin_replay();
+            if failing {
                 if !packet.completion.spared() {
                     packet.completion.status().record(EIO);
                     if self.terminal.is_none() {
@@ -1311,7 +1330,7 @@ impl Pair {
                 defer(Deferred::Retired(packet.completion.clone(), Err(EIO)))?;
                 self.memory.retire(ordinal)?;
                 self.active.pop().ok_or(EIO)?;
-                return Ok(true);
+                continue;
             }
             self.memory.retire(ordinal)?;
             self.active.pop().ok_or(EIO)?;
@@ -1484,8 +1503,14 @@ impl Pair {
                 let snapshot = observer.snapshot(active.ticket.ordinal)?;
                 let stamps = observer.stamps()?;
                 let (_, state) = observer.host.epoch()?;
+                // A torn sample is no proof, as in replay_abandoned(): the group stays retained
+                // (quarantined with the pair if nothing was retired) instead of the error
+                // stopping the runtime for every client.
                 if !active.outer_published
-                    || !retirement::abandoned(&active.ticket, snapshot, stamps, state, false)?
+                    || !matches!(
+                        retirement::abandoned(&active.ticket, snapshot, stamps, state, false),
+                        Ok(true)
+                    )
                 {
                     break;
                 }
