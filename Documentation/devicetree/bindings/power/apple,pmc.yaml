@@ -48,6 +48,8 @@ properties:
           - const: rails
           - const: voters
 
+  nonposted-mmio: true
+
   power-domains:
     maxItems: 1
 
