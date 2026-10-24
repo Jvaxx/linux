@@ -14,10 +14,12 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "afr";
-		apple,always-on;
 	};
 
-	/* The GPU firmware keeps running and does not survive this domain going off. */
+	/*
+	 * The GPU firmware keeps running and does not survive this domain going
+	 * off, so a board that enables the GPU keeps it and ps_afr always on.
+	 */
 	ps_gfx: power-controller@110 {
 		compatible = "apple,t6041-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x110 4>;
@@ -25,7 +27,6 @@
 		#reset-cells = <0>;
 		label = "gfx";
 		power-domains = <&ps_afr>;
-		apple,always-on;
 	};
 };
 

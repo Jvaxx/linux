@@ -807,10 +807,13 @@
 	status = "okay";
 };
 
-&gfx_mbox {
-	status = "okay";
-};
-
+/*
+ * The GPU stays disabled until a boot loader fills in this unit's operating
+ * points, leakage and regions from the ADT; the values here are one unit's.
+ * Enabling it also takes gfx_mbox, keeps ps_afr and ps_gfx always on and
+ * claims pmp_gfx always-on, so that the PMP sees the GPU on exactly while it
+ * is powered.
+ */
 &gpu {
 	memory-region = <&uat_ttbs>, <&uat_pagetables>, <&uat_handoff>,
 			<&gpu_fw_data>, <&uat_l2_pagetables>;
@@ -819,12 +822,7 @@
 	operating-points-v2 = <&gpu_opp>;
 	apple,cs-opp = <&gpu_cs_opp>;
 	apple,afr-opp = <&gpu_afr_opp>;
-	status = "okay";
-};
-
-/* The GPU firmware runs from boot on (ps_gfx is always on): the PMP must see the GPU on. */
-&pmp_gfx {
-	apple,always-on;
+	status = "disabled";
 };
 
 /*
