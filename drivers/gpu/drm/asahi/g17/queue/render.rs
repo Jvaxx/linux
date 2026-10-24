@@ -1283,7 +1283,18 @@ impl Pair {
                 return Ok(false);
             }
         }
-        if !grace || crate::debug::debug_enabled(crate::debug::DebugFlags::VerboseFaults) {
+        // decide() lets only the front be exhausted. An exhausted front fails, and its
+        // successors, which consume its output, fail with it rather than run without it.
+        let mut failing = self.active.front().is_some_and(|front| {
+            front.packet.completion.replay_count() >= crate::g17::completion::MAX_REPLAYS
+        });
+        if failing {
+            pr_warn!(
+                "G17: render slot {}: {} groups retired without execution; replay limit reached, failing them\n",
+                self.slot,
+                self.active.len()
+            );
+        } else if !grace || crate::debug::debug_enabled(crate::debug::DebugFlags::VerboseFaults) {
             pr_warn!(
                 "G17: render slot {}: {} groups retired without execution; replaying\n",
                 self.slot,
@@ -1308,7 +1319,8 @@ impl Pair {
             }
             let ordinal = front.ticket.ordinal;
             let packet = front.packet.clone();
-            if !packet.completion.begin_replay() {
+            failing = failing || !packet.completion.begin_replay();
+            if failing {
                 if !packet.completion.spared() {
                     packet.completion.status().record(EIO);
                     if self.terminal.is_none() {
@@ -1318,7 +1330,7 @@ impl Pair {
                 defer(Deferred::Retired(packet.completion.clone(), Err(EIO)))?;
                 self.memory.retire(ordinal)?;
                 self.active.pop().ok_or(EIO)?;
-                return Ok(true);
+                continue;
             }
             self.memory.retire(ordinal)?;
             self.active.pop().ok_or(EIO)?;
