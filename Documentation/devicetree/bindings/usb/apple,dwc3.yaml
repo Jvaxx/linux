@@ -25,6 +25,20 @@ allOf:
       required:
         - power-domains
 
+$defs:
+  apple,tunable:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    minItems: 1
+    maxItems: 512
+    items:
+      items:
+        - description: Register offset
+        - description: Mask to be applied to the register value
+        - description: Bits to be set after applying the mask
+    description: >
+      Controller table from the device's Apple device tree, applied after
+      every core reset (T6040).
+
 properties:
   compatible:
     oneOf:
@@ -66,19 +80,25 @@ properties:
   power-domains:
     maxItems: 1
 
-patternProperties:
-  "^apple,tunable-(gbl-default|gbl-host|dbg|cfg-host|link)$":
-    $ref: /schemas/types.yaml#/definitions/uint32-matrix
-    minItems: 1
-    maxItems: 512
-    items:
-      items:
-        - description: Register offset
-        - description: Mask to be applied to the register value
-        - description: Bits to be set after applying the mask
-    description: >
-      Controller tables from the device's Apple device tree, applied after
-      every core reset (T6040).
+  apple,tunable-gbl-default:
+    $ref: "#/$defs/apple,tunable"
+    description: Tunables applied to the DWC3 global registers.
+
+  apple,tunable-gbl-host:
+    $ref: "#/$defs/apple,tunable"
+    description: Host mode tunables applied to the DWC3 global registers.
+
+  apple,tunable-dbg:
+    $ref: "#/$defs/apple,tunable"
+    description: Tunables applied to the debug registers of the Apple region.
+
+  apple,tunable-cfg-host:
+    $ref: "#/$defs/apple,tunable"
+    description: Host mode tunables applied to the drd-cfg region.
+
+  apple,tunable-link:
+    $ref: "#/$defs/apple,tunable"
+    description: Tunables applied to the link registers of the Apple region.
 
 required:
   - compatible
